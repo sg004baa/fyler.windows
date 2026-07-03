@@ -12,3 +12,5 @@ arc-swap.workspace = true
 tokio.workspace = true
 # nvim-rsに依存してよいのはこのクレートだけ(AGENTS.md 絶対ルール2)
 nvim-rs.workspace = true
+rmpv.workspace = true
+async-trait.workspace = true

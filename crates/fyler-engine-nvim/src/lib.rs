@@ -9,9 +9,6 @@
 //! すべて無視)。nvim-rsはAPIをunstableと明言しているため、RPCクライアント部分は
 //! `rpc` モジュールに薄く隔離し、バージョンは固定する(Cargo.tomlで `=0.9.2`)。
 
-// scaffolding: todo!()スタブの引数警告を抑制。実装が入り次第このallowを削除する。
-#![allow(unused_variables)]
-
 pub mod engine;
 pub mod guard;
 pub mod spawn;

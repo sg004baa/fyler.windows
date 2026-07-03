@@ -4,6 +4,15 @@
 //! `:lua` 等の意図的な破壊操作への防御はスコープ外(脅威モデル参照)。
 //! cmdline(`:` / `/`)はユーザーに開放する(`:%s` バルクリネームは中核機能)。
 
+use anyhow::Context;
+use nvim_rs::compat::tokio::Compat;
+use nvim_rs::{Buffer, Neovim};
+use rmpv::Value;
+use tokio::process::ChildStdin;
+
+type NvimWriter = Compat<ChildStdin>;
+type Nvim = Neovim<NvimWriter>;
+
 /// fylerバッファの架空URIスキーム。バッファ名は `filer://C:/Users/...` 形式。
 pub const BUFFER_URI_SCHEME: &str = "filer://";
 
@@ -33,6 +42,85 @@ pub const HANDLED_WRITE_AUTOCMDS: &[&str] =
 ///
 /// シグネチャはnvim-rsのクライアント型を受ける形で実装時に確定する
 /// (nvim-rsの型はこのクレートの外に出さないこと)。
-pub fn install_guards() {
-    todo!("M1: バッファローカルmap + autocmd導入")
+pub(crate) async fn install_guards(
+    nvim: &Nvim,
+    buffer: &Buffer<NvimWriter>,
+    channel_id: i64,
+) -> anyhow::Result<()> {
+    let buffer_number = buffer
+        .get_number()
+        .await
+        .map_err(|error| anyhow::anyhow!("fylerバッファ番号の取得に失敗しました: {error}"))?;
+    let write_events = HANDLED_WRITE_AUTOCMDS
+        .iter()
+        .map(|event| Value::from(*event))
+        .collect();
+
+    nvim.exec_lua(
+        r#"
+local buffer, channel, write_events = ...
+
+vim.bo[buffer].buftype = "acwrite"
+vim.bo[buffer].bufhidden = "hide"
+vim.bo[buffer].swapfile = false
+
+local group = vim.api.nvim_create_augroup("fyler_guards", { clear = true })
+
+for _, lhs in ipairs({ "<CR>", "gf", "gF", "<C-]>" }) do
+  vim.keymap.set({ "n", "x" }, lhs, function()
+    vim.rpcnotify(channel, "fyler_action_blocked", lhs)
+  end, { buffer = buffer, silent = true, nowait = true })
+end
+
+for _, event in ipairs(write_events) do
+  local event_name = event
+  vim.api.nvim_create_autocmd(event_name, {
+    group = group,
+    buffer = buffer,
+    callback = function()
+      if event_name == "BufWriteCmd" then
+        vim.rpcnotify(channel, "fyler_commit_requested")
+        return
+      end
+
+      vim.rpcnotify(channel, "fyler_write_blocked", event_name)
+      error("fyler: unsupported write path: " .. event_name)
+    end,
+  })
+end
+
+vim.api.nvim_create_autocmd("BufEnter", {
+  group = group,
+  callback = function(args)
+    if args.buf == buffer or not vim.api.nvim_buf_is_valid(buffer) then
+      return
+    end
+
+    local unexpected = args.buf
+    vim.schedule(function()
+      if not vim.api.nvim_buf_is_valid(buffer) then
+        return
+      end
+      if vim.api.nvim_get_current_buf() == unexpected then
+        vim.api.nvim_set_current_buf(buffer)
+      end
+      if unexpected ~= buffer and vim.api.nvim_buf_is_valid(unexpected) then
+        pcall(vim.api.nvim_buf_delete, unexpected, { force = true })
+      end
+      vim.rpcnotify(channel, "fyler_unexpected_buffer", unexpected)
+    end)
+  end,
+})
+"#,
+        vec![
+            Value::from(buffer_number),
+            Value::from(channel_id),
+            Value::Array(write_events),
+        ],
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("事故防止設定の導入に失敗しました: {error}"))
+    .context("Neovim guard初期化エラー")?;
+
+    Ok(())
 }
