@@ -10,8 +10,8 @@ DESIGN.md「M0: 成立性スパイク」の記録。検証コードは `crates/m
 | 2 | in-buffer ID: カーソル列補正と描画隠蔽が破綻しない | 未実施 | |
 | 3 | `--embed --headless` 起動 + 後付け `nvim_ui_attach`(最小グリッド) + ext_cmdline / ext_messages のイベント疎通 | 未実施 | |
 | 4 | Windows IME(日本語入力)の入力経路(`EditorCommand::Text`) | 未実施 | |
-| 5 | 保存状態機械の遷移をコードで確定(`fyler_core::save::transition` のテストを通す) | 未実施 | |
-| 6 | バッファ文法の最終確定(`fyler_core::grammar` のテストが仕様通りであることの確認) | 未実施 | |
+| 5 | 保存状態機械の遷移をコードで確定(`fyler_core::save::transition` のテストを通す) | pass | Linux上で単体テスト3件 pass |
+| 6 | バッファ文法の最終確定(`fyler_core::grammar` のテストが仕様通りであることの確認) | pass | Linux上で単体テスト7件 pass。DESIGN.md「行フォーマット」「バッファ文法の決定事項」(prefix `/{id} `・半角2=1階層・IDなし=CREATE・Broken=保存中断・末尾`/`・3桁ゼロ埋め)と全項目一致 |
 
 ## 判定
 

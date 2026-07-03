@@ -55,7 +55,6 @@ fn collapsed(ids: &[u64]) -> EditContext {
 // ---- parse(DESIGN.md「行フォーマット」の例そのまま) ----
 
 #[test]
-#[ignore = "unimplemented: M2 parse"]
 fn parse_design_doc_example() {
     let buf = lines(&[
         "/012 src/",
@@ -84,7 +83,6 @@ fn parse_design_doc_example() {
 }
 
 #[test]
-#[ignore = "unimplemented: M2 parse"]
 fn parse_skips_empty_lines_but_keeps_line_numbers() {
     let buf = lines(&["/001 a.txt", "", "   ", "/002 b.txt"]);
     let parsed = parse::parse(&buf);
@@ -94,7 +92,6 @@ fn parse_skips_empty_lines_but_keeps_line_numbers() {
 }
 
 #[test]
-#[ignore = "unimplemented: M2 parse"]
 fn parse_flags_broken_id_prefix() {
     // 「/0だけ残っている等」(DESIGN.md)
     let buf = lines(&["/0", "/12x foo.txt"]);
@@ -103,7 +100,6 @@ fn parse_flags_broken_id_prefix() {
 }
 
 #[test]
-#[ignore = "unimplemented: M2 parse"]
 fn to_desired_tree_builds_nested_paths() {
     let buf = lines(&["/012 src/", "/013   main.rs", "新規.txt"]);
     let tree = parse::to_desired_tree(&parse::parse(&buf)).unwrap();
@@ -116,7 +112,6 @@ fn to_desired_tree_builds_nested_paths() {
 }
 
 #[test]
-#[ignore = "unimplemented: M2 parse"]
 fn to_desired_tree_rejects_broken_prefix_and_bad_indent() {
     // broken prefix → 保存中断
     let buf = lines(&["/0"]);
@@ -139,7 +134,6 @@ fn to_desired_tree_rejects_broken_prefix_and_bad_indent() {
 // ---- validate(DESIGN.md「validateで弾くもの」) ----
 
 #[test]
-#[ignore = "unimplemented: M2 validate"]
 fn validate_rejects_duplicate_names_in_same_dir() {
     let base = baseline(&[]);
     let desired = DesiredTree {
@@ -156,7 +150,6 @@ fn validate_rejects_duplicate_names_in_same_dir() {
 }
 
 #[test]
-#[ignore = "unimplemented: M2 validate"]
 fn validate_rejects_windows_naming_violations() {
     let base = baseline(&[]);
     let desired = DesiredTree {
@@ -194,7 +187,6 @@ fn validate_rejects_windows_naming_violations() {
 }
 
 #[test]
-#[ignore = "unimplemented: M2 validate"]
 fn validate_accepts_clean_tree() {
     let base = baseline(&[
         (1, "src", EntryKind::Dir),
@@ -212,7 +204,6 @@ fn validate_accepts_clean_tree() {
 // ---- diff(DESIGN.md「diff判定ルール」) ----
 
 #[test]
-#[ignore = "unimplemented: M2 diff (rename)"]
 fn diff_unchanged_tree_yields_empty_plan() {
     let base = baseline(&[(1, "a.txt", EntryKind::File)]);
     let desired = DesiredTree {
@@ -223,7 +214,6 @@ fn diff_unchanged_tree_yields_empty_plan() {
 }
 
 #[test]
-#[ignore = "unimplemented: M2 diff (rename)"]
 fn diff_rename_is_move_with_same_parent() {
     // M2のゴール: 「iでrenameを書いて:wするとダイアログに RENAME a → b が出る」
     let base = baseline(&[(1, "a.txt", EntryKind::File)]);
@@ -242,7 +232,6 @@ fn diff_rename_is_move_with_same_parent() {
 }
 
 #[test]
-#[ignore = "unimplemented: M3 diff (create/delete)"]
 fn diff_missing_id_is_delete_and_new_line_is_create() {
     let base = baseline(&[(1, "old.txt", EntryKind::File)]);
     let desired = DesiredTree {
@@ -261,7 +250,6 @@ fn diff_missing_id_is_delete_and_new_line_is_create() {
 }
 
 #[test]
-#[ignore = "unimplemented: M4 diff (move)"]
 fn diff_move_to_other_directory() {
     let base = baseline(&[
         (1, "src", EntryKind::Dir),
@@ -287,7 +275,6 @@ fn diff_move_to_other_directory() {
 }
 
 #[test]
-#[ignore = "unimplemented: M4 diff (copy)"]
 fn diff_duplicated_id_is_copy() {
     // yy → p: baselineと同一パスの行が元位置、残りがCOPY
     let base = baseline(&[(1, "a.txt", EntryKind::File)]);
@@ -309,7 +296,6 @@ fn diff_duplicated_id_is_copy() {
 }
 
 #[test]
-#[ignore = "unimplemented: M4 diff (collapsed dir)"]
 fn diff_collapsed_dir_moves_as_one_op_and_children_are_not_deleted() {
     // collapsedなディレクトリの子孫はバッファに現れないが、DELETEではない。
     // rename/moveは子孫ごと = planには親1件のみ。
@@ -332,7 +318,6 @@ fn diff_collapsed_dir_moves_as_one_op_and_children_are_not_deleted() {
 }
 
 #[test]
-#[ignore = "unimplemented: M3 diff (expanded dir children delete)"]
 fn diff_expanded_dir_missing_children_are_deleted() {
     // 展開中(collapsedでない)ディレクトリの子孫がバッファから消えていればDELETE
     let base = baseline(&[

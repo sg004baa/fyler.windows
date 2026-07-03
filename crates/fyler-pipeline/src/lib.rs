@@ -8,10 +8,6 @@
 //! - バッファ文法の解釈は必ず `fyler_core::grammar` を使う(再実装禁止)
 //! - Windows名前規則は必ず `fyler_core::win_naming` を使う(再実装禁止)
 //! - acceptance criteria: `tests/spec_m2.rs`(実装したら `#[ignore]` を外す)
-
-// scaffolding: todo!()スタブの引数警告を抑制。実装が入り次第このallowを削除する。
-#![allow(unused_variables)]
-
 pub mod diff;
 pub mod parse;
 pub mod validate;

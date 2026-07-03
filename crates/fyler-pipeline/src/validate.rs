@@ -1,7 +1,11 @@
 //! validate: DesiredTreeの妥当性検査(DESIGN.md「validateで弾くもの」)。
 
-use fyler_core::tree::{BaselineTree, DesiredTree, EditContext};
+use std::collections::HashSet;
+
+use fyler_core::path::TreePath;
+use fyler_core::tree::{BaselineTree, DesiredTree, EditContext, EntryKind};
 use fyler_core::validate::ValidateError;
+use fyler_core::win_naming;
 
 /// DesiredTreeを検査し、見つかった問題を**すべて**返す(最初の1件で止めない)。
 /// 1件でもあれば呼び出し側(保存状態機械)は保存を中断する。
@@ -23,5 +27,117 @@ pub fn validate(
     desired: &DesiredTree,
     ctx: &EditContext,
 ) -> Vec<ValidateError> {
-    todo!("M2: validateルールの実装(tests/spec_m2.rs参照)")
+    let mut errors = Vec::new();
+    let mut seen_paths = HashSet::new();
+    let mut duplicate_paths = HashSet::new();
+
+    for entry in &desired.entries {
+        if !seen_paths.insert(entry.path.clone()) && duplicate_paths.insert(entry.path.clone()) {
+            errors.push(ValidateError::DuplicateName {
+                path: entry.path.clone(),
+            });
+        }
+
+        let Some(name) = entry.path.name() else {
+            continue;
+        };
+
+        if let Some(ch) = win_naming::find_reserved_char(name) {
+            errors.push(ValidateError::ReservedChar {
+                line: entry.line,
+                name: name.to_owned(),
+                ch,
+            });
+        }
+        if win_naming::is_reserved_name(name) {
+            errors.push(ValidateError::ReservedName {
+                line: entry.line,
+                name: name.to_owned(),
+            });
+        }
+        if win_naming::has_invalid_trailing(name) {
+            errors.push(ValidateError::InvalidTrailing {
+                line: entry.line,
+                name: name.to_owned(),
+            });
+        }
+
+        let Some(id) = entry.id else {
+            continue;
+        };
+        let Some(original) = baseline.get(id) else {
+            continue;
+        };
+        if original.kind == EntryKind::Dir && original.path.is_strict_ancestor_of(&entry.path) {
+            errors.push(ValidateError::MoveIntoSelf {
+                id,
+                from: original.path.clone(),
+                to: entry.path.clone(),
+            });
+        }
+    }
+
+    let hidden_entries = hidden_entries_at_desired_paths(baseline, desired, ctx);
+    for entry in &desired.entries {
+        let Some(id) = entry.id else {
+            continue;
+        };
+        let Some(original) = baseline.get(id) else {
+            continue;
+        };
+        if original.path == entry.path {
+            continue;
+        }
+
+        if hidden_entries
+            .iter()
+            .any(|(hidden_id, hidden_path)| *hidden_id != id && *hidden_path == entry.path)
+            && duplicate_paths.insert(entry.path.clone())
+        {
+            errors.push(ValidateError::DuplicateName {
+                path: entry.path.clone(),
+            });
+        }
+    }
+
+    errors
+}
+
+fn hidden_entries_at_desired_paths(
+    baseline: &BaselineTree,
+    desired: &DesiredTree,
+    ctx: &EditContext,
+) -> Vec<(fyler_core::EntryId, TreePath)> {
+    let mut hidden = Vec::new();
+
+    for collapsed_id in &ctx.collapsed_dirs {
+        let Some(collapsed) = baseline.get(*collapsed_id) else {
+            continue;
+        };
+        if collapsed.kind != EntryKind::Dir {
+            continue;
+        }
+
+        for desired_root in desired
+            .entries
+            .iter()
+            .filter(|entry| entry.id == Some(*collapsed_id))
+        {
+            for descendant in baseline
+                .entries
+                .iter()
+                .filter(|entry| collapsed.path.is_strict_ancestor_of(&entry.path))
+            {
+                let components = desired_root
+                    .path
+                    .components()
+                    .iter()
+                    .chain(descendant.path.components()[collapsed.path.depth()..].iter())
+                    .cloned();
+                hidden.push((descendant.id, TreePath::from_components(components)));
+            }
+        }
+    }
+
+    hidden
 }

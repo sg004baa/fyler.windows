@@ -111,7 +111,60 @@ pub enum SaveEffect {
 /// - 上記以外の(状態, イベント)組は不正遷移として無視する(状態維持・副作用なし)。
 ///   ただしdebugビルドではログ等で気づけるようにしてよい
 pub fn transition(state: SaveState, event: SaveEvent) -> (SaveState, Vec<SaveEffect>) {
-    todo!("M0: 上記の実装契約どおりに遷移を実装し、下の#[ignore]テストを通す")
+    match (state, event) {
+        (SaveState::Idle, SaveEvent::CommitRequested { changedtick }) => (
+            SaveState::Planning { changedtick },
+            vec![SaveEffect::SetModifiable(false), SaveEffect::RunPipeline],
+        ),
+        (SaveState::Planning { .. }, SaveEvent::PlanReady { plan }) if plan.is_empty() => {
+            (SaveState::Idle, vec![SaveEffect::SetModifiable(true)])
+        }
+        (SaveState::Planning { changedtick }, SaveEvent::PlanReady { plan }) => (
+            SaveState::AwaitingConfirmation { changedtick, plan },
+            vec![SaveEffect::ShowConfirmDialog],
+        ),
+        (SaveState::Planning { .. }, SaveEvent::ValidationFailed { errors }) => (
+            SaveState::Idle,
+            vec![
+                SaveEffect::ShowValidationErrors(errors),
+                SaveEffect::SetModifiable(true),
+                SaveEffect::KeepBufferDirty,
+            ],
+        ),
+        (SaveState::AwaitingConfirmation { changedtick, plan }, SaveEvent::Approved) => (
+            SaveState::Applying { changedtick, plan },
+            vec![SaveEffect::ExecutePlan],
+        ),
+        (SaveState::AwaitingConfirmation { .. }, SaveEvent::Cancelled) => (
+            SaveState::Idle,
+            vec![SaveEffect::SetModifiable(true), SaveEffect::KeepBufferDirty],
+        ),
+        (SaveState::Applying { .. }, SaveEvent::ApplyFinished { report })
+            if report.all_failed() =>
+        {
+            (
+                SaveState::Idle,
+                vec![
+                    SaveEffect::ShowCommitReport(report),
+                    SaveEffect::SetModifiable(true),
+                    SaveEffect::KeepBufferDirty,
+                ],
+            )
+        }
+        (SaveState::Applying { .. }, SaveEvent::ApplyFinished { report }) => (
+            SaveState::Reconciling {
+                report: report.clone(),
+            },
+            vec![
+                SaveEffect::ShowCommitReport(report),
+                SaveEffect::ReconcileFromFs,
+            ],
+        ),
+        (SaveState::Reconciling { .. }, SaveEvent::ReconcileFinished) => {
+            (SaveState::Idle, vec![SaveEffect::SetModifiable(true)])
+        }
+        (state, _) => (state, Vec::new()),
+    }
 }
 
 #[cfg(test)]
@@ -119,7 +172,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "M0: save::transition 未実装"]
     fn commit_requested_locks_buffer_and_runs_pipeline() {
         let (state, effects) = transition(
             SaveState::Idle,
@@ -135,7 +187,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "M0: save::transition 未実装"]
     fn cancel_returns_to_idle_and_keeps_dirty() {
         let state = SaveState::AwaitingConfirmation {
             changedtick: 42,
@@ -162,7 +213,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "M0: save::transition 未実装"]
     fn commit_while_not_idle_is_ignored() {
         let state = SaveState::Planning { changedtick: 1 };
         let (state, effects) = transition(state, SaveEvent::CommitRequested { changedtick: 2 });

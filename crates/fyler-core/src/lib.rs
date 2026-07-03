@@ -10,10 +10,6 @@
 //!
 //! 依存境界(AGENTS.md 絶対ルール2): このクレートは std / anyhow / thiserror にしか
 //! 依存しない。nvim・egui・Win32の型をここに持ち込まないこと。
-
-// scaffolding: todo!()スタブの引数警告を抑制。実装が入り次第このallowを削除する。
-#![allow(unused_variables)]
-
 pub mod editor;
 pub mod grammar;
 pub mod id;

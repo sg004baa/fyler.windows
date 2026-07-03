@@ -1,8 +1,10 @@
 //! parse: バッファ行 → 行の構造化 → DesiredTree。
 
 use fyler_core::editor::EditorLine;
+use fyler_core::grammar::{self, INDENT_WIDTH, PrefixParse};
 use fyler_core::id::EntryId;
-use fyler_core::tree::DesiredTree;
+use fyler_core::path::TreePath;
+use fyler_core::tree::{DesiredEntry, DesiredTree, EntryKind};
 use fyler_core::validate::ValidateError;
 
 /// バッファ1行のparse結果(空行は含まれない)。
@@ -33,7 +35,32 @@ pub struct ParsedLine {
 /// - この関数はエラーを出さない(Broken等は`ParsedLine`のフラグとして記録し、
 ///   エラー化は [`to_desired_tree`] に任せる)
 pub fn parse(lines: &[EditorLine]) -> Vec<ParsedLine> {
-    todo!("M2: バッファ行の構造化(tests/spec_m2.rs参照)")
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(line, editor_line)| {
+            if editor_line.text.trim_matches(' ').is_empty() {
+                return None;
+            }
+
+            let (id, id_broken, rest) = match grammar::split_id_prefix(editor_line.text.as_str()) {
+                PrefixParse::WithId { id, rest } => (Some(id), false, rest),
+                PrefixParse::NoId { rest } => (None, false, rest),
+                PrefixParse::Broken => (None, true, editor_line.text.as_str()),
+            };
+            let (indent_spaces, name) = grammar::split_indent(rest);
+            let (name, is_dir) = grammar::split_dir_suffix(name);
+
+            Some(ParsedLine {
+                line,
+                id,
+                id_broken,
+                indent_spaces,
+                name: name.to_owned(),
+                is_dir,
+            })
+        })
+        .collect()
 }
 
 /// 構造化済みの行列からDesiredTreeを組み立てる。
@@ -47,5 +74,71 @@ pub fn parse(lines: &[EditorLine]) -> Vec<ParsedLine> {
 /// - 同一IDの複数出現はここでは**エラーにしない**(COPY表現。diff層が解釈する)
 /// - 名前の妥当性(予約文字等)もここでは見ない(validate層の責務)
 pub fn to_desired_tree(parsed: &[ParsedLine]) -> Result<DesiredTree, Vec<ValidateError>> {
-    todo!("M2: インデントからツリー構造を復元する(tests/spec_m2.rs参照)")
+    let mut entries = Vec::with_capacity(parsed.len());
+    let mut errors = Vec::new();
+    let mut ancestors: Vec<(TreePath, EntryKind)> = Vec::new();
+
+    for parsed_line in parsed {
+        let mut line_is_valid = true;
+
+        if parsed_line.id_broken {
+            errors.push(ValidateError::BrokenIdPrefix {
+                line: parsed_line.line,
+            });
+            line_is_valid = false;
+        }
+
+        if parsed_line.indent_spaces % INDENT_WIDTH != 0 {
+            errors.push(ValidateError::InvalidIndent {
+                line: parsed_line.line,
+            });
+            ancestors.truncate(parsed_line.indent_spaces / INDENT_WIDTH);
+            continue;
+        }
+
+        let depth = parsed_line.indent_spaces / INDENT_WIDTH;
+        ancestors.truncate(depth);
+
+        let parent = if depth == 0 {
+            Some(TreePath::root())
+        } else {
+            match ancestors.get(depth - 1) {
+                Some((path, EntryKind::Dir)) => Some(path.clone()),
+                _ => {
+                    errors.push(ValidateError::InvalidIndent {
+                        line: parsed_line.line,
+                    });
+                    line_is_valid = false;
+                    None
+                }
+            }
+        };
+
+        if !line_is_valid {
+            continue;
+        }
+
+        let path = parent
+            .expect("a structurally valid line always has a parent path")
+            .child(parsed_line.name.clone());
+        let kind = if parsed_line.is_dir {
+            EntryKind::Dir
+        } else {
+            EntryKind::File
+        };
+
+        entries.push(DesiredEntry {
+            id: parsed_line.id,
+            path: path.clone(),
+            kind,
+            line: parsed_line.line,
+        });
+        ancestors.push((path, kind));
+    }
+
+    if errors.is_empty() {
+        Ok(DesiredTree { entries })
+    } else {
+        Err(errors)
+    }
 }
