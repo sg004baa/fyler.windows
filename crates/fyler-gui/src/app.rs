@@ -4,9 +4,27 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 
 use eframe::egui;
-use fyler_core::editor::{CmdlineState, EditorEngine, EditorEvent, EditorMessage, MessageKind};
+use fyler_core::editor::{CmdlineState, EditorEngine, EditorEvent, EditorMessage};
+use fyler_core::plan::OperationPlan;
+use fyler_core::validate::ValidateError;
 
-use crate::{cmdline, input, modeline, tree_view};
+use crate::confirm::ConfirmChoice;
+use crate::{cmdline, confirm, input, modeline, tree_view};
+
+/// app層からGUIへ渡す描画指示。
+#[derive(Debug, Clone)]
+pub enum GuiEvent {
+    Editor(EditorEvent),
+    ShowPlan(OperationPlan),
+    ShowValidationErrors(Vec<ValidateError>),
+    CloseDialog,
+}
+
+#[derive(Debug, Clone)]
+enum DialogState {
+    Plan(OperationPlan),
+    ValidationErrors(Vec<ValidateError>),
+}
 
 /// fylerのGUIアプリケーション。
 ///
@@ -16,25 +34,26 @@ use crate::{cmdline, input, modeline, tree_view};
 /// - RPC完了を同期待ちしない。入力は [`EditorEngine::send`] へ投げるだけ
 pub struct FylerApp {
     pub engine: Arc<dyn EditorEngine>,
-    event_rx: mpsc::Receiver<EditorEvent>,
+    event_rx: mpsc::Receiver<GuiEvent>,
     cmdline: Option<CmdlineState>,
     message: Option<EditorMessage>,
     engine_error: Option<String>,
-    // TODO(M2): SaveState(fyler_core::save)、確認ダイアログ・validateエラーの表示状態
-    // TODO(M2): EditContext(collapsed_dirs)の管理
+    dialog: Option<DialogState>,
+    confirm_tx: mpsc::Sender<ConfirmChoice>,
 }
 
 impl FylerApp {
     fn new(
         engine: Arc<dyn EditorEngine>,
-        engine_events: mpsc::Receiver<EditorEvent>,
+        gui_events: mpsc::Receiver<GuiEvent>,
+        confirm_tx: mpsc::Sender<ConfirmChoice>,
         repaint_context: egui::Context,
     ) -> anyhow::Result<Self> {
         let (event_tx, event_rx) = mpsc::channel();
         thread::Builder::new()
             .name("fyler-editor-events".to_owned())
             .spawn(move || {
-                while let Ok(event) = engine_events.recv() {
+                while let Ok(event) = gui_events.recv() {
                     if event_tx.send(event).is_err() {
                         return;
                     }
@@ -49,25 +68,31 @@ impl FylerApp {
             cmdline: None,
             message: None,
             engine_error: None,
+            dialog: None,
+            confirm_tx,
         })
     }
 
     fn receive_events(&mut self) {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
-                EditorEvent::SnapshotUpdated => {}
-                EditorEvent::CommitRequested { .. } => {
-                    self.message = Some(EditorMessage {
-                        kind: MessageKind::Info,
-                        text: "M1では保存要求を実行しません".to_owned(),
-                    });
+                GuiEvent::Editor(event) => match event {
+                    EditorEvent::SnapshotUpdated => {}
+                    EditorEvent::CommitRequested { .. } => {}
+                    EditorEvent::CmdlineShow(state) => self.cmdline = Some(state),
+                    EditorEvent::CmdlineHide => self.cmdline = None,
+                    EditorEvent::Message(message) => self.message = Some(message),
+                    EditorEvent::EngineCrashed { reason } => {
+                        self.engine_error = Some(format!("編集エンジンが停止しました: {reason}"));
+                    }
+                },
+                GuiEvent::ShowPlan(plan) => {
+                    self.dialog = Some(DialogState::Plan(plan));
                 }
-                EditorEvent::CmdlineShow(state) => self.cmdline = Some(state),
-                EditorEvent::CmdlineHide => self.cmdline = None,
-                EditorEvent::Message(message) => self.message = Some(message),
-                EditorEvent::EngineCrashed { reason } => {
-                    self.engine_error = Some(format!("編集エンジンが停止しました: {reason}"));
+                GuiEvent::ShowValidationErrors(errors) => {
+                    self.dialog = Some(DialogState::ValidationErrors(errors));
                 }
+                GuiEvent::CloseDialog => self.dialog = None,
             }
         }
     }
@@ -83,6 +108,7 @@ impl eframe::App for FylerApp {
         let snapshot = self.engine.snapshot();
 
         if self.engine_error.is_none()
+            && self.dialog.is_none()
             && let Err(error) = input::forward_input(ui.ctx(), self.engine.as_ref(), &snapshot.mode)
         {
             self.engine_error = Some(format!("編集エンジンへ入力を送信できません: {error}"));
@@ -105,7 +131,34 @@ impl eframe::App for FylerApp {
             }
         });
 
-        // TODO(M2): SaveStateがAwaitingConfirmationのとき confirm::draw をモーダル表示
+        let mut confirm_choice = None;
+        let mut dismiss_errors = false;
+        match &self.dialog {
+            Some(DialogState::Plan(plan)) => {
+                confirm_choice = confirm::draw_plan(ui, plan);
+            }
+            Some(DialogState::ValidationErrors(errors)) => {
+                dismiss_errors = egui::Modal::new(egui::Id::new("save-validation-errors"))
+                    .show(ui.ctx(), |ui| {
+                        ui.heading("保存できません");
+                        ui.add_space(8.0);
+                        confirm::draw_validation_errors(ui, errors);
+                        ui.add_space(12.0);
+                        ui.button("Dismiss").clicked()
+                    })
+                    .inner;
+            }
+            None => {}
+        }
+
+        if dismiss_errors {
+            self.dialog = None;
+        }
+        if let Some(choice) = confirm_choice
+            && self.confirm_tx.send(choice).is_err()
+        {
+            self.engine_error = Some("確認結果をアプリへ送信できません".to_owned());
+        }
     }
 }
 
@@ -117,7 +170,8 @@ impl eframe::App for FylerApp {
 ///   ポーリングなしで再描画されるようにする
 pub fn run(
     engine: Arc<dyn EditorEngine>,
-    event_rx: mpsc::Receiver<EditorEvent>,
+    event_rx: mpsc::Receiver<GuiEvent>,
+    confirm_tx: mpsc::Sender<ConfirmChoice>,
 ) -> anyhow::Result<()> {
     let options = eframe::NativeOptions::default();
     eframe::run_native(
@@ -127,6 +181,7 @@ pub fn run(
             let app = FylerApp::new(
                 Arc::clone(&engine),
                 event_rx,
+                confirm_tx,
                 creation_context.egui_ctx.clone(),
             )
             .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
