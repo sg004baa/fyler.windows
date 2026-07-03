@@ -10,3 +10,10 @@ fyler-core.workspace = true
 fyler-engine-nvim.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
+# spikeが直接msgpack-RPCするため(境界ルールの例外 / DESIGN.md L8-9)。
+# nvim-rsはワークスペース固定版(=0.9.2, use_tokio)。バージョンは上げない。
+nvim-rs.workspace = true
+# nvim-rsが公開APIで用いるmsgpack Value型 / Handlerトレイトのasync実装マクロ。
+# バージョンはnvim-rs 0.9.2の依存(rmpv ^1.3, async-trait ^0.1.86)に合わせる。
+rmpv = "1.3"
+async-trait = "0.1"

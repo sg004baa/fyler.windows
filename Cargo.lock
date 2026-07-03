@@ -1998,8 +1998,11 @@ name = "m0-spike"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "fyler-core",
  "fyler-engine-nvim",
+ "nvim-rs",
+ "rmpv",
  "tokio",
 ]
 

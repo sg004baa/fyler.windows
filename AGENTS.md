@@ -59,8 +59,8 @@
 
 ## マイルストーン現況
 
-- [ ] **M0 成立性スパイク** ← いまここ。`crates/m0-spike` に検証コードを書き、`docs/M0_RESULTS.md` を埋める
-- [ ] M1 read-only表示
+- [x] **M0 成立性スパイク** — `crates/m0-spike` で #1..#4 を実nvim(Windows実機)検証し ALL PASS。`docs/M0_RESULTS.md` 記録済み
+- [ ] M1 read-only表示 ← いまここ
 - [ ] M2 rename限定dry-run(`spec_m2.rs` を全部通す)
 - [ ] M3 create / delete / rename 実行
 - [ ] M4 構造編集(move / copy・クロスボリューム)
