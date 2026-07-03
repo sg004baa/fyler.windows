@@ -1,0 +1,19 @@
+[package]
+name = "fyler-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "fyler"
+path = "src/main.rs"
+
+[dependencies]
+fyler-core.workspace = true
+fyler-pipeline.workspace = true
+fyler-engine-nvim.workspace = true
+fyler-fsops.workspace = true
+fyler-gui.workspace = true
+anyhow.workspace = true
+tokio.workspace = true

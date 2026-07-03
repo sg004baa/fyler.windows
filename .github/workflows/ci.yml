@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # 純粋ロジック(fyler-core / fyler-pipeline)はどのOSでもテスト可能
+  logic-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all --check
+      - name: Test pure logic crates
+        run: cargo test -p fyler-core -p fyler-pipeline
+
+  # 本来のターゲット。ワークスペース全体がWindowsでコンパイルできることを保証する
+  check-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace
+        run: cargo check --workspace --all-targets
+      - name: Test pure logic crates
+        run: cargo test -p fyler-core -p fyler-pipeline

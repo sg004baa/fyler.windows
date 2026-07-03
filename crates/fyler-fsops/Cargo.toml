@@ -1,0 +1,16 @@
+[package]
+name = "fyler-fsops"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+fyler-core.workspace = true
+anyhow.workspace = true
+trash.workspace = true
+notify.workspace = true
+
+# windowsクレートに依存してよいのはこのクレートだけ(AGENTS.md 絶対ルール3の周辺)
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

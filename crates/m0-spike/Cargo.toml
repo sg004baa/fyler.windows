@@ -1,0 +1,12 @@
+[package]
+name = "m0-spike"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+fyler-core.workspace = true
+fyler-engine-nvim.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
