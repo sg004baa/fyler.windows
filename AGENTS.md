@@ -60,8 +60,8 @@
 ## マイルストーン現況
 
 - [x] **M0 成立性スパイク** — `crates/m0-spike` で #1..#4 を実nvim(Windows実機)検証し ALL PASS。`docs/M0_RESULTS.md` 記録済み
-- [ ] M1 read-only表示 ← いまここ
-- [ ] M2 rename限定dry-run(`spec_m2.rs` を全部通す)
+- [x] **M1 read-only表示** — nvim spawn/RPC/snapshot同期 + eframe描画 + クラッシュ検知を実装。Windows実機(nvim v0.11.6)でGUI目視OK・コンソール窓なし。headless RPCスモークpass(実nvim)
+- [ ] M2 rename限定dry-run(`spec_m2.rs` を全部通す) ← いまここ
 - [ ] M3 create / delete / rename 実行
 - [ ] M4 構造編集(move / copy・クロスボリューム)
 - [ ] M5 統合・装飾
