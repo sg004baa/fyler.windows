@@ -137,6 +137,39 @@ async fn set_initial_lines_with_multiple_lines_has_no_duplication() -> anyhow::R
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn modifiable_blocks_normal_mode_edits_until_reenabled() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, _events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.send(EditorCommand::SetLines {
+        lines: vec![EditorLine::new("/001 alpha")],
+        cursor_line: None,
+    })?;
+    wait_for(&engine, |line| line == "/001 alpha").await?;
+
+    let revision = engine.snapshot().revision;
+    engine.send(EditorCommand::SetModifiable(false))?;
+    wait_for_revision_after(&engine, revision).await?;
+    let revision = engine.snapshot().revision;
+    engine.send(key_command(Key::Char('x')))?;
+    wait_for_revision_after(&engine, revision).await?;
+    assert_eq!(engine.snapshot().lines[0].text, "/001 alpha");
+
+    let revision = engine.snapshot().revision;
+    engine.send(EditorCommand::SetModifiable(true))?;
+    wait_for_revision_after(&engine, revision).await?;
+    engine.send(key_command(Key::Char('x')))?;
+    wait_for(&engine, |line| line == "/001 lpha").await?;
+
+    Ok(())
+}
+
 fn key_command(key: Key) -> EditorCommand {
     EditorCommand::Key(KeyInput {
         key,
@@ -160,6 +193,19 @@ async fn wait_for(engine: &NvimEngine, predicate: impl Fn(&str) -> bool) -> anyh
     })
     .await
     .map_err(|_| anyhow::anyhow!("snapshot update timed out"))
+}
+
+async fn wait_for_revision_after(engine: &NvimEngine, revision: u64) -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if engine.snapshot().revision > revision {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("snapshot revision update timed out"))
 }
 
 async fn wait_for_event(

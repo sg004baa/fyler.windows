@@ -176,13 +176,16 @@ impl eframe::App for FylerApp {
                 dismiss_report = confirm::draw_report(ui, report);
             }
             Some(DialogState::ValidationErrors(errors)) => {
+                let dismiss_from_keyboard = ui.ctx().input(|input| {
+                    input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape)
+                });
                 dismiss_errors = egui::Modal::new(egui::Id::new("save-validation-errors"))
                     .show(ui.ctx(), |ui| {
                         ui.heading("保存できません");
                         ui.add_space(8.0);
                         confirm::draw_validation_errors(ui, errors);
                         ui.add_space(12.0);
-                        ui.button("Dismiss").clicked()
+                        ui.button("Dismiss (Enter / Esc)").clicked() || dismiss_from_keyboard
                     })
                     .inner;
             }

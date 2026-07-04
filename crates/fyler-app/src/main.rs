@@ -60,7 +60,7 @@ fn main() -> anyhow::Result<()> {
     let save_engine: Arc<dyn EditorEngine> = engine.clone();
     let mut save_controller =
         SaveController::new(root.clone(), ids, baseline, Arc::clone(&save_engine));
-    save_controller.collapse_all_top_level();
+    save_controller.collapse_all_dirs();
     engine.set_initial_lines(save_controller.visible_lines())?;
 
     // tokioのengine channelとGUIのstd channelをapp内の1本へ集約する。
@@ -229,7 +229,7 @@ fn main() -> anyhow::Result<()> {
                             }
                             continue;
                         }
-                        save_controller.collapse_all_top_level();
+                        save_controller.collapse_all_dirs();
                         let new_lines = save_controller.visible_lines();
 
                         root = new_root;

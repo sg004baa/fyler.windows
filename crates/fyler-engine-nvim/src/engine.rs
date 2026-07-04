@@ -418,6 +418,9 @@ async fn handle_command(
         EngineCommand::Editor(EditorCommand::SetLines { lines, cursor_line }) => {
             replace_buffer_lines(nvim, buffer, lines, cursor_line, "reconcile").await?;
         }
+        EngineCommand::Editor(EditorCommand::SetModifiable(value)) => {
+            set_buffer_modifiable(nvim, buffer, value, "保存フロー").await?;
+        }
         EngineCommand::Editor(EditorCommand::RequestCommit) => {
             nvim.command("write")
                 .await
@@ -441,6 +444,12 @@ async fn handle_command(
     Ok(())
 }
 
+/// Rust側のプログラム的な全行差し替えを実行する。
+///
+/// `modifiable`はユーザー入力を止めるゲートであり、reconcileや初期化まで拒否する
+/// ものではない。保存フロー中の`SetLines`も成功するよう、差し替え前に必ず
+/// `modifiable=true`へ戻す。状態機械がreconcile完了後に改めて有効化するため、
+/// この関数内では元の値へ復元しない。
 async fn replace_buffer_lines(
     nvim: &Nvim,
     buffer: &Buffer<NvimWriter>,
@@ -448,6 +457,8 @@ async fn replace_buffer_lines(
     cursor_line: Option<usize>,
     purpose: &str,
 ) -> anyhow::Result<()> {
+    set_buffer_modifiable(nvim, buffer, true, purpose).await?;
+
     let new_lines: Vec<String> = if editor_lines.is_empty() {
         vec![String::new()]
     } else {
@@ -481,6 +492,22 @@ async fn replace_buffer_lines(
         .map_err(|error| anyhow::anyhow!("{purpose}後のカーソルを設定できません: {error}"))?;
 
     Ok(())
+}
+
+/// 対象バッファの`modifiable`オプションを、バッファスコープで設定する。
+async fn set_buffer_modifiable(
+    nvim: &Nvim,
+    buffer: &Buffer<NvimWriter>,
+    value: bool,
+    purpose: &str,
+) -> anyhow::Result<()> {
+    nvim.set_option_value(
+        "modifiable",
+        Value::Boolean(value),
+        vec![(Value::from("buf"), buffer.get_value().clone())],
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("{purpose}のバッファmodifiable設定を変更できません: {error}"))
 }
 
 #[derive(Debug)]

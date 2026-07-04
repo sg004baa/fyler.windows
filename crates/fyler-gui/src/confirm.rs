@@ -21,12 +21,22 @@ pub enum ConfirmChoice {
 ///   `DELETE src/old.rs (ごみ箱へ)`、`COPY a.txt → b.txt`)
 /// - 警告があれば操作一覧の下へ警告色で表示する
 /// - 表示中はGUIの入力ゲートでエンジンへの入力転送を止める
+/// - キーボード(`y` / `n` / `Esc`)でも選択できる。ダイアログ表示中はGUI側で
+///   入力転送がゲートされている前提とする
 /// - 選択結果はapp層の保存フローへ返す
 pub fn draw_plan(
     ui: &mut egui::Ui,
     plan: &OperationPlan,
     warnings: &[String],
 ) -> Option<ConfirmChoice> {
+    let key_choice = ui.ctx().input(|input| {
+        plan_choice_from_keys(
+            input.key_pressed(egui::Key::Y),
+            input.key_pressed(egui::Key::N),
+            input.key_pressed(egui::Key::Escape),
+        )
+    });
+
     egui::Modal::new(egui::Id::new("save-plan-confirmation"))
         .show(ui.ctx(), |ui| {
             ui.heading("変更内容の確認");
@@ -44,9 +54,11 @@ pub fn draw_plan(
 
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                if ui.button("Approve").clicked() {
+                let approve_clicked = ui.button("Approve (y)").clicked();
+                let cancel_clicked = ui.button("Cancel (n / Esc)").clicked();
+                if approve_clicked || key_choice == Some(ConfirmChoice::Approve) {
                     Some(ConfirmChoice::Approve)
-                } else if ui.button("Cancel").clicked() {
+                } else if cancel_clicked || key_choice == Some(ConfirmChoice::Cancel) {
                     Some(ConfirmChoice::Cancel)
                 } else {
                     None
@@ -68,6 +80,10 @@ pub fn draw_validation_errors(ui: &mut egui::Ui, errors: &[ValidateError]) {
 /// 非原子的操作の進捗(`OpOutcome::Failed.progress`)を明示する。
 /// 閉じるボタンが押されたら `true` を返す。
 pub fn draw_report(ui: &mut egui::Ui, report: &CommitReport) -> bool {
+    let dismiss_from_keyboard = ui
+        .ctx()
+        .input(|input| input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape));
+
     egui::Modal::new(egui::Id::new("save-commit-report"))
         .show(ui.ctx(), |ui| {
             ui.heading("実行結果");
@@ -89,9 +105,20 @@ pub fn draw_report(ui: &mut egui::Ui, report: &CommitReport) -> bool {
             }
 
             ui.add_space(12.0);
-            ui.button("閉じる").clicked()
+            ui.button("閉じる (Enter / Esc)").clicked() || dismiss_from_keyboard
         })
         .inner
+}
+
+/// plan確認キーの押下状態を、エンジン非依存の確認結果へ変換する。
+fn plan_choice_from_keys(y: bool, n: bool, esc: bool) -> Option<ConfirmChoice> {
+    if y {
+        Some(ConfirmChoice::Approve)
+    } else if n || esc {
+        Some(ConfirmChoice::Cancel)
+    } else {
+        None
+    }
 }
 
 fn report_label(result: &OpResult) -> String {
@@ -189,5 +216,22 @@ mod tests {
             report_label(&result),
             "NG  COPY a.txt → b.txt (理由: copy failed / 進捗: 2/3 files)"
         );
+    }
+
+    #[test]
+    fn plan_keyboard_shortcuts_map_to_choices() {
+        assert_eq!(
+            plan_choice_from_keys(true, false, false),
+            Some(ConfirmChoice::Approve)
+        );
+        assert_eq!(
+            plan_choice_from_keys(false, true, false),
+            Some(ConfirmChoice::Cancel)
+        );
+        assert_eq!(
+            plan_choice_from_keys(false, false, true),
+            Some(ConfirmChoice::Cancel)
+        );
+        assert_eq!(plan_choice_from_keys(false, false, false), None);
     }
 }

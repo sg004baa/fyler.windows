@@ -138,15 +138,16 @@ impl SaveController {
             .collect()
     }
 
-    /// ルート直下の全ディレクトリを折りたたみ状態へ初期化する。
+    /// すべてのディレクトリを折りたたみ状態へ初期化する。
     ///
-    /// baseline自体は全階層を保持し、表示行だけから各ディレクトリの子孫を除く。
-    pub fn collapse_all_top_level(&mut self) {
+    /// 展開は [`Self::toggle_collapse`] で1階層ずつ行う。baseline自体は全階層を
+    /// 保持し、表示行だけから各ディレクトリの子孫を除く。
+    pub fn collapse_all_dirs(&mut self) {
         self.context.collapsed_dirs.extend(
             self.baseline
                 .entries()
                 .iter()
-                .filter(|entry| entry.kind == EntryKind::Dir && entry.path.depth() == 1)
+                .filter(|entry| entry.kind == EntryKind::Dir)
                 .map(|entry| entry.id),
         );
     }
@@ -198,7 +199,7 @@ impl SaveController {
             &options,
         )
         .context("隠しファイル表示切り替え後の実FS再スキャンに失敗しました")?;
-        let context = retain_existing_collapsed_dirs(&self.context, &baseline);
+        let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
         let lines = baseline_to_lines(&baseline, &context);
 
         self.baseline = baseline;
@@ -245,8 +246,6 @@ impl SaveController {
             return SaveFlowResult::Ignored;
         }
 
-        // SetModifiable(false) はM2時点ではエンジンAPIがないためno-op。
-        // 確認/エラーダイアログ表示中のGUI入力ゲートで編集を止める。
         let parsed = fyler_pipeline::parse::parse(lines);
         let desired = match fyler_pipeline::parse::to_desired_tree(&parsed) {
             Ok(desired) => desired,
@@ -330,7 +329,7 @@ impl SaveController {
             );
         }
 
-        let context = retain_existing_collapsed_dirs(&self.context, &baseline);
+        let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
         let lines = baseline_to_lines(&baseline, &context);
         if let Err(error) = self
             .engine
@@ -414,7 +413,7 @@ impl SaveController {
             &self.scan_options,
         )
         .context("実FSの再スキャンに失敗しました")?;
-        let context = retain_existing_collapsed_dirs(&self.context, &baseline);
+        let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
         let lines = baseline_to_lines(&baseline, &context);
         self.engine
             .send(EditorCommand::SetLines {
@@ -439,7 +438,23 @@ impl SaveController {
         let state = std::mem::replace(&mut self.state, SaveState::Idle);
         let (state, effects) = save::transition(state, event);
         self.state = state;
+        self.execute_modifiable_effects(&effects);
         effects
+    }
+
+    /// 状態機械が発行したバッファロック効果をエンジンへ送る。
+    ///
+    /// GUI側の入力ゲートも残す二重防御なので、エンジン送信失敗だけで保存状態遷移を
+    /// 中断しない。失敗は診断用に標準エラーへ記録し、残りのフローを続行する。
+    fn execute_modifiable_effects(&self, effects: &[SaveEffect]) {
+        for value in effects.iter().filter_map(|effect| match effect {
+            SaveEffect::SetModifiable(value) => Some(*value),
+            _ => None,
+        }) {
+            if let Err(error) = self.engine.send(EditorCommand::SetModifiable(value)) {
+                eprintln!("バッファのmodifiable設定をエンジンへ送信できません: {error:#}");
+            }
+        }
     }
 }
 
@@ -489,13 +504,26 @@ fn human_readable_size(bytes: u64) -> String {
     }
 }
 
-fn retain_existing_collapsed_dirs(context: &EditContext, baseline: &BaselineTree) -> EditContext {
+/// 再スキャン後も既存ディレクトリの折りたたみ状態を維持し、新規ディレクトリは
+/// 既定の折りたたみ状態で表示する。消滅したIDとディレクトリでなくなったIDは除く。
+fn carry_collapsed_dirs(
+    context: &EditContext,
+    old_baseline: &BaselineTree,
+    new_baseline: &BaselineTree,
+) -> EditContext {
     let mut context = context.clone();
     context.collapsed_dirs.retain(|id| {
-        baseline
+        new_baseline
             .get(*id)
             .is_some_and(|entry| entry.kind == EntryKind::Dir)
     });
+    context.collapsed_dirs.extend(
+        new_baseline
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::Dir && old_baseline.get(entry.id).is_none())
+            .map(|entry| entry.id),
+    );
     context
 }
 
@@ -618,13 +646,43 @@ mod tests {
         (controller, engine)
     }
 
+    fn nested_dirs_controller(root: impl Into<PathBuf>) -> (SaveController, Arc<RecordingEngine>) {
+        let root = root.into();
+        let mut ids = IdAllocator::new();
+        let mut baseline = BaselineTree::new(&root);
+        for path in ["a", "a/b", "a/b/c"] {
+            baseline.insert(BaselineEntry {
+                id: ids.allocate(),
+                path: TreePath::parse(path),
+                kind: EntryKind::Dir,
+            });
+        }
+        let engine = Arc::new(RecordingEngine::default());
+        let controller =
+            SaveController::new(root, ids, baseline, Arc::<RecordingEngine>::clone(&engine));
+        (controller, engine)
+    }
+
     fn lines(lines: &[&str]) -> Vec<EditorLine> {
         lines.iter().map(|line| EditorLine::new(*line)).collect()
     }
 
+    fn modifiable_values(engine: &RecordingEngine) -> Vec<bool> {
+        engine
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|command| match command {
+                EditorCommand::SetModifiable(value) => Some(*value),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn rename_returns_confirmation_plan() {
-        let (mut controller, _) = controller("C:/test-root");
+        let (mut controller, engine) = controller("C:/test-root");
 
         let result = controller.on_commit(7, &lines(&["/001 b.txt"]));
 
@@ -645,6 +703,7 @@ mod tests {
             controller.state(),
             SaveState::AwaitingConfirmation { changedtick: 7, .. }
         ));
+        assert_eq!(modifiable_values(&engine), [false]);
     }
 
     #[test]
@@ -684,7 +743,7 @@ mod tests {
 
     #[test]
     fn reserved_character_returns_validation_errors() {
-        let (mut controller, _) = controller("C:/test-root");
+        let (mut controller, engine) = controller("C:/test-root");
 
         let result = controller.on_commit(1, &lines(&["/001 bad<name.txt"]));
 
@@ -697,6 +756,7 @@ mod tests {
                 ))
         ));
         assert!(matches!(controller.state(), SaveState::Idle));
+        assert_eq!(modifiable_values(&engine), [false, true]);
     }
 
     #[test]
@@ -772,6 +832,16 @@ mod tests {
                 if lines.iter().any(|line| line.text.ends_with("b.txt"))
                     && lines.iter().all(|line| !line.text.ends_with("a.txt"))
         )));
+        assert_eq!(
+            commands
+                .iter()
+                .filter_map(|command| match command {
+                    EditorCommand::SetModifiable(value) => Some(*value),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [false, true]
+        );
     }
 
     #[test]
@@ -796,7 +866,7 @@ mod tests {
             controller.baseline.entries()[0].path,
             TreePath::parse("a.txt")
         );
-        assert!(engine.commands.lock().unwrap().is_empty());
+        assert_eq!(modifiable_values(&engine), [false, true]);
     }
 
     #[test]
@@ -819,7 +889,7 @@ mod tests {
             controller.baseline.entries()[0].path,
             TreePath::parse("a.txt")
         );
-        assert!(engine.commands.lock().unwrap().is_empty());
+        assert_eq!(modifiable_values(&engine), [false, true]);
     }
 
     #[test]
@@ -890,7 +960,7 @@ mod tests {
         // 承認済みとして実行せず破棄し、Idleへ戻す(その後のApproveは無効)。
         let temp_root = tempdir().unwrap();
         fs::write(temp_root.path().join("a.txt"), b"a").unwrap();
-        let (mut controller, _) = controller(temp_root.path());
+        let (mut controller, engine) = controller(temp_root.path());
         assert!(matches!(
             controller.on_commit(1, &lines(&["/001 b.txt"])),
             SaveFlowResult::ShowPlan { .. }
@@ -905,6 +975,7 @@ mod tests {
                 if message.contains("外部でファイルが変更されたため、保存を中断しました")
         ));
         assert!(matches!(controller.state(), SaveState::Idle));
+        assert_eq!(modifiable_values(&engine), [false, true]);
         assert_eq!(
             controller.on_choice(ConfirmChoice::Approve),
             SaveFlowResult::Ignored
@@ -1018,16 +1089,70 @@ mod tests {
     }
 
     #[test]
-    fn collapse_all_top_level_hides_only_top_level_directory_descendants() {
+    fn collapse_all_dirs_marks_every_directory_collapsed() {
         let (mut controller, _) = hierarchy_controller("C:/test-root");
 
-        controller.collapse_all_top_level();
+        controller.collapse_all_dirs();
 
         let lines = controller.visible_lines();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].text.ends_with("a/"));
         assert!(lines[1].text.ends_with("top.txt"));
-        assert_eq!(controller.context.collapsed_dirs, [EntryId(1)].into());
+        assert_eq!(
+            controller.context.collapsed_dirs,
+            [EntryId(1), EntryId(2)].into()
+        );
+    }
+
+    #[test]
+    fn expanding_directory_reveals_only_one_level() {
+        let (mut controller, _) = nested_dirs_controller("C:/test-root");
+        controller.collapse_all_dirs();
+        let collapsed = controller.visible_lines();
+
+        let expanded_parent = match controller.toggle_collapse(&collapsed, 0) {
+            ToggleCollapseResult::Toggled(lines) => lines,
+            result => panic!("unexpected parent expand result: {result:?}"),
+        };
+
+        assert!(expanded_parent.iter().any(|line| line.text.ends_with("b/")));
+        assert!(
+            expanded_parent
+                .iter()
+                .all(|line| !line.text.ends_with("c/"))
+        );
+    }
+
+    #[test]
+    fn parent_collapse_and_reexpand_preserves_expanded_child() {
+        let (mut controller, _) = nested_dirs_controller("C:/test-root");
+        controller.collapse_all_dirs();
+        let collapsed = controller.visible_lines();
+        let expanded_parent = match controller.toggle_collapse(&collapsed, 0) {
+            ToggleCollapseResult::Toggled(lines) => lines,
+            result => panic!("unexpected parent expand result: {result:?}"),
+        };
+        let expanded_child = match controller.toggle_collapse(&expanded_parent, 1) {
+            ToggleCollapseResult::Toggled(lines) => lines,
+            result => panic!("unexpected child expand result: {result:?}"),
+        };
+        assert!(expanded_child.iter().any(|line| line.text.ends_with("c/")));
+
+        let collapsed_parent = match controller.toggle_collapse(&expanded_child, 0) {
+            ToggleCollapseResult::Toggled(lines) => lines,
+            result => panic!("unexpected parent collapse result: {result:?}"),
+        };
+        let reexpanded_parent = match controller.toggle_collapse(&collapsed_parent, 0) {
+            ToggleCollapseResult::Toggled(lines) => lines,
+            result => panic!("unexpected parent re-expand result: {result:?}"),
+        };
+
+        assert!(
+            reexpanded_parent
+                .iter()
+                .any(|line| line.text.ends_with("c/"))
+        );
+        assert!(!controller.context.collapsed_dirs.contains(&EntryId(2)));
     }
 
     #[test]
@@ -1193,5 +1318,34 @@ mod tests {
                 .iter()
                 .all(|line| !line.text.ends_with(".hidden.txt"))
         );
+    }
+
+    #[test]
+    fn toggle_hidden_adds_new_directory_as_collapsed() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join(".hidden")).unwrap();
+        fs::write(root.path().join(".hidden").join("child.txt"), b"hidden").unwrap();
+        let mut ids = IdAllocator::new();
+        let baseline = fyler_fsops::scan::scan_baseline(root.path(), &mut ids).unwrap();
+        let engine = Arc::new(RecordingEngine::default());
+        let mut controller = SaveController::new(
+            root.path().to_path_buf(),
+            ids,
+            baseline,
+            Arc::<RecordingEngine>::clone(&engine),
+        );
+        controller.collapse_all_dirs();
+
+        let shown = controller.toggle_hidden().unwrap();
+
+        assert!(shown.iter().any(|line| line.text.ends_with(".hidden/")));
+        assert!(shown.iter().all(|line| !line.text.ends_with("child.txt")));
+        let hidden_dir = controller
+            .baseline
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse(".hidden"))
+            .unwrap();
+        assert!(controller.context.collapsed_dirs.contains(&hidden_dir.id));
     }
 }

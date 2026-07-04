@@ -41,6 +41,9 @@ pub enum EditorCommand {
         lines: Vec<EditorLine>,
         cursor_line: Option<usize>,
     },
+    /// バッファの `modifiable` を設定する。保存フロー中のユーザー編集すり抜けを
+    /// 防ぐ(状態機械 [`crate::save`] の`SetModifiable`効果の実行系)。
+    SetModifiable(bool),
     /// `:w` 相当のトリガ(保存状態機械 [`crate::save`] の入口)。
     RequestCommit,
     Undo,
