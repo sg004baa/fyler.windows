@@ -102,8 +102,9 @@ impl NvimEngine {
     ///    `Paste` は `nvim_paste`、`RequestCommit` は `:w` 相当、
     ///    `Undo`/`Redo` は `u`/`<C-r>` 相当
     /// 7. **イベント**: BufWriteCmd等のrpcnotify → `EditorEvent::CommitRequested`、
-    ///    ext_cmdline → `CmdlineShow/CmdlineHide`、ext_messages → `Message`、
-    ///    プロセス終了検知 → `EngineCrashed` として `event_tx` へ流す
+    ///    行アクション → `ActivateLine` / `NavigateParent`、ext_cmdline →
+    ///    `CmdlineShow/CmdlineHide`、ext_messages → `Message`、プロセス終了検知 →
+    ///    `EngineCrashed` として `event_tx` へ流す
     ///
     /// 戻り値: エンジン本体と、GUI/app層が受けるイベントストリーム。
     pub async fn start(
@@ -304,11 +305,29 @@ impl NvimEngine {
                                     ),
                                 }
                             }
+                            "fyler_open" => {
+                                let line = notification.args.first()
+                                    .and_then(value_as_u64)
+                                    .and_then(|line| usize::try_from(line).ok());
+                                match line {
+                                    Some(line) => {
+                                        let _ = event_tx.send(EditorEvent::ActivateLine { line });
+                                    }
+                                    None => send_message(
+                                        &event_tx,
+                                        MessageKind::Error,
+                                        "開く対象の行番号を取得できません".to_owned(),
+                                    ),
+                                }
+                            }
+                            "fyler_parent" => {
+                                let _ = event_tx.send(EditorEvent::NavigateParent);
+                            }
                             "fyler_action_blocked" => {
                                 send_message(
                                     &event_tx,
                                     MessageKind::Info,
-                                    "M1ではファイルを開きません".to_owned(),
+                                    "このキーは無効です".to_owned(),
                                 );
                             }
                             "fyler_write_blocked" => {

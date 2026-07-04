@@ -66,6 +66,8 @@
 - [x] **M4 構造編集** — move/copy + クロスボリューム3分類 + 非原子的操作の進捗付きCommitReportを実装。Linuxでworkspace check/clippy警告ゼロ、対象テスト全pass。Windows実機動作確認は未実施
 - [ ] **M5 統合・装飾** — notify外部変更監視 / OneDriveプレースホルダ属性判定 / ツリーアイコン装飾(カーソル列オフセット補正込み) / longPathAware manifest(embed-manifest) / watch→再スキャン再描画のapp配線(dirty中は通知のみ・自己apply抑制)を実装。**git statusはユーザー判断で今回スコープ外(M5残件)**。Linuxでworkspace check/clippy警告ゼロ・対象テスト全pass(84件)、Windows GNUクロスターゲットでcheck/clippy pass(cfg(windows)のGetFileAttributesW判定を含む)。Windows実機動作確認は未実施
 - [x] **M5.5 バグ修正セッション(2026-07-04)** — 全クレート机上レビューで6件修正: (1) 親ディレクトリrename+子操作同時実行でplanが逐次実行不能(diff.rsのpre-move座標書き換え+順序edge追加、再作成循環はErr(MoveCycle)化)、(2) 展開済みディレクトリブロックCopyの子孫Copy重複、(3) case-fold重複のvalidate欠落(`Foo.txt`/`foo.txt`が黙って上書き)、(4) apply.rsのMove/Copy/Createに移動先preflight(fs::renameのMOVEFILE_REPLACE_EXISTING上書き対策)、(5) 確認ダイアログ中の外部変更でplan陳腐化→PlanInvalidatedでキャンセル、(6) 非ASCII case-only rename判定。回帰テスト12件追加(mutationで牙を確認済み)。既知の残リスク: SetModifiable未実装(:w→ダイアログ表示間の入力すり抜け)、`long_path::to_extended`/`is_cloud_placeholder`/`dir_is_case_sensitive`が未配線、watchのdebounceなし — いずれも docs/ROADMAP_M6.md のM6〜M8で対応
+- [x] **M6-1 ファイルを開く / M6-2 ルート移動** — `<CR>`から既定アプリ起動、`-`から親ルートへの安全な移動、root/baseline/watcher/バッファの差し替え、現在ルートのモードライン表示を実装。Linuxで対象テスト80件・workspace check/clippy警告ゼロ・headless RPCスモークpass(nvim v0.12.2)、Windows GNUクロスターゲットでcheck/clippy pass。Windows実機動作確認は未実施
+- [ ] **M6-3 / M6-4** — ディレクトリ折りたたみと隠しファイルトグルは未実装
 
 各マイルストーンの完了条件は DESIGN.md「マイルストーン」章を参照。
 完了したらこのチェックリストを更新すること。

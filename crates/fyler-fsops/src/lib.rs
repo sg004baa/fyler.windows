@@ -12,6 +12,7 @@ pub mod case;
 pub mod classify;
 pub mod long_path;
 pub mod onedrive;
+pub mod open;
 pub mod recycle;
 pub mod scan;
 pub mod watch;

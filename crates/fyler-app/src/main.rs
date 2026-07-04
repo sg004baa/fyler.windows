@@ -1,17 +1,20 @@
 //! fyler — エントリポイント。各レイヤーの配線だけを行う(ロジックを書かない)。
 //!
 //! 各レイヤーの役割はAGENTS.mdの依存境界表を参照。ここに書いてよいのは
-//! 「起動」「イベントの受け渡し」「保存状態機械の副作用(SaveEffect)の実行」のみ。
+//! 「起動」「イベントの受け渡し」「ユーザー操作の各レイヤーへの配線」
+//! 「保存状態機械の副作用(SaveEffect)の実行」のみ。
 
 mod save_flow;
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::thread;
 
-use fyler_core::editor::{EditorEngine, EditorEvent, EditorMessage, MessageKind};
+use fyler_core::editor::{EditorCommand, EditorEngine, EditorEvent, EditorMessage, MessageKind};
+use fyler_core::grammar::PrefixParse;
 use fyler_core::id::IdAllocator;
+use fyler_core::tree::EntryKind;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
 use fyler_fsops::watch::ExternalChange;
 use fyler_gui::app::GuiEvent;
@@ -50,7 +53,7 @@ fn main() -> anyhow::Result<()> {
     }))?;
 
     let (watch_tx, watch_rx) = mpsc::channel::<ExternalChange>();
-    let watcher = fyler_fsops::watch::watch(&root, watch_tx)?;
+    let watcher = fyler_fsops::watch::watch(&root, watch_tx.clone())?;
 
     let mut ids = IdAllocator::new();
     let baseline = fyler_fsops::scan::scan_baseline(&root, &mut ids)?;
@@ -101,12 +104,16 @@ fn main() -> anyhow::Result<()> {
 
     // GUIクレートへtokio型を漏らさず、core型とConfirmChoiceだけを受け渡す。
     let (gui_event_tx, gui_event_rx) = mpsc::channel();
+    gui_event_tx.send(GuiEvent::RootChanged(root.clone()))?;
     let save_root = root.clone();
     let save_engine: Arc<dyn EditorEngine> = engine.clone();
+    let app_engine = Arc::clone(&save_engine);
     let event_bridge = thread::Builder::new()
         .name("fyler-app-events".to_owned())
         .spawn(move || {
-            let mut save_controller = SaveController::new(save_root, ids, baseline, save_engine);
+            let mut root = save_root;
+            let mut _watcher = watcher;
+            let mut save_controller = SaveController::new(root.clone(), ids, baseline, save_engine);
             let mut pending_events = VecDeque::new();
             loop {
                 let event = match pending_events.pop_front() {
@@ -120,6 +127,122 @@ fn main() -> anyhow::Result<()> {
                     AppEvent::Editor(EditorEvent::CommitRequested { changedtick, lines }) => {
                         let result = save_controller.on_commit(changedtick, &lines);
                         if send_save_result(&gui_event_tx, result).is_err() {
+                            return;
+                        }
+                    }
+                    AppEvent::Editor(EditorEvent::ActivateLine { line }) => {
+                        if handle_activate_line(
+                            &save_controller,
+                            app_engine.as_ref(),
+                            &root,
+                            line,
+                            &gui_event_tx,
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    AppEvent::Editor(EditorEvent::NavigateParent) => {
+                        if app_engine.snapshot().dirty {
+                            if send_gui_message(
+                                &gui_event_tx,
+                                MessageKind::Info,
+                                "編集中です。保存または破棄してからディレクトリを移動してください",
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        if !save_controller.is_idle() {
+                            continue;
+                        }
+
+                        let Some(new_root) = root.parent().map(Path::to_path_buf) else {
+                            if send_gui_message(
+                                &gui_event_tx,
+                                MessageKind::Info,
+                                "これ以上、上のディレクトリはありません",
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        };
+
+                        let mut new_ids = IdAllocator::new();
+                        let new_baseline =
+                            match fyler_fsops::scan::scan_baseline(&new_root, &mut new_ids) {
+                                Ok(baseline) => baseline,
+                                Err(error) => {
+                                    if send_gui_message(
+                                        &gui_event_tx,
+                                        MessageKind::Error,
+                                        format!("上のディレクトリを読み込めません: {error:#}"),
+                                    )
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                            };
+                        let new_lines = baseline_to_lines(&new_baseline);
+
+                        // 新しい監視の作成に失敗した場合、現在のroot/baseline/watcherを
+                        // そのまま維持できるよう、状態差し替え前に準備だけ済ませる。
+                        let new_watcher =
+                            match fyler_fsops::watch::watch(&new_root, watch_tx.clone()) {
+                                Ok(watcher) => watcher,
+                                Err(error) => {
+                                    if send_gui_message(
+                                        &gui_event_tx,
+                                        MessageKind::Error,
+                                        format!("上のディレクトリを監視できません: {error:#}"),
+                                    )
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                            };
+
+                        if let Err(error) =
+                            save_controller.change_root(new_root.clone(), new_ids, new_baseline)
+                        {
+                            if send_gui_message(
+                                &gui_event_tx,
+                                MessageKind::Error,
+                                format!("表示ルートを変更できません: {error:#}"),
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+
+                        root = new_root;
+                        _watcher = new_watcher;
+                        if let Err(error) = app_engine.send(EditorCommand::SetLines(new_lines)) {
+                            if send_gui_message(
+                                &gui_event_tx,
+                                MessageKind::Error,
+                                format!("上のディレクトリを表示できません: {error:#}"),
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        if gui_event_tx
+                            .send(GuiEvent::RootChanged(root.clone()))
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -161,12 +284,82 @@ fn main() -> anyhow::Result<()> {
     let gui_engine: Arc<dyn EditorEngine> = engine;
     let gui_result = fyler_gui::app::run(gui_engine, gui_event_rx, confirm_tx);
     let _ = app_event_tx.send(AppEvent::Shutdown);
-    drop(watcher);
     let _ = watch_bridge.join();
     let _ = event_bridge.join();
     let _ = confirm_bridge.join();
     let _ = editor_bridge.join();
     gui_result
+}
+
+fn handle_activate_line(
+    save_controller: &SaveController,
+    engine: &dyn EditorEngine,
+    root: &Path,
+    line: usize,
+    gui_event_tx: &mpsc::Sender<GuiEvent>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    let snapshot = engine.snapshot();
+    let Some(editor_line) = snapshot.lines.get(line) else {
+        return send_gui_message(
+            gui_event_tx,
+            MessageKind::Error,
+            "開く対象の行が見つかりません",
+        );
+    };
+
+    match fyler_core::grammar::split_id_prefix(&editor_line.text) {
+        PrefixParse::NoId { .. } => {
+            return send_gui_message(gui_event_tx, MessageKind::Info, "保存されていない行です");
+        }
+        PrefixParse::Broken => {
+            return send_gui_message(
+                gui_event_tx,
+                MessageKind::Error,
+                "壊れたIDプレフィックスの行は開けません",
+            );
+        }
+        PrefixParse::WithId { .. } => {}
+    }
+
+    let Some((path, kind)) = save_controller.resolve_line(&snapshot.lines, line) else {
+        return send_gui_message(
+            gui_event_tx,
+            MessageKind::Error,
+            "行に対応するファイルが現在のツリーに見つかりません",
+        );
+    };
+
+    match kind {
+        EntryKind::File | EntryKind::Symlink => {
+            let path = path.to_fs_path(root);
+            if let Err(error) = fyler_fsops::open::open_with_default_app(&path) {
+                send_gui_message(
+                    gui_event_tx,
+                    MessageKind::Error,
+                    format!("ファイルを開けません: {error:#}"),
+                )?;
+            }
+        }
+        EntryKind::Dir => {
+            send_gui_message(
+                gui_event_tx,
+                MessageKind::Info,
+                "ディレクトリの折りたたみは未実装です",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn send_gui_message(
+    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    kind: MessageKind,
+    text: impl Into<String>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    gui_event_tx.send(GuiEvent::Editor(EditorEvent::Message(EditorMessage {
+        kind,
+        text: text.into(),
+    })))
 }
 
 fn send_save_result(

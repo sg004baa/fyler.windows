@@ -1,5 +1,6 @@
 //! eframeアプリ本体。毎フレーム、エンジンのsnapshotだけを描画する。
 
+use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::thread;
 
@@ -16,6 +17,8 @@ use crate::{cmdline, confirm, input, modeline, tree_view};
 #[derive(Debug, Clone)]
 pub enum GuiEvent {
     Editor(EditorEvent),
+    /// app層で表示ルートが切り替わったことをモードラインへ反映する。
+    RootChanged(PathBuf),
     ShowPlan(OperationPlan),
     ShowReport(CommitReport),
     ShowValidationErrors(Vec<ValidateError>),
@@ -41,6 +44,7 @@ pub struct FylerApp {
     event_rx: mpsc::Receiver<GuiEvent>,
     cmdline: Option<CmdlineState>,
     message: Option<EditorMessage>,
+    root: PathBuf,
     engine_error: Option<String>,
     dialog: Option<DialogState>,
     confirm_tx: mpsc::Sender<ConfirmChoice>,
@@ -71,6 +75,7 @@ impl FylerApp {
             event_rx,
             cmdline: None,
             message: None,
+            root: PathBuf::new(),
             engine_error: None,
             dialog: None,
             confirm_tx,
@@ -82,6 +87,8 @@ impl FylerApp {
             match event {
                 GuiEvent::Editor(event) => match event {
                     EditorEvent::SnapshotUpdated => {}
+                    EditorEvent::ActivateLine { .. } => {}
+                    EditorEvent::NavigateParent => {}
                     EditorEvent::CommitRequested { .. } => {}
                     EditorEvent::CmdlineShow(state) => self.cmdline = Some(state),
                     EditorEvent::CmdlineHide => self.cmdline = None,
@@ -90,6 +97,7 @@ impl FylerApp {
                         self.engine_error = Some(format!("編集エンジンが停止しました: {reason}"));
                     }
                 },
+                GuiEvent::RootChanged(root) => self.root = root,
                 GuiEvent::ShowPlan(plan) => {
                     self.dialog = Some(DialogState::Plan(plan));
                 }
@@ -125,7 +133,7 @@ impl eframe::App for FylerApp {
         }
 
         egui::Panel::bottom("modeline").show(ui, |ui| {
-            modeline::draw(ui, &snapshot);
+            modeline::draw(ui, &snapshot, &self.root);
             if let Some(state) = &self.cmdline {
                 cmdline::draw_cmdline(ui, state);
             } else if let Some(message) = &self.message {

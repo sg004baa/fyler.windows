@@ -157,6 +157,14 @@ pub struct Modifiers {
 pub enum EditorEvent {
     /// スナップショットが更新された(GUIは再描画すればよい)。
     SnapshotUpdated,
+    /// ユーザーが指定行のエントリを開くよう要求した。`line` は0始まり。
+    ///
+    /// 行テキストの解釈と、ファイル・ディレクトリごとの動作選択はapp層が行う。
+    ActivateLine {
+        line: usize,
+    },
+    /// ユーザーが現在の表示ルートの親ディレクトリへの移動を要求した。
+    NavigateParent,
     /// ユーザーが保存(`:w` 相当)を要求した。`lines` は保存要求時点のsnapshotに
     /// 属する行で、後続編集で更新されたsnapshotを誤ってplanしないため同梱する。
     /// [`crate::save::SaveEvent::CommitRequested`] へ接続する。

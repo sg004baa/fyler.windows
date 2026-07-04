@@ -25,6 +25,17 @@ async fn spawn_attach_and_edit_updates_snapshot() -> anyhow::Result<()> {
     engine.set_initial_lines(vec![EditorLine::new("/001 alpha")])?;
     wait_for(&engine, |line| line == "/001 alpha").await?;
 
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::ActivateLine { line: 0 })
+    })
+    .await?;
+    engine.send(key_command(Key::Char('-')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::NavigateParent)
+    })
+    .await?;
+
     engine.send(EditorCommand::Key(KeyInput {
         key: Key::Char('i'),
         mods: Modifiers::default(),

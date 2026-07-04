@@ -66,7 +66,16 @@ vim.bo[buffer].swapfile = false
 
 local group = vim.api.nvim_create_augroup("fyler_guards", { clear = true })
 
-for _, lhs in ipairs({ "<CR>", "gf", "gF", "<C-]>" }) do
+vim.keymap.set({ "n", "x" }, "<CR>", function()
+  local line = vim.api.nvim_win_get_cursor(0)[1] - 1
+  vim.rpcnotify(channel, "fyler_open", line)
+end, { buffer = buffer, silent = true, nowait = true })
+
+vim.keymap.set("n", "-", function()
+  vim.rpcnotify(channel, "fyler_parent")
+end, { buffer = buffer, silent = true, nowait = true })
+
+for _, lhs in ipairs({ "gf", "gF", "<C-]>" }) do
   vim.keymap.set({ "n", "x" }, lhs, function()
     vim.rpcnotify(channel, "fyler_action_blocked", lhs)
   end, { buffer = buffer, silent = true, nowait = true })

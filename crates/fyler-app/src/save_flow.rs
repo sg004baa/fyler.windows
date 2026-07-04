@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use fyler_core::editor::{EditorCommand, EditorEngine, EditorLine};
+use fyler_core::grammar::PrefixParse;
 use fyler_core::id::IdAllocator;
+use fyler_core::path::TreePath;
 use fyler_core::plan::OperationPlan;
 use fyler_core::report::CommitReport;
 use fyler_core::save::{self, SaveEffect, SaveEvent, SaveState};
@@ -58,6 +60,59 @@ impl SaveController {
             context: EditContext::default(),
             engine,
         }
+    }
+
+    /// 保存状態機械がルート差し替え可能な`Idle`状態かを返す。
+    ///
+    /// 確認ダイアログ表示中やapply/reconcile中のナビゲーションは、この判定で
+    /// 副作用を起こす前に拒否すること。
+    pub fn is_idle(&self) -> bool {
+        matches!(self.state, SaveState::Idle)
+    }
+
+    /// バッファの`line`に埋め込まれたIDを現在のbaselineへ解決する。
+    ///
+    /// 戻り値は表示上の編集済みパスではなく、最後に実FSと同期したルート相対パスと
+    /// エントリ種別である。行が範囲外、IDなし、壊れたID、またはbaselineに存在しない
+    /// IDの場合は`None`を返す。
+    pub fn resolve_line(&self, lines: &[EditorLine], line: usize) -> Option<(TreePath, EntryKind)> {
+        let editor_line = lines.get(line)?;
+        let PrefixParse::WithId { id, .. } =
+            fyler_core::grammar::split_id_prefix(&editor_line.text)
+        else {
+            return None;
+        };
+        let entry = self.baseline.get(id)?;
+        Some((entry.path.clone(), entry.kind))
+    }
+
+    /// 表示ルートとID採番器、baselineを新しいスキャン結果へ差し替える。
+    ///
+    /// 保存状態機械が`Idle`のときだけ成功する。成功時はルート固有の編集文脈も
+    /// リセットする。`baseline.root`が`root`と一致しない入力は拒否し、既存状態を
+    /// 変更しない。
+    pub fn change_root(
+        &mut self,
+        root: PathBuf,
+        ids: IdAllocator,
+        baseline: BaselineTree,
+    ) -> anyhow::Result<()> {
+        if !self.is_idle() {
+            anyhow::bail!("保存処理中は表示ルートを変更できません");
+        }
+        if baseline.root != root {
+            anyhow::bail!(
+                "表示ルートとbaselineのルートが一致しません: root={}, baseline={}",
+                root.display(),
+                baseline.root.display()
+            );
+        }
+
+        self.root = root;
+        self.ids = ids;
+        self.baseline = baseline;
+        self.context = EditContext::default();
+        Ok(())
     }
 
     pub fn on_commit(&mut self, changedtick: u64, lines: &[EditorLine]) -> SaveFlowResult {
@@ -611,5 +666,63 @@ mod tests {
             SaveFlowResult::ShowReport(report) if report.all_succeeded()
         ));
         assert!(temp_root.path().join("b.txt").exists());
+    }
+
+    #[test]
+    fn resolve_line_uses_embedded_id_and_current_baseline() {
+        let (controller, _) = controller("C:/test-root");
+        let id = controller.baseline.entries[0].id;
+        let buffer_lines = lines(&[
+            "保存前の新規行.txt",
+            &format!(
+                "{}edited-name.txt",
+                fyler_core::grammar::format_id_prefix(id)
+            ),
+            "/999 missing.txt",
+        ]);
+
+        assert_eq!(controller.resolve_line(&buffer_lines, 0), None);
+        assert_eq!(
+            controller.resolve_line(&buffer_lines, 1),
+            Some((TreePath::parse("a.txt"), EntryKind::File))
+        );
+        assert_eq!(controller.resolve_line(&buffer_lines, 2), None);
+        assert_eq!(controller.resolve_line(&buffer_lines, 3), None);
+    }
+
+    #[test]
+    fn change_root_succeeds_only_while_idle() {
+        let (mut controller, _) = controller("C:/old-root");
+        let new_root = PathBuf::from("C:/new-root");
+        let (new_baseline, new_ids) = baseline(&new_root);
+
+        controller
+            .change_root(new_root.clone(), new_ids, new_baseline)
+            .unwrap();
+
+        assert_eq!(controller.root, new_root);
+        assert_eq!(controller.baseline.root, new_root);
+        assert_eq!(
+            controller.resolve_line(&lines(&["/001 a.txt"]), 0),
+            Some((TreePath::parse("a.txt"), EntryKind::File))
+        );
+
+        assert!(matches!(
+            controller.on_commit(7, &lines(&["/001 b.txt"])),
+            SaveFlowResult::ShowPlan(_)
+        ));
+        let rejected_root = PathBuf::from("C:/rejected-root");
+        let (rejected_baseline, rejected_ids) = baseline(&rejected_root);
+
+        assert!(
+            controller
+                .change_root(rejected_root, rejected_ids, rejected_baseline)
+                .is_err()
+        );
+        assert_eq!(controller.root, new_root);
+        assert!(matches!(
+            controller.state(),
+            SaveState::AwaitingConfirmation { .. }
+        ));
     }
 }

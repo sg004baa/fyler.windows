@@ -1,13 +1,15 @@
 //! モードライン(NORMAL / INSERT / VISUAL ...)の描画。
 
+use std::path::Path;
+
 use eframe::egui;
 use fyler_core::editor::{EditorSnapshot, Mode};
 
 use crate::conceal;
 
-/// モード名・dirtyインジケータ・カーソル位置などを描く。
+/// モード名・dirtyインジケータ・現在ルート・カーソル位置などを描く。
 /// `Mode::Other(s)` は生文字列をそのまま表示する(隠さない)。
-pub fn draw(ui: &mut egui::Ui, snapshot: &EditorSnapshot) {
+pub fn draw(ui: &mut egui::Ui, snapshot: &EditorSnapshot, root: &Path) {
     let mode = match &snapshot.mode {
         Mode::Normal => "NORMAL",
         Mode::Insert => "INSERT",
@@ -38,6 +40,7 @@ pub fn draw(ui: &mut egui::Ui, snapshot: &EditorSnapshot) {
 
     ui.horizontal(|ui| {
         ui.monospace(format!("{mode}{dirty}"));
+        ui.monospace(root.display().to_string());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.monospace(format!("{line}:{column}"));
         });
