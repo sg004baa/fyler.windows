@@ -155,10 +155,12 @@ pub struct Modifiers {
 pub enum EditorEvent {
     /// スナップショットが更新された(GUIは再描画すればよい)。
     SnapshotUpdated,
-    /// ユーザーが保存(`:w` 相当)を要求した。保存状態機械
+    /// ユーザーが保存(`:w` 相当)を要求した。`lines` は保存要求時点のsnapshotに
+    /// 属する行で、後続編集で更新されたsnapshotを誤ってplanしないため同梱する。
     /// [`crate::save::SaveEvent::CommitRequested`] へ接続する。
     CommitRequested {
         changedtick: u64,
+        lines: Arc<[EditorLine]>,
     },
     /// cmdline表示の更新(`:` / `/` 入力中の内容)。GUIが自前描画する。
     CmdlineShow(CmdlineState),

@@ -33,7 +33,8 @@ use fyler_core::tree::{BaselineTree, DesiredTree, EditContext, EntryKind};
 ///   バッファに書かれているはずである(書かれていなければparse段階でInvalidIndent)
 /// - 変更がなければ空のplanを返す
 /// - **順序の契約**(`OperationPlan`のdoc参照): 親Createは子より先、
-///   Move/Copyの読み取り元を壊さない、Deleteは最後、Move玉突きは依存順
+///   Move/Copyの読み取り元を壊さない、既存pathを空けてからCreate/Move/Copyする、
+///   親をMove/Deleteする前に対象子孫のDeleteを済ませる。Move循環はvalidateで拒否済み。
 pub fn build_plan(
     baseline: &BaselineTree,
     desired: &DesiredTree,
@@ -44,6 +45,7 @@ pub fn build_plan(
         .iter()
         .filter_map(|entry| entry.id)
         .collect::<HashSet<_>>();
+    let moved_dirs = planned_directory_moves(baseline, desired);
 
     let mut operations = desired
         .entries
@@ -88,6 +90,10 @@ pub fn build_plan(
         }
 
         let origin = occurrences[origin_index];
+        if moved_with_ancestor(&original.path, &origin.path, &moved_dirs) {
+            continue;
+        }
+
         if origin.path != original.path {
             operations.push(FsOperation::Move {
                 id,
@@ -97,27 +103,23 @@ pub fn build_plan(
         }
     }
 
-    let mut deletes = baseline
-        .entries
-        .iter()
-        .filter(|entry| {
-            !desired_ids.contains(&entry.id)
-                && !is_hidden_by_collapsed_dir(&entry.path, baseline, ctx)
-        })
-        .map(|entry| FsOperation::Delete {
-            id: entry.id,
-            path: entry.path.clone(),
-        })
-        .collect::<Vec<_>>();
-    deletes.sort_by(|left, right| {
-        operation_path(right)
-            .depth()
-            .cmp(&operation_path(left).depth())
-    });
+    operations.extend(
+        baseline
+            .entries
+            .iter()
+            .filter(|entry| {
+                !desired_ids.contains(&entry.id)
+                    && !is_hidden_by_collapsed_dir(&entry.path, baseline, ctx)
+            })
+            .map(|entry| FsOperation::Delete {
+                id: entry.id,
+                path: entry.path.clone(),
+            }),
+    );
 
-    let mut ops = order_non_delete_operations(operations);
-    ops.extend(deletes);
-    OperationPlan { ops }
+    OperationPlan {
+        ops: order_operations(operations),
+    }
 }
 
 fn is_hidden_by_collapsed_dir(path: &TreePath, baseline: &BaselineTree, ctx: &EditContext) -> bool {
@@ -128,7 +130,65 @@ fn is_hidden_by_collapsed_dir(path: &TreePath, baseline: &BaselineTree, ctx: &Ed
     })
 }
 
-fn order_non_delete_operations(operations: Vec<FsOperation>) -> Vec<FsOperation> {
+fn planned_directory_moves(
+    baseline: &BaselineTree,
+    desired: &DesiredTree,
+) -> Vec<(TreePath, TreePath)> {
+    let mut planned_ids = HashSet::new();
+    let mut moves = Vec::new();
+
+    for entry in &desired.entries {
+        let Some(id) = entry.id else {
+            continue;
+        };
+        if !planned_ids.insert(id) {
+            continue;
+        }
+
+        let Some(original) = baseline.get(id) else {
+            continue;
+        };
+        if original.kind != EntryKind::Dir {
+            continue;
+        }
+
+        let occurrences = desired
+            .entries
+            .iter()
+            .filter(|candidate| candidate.id == Some(id))
+            .collect::<Vec<_>>();
+        let origin_index = occurrences
+            .iter()
+            .position(|candidate| candidate.path == original.path)
+            .unwrap_or(0);
+        let origin = occurrences[origin_index];
+        if origin.path != original.path {
+            moves.push((original.path.clone(), origin.path.clone()));
+        }
+    }
+
+    moves
+}
+
+fn moved_with_ancestor(
+    original_path: &TreePath,
+    desired_path: &TreePath,
+    moved_dirs: &[(TreePath, TreePath)],
+) -> bool {
+    moved_dirs.iter().any(|(from, to)| {
+        if !from.is_strict_ancestor_of(original_path) {
+            return false;
+        }
+        let components = to
+            .components()
+            .iter()
+            .chain(original_path.components()[from.depth()..].iter())
+            .cloned();
+        TreePath::from_components(components) == *desired_path
+    })
+}
+
+fn order_operations(operations: Vec<FsOperation>) -> Vec<FsOperation> {
     let mut successors = vec![Vec::new(); operations.len()];
     let mut predecessor_counts = vec![0_usize; operations.len()];
 
@@ -146,8 +206,7 @@ fn order_non_delete_operations(operations: Vec<FsOperation>) -> Vec<FsOperation>
     while ordered.len() < operations.len() {
         let next = (0..operations.len())
             .find(|index| !emitted[*index] && predecessor_counts[*index] == 0)
-            .or_else(|| (0..operations.len()).find(|index| !emitted[*index]))
-            .expect("an un-emitted operation must remain");
+            .expect("validated operation graph must be acyclic");
 
         emitted[next] = true;
         ordered.push(operations[next].clone());
@@ -160,24 +219,56 @@ fn order_non_delete_operations(operations: Vec<FsOperation>) -> Vec<FsOperation>
 }
 
 fn must_precede(before: &FsOperation, after: &FsOperation) -> bool {
+    if let FsOperation::Delete { path, .. } = before {
+        if let FsOperation::Delete {
+            path: later_path, ..
+        } = after
+        {
+            if path.is_strict_ancestor_of(later_path) {
+                return false;
+            }
+            if later_path.is_strict_ancestor_of(path) {
+                return true;
+            }
+        }
+
+        if operation_target(after)
+            .is_some_and(|target| target == path || path.is_strict_ancestor_of(target))
+        {
+            return true;
+        }
+
+        if let FsOperation::Move { from, .. } = after
+            && from.is_strict_ancestor_of(path)
+        {
+            return true;
+        }
+    }
+
+    if let Some(source) = operation_source(before)
+        && let FsOperation::Delete { path, .. } = after
+        && (path == source || path.is_strict_ancestor_of(source))
+    {
+        return true;
+    }
+
     if let FsOperation::Create {
         path,
         kind: EntryKind::Dir,
     } = before
+        && operation_target(after).is_some_and(|target| path.is_strict_ancestor_of(target))
     {
-        if operation_target(after).is_some_and(|target| path.is_strict_ancestor_of(target)) {
-            return true;
-        }
+        return true;
     }
 
     let Some(source) = operation_source(before) else {
         return false;
     };
 
-    if let FsOperation::Move { from, .. } = after {
-        if from == source || from.is_strict_ancestor_of(source) {
-            return true;
-        }
+    if let FsOperation::Move { from, .. } = after
+        && (from == source || from.is_strict_ancestor_of(source))
+    {
+        return true;
     }
 
     operation_target(after)
@@ -196,12 +287,5 @@ fn operation_target(operation: &FsOperation) -> Option<&TreePath> {
         FsOperation::Create { path, .. } => Some(path),
         FsOperation::Move { to, .. } | FsOperation::Copy { to, .. } => Some(to),
         FsOperation::Delete { .. } => None,
-    }
-}
-
-fn operation_path(operation: &FsOperation) -> &TreePath {
-    match operation {
-        FsOperation::Create { path, .. } | FsOperation::Delete { path, .. } => path,
-        FsOperation::Move { to, .. } | FsOperation::Copy { to, .. } => to,
     }
 }

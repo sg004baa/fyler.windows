@@ -77,10 +77,13 @@ fn validation_error_label(error: &ValidateError) -> String {
     let line = match error {
         ValidateError::BrokenIdPrefix { line }
         | ValidateError::InvalidIndent { line }
+        | ValidateError::EmptyName { line }
         | ValidateError::ReservedChar { line, .. }
         | ValidateError::ReservedName { line, .. }
         | ValidateError::InvalidTrailing { line, .. } => Some(*line),
-        ValidateError::DuplicateName { .. } | ValidateError::MoveIntoSelf { .. } => None,
+        ValidateError::DuplicateName { .. }
+        | ValidateError::MoveIntoSelf { .. }
+        | ValidateError::MoveCycle { .. } => None,
     };
 
     let label = error.to_string();

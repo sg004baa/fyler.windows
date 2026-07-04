@@ -1,7 +1,8 @@
 //! validate: DesiredTreeの妥当性検査(DESIGN.md「validateで弾くもの」)。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
+use fyler_core::id::EntryId;
 use fyler_core::path::TreePath;
 use fyler_core::tree::{BaselineTree, DesiredTree, EditContext, EntryKind};
 use fyler_core::validate::ValidateError;
@@ -16,8 +17,10 @@ use fyler_core::win_naming;
 ///   baseline上の既存エントリと重なる場合に検出する
 /// - ディレクトリの自分自身・自分の子孫への移動(`MoveIntoSelf`)。
 ///   baselineパスとdesiredパスの関係から判定する(`TreePath::is_strict_ancestor_of`)
+/// - 一時名なしでは安全に逐次実行できないMove循環(`MoveCycle`)
 /// - 名前規則(必ず `fyler_core::win_naming` を使う):
 ///   - 予約文字・制御文字(`ReservedChar`)
+///   - 空の名前(`EmptyName`)
 ///   - 予約名 CON, PRN, AUX, NUL, COM1-9, LPT1-9(拡張子付き含む)(`ReservedName`)
 ///   - 末尾のスペース・ピリオド(`InvalidTrailing`)
 ///
@@ -41,6 +44,9 @@ pub fn validate(
         let Some(name) = entry.path.name() else {
             continue;
         };
+        if name.is_empty() {
+            errors.push(ValidateError::EmptyName { line: entry.line });
+        }
 
         if let Some(ch) = win_naming::find_reserved_char(name) {
             errors.push(ValidateError::ReservedChar {
@@ -100,6 +106,8 @@ pub fn validate(
         }
     }
 
+    errors.extend(detect_move_cycles(baseline, desired));
+
     errors
 }
 
@@ -140,4 +148,98 @@ fn hidden_entries_at_desired_paths(
     }
 
     hidden
+}
+
+fn detect_move_cycles(baseline: &BaselineTree, desired: &DesiredTree) -> Vec<ValidateError> {
+    let moves = planned_moves(baseline, desired);
+    if moves.is_empty() {
+        return Vec::new();
+    }
+
+    let moves_by_source = moves
+        .iter()
+        .map(|planned| (planned.from.clone(), planned))
+        .collect::<HashMap<_, _>>();
+    let mut remaining_dependencies = moves
+        .iter()
+        .map(|planned| {
+            (
+                planned.id,
+                moves_by_source
+                    .get(&planned.to)
+                    .map(|dependency| dependency.id),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let ready = remaining_dependencies
+            .iter()
+            .filter_map(|(id, dependency)| {
+                dependency
+                    .filter(|dependency_id| remaining_dependencies.contains_key(dependency_id))
+                    .is_none()
+                    .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+
+        for id in ready {
+            changed |= remaining_dependencies.remove(&id).is_some();
+        }
+    }
+
+    moves
+        .iter()
+        .filter(|planned| remaining_dependencies.contains_key(&planned.id))
+        .map(|planned| ValidateError::MoveCycle {
+            path: planned.to.clone(),
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+struct PlannedMove {
+    id: EntryId,
+    from: TreePath,
+    to: TreePath,
+}
+
+fn planned_moves(baseline: &BaselineTree, desired: &DesiredTree) -> Vec<PlannedMove> {
+    let mut planned_ids = HashSet::new();
+    let mut moves = Vec::new();
+
+    for entry in &desired.entries {
+        let Some(id) = entry.id else {
+            continue;
+        };
+        if !planned_ids.insert(id) {
+            continue;
+        }
+
+        let Some(original) = baseline.get(id) else {
+            continue;
+        };
+        let occurrences = desired
+            .entries
+            .iter()
+            .filter(|candidate| candidate.id == Some(id))
+            .collect::<Vec<_>>();
+        let origin_index = occurrences
+            .iter()
+            .position(|candidate| candidate.path == original.path)
+            .unwrap_or(0);
+        let origin = occurrences[origin_index];
+
+        if origin.path != original.path {
+            moves.push(PlannedMove {
+                id,
+                from: original.path.clone(),
+                to: origin.path.clone(),
+            });
+        }
+    }
+
+    moves
 }

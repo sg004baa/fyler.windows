@@ -1,7 +1,8 @@
 //! baselineスキャン: 実FS → BaselineTree(ID採番)。
 
+use std::ffi::OsString;
 use std::fs::{self, Metadata};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use fyler_core::id::IdAllocator;
@@ -50,32 +51,32 @@ fn scan_directory(
     ids: &mut IdAllocator,
     tree: &mut BaselineTree,
 ) -> anyhow::Result<()> {
-    let mut entries = fs::read_dir(directory)
-        .with_context(|| format!("ディレクトリを列挙できません: {}", directory.display()))?
-        .collect::<Result<Vec<_>, _>>()
-        .with_context(|| {
-            format!(
-                "ディレクトリエントリを取得できません: {}",
-                directory.display()
-            )
-        })?;
+    let mut stack = vec![ScanFrame {
+        entries: read_sorted_entries(directory)?,
+        index: 0,
+        relative: relative.clone(),
+    }];
 
-    // read_dirの順序は未規定なので、表示とID採番をセッションごとに安定させる。
-    entries.sort_by_key(|entry| entry.file_name());
+    while let Some(frame) = stack.last_mut() {
+        if frame.index >= frame.entries.len() {
+            stack.pop();
+            continue;
+        }
 
-    for entry in entries {
-        let file_name = entry.file_name();
+        let (entry_path, file_name) = frame.entries[frame.index].clone();
+        frame.index += 1;
+
         let name = file_name.to_str().with_context(|| {
             format!(
                 "UTF-8として表現できないファイル名です: {}",
-                entry.path().display()
+                entry_path.display()
             )
         })?;
-        let path = relative.child(name);
-        let metadata = fs::symlink_metadata(entry.path()).with_context(|| {
+        let path = frame.relative.child(name);
+        let metadata = fs::symlink_metadata(&entry_path).with_context(|| {
             format!(
                 "エントリのメタデータを取得できません: {}",
-                entry.path().display()
+                entry_path.display()
             )
         })?;
 
@@ -94,11 +95,38 @@ fn scan_directory(
         });
 
         if kind == EntryKind::Dir {
-            scan_directory(&entry.path(), &path, ids, tree)?;
+            stack.push(ScanFrame {
+                entries: read_sorted_entries(&entry_path)?,
+                index: 0,
+                relative: path,
+            });
         }
     }
 
     Ok(())
+}
+
+struct ScanFrame {
+    entries: Vec<(PathBuf, OsString)>,
+    index: usize,
+    relative: TreePath,
+}
+
+fn read_sorted_entries(directory: &Path) -> anyhow::Result<Vec<(PathBuf, OsString)>> {
+    let mut entries = fs::read_dir(directory)
+        .with_context(|| format!("ディレクトリを列挙できません: {}", directory.display()))?
+        .map(|entry| entry.map(|entry| (entry.path(), entry.file_name())))
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| {
+            format!(
+                "ディレクトリエントリを取得できません: {}",
+                directory.display()
+            )
+        })?;
+
+    // read_dirの順序は未規定なので、表示とID採番をセッションごとに安定させる。
+    entries.sort_by_key(|(_, file_name)| file_name.clone());
+    Ok(entries)
 }
 
 fn is_link_or_reparse(metadata: &Metadata) -> bool {

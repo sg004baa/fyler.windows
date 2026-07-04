@@ -100,16 +100,14 @@ fn main() -> anyhow::Result<()> {
 
     // GUIクレートへtokio型を漏らさず、core型とConfirmChoiceだけを受け渡す。
     let (gui_event_tx, gui_event_rx) = mpsc::channel();
-    let controller_engine: Arc<dyn EditorEngine> = engine.clone();
     let event_bridge = thread::Builder::new()
         .name("fyler-app-events".to_owned())
         .spawn(move || {
             let mut save_controller = SaveController::new(baseline);
             while let Ok(event) = app_event_rx.recv() {
                 match event {
-                    AppEvent::Editor(EditorEvent::CommitRequested { changedtick }) => {
-                        let snapshot = controller_engine.snapshot();
-                        let result = save_controller.on_commit(changedtick, &snapshot.lines);
+                    AppEvent::Editor(EditorEvent::CommitRequested { changedtick, lines }) => {
+                        let result = save_controller.on_commit(changedtick, &lines);
                         if send_save_result(&gui_event_tx, result).is_err() {
                             return;
                         }

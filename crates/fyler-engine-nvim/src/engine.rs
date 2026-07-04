@@ -294,6 +294,7 @@ impl NvimEngine {
                                     Ok(snapshot) => {
                                         let _ = event_tx.send(EditorEvent::CommitRequested {
                                             changedtick: snapshot.changedtick,
+                                            lines: Arc::clone(&snapshot.lines),
                                         });
                                     }
                                     Err(error) => send_message(

@@ -187,6 +187,44 @@ fn validate_rejects_windows_naming_violations() {
 }
 
 #[test]
+fn validate_rejects_id_prefixed_empty_name_from_parser() {
+    // `/001 ` はID付きの既存行を空名へrenameした状態。
+    // parse/to_desired_treeで推測補完せず、validateで明示的に保存中断する。
+    let base = baseline(&[(1, "old.txt", EntryKind::File)]);
+    let desired = parse::to_desired_tree(&parse::parse(&lines(&["/001 "])))
+        .expect("empty names are a validate-level error, not a parse error");
+
+    let errors = validate::validate(&base, &desired, &no_collapse());
+
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, ValidateError::EmptyName { line: 0 }))
+    );
+}
+
+#[test]
+fn validate_rejects_two_file_name_swap_before_plan_building() {
+    // a→b と b→a をそのまま実FSへ投げると最初のMove先が既存パスに衝突する。
+    // diff/applyで非実行可能planにせず、validate段階で循環として保存中断する。
+    let base = baseline(&[(1, "a.txt", EntryKind::File), (2, "b.txt", EntryKind::File)]);
+    let desired = DesiredTree {
+        entries: vec![
+            desired_entry(Some(1), "b.txt", EntryKind::File, 0),
+            desired_entry(Some(2), "a.txt", EntryKind::File, 1),
+        ],
+    };
+
+    let errors = validate::validate(&base, &desired, &no_collapse());
+
+    assert!(errors.iter().any(|e| matches!(
+        e,
+        ValidateError::MoveCycle { path }
+            if *path == TreePath::parse("a.txt") || *path == TreePath::parse("b.txt")
+    )));
+}
+
+#[test]
 fn validate_accepts_clean_tree() {
     let base = baseline(&[
         (1, "src", EntryKind::Dir),
@@ -334,5 +372,96 @@ fn diff_expanded_dir_missing_children_are_deleted() {
             id: EntryId(2),
             path: TreePath::parse("src/main.rs"),
         }]
+    );
+}
+
+#[test]
+fn diff_expanded_dir_rename_moves_parent_only_not_descendants() {
+    // 展開中でもディレクトリrenameは実FSの親Move 1件で子孫を連れて動く。
+    // 子ファイル/孫ファイルのMoveを重複発行すると、親Move後に元パスが消えて実行不能になる。
+    let base = baseline(&[
+        (1, "src", EntryKind::Dir),
+        (2, "src/main.rs", EntryKind::File),
+        (3, "src/nested", EntryKind::Dir),
+        (4, "src/nested/lib.rs", EntryKind::File),
+    ]);
+    let desired = DesiredTree {
+        entries: vec![
+            desired_entry(Some(1), "lib", EntryKind::Dir, 0),
+            desired_entry(Some(2), "lib/main.rs", EntryKind::File, 1),
+            desired_entry(Some(3), "lib/nested", EntryKind::Dir, 2),
+            desired_entry(Some(4), "lib/nested/lib.rs", EntryKind::File, 3),
+        ],
+    };
+
+    let plan = diff::build_plan(&base, &desired, &no_collapse());
+
+    assert_eq!(
+        plan.ops,
+        vec![FsOperation::Move {
+            id: EntryId(1),
+            from: TreePath::parse("src"),
+            to: TreePath::parse("lib"),
+        }]
+    );
+}
+
+#[test]
+fn diff_delete_create_same_path_orders_delete_before_create() {
+    // 既存IDを消して同名の新規行を作る置換は、Create→Deleteでは既存パスに衝突する。
+    // 実行可能なplanとして、古いIDを先に削除してから同じパスを作成する。
+    let base = baseline(&[(1, "same.txt", EntryKind::File)]);
+    let desired = DesiredTree {
+        entries: vec![desired_entry(None, "same.txt", EntryKind::File, 0)],
+    };
+
+    let plan = diff::build_plan(&base, &desired, &no_collapse());
+
+    assert_eq!(
+        plan.ops,
+        vec![
+            FsOperation::Delete {
+                id: EntryId(1),
+                path: TreePath::parse("same.txt"),
+            },
+            FsOperation::Create {
+                path: TreePath::parse("same.txt"),
+                kind: EntryKind::File,
+            },
+        ]
+    );
+}
+
+#[test]
+fn diff_deletes_child_before_moving_parent_directory() {
+    // 子を削除しつつ親ディレクトリをrenameする場合、親Moveを先に実行すると
+    // 削除対象の旧パス(src/remove.txt)が消える。子Deleteを先に出せばそのまま実行できる。
+    let base = baseline(&[
+        (1, "src", EntryKind::Dir),
+        (2, "src/remove.txt", EntryKind::File),
+        (3, "src/keep.txt", EntryKind::File),
+    ]);
+    let desired = DesiredTree {
+        entries: vec![
+            desired_entry(Some(1), "lib", EntryKind::Dir, 0),
+            desired_entry(Some(3), "lib/keep.txt", EntryKind::File, 1),
+        ],
+    };
+
+    let plan = diff::build_plan(&base, &desired, &no_collapse());
+
+    assert_eq!(
+        plan.ops,
+        vec![
+            FsOperation::Delete {
+                id: EntryId(2),
+                path: TreePath::parse("src/remove.txt"),
+            },
+            FsOperation::Move {
+                id: EntryId(1),
+                from: TreePath::parse("src"),
+                to: TreePath::parse("lib"),
+            },
+        ]
     );
 }

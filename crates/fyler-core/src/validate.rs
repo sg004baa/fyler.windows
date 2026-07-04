@@ -23,6 +23,9 @@ pub enum ValidateError {
     /// 同一ディレクトリ内の名前重複。
     #[error("同名エントリが重複しています: {path}")]
     DuplicateName { path: TreePath },
+    /// 名前が空。IDプレフィックスだけの行(`/001 `)や空ディレクトリ名を実FS操作へ流さない。
+    #[error("行{line}: 名前が空です")]
+    EmptyName { line: usize },
 
     /// Windows予約文字(`< > : " / \ | ? *`)・制御文字を含む名前。
     /// 判定は `fyler_core::win_naming::find_reserved_char`。
@@ -46,4 +49,7 @@ pub enum ValidateError {
         from: TreePath,
         to: TreePath,
     },
+    /// 一時名なしでは安全に逐次実行できないMove循環。
+    #[error("ファイル名の入れ替えは一度に実行できません: {path}")]
+    MoveCycle { path: TreePath },
 }
