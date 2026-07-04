@@ -313,15 +313,17 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     AppEvent::ExternalChange(change) => {
-                        let _changed_path = change.path;
+                        let mut changed_paths = change.paths;
                         while let Ok(queued_event) = app_event_rx.try_recv() {
                             match queued_event {
                                 AppEvent::ExternalChange(change) => {
-                                    let _changed_path = change.path;
+                                    changed_paths.extend(change.paths);
                                 }
                                 event => pending_events.push_back(event),
                             }
                         }
+                        // M7では全再スキャンするため、集合は将来の部分再スキャンまで使わない。
+                        drop(changed_paths);
 
                         let result = save_controller.on_external_change();
                         if !matches!(&result, SaveFlowResult::NoChanges)
