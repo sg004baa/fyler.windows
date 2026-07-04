@@ -165,6 +165,8 @@ pub enum EditorEvent {
     },
     /// ユーザーが現在の表示ルートの親ディレクトリへの移動を要求した。
     NavigateParent,
+    /// ユーザーが隠しファイル表示の切り替えを要求した。
+    ToggleHidden,
     /// ユーザーが保存(`:w` 相当)を要求した。`lines` は保存要求時点のsnapshotに
     /// 属する行で、後続編集で更新されたsnapshotを誤ってplanしないため同梱する。
     /// [`crate::save::SaveEvent::CommitRequested`] へ接続する。

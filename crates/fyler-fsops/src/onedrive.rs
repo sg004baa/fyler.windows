@@ -21,28 +21,7 @@ pub const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
 pub fn is_cloud_placeholder(path: &Path) -> anyhow::Result<bool> {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-
-        use anyhow::bail;
-        use windows::Win32::Foundation::GetLastError;
-        use windows::Win32::Storage::FileSystem::GetFileAttributesW;
-        use windows::core::PCWSTR;
-
-        let wide_path: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let attributes = unsafe { GetFileAttributesW(PCWSTR(wide_path.as_ptr())) };
-        if attributes == u32::MAX {
-            let error = unsafe { GetLastError() };
-            bail!(
-                "ファイル属性を取得できません: {}: GetLastError={} ({})",
-                path.display(),
-                error.0,
-                std::io::Error::from_raw_os_error(error.0 as i32)
-            );
-        }
+        let attributes = crate::winattr::get(path)?;
 
         let cloud_attributes = FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
             | FILE_ATTRIBUTE_RECALL_ON_OPEN

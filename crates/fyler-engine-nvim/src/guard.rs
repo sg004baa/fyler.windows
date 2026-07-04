@@ -75,6 +75,10 @@ vim.keymap.set("n", "-", function()
   vim.rpcnotify(channel, "fyler_parent")
 end, { buffer = buffer, silent = true, nowait = true })
 
+vim.keymap.set("n", "g.", function()
+  vim.rpcnotify(channel, "fyler_toggle_hidden")
+end, { buffer = buffer, silent = true, nowait = true })
+
 for _, lhs in ipairs({ "gf", "gF", "<C-]>" }) do
   vim.keymap.set({ "n", "x" }, lhs, function()
     vim.rpcnotify(channel, "fyler_action_blocked", lhs)

@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use anyhow::Context;
 use fyler_core::editor::{
     EditorCommand, EditorEngine, EditorEvent, EditorLine, Key, KeyInput, Modifiers,
 };
@@ -35,6 +36,13 @@ async fn spawn_attach_and_edit_updates_snapshot() -> anyhow::Result<()> {
         matches!(event, EditorEvent::NavigateParent)
     })
     .await?;
+    engine.send(key_command(Key::Char('g')))?;
+    engine.send(key_command(Key::Char('.')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::ToggleHidden)
+    })
+    .await
+    .context("g. did not emit ToggleHidden")?;
 
     engine.send(EditorCommand::Key(KeyInput {
         key: Key::Char('i'),

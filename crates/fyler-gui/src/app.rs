@@ -89,6 +89,7 @@ impl FylerApp {
                     EditorEvent::SnapshotUpdated => {}
                     EditorEvent::ActivateLine { .. } => {}
                     EditorEvent::NavigateParent => {}
+                    EditorEvent::ToggleHidden => {}
                     EditorEvent::CommitRequested { .. } => {}
                     EditorEvent::CmdlineShow(state) => self.cmdline = Some(state),
                     EditorEvent::CmdlineHide => self.cmdline = None,

@@ -13,6 +13,7 @@ use fyler_core::report::CommitReport;
 use fyler_core::save::{self, SaveEffect, SaveEvent, SaveState};
 use fyler_core::tree::{BaselineTree, EditContext, EntryKind};
 use fyler_core::validate::ValidateError;
+use fyler_fsops::scan::ScanOptions;
 use fyler_gui::confirm::ConfirmChoice;
 
 /// 保存フローから配線層へ返す結果。
@@ -36,12 +37,26 @@ pub enum SaveFlowResult {
     Ignored,
 }
 
+/// ディレクトリ折りたたみ操作の結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToggleCollapseResult {
+    /// 折りたたみ状態を切り替え、バッファへ設定すべき全行を返す。
+    Toggled(Vec<EditorLine>),
+    /// 対象行を現在のbaselineへ解決できない。
+    NotFound,
+    /// 対象行はディレクトリではない。
+    NotADirectory,
+    /// 保存状態機械が`Idle`ではないため、状態を変更しなかった。
+    Busy,
+}
+
 pub struct SaveController {
     state: SaveState,
     root: PathBuf,
     ids: IdAllocator,
     baseline: BaselineTree,
     context: EditContext,
+    scan_options: ScanOptions,
     engine: Arc<dyn EditorEngine>,
 }
 
@@ -58,6 +73,7 @@ impl SaveController {
             ids,
             baseline,
             context: EditContext::default(),
+            scan_options: ScanOptions::default(),
             engine,
         }
     }
@@ -84,6 +100,88 @@ impl SaveController {
         };
         let entry = self.baseline.get(id)?;
         Some((entry.path.clone(), entry.kind))
+    }
+
+    /// 現在のbaselineと折りたたみ文脈から、バッファへ表示する全行を生成する。
+    pub fn visible_lines(&self) -> Vec<EditorLine> {
+        baseline_to_lines(&self.baseline, &self.context)
+    }
+
+    /// 現在のスキャンオプションを返す。
+    ///
+    /// 別ルートを先にスキャンしてから [`Self::change_root`] する配線では、この値を
+    /// 引き継いで隠しファイル表示設定を維持すること。
+    pub fn scan_options(&self) -> ScanOptions {
+        self.scan_options
+    }
+
+    /// ルート直下の全ディレクトリを折りたたみ状態へ初期化する。
+    ///
+    /// baseline自体は全階層を保持し、表示行だけから各ディレクトリの子孫を除く。
+    pub fn collapse_all_top_level(&mut self) {
+        self.context.collapsed_dirs.extend(
+            self.baseline
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == EntryKind::Dir && entry.path.depth() == 1)
+                .map(|entry| entry.id),
+        );
+    }
+
+    /// 指定行のディレクトリについて、折りたたみ状態を切り替える。
+    ///
+    /// 対象行は埋め込みIDを使って現在のbaselineへ解決する。展開時もbaselineから
+    /// 全行を再生成し、別の折りたたみディレクトリの子孫は表示しない。dirty判定は
+    /// 呼び出し元のapp層がこのAPIより先に行うこと。
+    pub fn toggle_collapse(&mut self, lines: &[EditorLine], line: usize) -> ToggleCollapseResult {
+        let Some((_, kind)) = self.resolve_line(lines, line) else {
+            return ToggleCollapseResult::NotFound;
+        };
+        if kind != EntryKind::Dir {
+            return ToggleCollapseResult::NotADirectory;
+        }
+        if !self.is_idle() {
+            return ToggleCollapseResult::Busy;
+        }
+
+        let PrefixParse::WithId { id, .. } =
+            fyler_core::grammar::split_id_prefix(&lines[line].text)
+        else {
+            return ToggleCollapseResult::NotFound;
+        };
+        if !self.context.collapsed_dirs.remove(&id) {
+            self.context.collapsed_dirs.insert(id);
+        }
+
+        ToggleCollapseResult::Toggled(self.visible_lines())
+    }
+
+    /// 隠しファイル表示を切り替えて現在のルートを再スキャンする。
+    ///
+    /// 保存状態機械が`Idle`のときだけ実行し、同じパスのIDと新baselineにも実在する
+    /// 折りたたみIDを維持する。戻り値はバッファへ設定すべき全行である。
+    pub fn toggle_hidden(&mut self) -> anyhow::Result<Vec<EditorLine>> {
+        if !self.is_idle() {
+            anyhow::bail!("保存処理中は隠しファイル表示を変更できません");
+        }
+
+        let options = ScanOptions {
+            show_hidden: !self.scan_options.show_hidden,
+        };
+        let baseline = fyler_fsops::scan::rescan_preserving_ids_with(
+            &self.root,
+            &mut self.ids,
+            &self.baseline,
+            &options,
+        )
+        .context("隠しファイル表示切り替え後の実FS再スキャンに失敗しました")?;
+        let context = retain_existing_collapsed_dirs(&self.context, &baseline);
+        let lines = baseline_to_lines(&baseline, &context);
+
+        self.baseline = baseline;
+        self.context = context;
+        self.scan_options = options;
+        Ok(lines)
     }
 
     /// 表示ルートとID採番器、baselineを新しいスキャン結果へ差し替える。
@@ -168,10 +266,11 @@ impl SaveController {
     }
 
     pub fn on_external_change(&mut self) -> SaveFlowResult {
-        let baseline = match fyler_fsops::scan::rescan_preserving_ids(
+        let baseline = match fyler_fsops::scan::rescan_preserving_ids_with(
             &self.root,
             &mut self.ids,
             &self.baseline,
+            &self.scan_options,
         )
         .context("外部変更後の実FS再スキャンに失敗しました")
         {
@@ -200,7 +299,8 @@ impl SaveController {
             );
         }
 
-        let lines = baseline_to_lines(&baseline);
+        let context = retain_existing_collapsed_dirs(&self.context, &baseline);
+        let lines = baseline_to_lines(&baseline, &context);
         if let Err(error) = self
             .engine
             .send(EditorCommand::SetLines(lines))
@@ -210,7 +310,7 @@ impl SaveController {
         }
 
         self.baseline = baseline;
-        self.context = EditContext::default();
+        self.context = context;
         SaveFlowResult::ExternalChanged
     }
 
@@ -273,16 +373,21 @@ impl SaveController {
     }
 
     fn reconcile_from_fs(&mut self) -> anyhow::Result<()> {
-        let baseline =
-            fyler_fsops::scan::rescan_preserving_ids(&self.root, &mut self.ids, &self.baseline)
-                .context("実FSの再スキャンに失敗しました")?;
-        let lines = baseline_to_lines(&baseline);
+        let baseline = fyler_fsops::scan::rescan_preserving_ids_with(
+            &self.root,
+            &mut self.ids,
+            &self.baseline,
+            &self.scan_options,
+        )
+        .context("実FSの再スキャンに失敗しました")?;
+        let context = retain_existing_collapsed_dirs(&self.context, &baseline);
+        let lines = baseline_to_lines(&baseline, &context);
         self.engine
             .send(EditorCommand::SetLines(lines))
             .context("reconcile後のバッファ行をエンジンへ送信できません")?;
 
         self.baseline = baseline;
-        self.context = EditContext::default();
+        self.context = context;
         let effects = self.apply_event(SaveEvent::ReconcileFinished);
         debug_assert!(matches!(self.state, SaveState::Idle));
         debug_assert!(
@@ -301,10 +406,33 @@ impl SaveController {
     }
 }
 
-pub(crate) fn baseline_to_lines(baseline: &BaselineTree) -> Vec<EditorLine> {
+fn retain_existing_collapsed_dirs(context: &EditContext, baseline: &BaselineTree) -> EditContext {
+    let mut context = context.clone();
+    context.collapsed_dirs.retain(|id| {
+        baseline
+            .get(*id)
+            .is_some_and(|entry| entry.kind == EntryKind::Dir)
+    });
+    context
+}
+
+pub(crate) fn baseline_to_lines(baseline: &BaselineTree, context: &EditContext) -> Vec<EditorLine> {
+    let collapsed_paths = context
+        .collapsed_dirs
+        .iter()
+        .filter_map(|id| baseline.get(*id))
+        .filter(|entry| entry.kind == EntryKind::Dir)
+        .map(|entry| &entry.path)
+        .collect::<Vec<_>>();
+
     baseline
         .entries
         .iter()
+        .filter(|entry| {
+            !collapsed_paths
+                .iter()
+                .any(|path| path.is_strict_ancestor_of(&entry.path))
+        })
         .map(|entry| {
             let indent = " "
                 .repeat(entry.path.depth().saturating_sub(1) * fyler_core::grammar::INDENT_WIDTH);
@@ -379,6 +507,29 @@ mod tests {
     fn controller(root: impl Into<PathBuf>) -> (SaveController, Arc<RecordingEngine>) {
         let root = root.into();
         let (baseline, ids) = baseline(&root);
+        let engine = Arc::new(RecordingEngine::default());
+        let controller =
+            SaveController::new(root, ids, baseline, Arc::<RecordingEngine>::clone(&engine));
+        (controller, engine)
+    }
+
+    fn hierarchy_controller(root: impl Into<PathBuf>) -> (SaveController, Arc<RecordingEngine>) {
+        let root = root.into();
+        let mut ids = IdAllocator::new();
+        let mut baseline = BaselineTree::new(&root);
+        for (path, kind) in [
+            ("a", EntryKind::Dir),
+            ("a/nested", EntryKind::Dir),
+            ("a/nested/leaf.txt", EntryKind::File),
+            ("a/child.txt", EntryKind::File),
+            ("top.txt", EntryKind::File),
+        ] {
+            baseline.insert(BaselineEntry {
+                id: ids.allocate(),
+                path: TreePath::parse(path),
+                kind,
+            });
+        }
         let engine = Arc::new(RecordingEngine::default());
         let controller =
             SaveController::new(root, ids, baseline, Arc::<RecordingEngine>::clone(&engine));
@@ -724,5 +875,200 @@ mod tests {
             controller.state(),
             SaveState::AwaitingConfirmation { .. }
         ));
+    }
+
+    #[test]
+    fn toggle_collapse_removes_descendants_and_expand_restores_them() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        let expanded = controller.visible_lines();
+
+        let collapsed = match controller.toggle_collapse(&expanded, 0) {
+            ToggleCollapseResult::Toggled(lines) => lines,
+            result => panic!("unexpected collapse result: {result:?}"),
+        };
+        assert_eq!(collapsed.len(), 2);
+        assert!(collapsed[0].text.ends_with("a/"));
+        assert!(collapsed[1].text.ends_with("top.txt"));
+
+        let expanded_again = match controller.toggle_collapse(&collapsed, 0) {
+            ToggleCollapseResult::Toggled(lines) => lines,
+            result => panic!("unexpected expand result: {result:?}"),
+        };
+        assert_eq!(expanded_again, expanded);
+    }
+
+    #[test]
+    fn collapse_all_top_level_hides_only_top_level_directory_descendants() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+
+        controller.collapse_all_top_level();
+
+        let lines = controller.visible_lines();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].text.ends_with("a/"));
+        assert!(lines[1].text.ends_with("top.txt"));
+        assert_eq!(controller.context.collapsed_dirs, [EntryId(1)].into());
+    }
+
+    #[test]
+    fn toggle_collapse_preserves_nested_collapsed_directory() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        let expanded = controller.visible_lines();
+
+        let nested_collapsed = match controller.toggle_collapse(&expanded, 1) {
+            ToggleCollapseResult::Toggled(lines) => lines,
+            result => panic!("unexpected nested collapse result: {result:?}"),
+        };
+        assert!(
+            nested_collapsed
+                .iter()
+                .all(|line| !line.text.ends_with("leaf.txt"))
+        );
+
+        let parent_collapsed = match controller.toggle_collapse(&nested_collapsed, 0) {
+            ToggleCollapseResult::Toggled(lines) => lines,
+            result => panic!("unexpected parent collapse result: {result:?}"),
+        };
+        let parent_expanded = match controller.toggle_collapse(&parent_collapsed, 0) {
+            ToggleCollapseResult::Toggled(lines) => lines,
+            result => panic!("unexpected parent expand result: {result:?}"),
+        };
+
+        assert!(
+            parent_expanded
+                .iter()
+                .any(|line| line.text.ends_with("nested/"))
+        );
+        assert!(
+            parent_expanded
+                .iter()
+                .any(|line| line.text.ends_with("child.txt"))
+        );
+        assert!(
+            parent_expanded
+                .iter()
+                .all(|line| !line.text.ends_with("leaf.txt"))
+        );
+    }
+
+    #[test]
+    fn toggle_collapse_rejects_non_directory() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        let lines = controller.visible_lines();
+
+        assert_eq!(
+            controller.toggle_collapse(&lines, 2),
+            ToggleCollapseResult::NotADirectory
+        );
+        assert_eq!(controller.visible_lines(), lines);
+    }
+
+    #[test]
+    fn toggle_collapse_rejects_non_idle_save_state() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        let mut lines = controller.visible_lines();
+        lines[4].text = lines[4].text.replace("top.txt", "renamed.txt");
+        assert!(matches!(
+            controller.on_commit(7, &lines),
+            SaveFlowResult::ShowPlan(_)
+        ));
+
+        assert_eq!(
+            controller.toggle_collapse(&lines, 0),
+            ToggleCollapseResult::Busy
+        );
+    }
+
+    #[test]
+    fn collapsed_directory_rename_builds_only_parent_move() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        let lines = controller.visible_lines();
+        let mut collapsed = match controller.toggle_collapse(&lines, 0) {
+            ToggleCollapseResult::Toggled(lines) => lines,
+            result => panic!("unexpected collapse result: {result:?}"),
+        };
+        collapsed[0].text = collapsed[0].text.replace("a/", "renamed/");
+
+        let result = controller.on_commit(7, &collapsed);
+
+        assert_eq!(
+            result,
+            SaveFlowResult::ShowPlan(OperationPlan {
+                ops: vec![FsOperation::Move {
+                    id: EntryId(1),
+                    from: TreePath::parse("a"),
+                    to: TreePath::parse("renamed"),
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn external_change_keeps_existing_collapsed_state() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("a")).unwrap();
+        fs::write(root.path().join("a").join("child.txt"), b"child").unwrap();
+        fs::write(root.path().join("top.txt"), b"top").unwrap();
+        let mut ids = IdAllocator::new();
+        let baseline = fyler_fsops::scan::scan_baseline(root.path(), &mut ids).unwrap();
+        let engine = Arc::new(RecordingEngine::default());
+        let mut controller = SaveController::new(
+            root.path().to_path_buf(),
+            ids,
+            baseline,
+            Arc::<RecordingEngine>::clone(&engine),
+        );
+        let expanded = controller.visible_lines();
+        let collapsed = match controller.toggle_collapse(&expanded, 0) {
+            ToggleCollapseResult::Toggled(lines) => lines,
+            result => panic!("unexpected collapse result: {result:?}"),
+        };
+        assert!(
+            collapsed
+                .iter()
+                .all(|line| !line.text.ends_with("child.txt"))
+        );
+        fs::write(root.path().join("new.txt"), b"new").unwrap();
+
+        assert_eq!(
+            controller.on_external_change(),
+            SaveFlowResult::ExternalChanged
+        );
+
+        let commands = engine.commands.lock().unwrap();
+        assert!(matches!(
+            commands.last(),
+            Some(EditorCommand::SetLines(lines))
+                if lines.iter().all(|line| !line.text.ends_with("child.txt"))
+                    && lines.iter().any(|line| line.text.ends_with("new.txt"))
+        ));
+    }
+
+    #[test]
+    fn toggle_hidden_rescans_and_preserves_the_option() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("visible.txt"), b"visible").unwrap();
+        fs::write(root.path().join(".hidden.txt"), b"hidden").unwrap();
+        let mut ids = IdAllocator::new();
+        let baseline = fyler_fsops::scan::scan_baseline(root.path(), &mut ids).unwrap();
+        let engine = Arc::new(RecordingEngine::default());
+        let mut controller = SaveController::new(
+            root.path().to_path_buf(),
+            ids,
+            baseline,
+            Arc::<RecordingEngine>::clone(&engine),
+        );
+
+        let shown = controller.toggle_hidden().unwrap();
+        assert!(controller.scan_options().show_hidden);
+        assert!(shown.iter().any(|line| line.text.ends_with(".hidden.txt")));
+
+        let hidden = controller.toggle_hidden().unwrap();
+        assert!(!controller.scan_options().show_hidden);
+        assert!(
+            hidden
+                .iter()
+                .all(|line| !line.text.ends_with(".hidden.txt"))
+        );
     }
 }

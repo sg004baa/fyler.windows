@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use fyler_core::editor::{
     CmdlineState, Cursor, EditorCommand, EditorEngine, EditorEvent, EditorLine, EditorMessage,
-    EditorSnapshot, MessageKind, Mode,
+    EditorSnapshot, Key, MessageKind, Mode,
 };
 use nvim_rs::compat::tokio::Compat;
 use nvim_rs::create::tokio::new_child_cmd;
@@ -102,7 +102,7 @@ impl NvimEngine {
     ///    `Paste` は `nvim_paste`、`RequestCommit` は `:w` 相当、
     ///    `Undo`/`Redo` は `u`/`<C-r>` 相当
     /// 7. **イベント**: BufWriteCmd等のrpcnotify → `EditorEvent::CommitRequested`、
-    ///    行アクション → `ActivateLine` / `NavigateParent`、ext_cmdline →
+    ///    行アクション → `ActivateLine` / `NavigateParent` / `ToggleHidden`、ext_cmdline →
     ///    `CmdlineShow/CmdlineHide`、ext_messages → `Message`、プロセス終了検知 →
     ///    `EngineCrashed` として `event_tx` へ流す
     ///
@@ -197,6 +197,7 @@ impl NvimEngine {
 
         tokio::spawn(async move {
             let mut cmdline_state = None;
+            let mut pending_normal_g = false;
             let crash_reason = loop {
                 tokio::select! {
                     child_status = child.wait() => {
@@ -219,25 +220,39 @@ impl NvimEngine {
                             return;
                         };
 
-                        if let Err(error) = handle_command(&nvim, &buffer, command).await {
-                            send_message(
+                        let defer_snapshot = !pending_normal_g
+                            && is_normal_g_prefix(&command, &task_snapshot.load());
+                        let command_succeeded =
+                            if let Err(error) = handle_command(&nvim, &buffer, command).await {
+                                send_message(
+                                    &event_tx,
+                                    MessageKind::Error,
+                                    format!("エディタ入力に失敗しました: {error}"),
+                                );
+                                false
+                            } else {
+                                true
+                            };
+                        if defer_snapshot && command_succeeded {
+                            // `nvim_input("g")`直後に状態RPCを挟むと、nvimが後続キーを
+                            // 待つ間にRPCがmapping timeoutまで停止する。`g.`等の
+                            // 2キー操作を次の入力まで通し、完結後にsnapshotを更新する。
+                            pending_normal_g = true;
+                        } else {
+                            pending_normal_g = false;
+                            if let Err(error) = publish_snapshot(
+                                &nvim,
+                                &lines,
+                                &mut revision,
+                                &task_snapshot,
                                 &event_tx,
-                                MessageKind::Error,
-                                format!("エディタ入力に失敗しました: {error}"),
-                            );
-                        }
-                        if let Err(error) = publish_snapshot(
-                            &nvim,
-                            &lines,
-                            &mut revision,
-                            &task_snapshot,
-                            &event_tx,
-                        ).await {
-                            send_message(
-                                &event_tx,
-                                MessageKind::Error,
-                                format!("エディタ状態を更新できません: {error}"),
-                            );
+                            ).await {
+                                send_message(
+                                    &event_tx,
+                                    MessageKind::Error,
+                                    format!("エディタ状態を更新できません: {error}"),
+                                );
+                            }
                         }
                     }
                     notification = notification_rx.recv() => {
@@ -323,6 +338,9 @@ impl NvimEngine {
                             "fyler_parent" => {
                                 let _ = event_tx.send(EditorEvent::NavigateParent);
                             }
+                            "fyler_toggle_hidden" => {
+                                let _ = event_tx.send(EditorEvent::ToggleHidden);
+                            }
                             "fyler_action_blocked" => {
                                 send_message(
                                     &event_tx,
@@ -365,6 +383,18 @@ impl NvimEngine {
         });
         Ok((engine, event_rx))
     }
+}
+
+fn is_normal_g_prefix(command: &EngineCommand, snapshot: &EditorSnapshot) -> bool {
+    matches!(
+        command,
+        EngineCommand::Editor(EditorCommand::Key(input))
+            if snapshot.mode == Mode::Normal
+                && input.key == Key::Char('g')
+                && !input.mods.ctrl
+                && !input.mods.alt
+                && !input.mods.shift
+    )
 }
 
 async fn handle_command(

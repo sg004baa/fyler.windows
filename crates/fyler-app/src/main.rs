@@ -20,7 +20,7 @@ use fyler_fsops::watch::ExternalChange;
 use fyler_gui::app::GuiEvent;
 use fyler_gui::confirm::ConfirmChoice;
 
-use crate::save_flow::{SaveController, SaveFlowResult, baseline_to_lines};
+use crate::save_flow::{SaveController, SaveFlowResult, ToggleCollapseResult};
 
 enum AppEvent {
     Editor(EditorEvent),
@@ -57,8 +57,11 @@ fn main() -> anyhow::Result<()> {
 
     let mut ids = IdAllocator::new();
     let baseline = fyler_fsops::scan::scan_baseline(&root, &mut ids)?;
-    let initial_lines = baseline_to_lines(&baseline);
-    engine.set_initial_lines(initial_lines)?;
+    let save_engine: Arc<dyn EditorEngine> = engine.clone();
+    let mut save_controller =
+        SaveController::new(root.clone(), ids, baseline, Arc::clone(&save_engine));
+    save_controller.collapse_all_top_level();
+    engine.set_initial_lines(save_controller.visible_lines())?;
 
     // tokioのengine channelとGUIのstd channelをapp内の1本へ集約する。
     let (app_event_tx, app_event_rx) = mpsc::channel();
@@ -105,15 +108,12 @@ fn main() -> anyhow::Result<()> {
     // GUIクレートへtokio型を漏らさず、core型とConfirmChoiceだけを受け渡す。
     let (gui_event_tx, gui_event_rx) = mpsc::channel();
     gui_event_tx.send(GuiEvent::RootChanged(root.clone()))?;
-    let save_root = root.clone();
-    let save_engine: Arc<dyn EditorEngine> = engine.clone();
     let app_engine = Arc::clone(&save_engine);
     let event_bridge = thread::Builder::new()
         .name("fyler-app-events".to_owned())
         .spawn(move || {
-            let mut root = save_root;
+            let mut root = root;
             let mut _watcher = watcher;
-            let mut save_controller = SaveController::new(root.clone(), ids, baseline, save_engine);
             let mut pending_events = VecDeque::new();
             loop {
                 let event = match pending_events.pop_front() {
@@ -132,7 +132,7 @@ fn main() -> anyhow::Result<()> {
                     }
                     AppEvent::Editor(EditorEvent::ActivateLine { line }) => {
                         if handle_activate_line(
-                            &save_controller,
+                            &mut save_controller,
                             app_engine.as_ref(),
                             &root,
                             line,
@@ -174,8 +174,12 @@ fn main() -> anyhow::Result<()> {
                         };
 
                         let mut new_ids = IdAllocator::new();
-                        let new_baseline =
-                            match fyler_fsops::scan::scan_baseline(&new_root, &mut new_ids) {
+                        let scan_options = save_controller.scan_options();
+                        let new_baseline = match fyler_fsops::scan::scan_baseline_with(
+                            &new_root,
+                            &mut new_ids,
+                            &scan_options,
+                        ) {
                                 Ok(baseline) => baseline,
                                 Err(error) => {
                                     if send_gui_message(
@@ -190,7 +194,6 @@ fn main() -> anyhow::Result<()> {
                                     continue;
                                 }
                             };
-                        let new_lines = baseline_to_lines(&new_baseline);
 
                         // 新しい監視の作成に失敗した場合、現在のroot/baseline/watcherを
                         // そのまま維持できるよう、状態差し替え前に準備だけ済ませる。
@@ -225,6 +228,8 @@ fn main() -> anyhow::Result<()> {
                             }
                             continue;
                         }
+                        save_controller.collapse_all_top_level();
+                        let new_lines = save_controller.visible_lines();
 
                         root = new_root;
                         _watcher = new_watcher;
@@ -244,6 +249,50 @@ fn main() -> anyhow::Result<()> {
                             .is_err()
                         {
                             return;
+                        }
+                    }
+                    AppEvent::Editor(EditorEvent::ToggleHidden) => {
+                        if app_engine.snapshot().dirty {
+                            if send_gui_message(
+                                &gui_event_tx,
+                                MessageKind::Info,
+                                "編集中は隠しファイル表示を切り替えできません。保存または破棄してください",
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        if !save_controller.is_idle() {
+                            continue;
+                        }
+
+                        let lines = match save_controller.toggle_hidden() {
+                            Ok(lines) => lines,
+                            Err(error) => {
+                                if send_gui_message(
+                                    &gui_event_tx,
+                                    MessageKind::Error,
+                                    format!("隠しファイル表示を切り替えできません: {error:#}"),
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                                continue;
+                            }
+                        };
+                        if let Err(error) = app_engine.send(EditorCommand::SetLines(lines)) {
+                            if send_gui_message(
+                                &gui_event_tx,
+                                MessageKind::Error,
+                                format!("隠しファイル表示を更新できません: {error:#}"),
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
                         }
                     }
                     AppEvent::Editor(event) => {
@@ -292,7 +341,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn handle_activate_line(
-    save_controller: &SaveController,
+    save_controller: &mut SaveController,
     engine: &dyn EditorEngine,
     root: &Path,
     line: usize,
@@ -341,11 +390,40 @@ fn handle_activate_line(
             }
         }
         EntryKind::Dir => {
-            send_gui_message(
-                gui_event_tx,
-                MessageKind::Info,
-                "ディレクトリの折りたたみは未実装です",
-            )?;
+            if snapshot.dirty {
+                return send_gui_message(
+                    gui_event_tx,
+                    MessageKind::Info,
+                    "編集中は折りたたみできません。保存または破棄してください",
+                );
+            }
+
+            match save_controller.toggle_collapse(&snapshot.lines, line) {
+                ToggleCollapseResult::Toggled(lines) => {
+                    if let Err(error) = engine.send(EditorCommand::SetLines(lines)) {
+                        send_gui_message(
+                            gui_event_tx,
+                            MessageKind::Error,
+                            format!("折りたたみ表示を更新できません: {error:#}"),
+                        )?;
+                    }
+                }
+                ToggleCollapseResult::NotADirectory => {
+                    send_gui_message(
+                        gui_event_tx,
+                        MessageKind::Error,
+                        "対象行はディレクトリではありません",
+                    )?;
+                }
+                ToggleCollapseResult::NotFound => {
+                    send_gui_message(
+                        gui_event_tx,
+                        MessageKind::Error,
+                        "行に対応するディレクトリが現在のツリーに見つかりません",
+                    )?;
+                }
+                ToggleCollapseResult::Busy => {}
+            }
         }
     }
     Ok(())

@@ -16,3 +16,5 @@ pub mod open;
 pub mod recycle;
 pub mod scan;
 pub mod watch;
+
+mod winattr;

@@ -1,7 +1,8 @@
 //! baselineスキャン: 実FS → BaselineTree(ID採番)。
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 
@@ -14,6 +15,13 @@ use fyler_core::tree::{BaselineEntry, BaselineTree, EntryKind};
 use std::os::windows::fs::MetadataExt;
 #[cfg(windows)]
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+/// baselineスキャン時の表示対象オプション。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScanOptions {
+    /// `true`ならdotfileとWindowsのhidden属性を持つエントリもbaselineへ含める。
+    pub show_hidden: bool,
+}
 
 /// ルート以下をスキャンしてBaselineTreeを構築する。
 ///
@@ -29,7 +37,19 @@ use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 ///   collapsed move追従に必要)。ただし深い階層の遅延スキャンにするかはM1で判断し、
 ///   遅延にする場合はEditContext/diffの契約と整合させること
 pub fn scan_baseline(root: &Path, ids: &mut IdAllocator) -> anyhow::Result<BaselineTree> {
-    scan_with_id_resolver(root, |_: &TreePath| ids.allocate())
+    scan_baseline_with(root, ids, &ScanOptions::default())
+}
+
+/// 指定した表示対象オプションでルート以下をスキャンする。
+///
+/// 隠しエントリを除外する場合、そのディレクトリの中にも潜らず、baselineへ
+/// 子孫を混入させない。
+pub fn scan_baseline_with(
+    root: &Path,
+    ids: &mut IdAllocator,
+    options: &ScanOptions,
+) -> anyhow::Result<BaselineTree> {
+    scan_with_id_resolver(root, options, |_: &TreePath| ids.allocate())
 }
 
 /// 実FSを再スキャンし、同じパスに存在し続けるエントリのIDを維持する。
@@ -41,12 +61,22 @@ pub fn rescan_preserving_ids(
     ids: &mut IdAllocator,
     previous: &BaselineTree,
 ) -> anyhow::Result<BaselineTree> {
+    rescan_preserving_ids_with(root, ids, previous, &ScanOptions::default())
+}
+
+/// 指定した表示対象オプションで再スキャンし、同じパスのIDを維持する。
+pub fn rescan_preserving_ids_with(
+    root: &Path,
+    ids: &mut IdAllocator,
+    previous: &BaselineTree,
+    options: &ScanOptions,
+) -> anyhow::Result<BaselineTree> {
     let previous_ids: HashMap<TreePath, _> = previous
         .entries
         .iter()
         .map(|entry| (entry.path.clone(), entry.id))
         .collect();
-    scan_with_id_resolver(root, |path| {
+    scan_with_id_resolver(root, options, |path| {
         previous_ids
             .get(path)
             .copied()
@@ -56,6 +86,7 @@ pub fn rescan_preserving_ids(
 
 fn scan_with_id_resolver(
     root: &Path,
+    options: &ScanOptions,
     mut resolve_id: impl FnMut(&TreePath) -> fyler_core::id::EntryId,
 ) -> anyhow::Result<BaselineTree> {
     let root_metadata = fs::symlink_metadata(root)
@@ -71,18 +102,19 @@ fn scan_with_id_resolver(
     }
 
     let mut tree = BaselineTree::new(root);
-    scan_directory(root, &TreePath::root(), &mut resolve_id, &mut tree)?;
+    scan_directory(root, &TreePath::root(), options, &mut resolve_id, &mut tree)?;
     Ok(tree)
 }
 
 fn scan_directory(
     directory: &Path,
     relative: &TreePath,
+    options: &ScanOptions,
     resolve_id: &mut impl FnMut(&TreePath) -> fyler_core::id::EntryId,
     tree: &mut BaselineTree,
 ) -> anyhow::Result<()> {
     let mut stack = vec![ScanFrame {
-        entries: read_sorted_entries(directory)?,
+        entries: read_sorted_entries(directory, options)?,
         index: 0,
         relative: relative.clone(),
     }];
@@ -93,24 +125,17 @@ fn scan_directory(
             continue;
         }
 
-        let (entry_path, file_name) = frame.entries[frame.index].clone();
+        let entry = frame.entries[frame.index].clone();
         frame.index += 1;
 
-        let name = file_name.to_str().with_context(|| {
+        let name = entry.file_name.to_str().with_context(|| {
             format!(
                 "UTF-8として表現できないファイル名です: {}",
-                entry_path.display()
+                entry.path.display()
             )
         })?;
         let path = frame.relative.child(name);
-        let metadata = fs::symlink_metadata(&entry_path).with_context(|| {
-            format!(
-                "エントリのメタデータを取得できません: {}",
-                entry_path.display()
-            )
-        })?;
-
-        let kind = kind_from_metadata(&metadata);
+        let kind = kind_from_metadata(&entry.metadata);
 
         tree.insert(BaselineEntry {
             id: resolve_id(&path),
@@ -120,7 +145,7 @@ fn scan_directory(
 
         if kind == EntryKind::Dir {
             stack.push(ScanFrame {
-                entries: read_sorted_entries(&entry_path)?,
+                entries: read_sorted_entries(&entry.path, options)?,
                 index: 0,
                 relative: path,
             });
@@ -131,26 +156,135 @@ fn scan_directory(
 }
 
 struct ScanFrame {
-    entries: Vec<(PathBuf, OsString)>,
+    entries: Vec<ScannedEntry>,
     index: usize,
     relative: TreePath,
 }
 
-fn read_sorted_entries(directory: &Path) -> anyhow::Result<Vec<(PathBuf, OsString)>> {
-    let mut entries = fs::read_dir(directory)
-        .with_context(|| format!("ディレクトリを列挙できません: {}", directory.display()))?
-        .map(|entry| entry.map(|entry| (entry.path(), entry.file_name())))
-        .collect::<Result<Vec<_>, _>>()
-        .with_context(|| {
+#[derive(Clone)]
+struct ScannedEntry {
+    path: PathBuf,
+    file_name: OsString,
+    metadata: Metadata,
+}
+
+fn read_sorted_entries(
+    directory: &Path,
+    options: &ScanOptions,
+) -> anyhow::Result<Vec<ScannedEntry>> {
+    let read_dir = fs::read_dir(directory)
+        .with_context(|| format!("ディレクトリを列挙できません: {}", directory.display()))?;
+    let mut entries = Vec::new();
+    for entry in read_dir {
+        let entry = entry.with_context(|| {
             format!(
                 "ディレクトリエントリを取得できません: {}",
                 directory.display()
             )
         })?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        if !options.show_hidden && is_hidden(&path, &file_name)? {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("エントリのメタデータを取得できません: {}", path.display()))?;
+        entries.push(ScannedEntry {
+            path,
+            file_name,
+            metadata,
+        });
+    }
 
-    // read_dirの順序は未規定なので、表示とID採番をセッションごとに安定させる。
-    entries.sort_by_key(|(_, file_name)| file_name.clone());
+    // read_dirの順序は未規定なので、ディレクトリ優先の自然順で表示とID採番を
+    // セッションごとに安定させる。同値時は元のOsStringで順序を確定する。
+    entries.sort_by(|left, right| {
+        let left_is_dir = kind_from_metadata(&left.metadata) == EntryKind::Dir;
+        let right_is_dir = kind_from_metadata(&right.metadata) == EntryKind::Dir;
+        right_is_dir
+            .cmp(&left_is_dir)
+            .then_with(|| natural_cmp_case_insensitive(&left.file_name, &right.file_name))
+            .then_with(|| left.file_name.cmp(&right.file_name))
+    });
     Ok(entries)
+}
+
+fn is_hidden(path: &Path, file_name: &OsStr) -> anyhow::Result<bool> {
+    if file_name.to_string_lossy().starts_with('.') {
+        return Ok(true);
+    }
+
+    #[cfg(windows)]
+    {
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        Ok(crate::winattr::get(path)? & FILE_ATTRIBUTE_HIDDEN != 0)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(false)
+    }
+}
+
+fn natural_cmp_case_insensitive(left: &OsStr, right: &OsStr) -> Ordering {
+    let left = left.to_string_lossy().to_lowercase();
+    let right = right.to_string_lossy().to_lowercase();
+    natural_cmp_bytes(left.as_bytes(), right.as_bytes())
+}
+
+fn natural_cmp_bytes(mut left: &[u8], mut right: &[u8]) -> Ordering {
+    while !left.is_empty() && !right.is_empty() {
+        let left_is_digit = left[0].is_ascii_digit();
+        let right_is_digit = right[0].is_ascii_digit();
+        if left_is_digit && right_is_digit {
+            let left_end = left
+                .iter()
+                .position(|byte| !byte.is_ascii_digit())
+                .unwrap_or(left.len());
+            let right_end = right
+                .iter()
+                .position(|byte| !byte.is_ascii_digit())
+                .unwrap_or(right.len());
+            let left_digits = &left[..left_end];
+            let right_digits = &right[..right_end];
+            let left_significant =
+                &left_digits[left_digits.iter().take_while(|byte| **byte == b'0').count()..];
+            let right_significant = &right_digits[right_digits
+                .iter()
+                .take_while(|byte| **byte == b'0')
+                .count()..];
+            let ordering = left_significant
+                .len()
+                .cmp(&right_significant.len())
+                .then_with(|| left_significant.cmp(right_significant));
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+            left = &left[left_end..];
+            right = &right[right_end..];
+            continue;
+        }
+
+        let left_end = left
+            .iter()
+            .position(|byte| byte.is_ascii_digit())
+            .unwrap_or(left.len());
+        let right_end = right
+            .iter()
+            .position(|byte| byte.is_ascii_digit())
+            .unwrap_or(right.len());
+        let left_end = left_end.max(1);
+        let right_end = right_end.max(1);
+        let ordering = left[..left_end].cmp(&right[..right_end]);
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+        left = &left[left_end..];
+        right = &right[right_end..];
+    }
+
+    left.len().cmp(&right.len())
 }
 
 fn is_link_or_reparse(metadata: &Metadata) -> bool {
@@ -226,6 +360,87 @@ mod tests {
                 .entries
                 .iter()
                 .all(|entry| entry.path != TreePath::parse("removed.txt"))
+        );
+    }
+
+    #[test]
+    fn hidden_dot_entries_follow_scan_options() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("visible.txt"), b"visible").unwrap();
+        fs::write(root.path().join(".hidden.txt"), b"hidden").unwrap();
+        fs::create_dir(root.path().join(".hidden-dir")).unwrap();
+        fs::write(root.path().join(".hidden-dir").join("child.txt"), b"child").unwrap();
+
+        let mut hidden_ids = IdAllocator::new();
+        let hidden = scan_baseline(root.path(), &mut hidden_ids).unwrap();
+        assert_eq!(
+            hidden
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            [TreePath::parse("visible.txt")]
+        );
+
+        let mut shown_ids = IdAllocator::new();
+        let shown = scan_baseline_with(
+            root.path(),
+            &mut shown_ids,
+            &ScanOptions { show_hidden: true },
+        )
+        .unwrap();
+        assert!(
+            shown
+                .entries
+                .iter()
+                .any(|entry| entry.path == TreePath::parse(".hidden.txt"))
+        );
+        assert!(
+            shown
+                .entries
+                .iter()
+                .any(|entry| entry.path == TreePath::parse(".hidden-dir/child.txt"))
+        );
+    }
+
+    #[test]
+    fn scan_sorts_directories_first_then_names_in_natural_order() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("10.txt"), b"10").unwrap();
+        fs::write(root.path().join("2.txt"), b"2").unwrap();
+        fs::write(root.path().join("1.txt"), b"1").unwrap();
+        fs::create_dir(root.path().join("20-dir")).unwrap();
+        fs::create_dir(root.path().join("3-dir")).unwrap();
+
+        let mut ids = IdAllocator::new();
+        let baseline = scan_baseline(root.path(), &mut ids).unwrap();
+        let paths = baseline
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            [
+                TreePath::parse("3-dir"),
+                TreePath::parse("20-dir"),
+                TreePath::parse("1.txt"),
+                TreePath::parse("2.txt"),
+                TreePath::parse("10.txt"),
+            ]
+        );
+    }
+
+    #[test]
+    fn natural_sort_is_case_insensitive_and_numeric_aware() {
+        assert_eq!(
+            natural_cmp_case_insensitive(OsStr::new("FILE2.txt"), OsStr::new("file10.TXT")),
+            Ordering::Less
+        );
+        assert_eq!(
+            natural_cmp_case_insensitive(OsStr::new("b.txt"), OsStr::new("A.txt")),
+            Ordering::Greater
         );
     }
 }
