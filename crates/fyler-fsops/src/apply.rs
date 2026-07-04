@@ -467,6 +467,19 @@ mod tests {
 
     use super::*;
 
+    /// ディレクトリ直下の実際の格納名を返す(ソート済み)。
+    ///
+    /// NTFSなどcase-insensitiveなFSでは `Path::exists()` がcase違いにも
+    /// マッチするため、case-only renameの検証はこれで格納名を完全一致比較する。
+    fn stored_entry_names(directory: &Path) -> Vec<String> {
+        let mut names = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
     #[test]
     fn creates_directories_and_files_in_plan_order() {
         let root = tempdir().unwrap();
@@ -531,7 +544,9 @@ mod tests {
         let report = apply_plan(root.path(), &plan);
 
         assert!(report.all_succeeded());
-        assert!(!root.path().join("Name.txt").exists());
+        // NTFSはcase-insensitiveで `Name.txt` の exists() が rename後の
+        // `name.txt` にもマッチするため、実際に格納された名前を列挙して検証する。
+        assert_eq!(stored_entry_names(root.path()), ["name.txt"]);
         assert_eq!(fs::read(root.path().join("name.txt")).unwrap(), b"content");
     }
 
@@ -628,7 +643,8 @@ mod tests {
         let report = apply_plan(root.path(), &plan);
 
         assert!(report.all_succeeded());
-        assert!(!root.path().join("Ähnlich.txt").exists());
+        // supports_case_only_rename と同じ理由で、格納名の完全一致で検証する。
+        assert_eq!(stored_entry_names(root.path()), ["ähnlich.txt"]);
         assert_eq!(
             fs::read(root.path().join("ähnlich.txt")).unwrap(),
             b"content"

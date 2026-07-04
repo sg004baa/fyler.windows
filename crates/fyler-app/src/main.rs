@@ -233,7 +233,10 @@ fn main() -> anyhow::Result<()> {
 
                         root = new_root;
                         _watcher = new_watcher;
-                        if let Err(error) = app_engine.send(EditorCommand::SetLines(new_lines)) {
+                        if let Err(error) = app_engine.send(EditorCommand::SetLines {
+                            lines: new_lines,
+                            cursor_line: None,
+                        }) {
                             if send_gui_message(
                                 &gui_event_tx,
                                 MessageKind::Error,
@@ -283,7 +286,10 @@ fn main() -> anyhow::Result<()> {
                                 continue;
                             }
                         };
-                        if let Err(error) = app_engine.send(EditorCommand::SetLines(lines)) {
+                        if let Err(error) = app_engine.send(EditorCommand::SetLines {
+                            lines,
+                            cursor_line: None,
+                        }) {
                             if send_gui_message(
                                 &gui_event_tx,
                                 MessageKind::Error,
@@ -400,7 +406,12 @@ fn handle_activate_line(
 
             match save_controller.toggle_collapse(&snapshot.lines, line) {
                 ToggleCollapseResult::Toggled(lines) => {
-                    if let Err(error) = engine.send(EditorCommand::SetLines(lines)) {
+                    // 折りたたみ/展開した行は差し替え後も同じindexに残るため、
+                    // カーソルをその行へ戻す(先頭へ飛ばさない)。
+                    if let Err(error) = engine.send(EditorCommand::SetLines {
+                        lines,
+                        cursor_line: Some(line),
+                    }) {
                         send_gui_message(
                             gui_event_tx,
                             MessageKind::Error,

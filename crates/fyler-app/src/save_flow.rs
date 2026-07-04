@@ -303,7 +303,10 @@ impl SaveController {
         let lines = baseline_to_lines(&baseline, &context);
         if let Err(error) = self
             .engine
-            .send(EditorCommand::SetLines(lines))
+            .send(EditorCommand::SetLines {
+                lines,
+                cursor_line: None,
+            })
             .context("外部変更後のバッファ行をエンジンへ送信できません")
         {
             return SaveFlowResult::ExternalChangeFailed(error.to_string());
@@ -383,7 +386,10 @@ impl SaveController {
         let context = retain_existing_collapsed_dirs(&self.context, &baseline);
         let lines = baseline_to_lines(&baseline, &context);
         self.engine
-            .send(EditorCommand::SetLines(lines))
+            .send(EditorCommand::SetLines {
+                lines,
+                cursor_line: None,
+            })
             .context("reconcile後のバッファ行をエンジンへ送信できません")?;
 
         self.baseline = baseline;
@@ -648,7 +654,7 @@ mod tests {
         let commands = engine.commands.lock().unwrap();
         assert!(commands.iter().any(|command| matches!(
             command,
-            EditorCommand::SetLines(lines)
+            EditorCommand::SetLines { lines, .. }
                 if lines.iter().any(|line| line.text.ends_with("b.txt"))
                     && lines.iter().all(|line| !line.text.ends_with("a.txt"))
         )));
@@ -722,7 +728,7 @@ mod tests {
         let commands = engine.commands.lock().unwrap();
         assert!(matches!(
             commands.as_slice(),
-            [EditorCommand::SetLines(lines)]
+            [EditorCommand::SetLines { lines, .. }]
                 if lines.iter().any(|line| line.text.ends_with("b.txt"))
         ));
     }
@@ -1038,7 +1044,7 @@ mod tests {
         let commands = engine.commands.lock().unwrap();
         assert!(matches!(
             commands.last(),
-            Some(EditorCommand::SetLines(lines))
+            Some(EditorCommand::SetLines { lines, .. })
                 if lines.iter().all(|line| !line.text.ends_with("child.txt"))
                     && lines.iter().any(|line| line.text.ends_with("new.txt"))
         ));

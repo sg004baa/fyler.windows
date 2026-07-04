@@ -33,7 +33,14 @@ pub enum EditorCommand {
     /// ペースト(NvimEngineでは `nvim_paste` 経由)。
     Paste(String),
     /// reconcile等でバッファ全体を差し替える。投入後は `dirty=false` に戻す。
-    SetLines(Vec<EditorLine>),
+    ///
+    /// `cursor_line` は差し替え後にカーソルを置く0始まりの行番号。`None` なら
+    /// 先頭行。折りたたみトグルのように「操作した行に留まる」べき差し替えで使う
+    /// (行数を超える指定は最終行へクランプする)。
+    SetLines {
+        lines: Vec<EditorLine>,
+        cursor_line: Option<usize>,
+    },
     /// `:w` 相当のトリガ(保存状態機械 [`crate::save`] の入口)。
     RequestCommit,
     Undo,

@@ -415,8 +415,8 @@ async fn handle_command(
                 .await
                 .map_err(|error| anyhow::anyhow!("テキスト入力RPCに失敗しました: {error}"))?;
         }
-        EngineCommand::Editor(EditorCommand::SetLines(editor_lines)) => {
-            replace_buffer_lines(nvim, buffer, editor_lines, "reconcile").await?;
+        EngineCommand::Editor(EditorCommand::SetLines { lines, cursor_line }) => {
+            replace_buffer_lines(nvim, buffer, lines, cursor_line, "reconcile").await?;
         }
         EngineCommand::Editor(EditorCommand::RequestCommit) => {
             nvim.command("write")
@@ -434,7 +434,7 @@ async fn handle_command(
                 .map_err(|error| anyhow::anyhow!("redo RPCに失敗しました: {error}"))?;
         }
         EngineCommand::SetInitialLines(editor_lines) => {
-            replace_buffer_lines(nvim, buffer, editor_lines, "初期化").await?;
+            replace_buffer_lines(nvim, buffer, editor_lines, None, "初期化").await?;
         }
     }
 
@@ -445,6 +445,7 @@ async fn replace_buffer_lines(
     nvim: &Nvim,
     buffer: &Buffer<NvimWriter>,
     editor_lines: Vec<EditorLine>,
+    cursor_line: Option<usize>,
     purpose: &str,
 ) -> anyhow::Result<()> {
     let new_lines: Vec<String> = if editor_lines.is_empty() {
@@ -461,8 +462,13 @@ async fn replace_buffer_lines(
         .await
         .map_err(|error| anyhow::anyhow!("{purpose}後にバッファをcleanにできません: {error}"))?;
 
-    let first_column = new_lines
-        .first()
+    // 折りたたみトグル等では操作した行へカーソルを戻す。行数を超える指定は
+    // 最終行へクランプする(nvimのset_cursorは範囲外でエラーになるため)。
+    let target_line = cursor_line
+        .unwrap_or(0)
+        .min(new_lines.len().saturating_sub(1));
+    let target_column = new_lines
+        .get(target_line)
         .map(|line| fyler_core::grammar::id_prefix_len(line))
         .unwrap_or_default();
     let window = nvim
@@ -470,7 +476,7 @@ async fn replace_buffer_lines(
         .await
         .map_err(|error| anyhow::anyhow!("{purpose}対象のウィンドウを取得できません: {error}"))?;
     window
-        .set_cursor((1, first_column as i64))
+        .set_cursor((target_line as i64 + 1, target_column as i64))
         .await
         .map_err(|error| anyhow::anyhow!("{purpose}後のカーソルを設定できません: {error}"))?;
 
