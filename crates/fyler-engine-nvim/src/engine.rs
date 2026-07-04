@@ -218,7 +218,7 @@ impl NvimEngine {
                             return;
                         };
 
-                        if let Err(error) = handle_command(&nvim, &buffer, command, &mut lines).await {
+                        if let Err(error) = handle_command(&nvim, &buffer, command).await {
                             send_message(
                                 &event_tx,
                                 MessageKind::Error,
@@ -351,7 +351,6 @@ async fn handle_command(
     nvim: &Nvim,
     buffer: &Buffer<NvimWriter>,
     command: EngineCommand,
-    lines: &mut Vec<String>,
 ) -> anyhow::Result<()> {
     match command {
         EngineCommand::Editor(EditorCommand::Key(key)) => {
@@ -408,7 +407,6 @@ async fn handle_command(
                 .set_cursor((1, first_column as i64))
                 .await
                 .map_err(|error| anyhow::anyhow!("初期カーソルを設定できません: {error}"))?;
-            *lines = new_lines;
         }
     }
 
