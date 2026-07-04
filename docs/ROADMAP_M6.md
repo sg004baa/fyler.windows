@@ -91,9 +91,9 @@
 ## M7: Windows堅牢性と性能(実用の信頼性)
 
 > **実装済み(2026-07-05)**。M7-1/M7-2/M7-3(インデックス化)/M7-4すべて
-> Linuxゲート(fmt/test/clippy/クロスターゲット)pass。完了条件のうち
-> Windows実機項目(260字超パス・OneDrive hydration・git checkout負荷・バッジ目視)は未実施。
-> trashクレートの拡張形式パス受け入れも実機要検証(recycle.rs参照)。
+> Linuxゲート(fmt/test/clippy/クロスターゲット)pass。
+> **Windows実機テスト・挙動確認OK(2026-07-05、ユーザー確認)**。
+> trashクレートの拡張形式パス受け入れ(MAX_PATH超のごみ箱削除)のみ実機未検証(recycle.rs参照)。
 
 ### M7-1: 未配線コードの配線(実装済み・呼び出しゼロの3件)
 
