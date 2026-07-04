@@ -239,6 +239,66 @@ fn validate_accepts_clean_tree() {
     assert!(validate::validate(&base, &desired, &no_collapse()).is_empty());
 }
 
+#[test]
+fn validate_rejects_case_fold_duplicate_when_rename_collides_with_existing_name() {
+    // Windowsの既定はcase-insensitiveのため、`bar.txt → foo.txt` のrenameは
+    // 既存の `Foo.txt` と同名扱いになり、applyのrenameが黙って上書きし得る。
+    let base = baseline(&[
+        (1, "Foo.txt", EntryKind::File),
+        (2, "bar.txt", EntryKind::File),
+    ]);
+    let desired = DesiredTree {
+        entries: vec![
+            desired_entry(Some(1), "Foo.txt", EntryKind::File, 0),
+            desired_entry(Some(2), "foo.txt", EntryKind::File, 1),
+        ],
+    };
+
+    let errors = validate::validate(&base, &desired, &no_collapse());
+
+    assert!(errors.iter().any(|e| matches!(
+        e,
+        ValidateError::DuplicateName { path } if *path == TreePath::parse("foo.txt")
+    )));
+}
+
+#[test]
+fn validate_rejects_case_fold_duplicate_when_new_line_collides_with_existing_name() {
+    // IDなしの新規行(Create)でも、既存エントリとのfold一致は着地時に衝突する。
+    let base = baseline(&[(1, "Foo.txt", EntryKind::File)]);
+    let desired = DesiredTree {
+        entries: vec![
+            desired_entry(Some(1), "Foo.txt", EntryKind::File, 0),
+            desired_entry(None, "foo.txt", EntryKind::File, 1),
+        ],
+    };
+
+    let errors = validate::validate(&base, &desired, &no_collapse());
+
+    assert!(errors.iter().any(|e| matches!(
+        e,
+        ValidateError::DuplicateName { path } if *path == TreePath::parse("foo.txt")
+    )));
+}
+
+#[test]
+fn validate_accepts_unmoved_case_fold_pair_from_case_sensitive_directory() {
+    // WSL等のcase-sensitiveディレクトリでは `Foo.txt` と `foo.txt` が実在し得る。
+    // 両方ともbaselineから動いていなければ、既存ツリーの保存を妨げない。
+    let base = baseline(&[
+        (1, "Foo.txt", EntryKind::File),
+        (2, "foo.txt", EntryKind::File),
+    ]);
+    let desired = DesiredTree {
+        entries: vec![
+            desired_entry(Some(1), "Foo.txt", EntryKind::File, 0),
+            desired_entry(Some(2), "foo.txt", EntryKind::File, 1),
+        ],
+    };
+
+    assert!(validate::validate(&base, &desired, &no_collapse()).is_empty());
+}
+
 // ---- diff(DESIGN.md「diff判定ルール」) ----
 
 #[test]
@@ -247,7 +307,7 @@ fn diff_unchanged_tree_yields_empty_plan() {
     let desired = DesiredTree {
         entries: vec![desired_entry(Some(1), "a.txt", EntryKind::File, 0)],
     };
-    let plan = diff::build_plan(&base, &desired, &no_collapse());
+    let plan = diff::build_plan(&base, &desired, &no_collapse()).expect("plan must be executable");
     assert!(plan.is_empty());
 }
 
@@ -258,7 +318,7 @@ fn diff_rename_is_move_with_same_parent() {
     let desired = DesiredTree {
         entries: vec![desired_entry(Some(1), "b.txt", EntryKind::File, 0)],
     };
-    let plan = diff::build_plan(&base, &desired, &no_collapse());
+    let plan = diff::build_plan(&base, &desired, &no_collapse()).expect("plan must be executable");
     assert_eq!(
         plan.ops,
         vec![FsOperation::Move {
@@ -275,7 +335,7 @@ fn diff_missing_id_is_delete_and_new_line_is_create() {
     let desired = DesiredTree {
         entries: vec![desired_entry(None, "new.txt", EntryKind::File, 0)],
     };
-    let plan = diff::build_plan(&base, &desired, &no_collapse());
+    let plan = diff::build_plan(&base, &desired, &no_collapse()).expect("plan must be executable");
     assert!(plan.ops.contains(&FsOperation::Create {
         path: TreePath::parse("new.txt"),
         kind: EntryKind::File,
@@ -301,7 +361,7 @@ fn diff_move_to_other_directory() {
             desired_entry(Some(2), "dst/main.rs", EntryKind::File, 2),
         ],
     };
-    let plan = diff::build_plan(&base, &desired, &no_collapse());
+    let plan = diff::build_plan(&base, &desired, &no_collapse()).expect("plan must be executable");
     assert_eq!(
         plan.ops,
         vec![FsOperation::Move {
@@ -322,7 +382,7 @@ fn diff_duplicated_id_is_copy() {
             desired_entry(Some(1), "b.txt", EntryKind::File, 1),
         ],
     };
-    let plan = diff::build_plan(&base, &desired, &no_collapse());
+    let plan = diff::build_plan(&base, &desired, &no_collapse()).expect("plan must be executable");
     assert_eq!(
         plan.ops,
         vec![FsOperation::Copy {
@@ -344,7 +404,8 @@ fn diff_collapsed_dir_moves_as_one_op_and_children_are_not_deleted() {
     let desired = DesiredTree {
         entries: vec![desired_entry(Some(1), "lib", EntryKind::Dir, 0)],
     };
-    let plan = diff::build_plan(&base, &desired, &collapsed(&[1]));
+    let plan =
+        diff::build_plan(&base, &desired, &collapsed(&[1])).expect("plan must be executable");
     assert_eq!(
         plan.ops,
         vec![FsOperation::Move {
@@ -365,7 +426,7 @@ fn diff_expanded_dir_missing_children_are_deleted() {
     let desired = DesiredTree {
         entries: vec![desired_entry(Some(1), "src", EntryKind::Dir, 0)],
     };
-    let plan = diff::build_plan(&base, &desired, &no_collapse());
+    let plan = diff::build_plan(&base, &desired, &no_collapse()).expect("plan must be executable");
     assert_eq!(
         plan.ops,
         vec![FsOperation::Delete {
@@ -394,7 +455,7 @@ fn diff_expanded_dir_rename_moves_parent_only_not_descendants() {
         ],
     };
 
-    let plan = diff::build_plan(&base, &desired, &no_collapse());
+    let plan = diff::build_plan(&base, &desired, &no_collapse()).expect("plan must be executable");
 
     assert_eq!(
         plan.ops,
@@ -415,7 +476,7 @@ fn diff_delete_create_same_path_orders_delete_before_create() {
         entries: vec![desired_entry(None, "same.txt", EntryKind::File, 0)],
     };
 
-    let plan = diff::build_plan(&base, &desired, &no_collapse());
+    let plan = diff::build_plan(&base, &desired, &no_collapse()).expect("plan must be executable");
 
     assert_eq!(
         plan.ops,
@@ -448,7 +509,7 @@ fn diff_deletes_child_before_moving_parent_directory() {
         ],
     };
 
-    let plan = diff::build_plan(&base, &desired, &no_collapse());
+    let plan = diff::build_plan(&base, &desired, &no_collapse()).expect("plan must be executable");
 
     assert_eq!(
         plan.ops,
@@ -463,5 +524,127 @@ fn diff_deletes_child_before_moving_parent_directory() {
                 to: TreePath::parse("lib"),
             },
         ]
+    );
+}
+
+#[test]
+fn diff_renames_child_at_pre_move_path_before_moving_parent_directory() {
+    // 親ディレクトリrenameと子のrenameを同時に書いた場合、子のMove先を
+    // 移動前座標(dir/b.txt)へ巻き戻し、親Move(dir → lib)より先に実行する。
+    // 巻き戻さないと移動先 lib/ がまだ存在せず、親Moveを先にすると
+    // 移動元 dir/a.txt が消えて、どちらの順序でも実行不能になる。
+    let base = baseline(&[
+        (1, "dir", EntryKind::Dir),
+        (2, "dir/a.txt", EntryKind::File),
+    ]);
+    let desired = DesiredTree {
+        entries: vec![
+            desired_entry(Some(1), "lib", EntryKind::Dir, 0),
+            desired_entry(Some(2), "lib/b.txt", EntryKind::File, 1),
+        ],
+    };
+
+    let plan = diff::build_plan(&base, &desired, &no_collapse()).expect("plan must be executable");
+
+    let child_rename = plan
+        .ops
+        .iter()
+        .position(|op| {
+            *op == FsOperation::Move {
+                id: EntryId(2),
+                from: TreePath::parse("dir/a.txt"),
+                to: TreePath::parse("dir/b.txt"),
+            }
+        })
+        .expect("child rename must target the pre-move path");
+    let parent_move = plan
+        .ops
+        .iter()
+        .position(|op| {
+            *op == FsOperation::Move {
+                id: EntryId(1),
+                from: TreePath::parse("dir"),
+                to: TreePath::parse("lib"),
+            }
+        })
+        .expect("parent directory move must be planned");
+    assert!(
+        child_rename < parent_move,
+        "child rename must run before the parent directory move: {:?}",
+        plan.ops
+    );
+    assert_eq!(plan.ops.len(), 2);
+}
+
+#[test]
+fn diff_creates_new_child_at_pre_move_path_before_moving_parent_directory() {
+    // 親ディレクトリrename + 配下への新規行は、Create先を移動前座標
+    // (dir/new.txt)へ巻き戻し、親Moveより先に実行する。親Moveが後から
+    // 成果物ごと最終位置(lib/new.txt)へ動かす。
+    let base = baseline(&[(1, "dir", EntryKind::Dir)]);
+    let desired = DesiredTree {
+        entries: vec![
+            desired_entry(Some(1), "lib", EntryKind::Dir, 0),
+            desired_entry(None, "lib/new.txt", EntryKind::File, 1),
+        ],
+    };
+
+    let plan = diff::build_plan(&base, &desired, &no_collapse()).expect("plan must be executable");
+
+    let create = plan
+        .ops
+        .iter()
+        .position(|op| {
+            *op == FsOperation::Create {
+                path: TreePath::parse("dir/new.txt"),
+                kind: EntryKind::File,
+            }
+        })
+        .expect("create must target the pre-move path");
+    let parent_move = plan
+        .ops
+        .iter()
+        .position(|op| {
+            *op == FsOperation::Move {
+                id: EntryId(1),
+                from: TreePath::parse("dir"),
+                to: TreePath::parse("lib"),
+            }
+        })
+        .expect("parent directory move must be planned");
+    assert!(
+        create < parent_move,
+        "create must run before the parent directory move: {:?}",
+        plan.ops
+    );
+    assert_eq!(plan.ops.len(), 2);
+}
+
+#[test]
+fn diff_expanded_dir_copy_emits_parent_copy_only_not_descendants() {
+    // 展開済みディレクトリブロックのyy→p複製では、親CopyのFS再帰コピーが
+    // 子孫も複製する。子孫の個別Copyを重ねると同一パスへの二重コピーになる。
+    let base = baseline(&[
+        (1, "dir", EntryKind::Dir),
+        (2, "dir/a.txt", EntryKind::File),
+    ]);
+    let desired = DesiredTree {
+        entries: vec![
+            desired_entry(Some(1), "dir", EntryKind::Dir, 0),
+            desired_entry(Some(2), "dir/a.txt", EntryKind::File, 1),
+            desired_entry(Some(1), "dir2", EntryKind::Dir, 2),
+            desired_entry(Some(2), "dir2/a.txt", EntryKind::File, 3),
+        ],
+    };
+
+    let plan = diff::build_plan(&base, &desired, &no_collapse()).expect("plan must be executable");
+
+    assert_eq!(
+        plan.ops,
+        vec![FsOperation::Copy {
+            src: EntryId(1),
+            from: TreePath::parse("dir"),
+            to: TreePath::parse("dir2"),
+        }]
     );
 }

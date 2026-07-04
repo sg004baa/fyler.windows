@@ -98,10 +98,15 @@ fn execute_operation(root: &Path, operation: &FsOperation) -> Result<(), OpFailu
         FsOperation::Create { path, kind } => {
             let target = path.to_fs_path(root);
             match kind {
+                // create_dir / create_new(true) は既存パスで必ず失敗する
+                // (fs::File::createの黙った切り詰めを防ぐ。preflight不要)。
                 EntryKind::Dir => fs::create_dir(&target)
                     .with_context(|| format!("ディレクトリを作成できません: {}", target.display()))
                     .map_err(OpFailure::from),
-                EntryKind::File => fs::File::create(&target)
+                EntryKind::File => fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&target)
                     .map(|_| ())
                     .with_context(|| format!("ファイルを作成できません: {}", target.display()))
                     .map_err(OpFailure::from),
@@ -119,6 +124,10 @@ fn execute_operation(root: &Path, operation: &FsOperation) -> Result<(), OpFailu
             if is_case_only_rename(from, to) {
                 crate::case::case_only_rename(&source, &target).map_err(OpFailure::from)
             } else {
+                // fs::renameはWindows(MOVEFILE_REPLACE_EXISTING)でもUnixでも
+                // 既存の移動先ファイルを黙って上書きする。baseline取得後の外部変更
+                // (TOCTOU)でユーザーデータを消さないよう、直前に存在確認する。
+                ensure_target_vacant(&target)?;
                 match crate::classify::classify_move(&source, &target, kind)
                     .map_err(OpFailure::from)?
                 {
@@ -148,6 +157,8 @@ fn execute_operation(root: &Path, operation: &FsOperation) -> Result<(), OpFailu
                     format!("コピー元のmetadataを取得できません: {}", source.display())
                 })
                 .map_err(OpFailure::from)?;
+            // fs::copyも既存の移動先を黙って上書きするため、同様に存在確認する。
+            ensure_target_vacant(&target)?;
             match crate::scan::kind_from_metadata(&metadata) {
                 EntryKind::Dir => copy_tree(&source, &target).map(|_| ()),
                 kind @ (EntryKind::File | EntryKind::Symlink) => {
@@ -163,6 +174,22 @@ fn execute_operation(root: &Path, operation: &FsOperation) -> Result<(), OpFailu
         FsOperation::Delete { path, .. } => {
             crate::recycle::delete_to_recycle_bin(&path.to_fs_path(root)).map_err(OpFailure::from)
         }
+    }
+}
+
+/// Move/Copyの直前preflight: 移動先にエントリが既に存在したら失敗させる。
+/// planのvalidate/orderingが正しければ通常は空いているはずで、これは
+/// baseline取得後の外部変更(TOCTOU)による黙った上書きへの最終防衛線。
+fn ensure_target_vacant(target: &Path) -> Result<(), OpFailure> {
+    match fs::symlink_metadata(target) {
+        Ok(_) => Err(OpFailure::from(anyhow!(
+            "移動先に別のエントリが既に存在します(外部で変更された可能性): {}",
+            target.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(OpFailure::from(anyhow::Error::from(error).context(
+            format!("移動先の存在確認に失敗しました: {}", target.display()),
+        ))),
     }
 }
 
@@ -412,9 +439,12 @@ fn is_case_only_rename(from: &TreePath, to: &TreePath) -> bool {
     let (Some(from_name), Some(to_name)) = (from.name(), to.name()) else {
         return false;
     };
+    // ASCII限定比較だと `Ähnlich → ähnlich` 等の非ASCII case-only renameが
+    // 通常のrename経路に落ち、case-insensitiveなNTFSでpreflightに衝突する。
+    // Windowsの大文字小文字判定の近似としてUnicode小文字化で比較する。
     from.parent() == to.parent()
-        && from_name.as_bytes() != to_name.as_bytes()
-        && from_name.eq_ignore_ascii_case(to_name)
+        && from_name != to_name
+        && from_name.to_lowercase() == to_name.to_lowercase()
 }
 
 fn failed_parent<'a>(
@@ -503,6 +533,106 @@ mod tests {
         assert!(report.all_succeeded());
         assert!(!root.path().join("Name.txt").exists());
         assert_eq!(fs::read(root.path().join("name.txt")).unwrap(), b"content");
+    }
+
+    #[test]
+    fn move_fails_instead_of_overwriting_existing_target() {
+        // baseline取得後に外部で移動先が作られた場合(TOCTOU)、fs::renameは
+        // 黙って上書きする。preflightで失敗させ、既存内容を守る。
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("a.txt"), b"source").unwrap();
+        fs::write(root.path().join("b.txt"), b"existing").unwrap();
+        let plan = OperationPlan {
+            ops: vec![FsOperation::Move {
+                id: EntryId(1),
+                from: TreePath::parse("a.txt"),
+                to: TreePath::parse("b.txt"),
+            }],
+        };
+
+        let report = apply_plan(root.path(), &plan);
+
+        assert!(matches!(
+            report.results[0].outcome,
+            OpOutcome::Failed { .. }
+        ));
+        assert_eq!(fs::read(root.path().join("a.txt")).unwrap(), b"source");
+        assert_eq!(fs::read(root.path().join("b.txt")).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn copy_fails_instead_of_overwriting_existing_target() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("a.txt"), b"source").unwrap();
+        fs::write(root.path().join("b.txt"), b"existing").unwrap();
+        let plan = OperationPlan {
+            ops: vec![FsOperation::Copy {
+                src: EntryId(1),
+                from: TreePath::parse("a.txt"),
+                to: TreePath::parse("b.txt"),
+            }],
+        };
+
+        let report = apply_plan(root.path(), &plan);
+
+        assert!(matches!(
+            report.results[0].outcome,
+            OpOutcome::Failed { .. }
+        ));
+        assert_eq!(fs::read(root.path().join("b.txt")).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn create_file_fails_without_truncating_existing_target() {
+        // fs::File::createは既存ファイルを黙って0バイトに切り詰める。
+        // create_newで失敗させ、既存内容を守る。
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("a.txt"), b"existing").unwrap();
+        let plan = OperationPlan {
+            ops: vec![FsOperation::Create {
+                path: TreePath::parse("a.txt"),
+                kind: EntryKind::File,
+            }],
+        };
+
+        let report = apply_plan(root.path(), &plan);
+
+        assert!(matches!(
+            report.results[0].outcome,
+            OpOutcome::Failed { .. }
+        ));
+        assert_eq!(fs::read(root.path().join("a.txt")).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn supports_non_ascii_case_only_rename() {
+        // `Ähnlich → ähnlich` はASCII限定比較だとcase-only判定から漏れ、
+        // case-insensitiveなNTFSで通常rename経路のpreflightに衝突する。
+        // Unicode小文字化での判定を固定する(実FS挙動はcase-sensitiveな
+        // Linuxでは経路によらず成功するため、判定関数も直接検証する)。
+        assert!(is_case_only_rename(
+            &TreePath::parse("Ähnlich.txt"),
+            &TreePath::parse("ähnlich.txt"),
+        ));
+
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("Ähnlich.txt"), b"content").unwrap();
+        let plan = OperationPlan {
+            ops: vec![FsOperation::Move {
+                id: EntryId(1),
+                from: TreePath::parse("Ähnlich.txt"),
+                to: TreePath::parse("ähnlich.txt"),
+            }],
+        };
+
+        let report = apply_plan(root.path(), &plan);
+
+        assert!(report.all_succeeded());
+        assert!(!root.path().join("Ähnlich.txt").exists());
+        assert_eq!(
+            fs::read(root.path().join("ähnlich.txt")).unwrap(),
+            b"content"
+        );
     }
 
     #[test]

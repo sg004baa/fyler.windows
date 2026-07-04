@@ -31,16 +31,49 @@ pub fn validate(
     ctx: &EditContext,
 ) -> Vec<ValidateError> {
     let mut errors = Vec::new();
-    let mut seen_paths = HashSet::new();
     let mut duplicate_paths = HashSet::new();
 
+    // 完全一致の重複は常にエラー。fold一致(case違い)の重複は、Windowsの既定が
+    // case-insensitiveのため applyのrenameが黙って上書きする危険がある。ただし
+    // 「baselineから動いていないエントリ同士」のfold一致は、case-sensitive
+    // ディレクトリ(WSL等)で実在し得るため許す(触っていないツリーの保存を妨げない)。
+    let mut seen_exact = HashSet::new();
+    let mut fold_groups: HashMap<Vec<String>, Vec<&fyler_core::tree::DesiredEntry>> =
+        HashMap::new();
     for entry in &desired.entries {
-        if !seen_paths.insert(entry.path.clone()) && duplicate_paths.insert(entry.path.clone()) {
+        if !seen_exact.insert(entry.path.clone()) && duplicate_paths.insert(entry.path.clone()) {
             errors.push(ValidateError::DuplicateName {
                 path: entry.path.clone(),
             });
         }
+        fold_groups
+            .entry(case_fold_path(&entry.path))
+            .or_default()
+            .push(entry);
+    }
+    for group in fold_groups.values() {
+        if group.len() < 2 {
+            continue;
+        }
+        let any_changed = group.iter().any(|entry| {
+            entry
+                .id
+                .and_then(|id| baseline.get(id))
+                .is_none_or(|original| original.path != entry.path)
+        });
+        if !any_changed {
+            continue;
+        }
+        for entry in group {
+            if duplicate_paths.insert(entry.path.clone()) {
+                errors.push(ValidateError::DuplicateName {
+                    path: entry.path.clone(),
+                });
+            }
+        }
+    }
 
+    for entry in &desired.entries {
         let Some(name) = entry.path.name() else {
             continue;
         };
@@ -95,10 +128,9 @@ pub fn validate(
             continue;
         }
 
-        if hidden_entries
-            .iter()
-            .any(|(hidden_id, hidden_path)| *hidden_id != id && *hidden_path == entry.path)
-            && duplicate_paths.insert(entry.path.clone())
+        if hidden_entries.iter().any(|(hidden_id, hidden_path)| {
+            *hidden_id != id && case_fold_path(hidden_path) == case_fold_path(&entry.path)
+        }) && duplicate_paths.insert(entry.path.clone())
         {
             errors.push(ValidateError::DuplicateName {
                 path: entry.path.clone(),
@@ -109,6 +141,15 @@ pub fn validate(
     errors.extend(detect_move_cycles(baseline, desired));
 
     errors
+}
+
+/// Windowsのcase-insensitive比較の近似(Unicode simple case fold相当の小文字化)。
+/// FILE_CASE_SENSITIVE_DIRの実測はfsops層の責務のため、純粋層では保守側に倒す。
+fn case_fold_path(path: &TreePath) -> Vec<String> {
+    path.components()
+        .iter()
+        .map(|component| component.to_lowercase())
+        .collect()
 }
 
 fn hidden_entries_at_desired_paths(

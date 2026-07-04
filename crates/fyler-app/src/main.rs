@@ -198,6 +198,13 @@ fn send_save_result(
                 text,
             })))
         }
+        SaveFlowResult::PlanInvalidated(text) => {
+            gui_event_tx.send(GuiEvent::CloseDialog)?;
+            gui_event_tx.send(GuiEvent::Editor(EditorEvent::Message(EditorMessage {
+                kind: MessageKind::Warn,
+                text,
+            })))
+        }
         SaveFlowResult::NoChanges => {
             gui_event_tx.send(GuiEvent::Editor(EditorEvent::Message(EditorMessage {
                 kind: MessageKind::Info,

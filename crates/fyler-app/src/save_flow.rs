@@ -19,10 +19,16 @@ pub enum SaveFlowResult {
     ShowPlan(OperationPlan),
     ShowValidationErrors(Vec<ValidateError>),
     ShowReport(CommitReport),
-    ReconcileFailed { report: CommitReport, error: String },
+    ReconcileFailed {
+        report: CommitReport,
+        error: String,
+    },
     ExternalChanged,
     ExternalChangeNotified(String),
     ExternalChangeFailed(String),
+    /// 確認ダイアログ表示中に外部変更を検知し、表示中のplanを破棄した。
+    /// 配線層はダイアログを閉じ、メッセージを表示すること。
+    PlanInvalidated(String),
     NoChanges,
     Cancelled,
     Ignored,
@@ -76,7 +82,10 @@ impl SaveController {
             return self.validation_failed(errors);
         }
 
-        let plan = fyler_pipeline::diff::build_plan(&self.baseline, &desired, &self.context);
+        let plan = match fyler_pipeline::diff::build_plan(&self.baseline, &desired, &self.context) {
+            Ok(plan) => plan,
+            Err(errors) => return self.validation_failed(errors),
+        };
         let display_plan = plan.clone();
         let effects = self.apply_event(SaveEvent::PlanReady { plan });
         if effects
@@ -117,6 +126,17 @@ impl SaveController {
 
         if baseline == self.baseline {
             return SaveFlowResult::NoChanges;
+        }
+
+        // 確認ダイアログ表示中の外部変更は、表示中のplanを陳腐化させる。
+        // 承認済みとして実行すると古いbaseline前提の操作が実FSへ流れるため、
+        // ここでキャンセル扱いにしてダイアログを閉じ、ユーザーへ通知する。
+        if matches!(self.state, SaveState::AwaitingConfirmation { .. }) {
+            self.apply_event(SaveEvent::Cancelled);
+            return SaveFlowResult::PlanInvalidated(
+                "外部でファイルが変更されたため、保存を中断しました。内容を確認して再度 :w してください"
+                    .to_owned(),
+            );
         }
 
         if self.engine.snapshot().dirty {
@@ -536,5 +556,60 @@ mod tests {
 
         assert_eq!(result, SaveFlowResult::NoChanges);
         assert!(engine.commands.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn external_change_during_confirmation_invalidates_plan_and_blocks_approve() {
+        // 確認ダイアログ表示中に実FSが変わると、表示中のplanは古いbaseline前提。
+        // 承認済みとして実行せず破棄し、Idleへ戻す(その後のApproveは無効)。
+        let temp_root = tempdir().unwrap();
+        fs::write(temp_root.path().join("a.txt"), b"a").unwrap();
+        let (mut controller, _) = controller(temp_root.path());
+        assert!(matches!(
+            controller.on_commit(1, &lines(&["/001 b.txt"])),
+            SaveFlowResult::ShowPlan(_)
+        ));
+        fs::write(temp_root.path().join("c.txt"), b"c").unwrap();
+
+        let result = controller.on_external_change();
+
+        assert!(matches!(
+            &result,
+            SaveFlowResult::PlanInvalidated(message)
+                if message.contains("外部でファイルが変更されたため、保存を中断しました")
+        ));
+        assert!(matches!(controller.state(), SaveState::Idle));
+        assert_eq!(
+            controller.on_choice(ConfirmChoice::Approve),
+            SaveFlowResult::Ignored
+        );
+        assert!(temp_root.path().join("a.txt").exists());
+        assert!(!temp_root.path().join("b.txt").exists());
+    }
+
+    #[test]
+    fn external_change_event_matching_baseline_keeps_confirmation_approvable() {
+        // 実FSがbaselineと一致するままの外部変更イベント(誤検知)では
+        // planを破棄せず、ダイアログはそのまま承認可能。
+        let temp_root = tempdir().unwrap();
+        fs::write(temp_root.path().join("a.txt"), b"a").unwrap();
+        let (mut controller, _) = controller(temp_root.path());
+        assert!(matches!(
+            controller.on_commit(1, &lines(&["/001 b.txt"])),
+            SaveFlowResult::ShowPlan(_)
+        ));
+
+        let result = controller.on_external_change();
+
+        assert_eq!(result, SaveFlowResult::NoChanges);
+        assert!(matches!(
+            controller.state(),
+            SaveState::AwaitingConfirmation { .. }
+        ));
+        assert!(matches!(
+            controller.on_choice(ConfirmChoice::Approve),
+            SaveFlowResult::ShowReport(report) if report.all_succeeded()
+        ));
+        assert!(temp_root.path().join("b.txt").exists());
     }
 }
