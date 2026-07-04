@@ -1,7 +1,12 @@
 //! ツリー本体の描画。
 
+use std::collections::HashMap;
+
 use eframe::egui;
 use fyler_core::editor::{EditorSnapshot, Mode};
+use fyler_core::gitstatus::GitBadge;
+use fyler_core::grammar::PrefixParse;
+use fyler_core::id::EntryId;
 
 use crate::{conceal, icon};
 
@@ -14,7 +19,7 @@ use crate::{conceal, icon};
 /// - Visual系モードの選択範囲ハイライトもここ(M1はカーソルのみでよい)
 /// - アイコン・git status・インデントガイドはバッファ文字列に含まれない
 ///   Rust側装飾として描く(M5)
-pub fn draw(ui: &mut egui::Ui, snapshot: &EditorSnapshot) {
+pub fn draw(ui: &mut egui::Ui, snapshot: &EditorSnapshot, git_badges: &HashMap<EntryId, GitBadge>) {
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
     let text_color = ui.visuals().text_color();
     let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
@@ -30,22 +35,36 @@ pub fn draw(ui: &mut egui::Ui, snapshot: &EditorSnapshot) {
                     font_id.clone(),
                     text_color,
                 );
+                let badge = badge_for_line(&line.text, git_badges);
+                let badge_galley = painter.layout_no_wrap(
+                    format!("{} ", badge.map(badge_character).unwrap_or(" ")),
+                    font_id.clone(),
+                    badge_color(ui.visuals(), badge),
+                );
                 let text_galley = painter.layout_no_wrap(
                     concealed.display.to_owned(),
                     font_id.clone(),
                     text_color,
                 );
                 let icon_width = icon_galley.size().x;
+                let badge_width = badge_galley.size().x;
                 let height = row_height
                     .max(icon_galley.size().y)
+                    .max(badge_galley.size().y)
                     .max(text_galley.size().y);
-                let width = ui.available_width().max(icon_width + text_galley.size().x);
+                let text_offset = icon_width + badge_width;
+                let width = ui.available_width().max(text_offset + text_galley.size().x);
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
 
                 painter.galley(rect.min, icon_galley, text_color);
                 painter.galley(
                     egui::pos2(rect.left() + icon_width, rect.top()),
+                    badge_galley,
+                    badge_color(ui.visuals(), badge),
+                );
+                painter.galley(
+                    egui::pos2(rect.left() + text_offset, rect.top()),
                     text_galley,
                     text_color,
                 );
@@ -58,11 +77,38 @@ pub fn draw(ui: &mut egui::Ui, snapshot: &EditorSnapshot) {
                         &line.text,
                         snapshot,
                         &font_id,
-                        icon_width,
+                        text_offset,
                     );
                 }
             }
         });
+}
+
+fn badge_for_line(raw: &str, git_badges: &HashMap<EntryId, GitBadge>) -> Option<GitBadge> {
+    let PrefixParse::WithId { id, .. } = fyler_core::grammar::split_id_prefix(raw) else {
+        return None;
+    };
+    git_badges.get(&id).copied()
+}
+
+fn badge_character(badge: GitBadge) -> &'static str {
+    match badge {
+        GitBadge::Modified => "M",
+        GitBadge::Added => "A",
+        GitBadge::Deleted => "D",
+        GitBadge::Renamed => "R",
+        GitBadge::Untracked => "?",
+        GitBadge::Conflicted => "!",
+    }
+}
+
+fn badge_color(visuals: &egui::Visuals, badge: Option<GitBadge>) -> egui::Color32 {
+    match badge {
+        Some(GitBadge::Modified | GitBadge::Renamed) => egui::Color32::from_rgb(230, 190, 60),
+        Some(GitBadge::Added) => egui::Color32::from_rgb(80, 200, 120),
+        Some(GitBadge::Deleted | GitBadge::Conflicted) => visuals.error_fg_color,
+        Some(GitBadge::Untracked) | None => visuals.weak_text_color(),
+    }
 }
 
 fn draw_cursor(
@@ -150,6 +196,28 @@ fn valid_byte_index(text: &str, requested: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_badge_characters_match_decoration_contract() {
+        assert_eq!(badge_character(GitBadge::Modified), "M");
+        assert_eq!(badge_character(GitBadge::Added), "A");
+        assert_eq!(badge_character(GitBadge::Deleted), "D");
+        assert_eq!(badge_character(GitBadge::Renamed), "R");
+        assert_eq!(badge_character(GitBadge::Untracked), "?");
+        assert_eq!(badge_character(GitBadge::Conflicted), "!");
+    }
+
+    #[test]
+    fn git_badge_is_resolved_only_from_valid_id_prefix() {
+        let badges = HashMap::from([(EntryId(7), GitBadge::Modified)]);
+
+        assert_eq!(
+            badge_for_line("/007 src/main.rs", &badges),
+            Some(GitBadge::Modified)
+        );
+        assert_eq!(badge_for_line("new.txt", &badges), None);
+        assert_eq!(badge_for_line("/0", &badges), None);
+    }
 
     #[test]
     fn cursor_byte_index_is_clamped_to_utf8_boundary() {

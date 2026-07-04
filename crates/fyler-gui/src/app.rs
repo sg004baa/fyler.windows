@@ -1,11 +1,14 @@
 //! eframeアプリ本体。毎フレーム、エンジンのsnapshotだけを描画する。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::thread;
 
 use eframe::egui;
 use fyler_core::editor::{CmdlineState, EditorEngine, EditorEvent, EditorMessage};
+use fyler_core::gitstatus::GitBadge;
+use fyler_core::id::EntryId;
 use fyler_core::plan::OperationPlan;
 use fyler_core::report::CommitReport;
 use fyler_core::validate::ValidateError;
@@ -19,6 +22,8 @@ pub enum GuiEvent {
     Editor(EditorEvent),
     /// app層で表示ルートが切り替わったことをモードラインへ反映する。
     RootChanged(PathBuf),
+    /// baselineのエントリIDに対応するGit装飾を全件差し替える。
+    GitBadges(HashMap<EntryId, GitBadge>),
     /// 保存planと実行前に確認すべき警告を表示する。
     ShowPlan {
         plan: OperationPlan,
@@ -52,6 +57,7 @@ pub struct FylerApp {
     cmdline: Option<CmdlineState>,
     message: Option<EditorMessage>,
     root: PathBuf,
+    git_badges: HashMap<EntryId, GitBadge>,
     engine_error: Option<String>,
     dialog: Option<DialogState>,
     confirm_tx: mpsc::Sender<ConfirmChoice>,
@@ -83,6 +89,7 @@ impl FylerApp {
             cmdline: None,
             message: None,
             root: PathBuf::new(),
+            git_badges: HashMap::new(),
             engine_error: None,
             dialog: None,
             confirm_tx,
@@ -106,6 +113,7 @@ impl FylerApp {
                     }
                 },
                 GuiEvent::RootChanged(root) => self.root = root,
+                GuiEvent::GitBadges(git_badges) => self.git_badges = git_badges,
                 GuiEvent::ShowPlan { plan, warnings } => {
                     self.dialog = Some(DialogState::Plan { plan, warnings });
                 }
@@ -153,7 +161,7 @@ impl eframe::App for FylerApp {
             if let Some(error) = &self.engine_error {
                 ui.colored_label(ui.visuals().error_fg_color, error);
             } else {
-                tree_view::draw(ui, &snapshot);
+                tree_view::draw(ui, &snapshot, &self.git_badges);
             }
         });
 

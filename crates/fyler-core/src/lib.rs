@@ -11,6 +11,7 @@
 //! 依存境界(AGENTS.md 絶対ルール2): このクレートは std / anyhow / thiserror にしか
 //! 依存しない。nvim・egui・Win32の型をここに持ち込まないこと。
 pub mod editor;
+pub mod gitstatus;
 pub mod grammar;
 pub mod id;
 pub mod path;
@@ -22,6 +23,7 @@ pub mod validate;
 pub mod win_naming;
 
 pub use editor::{EditorCommand, EditorEngine, EditorEvent, EditorLine, EditorSnapshot};
+pub use gitstatus::GitBadge;
 pub use id::{EntryId, IdAllocator};
 pub use path::TreePath;
 pub use plan::{FsOperation, OperationPlan};

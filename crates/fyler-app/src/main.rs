@@ -108,6 +108,7 @@ fn main() -> anyhow::Result<()> {
     // GUIクレートへtokio型を漏らさず、core型とConfirmChoiceだけを受け渡す。
     let (gui_event_tx, gui_event_rx) = mpsc::channel();
     gui_event_tx.send(GuiEvent::RootChanged(root.clone()))?;
+    send_git_badges(&gui_event_tx, &save_controller)?;
     let app_engine = Arc::clone(&save_engine);
     let event_bridge = thread::Builder::new()
         .name("fyler-app-events".to_owned())
@@ -253,6 +254,9 @@ fn main() -> anyhow::Result<()> {
                         {
                             return;
                         }
+                        if send_git_badges(&gui_event_tx, &save_controller).is_err() {
+                            return;
+                        }
                     }
                     AppEvent::Editor(EditorEvent::ToggleHidden) => {
                         if app_engine.snapshot().dirty {
@@ -300,6 +304,9 @@ fn main() -> anyhow::Result<()> {
                                 return;
                             }
                         }
+                        if send_git_badges(&gui_event_tx, &save_controller).is_err() {
+                            return;
+                        }
                     }
                     AppEvent::Editor(event) => {
                         if gui_event_tx.send(GuiEvent::Editor(event)).is_err() {
@@ -308,7 +315,17 @@ fn main() -> anyhow::Result<()> {
                     }
                     AppEvent::Confirm(choice) => {
                         let result = save_controller.on_choice(choice);
+                        let refresh_git_badges = matches!(
+                            &result,
+                            SaveFlowResult::ShowReport(_)
+                                | SaveFlowResult::ReconcileFailed { .. }
+                        );
                         if send_save_result(&gui_event_tx, result).is_err() {
+                            return;
+                        }
+                        if refresh_git_badges
+                            && send_git_badges(&gui_event_tx, &save_controller).is_err()
+                        {
                             return;
                         }
                     }
@@ -329,6 +346,9 @@ fn main() -> anyhow::Result<()> {
                         if !matches!(&result, SaveFlowResult::NoChanges)
                             && send_save_result(&gui_event_tx, result).is_err()
                         {
+                            return;
+                        }
+                        if send_git_badges(&gui_event_tx, &save_controller).is_err() {
                             return;
                         }
                     }
@@ -451,6 +471,16 @@ fn send_gui_message(
         kind,
         text: text.into(),
     })))
+}
+
+/// 現在のbaselineに対応するGit装飾を再計算し、GUIの保持mapを全件差し替える。
+///
+/// Gitが利用できない場合とリポジトリ外では、空のmapを送って既存装飾を消す。
+fn send_git_badges(
+    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    save_controller: &SaveController,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    gui_event_tx.send(GuiEvent::GitBadges(save_controller.git_badges()))
 }
 
 fn send_save_result(

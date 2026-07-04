@@ -1,13 +1,15 @@
 //! 保存フロー: parse → validate → diff → confirm → apply → reconcile。
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
 use fyler_core::editor::{EditorCommand, EditorEngine, EditorLine};
+use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
-use fyler_core::id::IdAllocator;
+use fyler_core::id::{EntryId, IdAllocator};
 use fyler_core::path::TreePath;
 use fyler_core::plan::OperationPlan;
 use fyler_core::report::CommitReport;
@@ -118,6 +120,22 @@ impl SaveController {
     /// 引き継いで隠しファイル表示設定を維持すること。
     pub fn scan_options(&self) -> ScanOptions {
         self.scan_options
+    }
+
+    /// 現在の表示ルートのGit状態を、baselineのエントリIDへ対応付けて返す。
+    ///
+    /// Gitが利用できない場合やリポジトリ外では空のmapを返す。Gitがディレクトリ単位で
+    /// 報告した状態は同じパスのエントリだけへ付け、子孫や親ディレクトリへ伝播しない。
+    pub fn git_badges(&self) -> HashMap<EntryId, GitBadge> {
+        let statuses = fyler_fsops::gitstatus::status_badges(&self.root).unwrap_or_default();
+        self.baseline
+            .entries()
+            .iter()
+            .filter_map(|entry| {
+                let relative = entry.path.to_fs_path(Path::new(""));
+                statuses.get(&relative).map(|badge| (entry.id, *badge))
+            })
+            .collect()
     }
 
     /// ルート直下の全ディレクトリを折りたたみ状態へ初期化する。
@@ -524,7 +542,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use fyler_core::editor::EditorSnapshot;
-    use fyler_core::id::EntryId;
     use fyler_core::path::TreePath;
     use fyler_core::plan::FsOperation;
     use fyler_core::tree::{BaselineEntry, EntryKind};

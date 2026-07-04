@@ -70,6 +70,7 @@
 - [x] **M6-3 ディレクトリ折りたたみ / M6-4 隠しファイルトグル + ソート改善** — `<CR>`での折りたたみ、初期/ルート移動時のトップレベル折りたたみ、折りたたみ状態を維持するreconcile、`g.`での隠し表示切り替え、dotfile/Windows hidden属性判定、ディレクトリ優先のcase-insensitive自然順を実装。Linuxで指定テスト91件・workspace clippy警告ゼロ、Windows GNUクロスターゲットでcheck/clippy pass。Windows実機動作確認は未実施
 - [x] **M7-1 未配線コードの配線** — long path変換 / OneDriveプレースホルダ警告 / ディレクトリcase sensitivity実測を実処理へ配線し、BaselineTreeのID検索をO(1)化
 - [x] **M7-2 watchのdebounce/coalesce** — notifyイベントを200ms固定ウィンドウでパス集合へ集約し、watcher drop時のスレッド終了とapp層の二段coalesceを実装。Linuxで指定テスト100件・workspace clippy警告ゼロ、Windows GNUクロスターゲットでclippy pass。Windows実機動作確認は未実施
+- [x] **M7-4 git status装飾** — porcelain v1のGit状態取得とサブディレクトリ基準のパス解決、EntryIdへの対応付け、GUI装飾列と更新配線を実装。Linuxで指定テスト128件・workspace clippy警告ゼロ、Windows GNUクロスターゲットでclippy pass。Windows実機動作確認は未実施
 
 各マイルストーンの完了条件は DESIGN.md「マイルストーン」章を参照。
 完了したらこのチェックリストを更新すること。
