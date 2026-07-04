@@ -63,8 +63,8 @@
 - [x] **M1 read-only表示** — nvim spawn/RPC/snapshot同期 + eframe描画 + クラッシュ検知を実装。Windows実機(nvim v0.11.6)でGUI目視OK・コンソール窓なし。headless RPCスモークpass(実nvim)
 - [x] **M2 rename限定dry-run** — `spec_m2.rs` 全pass(parse/validate/diff)。確認ダイアログ + 保存フロー配線(fyler-app/save_flow.rs、dry-run保証=承認しても実FS不可)。Windows実機で `:w`→`RENAME a→b` 表示・重複表示バグ修正を目視OK。SaveControllerテスト5件 + headless RPCスモークpass
 - [x] **M3 create / delete / rename 実行** — 同一ボリュームapply(create/delete/rename) + 操作単位CommitReport + 実FS再スキャンreconcileを実装。Linuxでworkspace check/clippy警告ゼロ、対象テスト全pass。Windows実機動作確認は未実施
-- [ ] M4 構造編集(move / copy・クロスボリューム) ← 次
-- [ ] M5 統合・装飾
+- [x] **M4 構造編集** — move/copy + クロスボリューム3分類 + 非原子的操作の進捗付きCommitReportを実装。Linuxでworkspace check/clippy警告ゼロ、対象テスト全pass。Windows実機動作確認は未実施
+- [ ] M5 統合・装飾 ← 次
 
 各マイルストーンの完了条件は DESIGN.md「マイルストーン」章を参照。
 完了したらこのチェックリストを更新すること。

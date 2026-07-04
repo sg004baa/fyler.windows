@@ -110,13 +110,7 @@ fn scan_directory(
             )
         })?;
 
-        let kind = if is_link_or_reparse(&metadata) {
-            EntryKind::Symlink
-        } else if metadata.is_dir() {
-            EntryKind::Dir
-        } else {
-            EntryKind::File
-        };
+        let kind = kind_from_metadata(&metadata);
 
         tree.insert(BaselineEntry {
             id: resolve_id(&path),
@@ -172,6 +166,16 @@ fn is_link_or_reparse(metadata: &Metadata) -> bool {
     #[cfg(not(windows))]
     {
         false
+    }
+}
+
+pub(crate) fn kind_from_metadata(metadata: &Metadata) -> EntryKind {
+    if is_link_or_reparse(metadata) {
+        EntryKind::Symlink
+    } else if metadata.is_dir() {
+        EntryKind::Dir
+    } else {
+        EntryKind::File
     }
 }
 
