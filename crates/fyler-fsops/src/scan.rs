@@ -72,7 +72,7 @@ pub fn rescan_preserving_ids_with(
     options: &ScanOptions,
 ) -> anyhow::Result<BaselineTree> {
     let previous_ids: HashMap<TreePath, _> = previous
-        .entries
+        .entries()
         .iter()
         .map(|entry| (entry.path.clone(), entry.id))
         .collect();
@@ -89,7 +89,7 @@ fn scan_with_id_resolver(
     options: &ScanOptions,
     mut resolve_id: impl FnMut(&TreePath) -> fyler_core::id::EntryId,
 ) -> anyhow::Result<BaselineTree> {
-    let root_metadata = fs::symlink_metadata(root)
+    let root_metadata = fs::symlink_metadata(crate::long_path::to_fs(root))
         .with_context(|| format!("表示ルートのメタデータを取得できません: {}", root.display()))?;
     if is_link_or_reparse(&root_metadata) {
         bail!(
@@ -172,7 +172,7 @@ fn read_sorted_entries(
     directory: &Path,
     options: &ScanOptions,
 ) -> anyhow::Result<Vec<ScannedEntry>> {
-    let read_dir = fs::read_dir(directory)
+    let read_dir = fs::read_dir(crate::long_path::to_fs(directory))
         .with_context(|| format!("ディレクトリを列挙できません: {}", directory.display()))?;
     let mut entries = Vec::new();
     for entry in read_dir {
@@ -187,7 +187,7 @@ fn read_sorted_entries(
         if !options.show_hidden && is_hidden(&path, &file_name)? {
             continue;
         }
-        let metadata = fs::symlink_metadata(&path)
+        let metadata = fs::symlink_metadata(crate::long_path::to_fs(&path))
             .with_context(|| format!("エントリのメタデータを取得できません: {}", path.display()))?;
         entries.push(ScannedEntry {
             path,
@@ -329,7 +329,7 @@ mod tests {
         let mut ids = IdAllocator::new();
         let previous = scan_baseline(root.path(), &mut ids).unwrap();
         let kept_id = previous
-            .entries
+            .entries()
             .iter()
             .find(|entry| entry.path == TreePath::parse("kept.txt"))
             .unwrap()
@@ -341,7 +341,7 @@ mod tests {
 
         assert_eq!(
             rescanned
-                .entries
+                .entries()
                 .iter()
                 .find(|entry| entry.path == TreePath::parse("kept.txt"))
                 .unwrap()
@@ -349,7 +349,7 @@ mod tests {
             kept_id
         );
         let new_id = rescanned
-            .entries
+            .entries()
             .iter()
             .find(|entry| entry.path == TreePath::parse("new.txt"))
             .unwrap()
@@ -357,7 +357,7 @@ mod tests {
         assert_ne!(new_id, kept_id);
         assert!(
             rescanned
-                .entries
+                .entries()
                 .iter()
                 .all(|entry| entry.path != TreePath::parse("removed.txt"))
         );
@@ -375,7 +375,7 @@ mod tests {
         let hidden = scan_baseline(root.path(), &mut hidden_ids).unwrap();
         assert_eq!(
             hidden
-                .entries
+                .entries()
                 .iter()
                 .map(|entry| entry.path.clone())
                 .collect::<Vec<_>>(),
@@ -391,13 +391,13 @@ mod tests {
         .unwrap();
         assert!(
             shown
-                .entries
+                .entries()
                 .iter()
                 .any(|entry| entry.path == TreePath::parse(".hidden.txt"))
         );
         assert!(
             shown
-                .entries
+                .entries()
                 .iter()
                 .any(|entry| entry.path == TreePath::parse(".hidden-dir/child.txt"))
         );
@@ -415,7 +415,7 @@ mod tests {
         let mut ids = IdAllocator::new();
         let baseline = scan_baseline(root.path(), &mut ids).unwrap();
         let paths = baseline
-            .entries
+            .entries()
             .iter()
             .map(|entry| entry.path.clone())
             .collect::<Vec<_>>();

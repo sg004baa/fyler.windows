@@ -456,7 +456,9 @@ fn send_save_result(
     result: SaveFlowResult,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     match result {
-        SaveFlowResult::ShowPlan(plan) => gui_event_tx.send(GuiEvent::ShowPlan(plan)),
+        SaveFlowResult::ShowPlan { plan, warnings } => {
+            gui_event_tx.send(GuiEvent::ShowPlan { plan, warnings })
+        }
         SaveFlowResult::ShowValidationErrors(errors) => {
             gui_event_tx.send(GuiEvent::ShowValidationErrors(errors))
         }

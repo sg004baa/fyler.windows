@@ -13,6 +13,23 @@ const EXTENDED_PREFIX: &str = r"\\?\";
 const EXTENDED_UNC_PREFIX: &str = r"\\?\UNC\";
 const UNC_PREFIX: &str = r"\\";
 
+/// `fs::*` 呼び出し直前の最終変換を行う。
+///
+/// Windowsでは [`to_extended`] を試み、相対パス・非UTF-8等で変換できない場合は
+/// 元のパスを返す。非Windowsでは恒等変換する。`\\?\` を扱うのはこのモジュール
+/// だけとする(絶対ルール3)。
+pub fn to_fs(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        to_extended(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
 /// MAX_PATHを超えるパスでもWin32 APIに渡せる形へ変換する。
 ///
 /// 実装契約:
@@ -134,5 +151,25 @@ mod tests {
             to_extended(Path::new(r"\\server\share\foo\..\bar")).unwrap(),
             PathBuf::from(r"\\?\UNC\server\share\bar")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn to_fs_extends_absolute_path_and_preserves_unconvertible_relative_path() {
+        assert_eq!(
+            to_fs(Path::new(r"C:\foo\bar.txt")),
+            PathBuf::from(r"\\?\C:\foo\bar.txt")
+        );
+        assert_eq!(
+            to_fs(Path::new(r"relative\file.txt")),
+            PathBuf::from(r"relative\file.txt")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn to_fs_is_identity_off_windows() {
+        let path = Path::new("/tmp/fyler/../file.txt");
+        assert_eq!(to_fs(path), path);
     }
 }

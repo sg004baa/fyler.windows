@@ -19,7 +19,11 @@ pub enum GuiEvent {
     Editor(EditorEvent),
     /// app層で表示ルートが切り替わったことをモードラインへ反映する。
     RootChanged(PathBuf),
-    ShowPlan(OperationPlan),
+    /// 保存planと実行前に確認すべき警告を表示する。
+    ShowPlan {
+        plan: OperationPlan,
+        warnings: Vec<String>,
+    },
     ShowReport(CommitReport),
     ShowValidationErrors(Vec<ValidateError>),
     FatalError(String),
@@ -28,7 +32,10 @@ pub enum GuiEvent {
 
 #[derive(Debug, Clone)]
 enum DialogState {
-    Plan(OperationPlan),
+    Plan {
+        plan: OperationPlan,
+        warnings: Vec<String>,
+    },
     Report(CommitReport),
     ValidationErrors(Vec<ValidateError>),
 }
@@ -99,8 +106,8 @@ impl FylerApp {
                     }
                 },
                 GuiEvent::RootChanged(root) => self.root = root,
-                GuiEvent::ShowPlan(plan) => {
-                    self.dialog = Some(DialogState::Plan(plan));
+                GuiEvent::ShowPlan { plan, warnings } => {
+                    self.dialog = Some(DialogState::Plan { plan, warnings });
                 }
                 GuiEvent::ShowReport(report) => {
                     self.dialog = Some(DialogState::Report(report));
@@ -154,8 +161,8 @@ impl eframe::App for FylerApp {
         let mut dismiss_errors = false;
         let mut dismiss_report = false;
         match &self.dialog {
-            Some(DialogState::Plan(plan)) => {
-                confirm_choice = confirm::draw_plan(ui, plan);
+            Some(DialogState::Plan { plan, warnings }) => {
+                confirm_choice = confirm::draw_plan(ui, plan, warnings);
             }
             Some(DialogState::Report(report)) => {
                 dismiss_report = confirm::draw_report(ui, report);

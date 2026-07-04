@@ -1,6 +1,7 @@
 //! 保存フロー: parse → validate → diff → confirm → apply → reconcile。
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -19,7 +20,11 @@ use fyler_gui::confirm::ConfirmChoice;
 /// 保存フローから配線層へ返す結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SaveFlowResult {
-    ShowPlan(OperationPlan),
+    /// 確認対象のplanと、実行時に発生し得るクラウド取得等の警告を表示する。
+    ShowPlan {
+        plan: OperationPlan,
+        warnings: Vec<String>,
+    },
     ShowValidationErrors(Vec<ValidateError>),
     ShowReport(CommitReport),
     ReconcileFailed {
@@ -121,7 +126,7 @@ impl SaveController {
     pub fn collapse_all_top_level(&mut self) {
         self.context.collapsed_dirs.extend(
             self.baseline
-                .entries
+                .entries()
                 .iter()
                 .filter(|entry| entry.kind == EntryKind::Dir && entry.path.depth() == 1)
                 .map(|entry| entry.id),
@@ -240,12 +245,20 @@ impl SaveController {
             Err(errors) => return self.validation_failed(errors),
         };
         let display_plan = plan.clone();
+        let warnings = plan_warnings(
+            &self.root,
+            &display_plan,
+            fyler_fsops::onedrive::is_cloud_placeholder,
+        );
         let effects = self.apply_event(SaveEvent::PlanReady { plan });
         if effects
             .iter()
             .any(|effect| matches!(effect, SaveEffect::ShowConfirmDialog))
         {
-            SaveFlowResult::ShowPlan(display_plan)
+            SaveFlowResult::ShowPlan {
+                plan: display_plan,
+                warnings,
+            }
         } else {
             SaveFlowResult::NoChanges
         }
@@ -412,6 +425,52 @@ impl SaveController {
     }
 }
 
+/// planの読み取り元を属性だけで検査し、クラウド取得を伴い得る操作の警告を返す。
+///
+/// `is_placeholder`はテストで差し替え可能にし、本番では
+/// [`fyler_fsops::onedrive::is_cloud_placeholder`]を渡す。述語またはmetadata取得に
+/// 失敗した場合は保存計画を妨げず、サイズを取得できない場合だけサイズ表記を省略する。
+fn plan_warnings(
+    root: &Path,
+    plan: &OperationPlan,
+    is_placeholder: impl Fn(&Path) -> anyhow::Result<bool>,
+) -> Vec<String> {
+    plan.ops
+        .iter()
+        .filter_map(|operation| {
+            let from = match operation {
+                fyler_core::plan::FsOperation::Move { from, .. }
+                | fyler_core::plan::FsOperation::Copy { from, .. } => from,
+                fyler_core::plan::FsOperation::Create { .. }
+                | fyler_core::plan::FsOperation::Delete { .. } => return None,
+            };
+            let source = from.to_fs_path(root);
+            if !is_placeholder(&source).unwrap_or(false) {
+                return None;
+            }
+
+            let size = fs::metadata(&source)
+                .ok()
+                .map(|metadata| human_readable_size(metadata.len()));
+            Some(match size {
+                Some(size) => format!("クラウドから取得します: {from}({size})"),
+                None => format!("クラウドから取得します: {from}"),
+            })
+        })
+        .collect()
+}
+
+fn human_readable_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= MIB {
+        format!("{:.1} MB", bytes / MIB)
+    } else {
+        format!("{:.1} KB", bytes / KIB)
+    }
+}
+
 fn retain_existing_collapsed_dirs(context: &EditContext, baseline: &BaselineTree) -> EditContext {
     let mut context = context.clone();
     context.collapsed_dirs.retain(|id| {
@@ -432,7 +491,7 @@ pub(crate) fn baseline_to_lines(baseline: &BaselineTree, context: &EditContext) 
         .collect::<Vec<_>>();
 
     baseline
-        .entries
+        .entries()
         .iter()
         .filter(|entry| {
             !collapsed_paths
@@ -554,18 +613,56 @@ mod tests {
 
         assert_eq!(
             result,
-            SaveFlowResult::ShowPlan(OperationPlan {
-                ops: vec![FsOperation::Move {
-                    id: EntryId(1),
-                    from: TreePath::parse("a.txt"),
-                    to: TreePath::parse("b.txt"),
-                }],
-            })
+            SaveFlowResult::ShowPlan {
+                plan: OperationPlan {
+                    ops: vec![FsOperation::Move {
+                        id: EntryId(1),
+                        from: TreePath::parse("a.txt"),
+                        to: TreePath::parse("b.txt"),
+                    }],
+                },
+                warnings: Vec::new(),
+            }
         );
         assert!(matches!(
             controller.state(),
             SaveState::AwaitingConfirmation { changedtick: 7, .. }
         ));
+    }
+
+    #[test]
+    fn plan_warnings_include_placeholder_path_and_human_readable_size() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("cloud.bin"), vec![0_u8; 2048]).unwrap();
+        let plan = OperationPlan {
+            ops: vec![FsOperation::Copy {
+                src: EntryId(1),
+                from: TreePath::parse("cloud.bin"),
+                to: TreePath::parse("cloud-copy.bin"),
+            }],
+        };
+
+        let warnings = plan_warnings(root.path(), &plan, |path| {
+            Ok(path == root.path().join("cloud.bin"))
+        });
+
+        assert_eq!(warnings, ["クラウドから取得します: cloud.bin(2.0 KB)"]);
+    }
+
+    #[test]
+    fn plan_warnings_omit_size_when_metadata_is_unavailable() {
+        let root = tempdir().unwrap();
+        let plan = OperationPlan {
+            ops: vec![FsOperation::Move {
+                id: EntryId(1),
+                from: TreePath::parse("missing.bin"),
+                to: TreePath::parse("renamed.bin"),
+            }],
+        };
+
+        let warnings = plan_warnings(root.path(), &plan, |_| Ok(true));
+
+        assert_eq!(warnings, ["クラウドから取得します: missing.bin"]);
     }
 
     #[test]
@@ -615,7 +712,7 @@ mod tests {
         fs::write(temp_root.path().join("a.txt"), b"content").unwrap();
         let mut ids = IdAllocator::new();
         let baseline = fyler_fsops::scan::scan_baseline(temp_root.path(), &mut ids).unwrap();
-        let original_id = baseline.entries[0].id;
+        let original_id = baseline.entries()[0].id;
         let engine = Arc::new(RecordingEngine::default());
         let mut controller = SaveController::new(
             temp_root.path().to_path_buf(),
@@ -629,7 +726,7 @@ mod tests {
         ));
         assert!(matches!(
             controller.on_commit(1, &[renamed_line]),
-            SaveFlowResult::ShowPlan(_)
+            SaveFlowResult::ShowPlan { .. }
         ));
 
         let result = controller.on_choice(ConfirmChoice::Approve);
@@ -647,7 +744,7 @@ mod tests {
         assert!(
             controller
                 .baseline
-                .entries
+                .entries()
                 .iter()
                 .any(|entry| entry.path == TreePath::parse("b.txt"))
         );
@@ -667,7 +764,7 @@ mod tests {
         let (mut controller, engine) = controller(temp_root.path());
         assert!(matches!(
             controller.on_commit(1, &lines(&["/001 b.txt"])),
-            SaveFlowResult::ShowPlan(_)
+            SaveFlowResult::ShowPlan { .. }
         ));
 
         assert_eq!(
@@ -679,7 +776,7 @@ mod tests {
         assert!(temp_root.path().join("a.txt").exists());
         assert!(!temp_root.path().join("b.txt").exists());
         assert_eq!(
-            controller.baseline.entries[0].path,
+            controller.baseline.entries()[0].path,
             TreePath::parse("a.txt")
         );
         assert!(engine.commands.lock().unwrap().is_empty());
@@ -691,7 +788,7 @@ mod tests {
         let (mut controller, engine) = controller(temp_root.path());
         assert!(matches!(
             controller.on_commit(1, &lines(&["/001 b.txt"])),
-            SaveFlowResult::ShowPlan(_)
+            SaveFlowResult::ShowPlan { .. }
         ));
 
         let result = controller.on_choice(ConfirmChoice::Approve);
@@ -702,7 +799,7 @@ mod tests {
         ));
         assert!(matches!(controller.state(), SaveState::Idle));
         assert_eq!(
-            controller.baseline.entries[0].path,
+            controller.baseline.entries()[0].path,
             TreePath::parse("a.txt")
         );
         assert!(engine.commands.lock().unwrap().is_empty());
@@ -721,7 +818,7 @@ mod tests {
         assert!(
             controller
                 .baseline
-                .entries
+                .entries()
                 .iter()
                 .any(|entry| entry.path == TreePath::parse("b.txt"))
         );
@@ -751,7 +848,7 @@ mod tests {
         assert!(
             controller
                 .baseline
-                .entries
+                .entries()
                 .iter()
                 .all(|entry| entry.path != TreePath::parse("b.txt"))
         );
@@ -779,7 +876,7 @@ mod tests {
         let (mut controller, _) = controller(temp_root.path());
         assert!(matches!(
             controller.on_commit(1, &lines(&["/001 b.txt"])),
-            SaveFlowResult::ShowPlan(_)
+            SaveFlowResult::ShowPlan { .. }
         ));
         fs::write(temp_root.path().join("c.txt"), b"c").unwrap();
 
@@ -808,7 +905,7 @@ mod tests {
         let (mut controller, _) = controller(temp_root.path());
         assert!(matches!(
             controller.on_commit(1, &lines(&["/001 b.txt"])),
-            SaveFlowResult::ShowPlan(_)
+            SaveFlowResult::ShowPlan { .. }
         ));
 
         let result = controller.on_external_change();
@@ -828,7 +925,7 @@ mod tests {
     #[test]
     fn resolve_line_uses_embedded_id_and_current_baseline() {
         let (controller, _) = controller("C:/test-root");
-        let id = controller.baseline.entries[0].id;
+        let id = controller.baseline.entries()[0].id;
         let buffer_lines = lines(&[
             "保存前の新規行.txt",
             &format!(
@@ -866,7 +963,7 @@ mod tests {
 
         assert!(matches!(
             controller.on_commit(7, &lines(&["/001 b.txt"])),
-            SaveFlowResult::ShowPlan(_)
+            SaveFlowResult::ShowPlan { .. }
         ));
         let rejected_root = PathBuf::from("C:/rejected-root");
         let (rejected_baseline, rejected_ids) = baseline(&rejected_root);
@@ -976,7 +1073,7 @@ mod tests {
         lines[4].text = lines[4].text.replace("top.txt", "renamed.txt");
         assert!(matches!(
             controller.on_commit(7, &lines),
-            SaveFlowResult::ShowPlan(_)
+            SaveFlowResult::ShowPlan { .. }
         ));
 
         assert_eq!(
@@ -999,13 +1096,16 @@ mod tests {
 
         assert_eq!(
             result,
-            SaveFlowResult::ShowPlan(OperationPlan {
-                ops: vec![FsOperation::Move {
-                    id: EntryId(1),
-                    from: TreePath::parse("a"),
-                    to: TreePath::parse("renamed"),
-                }],
-            })
+            SaveFlowResult::ShowPlan {
+                plan: OperationPlan {
+                    ops: vec![FsOperation::Move {
+                        id: EntryId(1),
+                        from: TreePath::parse("a"),
+                        to: TreePath::parse("renamed"),
+                    }],
+                },
+                warnings: Vec::new(),
+            }
         );
     }
 

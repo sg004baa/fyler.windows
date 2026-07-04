@@ -173,7 +173,7 @@ fn hidden_entries_at_desired_paths(
             .filter(|entry| entry.id == Some(*collapsed_id))
         {
             for descendant in baseline
-                .entries
+                .entries()
                 .iter()
                 .filter(|entry| collapsed.path.is_strict_ancestor_of(&entry.path))
             {

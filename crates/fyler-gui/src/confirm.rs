@@ -19,9 +19,14 @@ pub enum ConfirmChoice {
 /// 実装契約:
 /// - 操作を1件1行で人間可読に表示する(例: `RENAME a.txt → b.txt`、
 ///   `DELETE src/old.rs (ごみ箱へ)`、`COPY a.txt → b.txt`)
+/// - 警告があれば操作一覧の下へ警告色で表示する
 /// - 表示中はGUIの入力ゲートでエンジンへの入力転送を止める
 /// - 選択結果はapp層の保存フローへ返す
-pub fn draw_plan(ui: &mut egui::Ui, plan: &OperationPlan) -> Option<ConfirmChoice> {
+pub fn draw_plan(
+    ui: &mut egui::Ui,
+    plan: &OperationPlan,
+    warnings: &[String],
+) -> Option<ConfirmChoice> {
     egui::Modal::new(egui::Id::new("save-plan-confirmation"))
         .show(ui.ctx(), |ui| {
             ui.heading("変更内容の確認");
@@ -29,6 +34,12 @@ pub fn draw_plan(ui: &mut egui::Ui, plan: &OperationPlan) -> Option<ConfirmChoic
 
             for operation in &plan.ops {
                 ui.monospace(operation_label(operation));
+            }
+            if !warnings.is_empty() {
+                ui.add_space(8.0);
+                for warning in warnings {
+                    ui.colored_label(ui.visuals().warn_fg_color, warning);
+                }
             }
 
             ui.add_space(12.0);

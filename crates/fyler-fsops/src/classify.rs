@@ -55,7 +55,7 @@ fn same_volume(from: &Path, to: &Path) -> anyhow::Result<bool> {
 
     let from_parent = nearest_existing_directory(parent_or_current_dir(from))?;
     let to_parent = nearest_existing_directory(parent_or_current_dir(to))?;
-    let from_device = fs::metadata(&from_parent)
+    let from_device = fs::metadata(crate::long_path::to_fs(&from_parent))
         .with_context(|| {
             format!(
                 "移動元の親ディレクトリのmetadataを取得できません: {}",
@@ -63,7 +63,7 @@ fn same_volume(from: &Path, to: &Path) -> anyhow::Result<bool> {
             )
         })?
         .dev();
-    let to_device = fs::metadata(&to_parent)
+    let to_device = fs::metadata(crate::long_path::to_fs(&to_parent))
         .with_context(|| {
             format!(
                 "移動先の親ディレクトリのmetadataを取得できません: {}",
@@ -88,7 +88,7 @@ fn nearest_existing_directory(start: &Path) -> anyhow::Result<PathBuf> {
         } else {
             candidate
         };
-        match fs::metadata(candidate) {
+        match fs::metadata(crate::long_path::to_fs(candidate)) {
             Ok(metadata) if metadata.is_dir() => return Ok(candidate.to_path_buf()),
             Ok(_) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -117,7 +117,7 @@ fn nearest_existing_path(start: &Path) -> anyhow::Result<PathBuf> {
         } else {
             candidate
         };
-        match fs::symlink_metadata(candidate) {
+        match fs::symlink_metadata(crate::long_path::to_fs(candidate)) {
             Ok(_) => return Ok(candidate.to_path_buf()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
@@ -145,7 +145,8 @@ fn volume_mount_point(path: &Path) -> anyhow::Result<PathBuf> {
     use windows::Win32::Storage::FileSystem::GetVolumePathNameW;
     use windows::core::PCWSTR;
 
-    let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let fs_path = crate::long_path::to_fs(path);
+    let path_wide: Vec<u16> = fs_path.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut volume_wide = vec![0_u16; 32_768];
     unsafe { GetVolumePathNameW(PCWSTR::from_raw(path_wide.as_ptr()), &mut volume_wide) }
         .with_context(|| {

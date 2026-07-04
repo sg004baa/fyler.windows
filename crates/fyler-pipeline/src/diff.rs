@@ -112,7 +112,7 @@ pub fn build_plan(
 
     operations.extend(
         baseline
-            .entries
+            .entries()
             .iter()
             .filter(|entry| {
                 !desired_ids.contains(&entry.id)

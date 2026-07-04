@@ -16,7 +16,8 @@ pub(crate) fn get(path: &Path) -> anyhow::Result<u32> {
     use windows::Win32::Storage::FileSystem::GetFileAttributesW;
     use windows::core::PCWSTR;
 
-    let wide_path: Vec<u16> = path
+    let fs_path = crate::long_path::to_fs(path);
+    let wide_path: Vec<u16> = fs_path
         .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))

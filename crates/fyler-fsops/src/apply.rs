@@ -96,7 +96,7 @@ pub fn apply_plan(root: &Path, plan: &OperationPlan) -> CommitReport {
 fn execute_operation(root: &Path, operation: &FsOperation) -> Result<(), OpFailure> {
     match operation {
         FsOperation::Create { path, kind } => {
-            let target = path.to_fs_path(root);
+            let target = crate::long_path::to_fs(&path.to_fs_path(root));
             match kind {
                 // create_dir / create_new(true) は既存パスで必ず失敗する
                 // (fs::File::createの黙った切り詰めを防ぐ。preflight不要)。
@@ -114,14 +114,23 @@ fn execute_operation(root: &Path, operation: &FsOperation) -> Result<(), OpFailu
             }
         }
         FsOperation::Move { from, to, .. } => {
-            let source = from.to_fs_path(root);
-            let target = to.to_fs_path(root);
+            let source = crate::long_path::to_fs(&from.to_fs_path(root));
+            let target = crate::long_path::to_fs(&to.to_fs_path(root));
             let metadata = fs::symlink_metadata(&source)
                 .with_context(|| format!("移動元のmetadataを取得できません: {}", source.display()))
                 .map_err(OpFailure::from)?;
             let kind = crate::scan::kind_from_metadata(&metadata);
 
-            if is_case_only_rename(from, to) {
+            let case_only_rename = is_case_only_rename(from, to);
+            let case_sensitive_directory = case_only_rename
+                && source.parent().is_some_and(|parent| {
+                    crate::case::dir_is_case_sensitive(parent).unwrap_or(false)
+                });
+
+            // case-sensitiveディレクトリでは大文字小文字違いも別名であり、2段renameは
+            // 既存の別エントリを黙って上書きし得る。通常rename経路の移動先preflightを
+            // 必ず通す。判定失敗時は従来どおり保守的に2段renameを使う。
+            if case_only_rename && !case_sensitive_directory {
                 crate::case::case_only_rename(&source, &target).map_err(OpFailure::from)
             } else {
                 // fs::renameはWindows(MOVEFILE_REPLACE_EXISTING)でもUnixでも
@@ -150,8 +159,8 @@ fn execute_operation(root: &Path, operation: &FsOperation) -> Result<(), OpFailu
             }
         }
         FsOperation::Copy { from, to, .. } => {
-            let source = from.to_fs_path(root);
-            let target = to.to_fs_path(root);
+            let source = crate::long_path::to_fs(&from.to_fs_path(root));
+            let target = crate::long_path::to_fs(&to.to_fs_path(root));
             let metadata = fs::symlink_metadata(&source)
                 .with_context(|| {
                     format!("コピー元のmetadataを取得できません: {}", source.display())
@@ -181,7 +190,7 @@ fn execute_operation(root: &Path, operation: &FsOperation) -> Result<(), OpFailu
 /// planのvalidate/orderingが正しければ通常は空いているはずで、これは
 /// baseline取得後の外部変更(TOCTOU)による黙った上書きへの最終防衛線。
 fn ensure_target_vacant(target: &Path) -> Result<(), OpFailure> {
-    match fs::symlink_metadata(target) {
+    match fs::symlink_metadata(crate::long_path::to_fs(target)) {
         Ok(_) => Err(OpFailure::from(anyhow!(
             "移動先に別のエントリが既に存在します(外部で変更された可能性): {}",
             target.display()
@@ -223,7 +232,7 @@ fn move_file_across_volumes(
 
 fn move_directory_across_volumes(source: &Path, target: &Path) -> Result<(), OpFailure> {
     let progress = copy_tree(source, target)?;
-    fs::remove_dir_all(source)
+    fs::remove_dir_all(crate::long_path::to_fs(source))
         .with_context(|| {
             format!(
                 "コピー後に移動元ディレクトリを削除できません: {}",
@@ -243,7 +252,12 @@ fn move_directory_across_volumes(source: &Path, target: &Path) -> Result<(), OpF
 
 fn copy_single_entry(source: &Path, target: &Path, kind: EntryKind) -> anyhow::Result<()> {
     match kind {
-        EntryKind::File => fs::copy(source, target).map(|_| ()).with_context(|| {
+        EntryKind::File => fs::copy(
+            crate::long_path::to_fs(source),
+            crate::long_path::to_fs(target),
+        )
+        .map(|_| ())
+        .with_context(|| {
             format!(
                 "ファイルをコピーできません: {} → {}",
                 source.display(),
@@ -279,13 +293,13 @@ fn copy_tree(source: &Path, target: &Path) -> Result<CopyProgress, OpFailure> {
     })?;
     let total = tasks.len();
 
-    fs::create_dir(target)
+    fs::create_dir(crate::long_path::to_fs(target))
         .with_context(|| format!("コピー先ディレクトリを作成できません: {}", target.display()))
         .map_err(|error| OpFailure::with_progress(error, copy_progress(0, total)))?;
 
     for (copied, task) in tasks.into_iter().enumerate() {
         let result = match task.kind {
-            EntryKind::Dir => fs::create_dir(&task.target)
+            EntryKind::Dir => fs::create_dir(crate::long_path::to_fs(&task.target))
                 .with_context(|| {
                     format!(
                         "コピー先ディレクトリを作成できません: {}",
@@ -313,7 +327,7 @@ fn collect_copy_tasks(source: &Path, target: &Path) -> anyhow::Result<Vec<CopyTa
     let mut directories = vec![(source.to_path_buf(), target.to_path_buf())];
 
     while let Some((source_dir, target_dir)) = directories.pop() {
-        let entries = fs::read_dir(&source_dir).with_context(|| {
+        let entries = fs::read_dir(crate::long_path::to_fs(&source_dir)).with_context(|| {
             format!(
                 "コピー元ディレクトリを読み取れません: {}",
                 source_dir.display()
@@ -328,12 +342,13 @@ fn collect_copy_tasks(source: &Path, target: &Path) -> anyhow::Result<Vec<CopyTa
             })?;
             let child_source = entry.path();
             let child_target = target_dir.join(entry.file_name());
-            let metadata = fs::symlink_metadata(&child_source).with_context(|| {
-                format!(
-                    "コピー元のmetadataを取得できません: {}",
-                    child_source.display()
-                )
-            })?;
+            let metadata = fs::symlink_metadata(crate::long_path::to_fs(&child_source))
+                .with_context(|| {
+                    format!(
+                        "コピー元のmetadataを取得できません: {}",
+                        child_source.display()
+                    )
+                })?;
             let kind = crate::scan::kind_from_metadata(&metadata);
 
             tasks.push(CopyTask {
@@ -355,7 +370,7 @@ fn copy_progress(copied: usize, total: usize) -> String {
 }
 
 fn copy_symlink(source: &Path, target: &Path) -> anyhow::Result<()> {
-    let link_target = fs::read_link(source)
+    let link_target = fs::read_link(crate::long_path::to_fs(source))
         .with_context(|| format!("symlinkを読み取れません: {}", source.display()))?;
     create_symlink_like(source, &link_target, target).with_context(|| {
         format!(
@@ -368,23 +383,23 @@ fn copy_symlink(source: &Path, target: &Path) -> anyhow::Result<()> {
 
 #[cfg(unix)]
 fn create_symlink_like(_source: &Path, link_target: &Path, target: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(link_target, target)
+    std::os::unix::fs::symlink(link_target, crate::long_path::to_fs(target))
 }
 
 #[cfg(windows)]
 fn create_symlink_like(source: &Path, link_target: &Path, target: &Path) -> std::io::Result<()> {
     use std::os::windows::fs::{FileTypeExt, symlink_dir, symlink_file};
 
-    let file_type = fs::symlink_metadata(source)?.file_type();
+    let file_type = fs::symlink_metadata(crate::long_path::to_fs(source))?.file_type();
     if file_type.is_symlink_dir() {
-        symlink_dir(link_target, target)
+        symlink_dir(link_target, crate::long_path::to_fs(target))
     } else {
-        symlink_file(link_target, target)
+        symlink_file(link_target, crate::long_path::to_fs(target))
     }
 }
 
 fn cleanup_incomplete_target(target: &Path) -> anyhow::Result<bool> {
-    let metadata = match fs::symlink_metadata(target) {
+    let metadata = match fs::symlink_metadata(crate::long_path::to_fs(target)) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => {
@@ -407,7 +422,7 @@ fn cleanup_incomplete_target(target: &Path) -> anyhow::Result<bool> {
 
 fn remove_non_directory_entry(path: &Path, kind: EntryKind) -> anyhow::Result<()> {
     match kind {
-        EntryKind::File => fs::remove_file(path)
+        EntryKind::File => fs::remove_file(crate::long_path::to_fs(path))
             .with_context(|| format!("ファイルを削除できません: {}", path.display())),
         EntryKind::Symlink => remove_symlink(path)
             .with_context(|| format!("symlinkを削除できません: {}", path.display())),
@@ -420,18 +435,18 @@ fn remove_non_directory_entry(path: &Path, kind: EntryKind) -> anyhow::Result<()
 
 #[cfg(not(windows))]
 fn remove_symlink(path: &Path) -> std::io::Result<()> {
-    fs::remove_file(path)
+    fs::remove_file(crate::long_path::to_fs(path))
 }
 
 #[cfg(windows)]
 fn remove_symlink(path: &Path) -> std::io::Result<()> {
     use std::os::windows::fs::FileTypeExt;
 
-    let file_type = fs::symlink_metadata(path)?.file_type();
+    let file_type = fs::symlink_metadata(crate::long_path::to_fs(path))?.file_type();
     if file_type.is_symlink_dir() {
-        fs::remove_dir(path)
+        fs::remove_dir(crate::long_path::to_fs(path))
     } else {
-        fs::remove_file(path)
+        fs::remove_file(crate::long_path::to_fs(path))
     }
 }
 
@@ -548,6 +563,30 @@ mod tests {
         // `name.txt` にもマッチするため、実際に格納された名前を列挙して検証する。
         assert_eq!(stored_entry_names(root.path()), ["name.txt"]);
         assert_eq!(fs::read(root.path().join("name.txt")).unwrap(), b"content");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn case_sensitive_directory_uses_normal_rename_preflight_for_case_only_names() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("Name.txt"), b"source").unwrap();
+        fs::write(root.path().join("name.txt"), b"existing").unwrap();
+        let plan = OperationPlan {
+            ops: vec![FsOperation::Move {
+                id: EntryId(1),
+                from: TreePath::parse("Name.txt"),
+                to: TreePath::parse("name.txt"),
+            }],
+        };
+
+        let report = apply_plan(root.path(), &plan);
+
+        assert!(matches!(
+            report.results[0].outcome,
+            OpOutcome::Failed { .. }
+        ));
+        assert_eq!(fs::read(root.path().join("Name.txt")).unwrap(), b"source");
+        assert_eq!(fs::read(root.path().join("name.txt")).unwrap(), b"existing");
     }
 
     #[test]

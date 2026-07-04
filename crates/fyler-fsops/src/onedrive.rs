@@ -16,6 +16,8 @@ pub const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
 ///
 /// 実装契約:
 /// - 属性取得のみで判定する(データを読まない)
+/// - Windowsの属性APIへ渡す直前のパス変換は、共有属性ヘルパー内で
+///   [`crate::long_path::to_fs`]を通す
 /// - サイズ取得・プレビュー・ハッシュ等、**内容に触れる処理の前に必ずこれを確認**し、
 ///   プレースホルダに対しては不要なhydrationを発生させない
 pub fn is_cloud_placeholder(path: &Path) -> anyhow::Result<bool> {
