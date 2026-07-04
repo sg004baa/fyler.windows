@@ -166,24 +166,29 @@ fn volume_mount_point(path: &Path) -> anyhow::Result<PathBuf> {
 fn windows_paths_equal(left: &Path, right: &Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
 
+    fn ascii_lower(unit: u16) -> u16 {
+        if (b'A' as u16..=b'Z' as u16).contains(&unit) {
+            unit + 32
+        } else {
+            unit
+        }
+    }
+
     left.as_os_str()
         .encode_wide()
-        .map(|unit| unit.to_ascii_lowercase())
-        .eq(right
-            .as_os_str()
-            .encode_wide()
-            .map(|unit| unit.to_ascii_lowercase()))
+        .map(ascii_lower)
+        .eq(right.as_os_str().encode_wide().map(ascii_lower))
 }
 
 #[cfg(test)]
 mod tests {
-    use tempfile::tempdir;
-
-    use super::*;
-
     #[cfg(not(windows))]
     #[test]
     fn classifies_paths_in_same_tempdir_as_same_volume() {
+        use tempfile::tempdir;
+
+        use super::*;
+
         let root = tempdir().unwrap();
         let source = root.path().join("from.txt");
         fs::write(&source, b"content").unwrap();
