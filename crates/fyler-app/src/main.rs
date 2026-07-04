@@ -5,6 +5,7 @@
 
 mod save_flow;
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -12,6 +13,7 @@ use std::thread;
 use fyler_core::editor::{EditorEngine, EditorEvent, EditorMessage, MessageKind};
 use fyler_core::id::IdAllocator;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
+use fyler_fsops::watch::ExternalChange;
 use fyler_gui::app::GuiEvent;
 use fyler_gui::confirm::ConfirmChoice;
 
@@ -20,6 +22,7 @@ use crate::save_flow::{SaveController, SaveFlowResult, baseline_to_lines};
 enum AppEvent {
     Editor(EditorEvent),
     Confirm(ConfirmChoice),
+    ExternalChange(ExternalChange),
     Shutdown,
 }
 
@@ -45,6 +48,9 @@ fn main() -> anyhow::Result<()> {
         nvim_exe,
         root: root.clone(),
     }))?;
+
+    let (watch_tx, watch_rx) = mpsc::channel::<ExternalChange>();
+    let watcher = fyler_fsops::watch::watch(&root, watch_tx)?;
 
     let mut ids = IdAllocator::new();
     let baseline = fyler_fsops::scan::scan_baseline(&root, &mut ids)?;
@@ -78,6 +84,21 @@ fn main() -> anyhow::Result<()> {
         })
         .map_err(|error| anyhow::anyhow!("確認結果の配線を開始できません: {error}"))?;
 
+    let watch_event_tx = app_event_tx.clone();
+    let watch_bridge = thread::Builder::new()
+        .name("fyler-watch-events".to_owned())
+        .spawn(move || {
+            while let Ok(change) = watch_rx.recv() {
+                if watch_event_tx
+                    .send(AppEvent::ExternalChange(change))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .map_err(|error| anyhow::anyhow!("ファイル監視イベントの配線を開始できません: {error}"))?;
+
     // GUIクレートへtokio型を漏らさず、core型とConfirmChoiceだけを受け渡す。
     let (gui_event_tx, gui_event_rx) = mpsc::channel();
     let save_root = root.clone();
@@ -86,7 +107,15 @@ fn main() -> anyhow::Result<()> {
         .name("fyler-app-events".to_owned())
         .spawn(move || {
             let mut save_controller = SaveController::new(save_root, ids, baseline, save_engine);
-            while let Ok(event) = app_event_rx.recv() {
+            let mut pending_events = VecDeque::new();
+            loop {
+                let event = match pending_events.pop_front() {
+                    Some(event) => event,
+                    None => match app_event_rx.recv() {
+                        Ok(event) => event,
+                        Err(_) => return,
+                    },
+                };
                 match event {
                     AppEvent::Editor(EditorEvent::CommitRequested { changedtick, lines }) => {
                         let result = save_controller.on_commit(changedtick, &lines);
@@ -105,6 +134,24 @@ fn main() -> anyhow::Result<()> {
                             return;
                         }
                     }
+                    AppEvent::ExternalChange(change) => {
+                        let _changed_path = change.path;
+                        while let Ok(queued_event) = app_event_rx.try_recv() {
+                            match queued_event {
+                                AppEvent::ExternalChange(change) => {
+                                    let _changed_path = change.path;
+                                }
+                                event => pending_events.push_back(event),
+                            }
+                        }
+
+                        let result = save_controller.on_external_change();
+                        if !matches!(&result, SaveFlowResult::NoChanges)
+                            && send_save_result(&gui_event_tx, result).is_err()
+                        {
+                            return;
+                        }
+                    }
                     AppEvent::Shutdown => return,
                 }
             }
@@ -114,14 +161,12 @@ fn main() -> anyhow::Result<()> {
     let gui_engine: Arc<dyn EditorEngine> = engine;
     let gui_result = fyler_gui::app::run(gui_engine, gui_event_rx, confirm_tx);
     let _ = app_event_tx.send(AppEvent::Shutdown);
+    drop(watcher);
+    let _ = watch_bridge.join();
     let _ = event_bridge.join();
     let _ = confirm_bridge.join();
     let _ = editor_bridge.join();
     gui_result
-
-    // M5で追加する配線:
-    // - fyler_fsops::watch → 再スキャン・再描画(dirty中は通知のみ)
-    // - アプリmanifestに longPathAware を入れる(ビルド設定)
 }
 
 fn send_save_result(
@@ -139,6 +184,19 @@ fn send_save_result(
             gui_event_tx.send(GuiEvent::FatalError(format!(
                 "実行後の再読込に失敗しました。安全のため編集を停止します: {error}"
             )))
+        }
+        SaveFlowResult::ExternalChanged => Ok(()),
+        SaveFlowResult::ExternalChangeNotified(text) => {
+            gui_event_tx.send(GuiEvent::Editor(EditorEvent::Message(EditorMessage {
+                kind: MessageKind::Info,
+                text,
+            })))
+        }
+        SaveFlowResult::ExternalChangeFailed(text) => {
+            gui_event_tx.send(GuiEvent::Editor(EditorEvent::Message(EditorMessage {
+                kind: MessageKind::Error,
+                text,
+            })))
         }
         SaveFlowResult::NoChanges => {
             gui_event_tx.send(GuiEvent::Editor(EditorEvent::Message(EditorMessage {

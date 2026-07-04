@@ -64,7 +64,7 @@
 - [x] **M2 rename限定dry-run** — `spec_m2.rs` 全pass(parse/validate/diff)。確認ダイアログ + 保存フロー配線(fyler-app/save_flow.rs、dry-run保証=承認しても実FS不可)。Windows実機で `:w`→`RENAME a→b` 表示・重複表示バグ修正を目視OK。SaveControllerテスト5件 + headless RPCスモークpass
 - [x] **M3 create / delete / rename 実行** — 同一ボリュームapply(create/delete/rename) + 操作単位CommitReport + 実FS再スキャンreconcileを実装。Linuxでworkspace check/clippy警告ゼロ、対象テスト全pass。Windows実機動作確認は未実施
 - [x] **M4 構造編集** — move/copy + クロスボリューム3分類 + 非原子的操作の進捗付きCommitReportを実装。Linuxでworkspace check/clippy警告ゼロ、対象テスト全pass。Windows実機動作確認は未実施
-- [ ] M5 統合・装飾 ← 次
+- [ ] **M5 統合・装飾** — notify外部変更監視 / OneDriveプレースホルダ属性判定 / ツリーアイコン装飾(カーソル列オフセット補正込み) / longPathAware manifest(embed-manifest) / watch→再スキャン再描画のapp配線(dirty中は通知のみ・自己apply抑制)を実装。**git statusはユーザー判断で今回スコープ外(M5残件)**。Linuxでworkspace check/clippy警告ゼロ・対象テスト全pass(84件)、Windows GNUクロスターゲットでcheck/clippy pass(cfg(windows)のGetFileAttributesW判定を含む)。Windows実機動作確認は未実施
 
 各マイルストーンの完了条件は DESIGN.md「マイルストーン」章を参照。
 完了したらこのチェックリストを更新すること。

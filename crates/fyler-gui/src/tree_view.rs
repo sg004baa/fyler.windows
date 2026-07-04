@@ -3,7 +3,7 @@
 use eframe::egui;
 use fyler_core::editor::{EditorSnapshot, Mode};
 
-use crate::conceal;
+use crate::{conceal, icon};
 
 /// snapshotのバッファ行をツリーとして描画する。
 ///
@@ -25,20 +25,41 @@ pub fn draw(ui: &mut egui::Ui, snapshot: &EditorSnapshot) {
             for (line_index, line) in snapshot.lines.iter().enumerate() {
                 let concealed = conceal::conceal_line(&line.text);
                 let painter = ui.painter().clone();
-                let galley = painter.layout_no_wrap(
+                let icon_galley = painter.layout_no_wrap(
+                    format!("{} ", icon::for_display_name(concealed.display)),
+                    font_id.clone(),
+                    text_color,
+                );
+                let text_galley = painter.layout_no_wrap(
                     concealed.display.to_owned(),
                     font_id.clone(),
                     text_color,
                 );
-                let height = row_height.max(galley.size().y);
-                let width = ui.available_width().max(galley.size().x);
+                let icon_width = icon_galley.size().x;
+                let height = row_height
+                    .max(icon_galley.size().y)
+                    .max(text_galley.size().y);
+                let width = ui.available_width().max(icon_width + text_galley.size().x);
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
 
-                painter.galley(rect.min, galley, text_color);
+                painter.galley(rect.min, icon_galley, text_color);
+                painter.galley(
+                    egui::pos2(rect.left() + icon_width, rect.top()),
+                    text_galley,
+                    text_color,
+                );
 
                 if snapshot.cursor.line == line_index {
-                    draw_cursor(ui, rect, concealed.display, &line.text, snapshot, &font_id);
+                    draw_cursor(
+                        ui,
+                        rect,
+                        concealed.display,
+                        &line.text,
+                        snapshot,
+                        &font_id,
+                        icon_width,
+                    );
                 }
             }
         });
@@ -51,6 +72,7 @@ fn draw_cursor(
     raw: &str,
     snapshot: &EditorSnapshot,
     font_id: &egui::FontId,
+    text_offset: f32,
 ) {
     let display_cursor = conceal::display_cursor(raw, snapshot.cursor);
     let byte_index = valid_byte_index(display, display_cursor.col);
@@ -79,7 +101,7 @@ fn draw_cursor(
         .size()
         .x
         .max(1.0);
-    let cursor_x = row_rect.left() + before_width;
+    let cursor_x = row_rect.left() + text_offset + before_width;
 
     match snapshot.mode {
         Mode::Insert | Mode::Cmdline => {

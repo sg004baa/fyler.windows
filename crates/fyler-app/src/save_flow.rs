@@ -20,6 +20,9 @@ pub enum SaveFlowResult {
     ShowValidationErrors(Vec<ValidateError>),
     ShowReport(CommitReport),
     ReconcileFailed { report: CommitReport, error: String },
+    ExternalChanged,
+    ExternalChangeNotified(String),
+    ExternalChangeFailed(String),
     NoChanges,
     Cancelled,
     Ignored,
@@ -98,6 +101,42 @@ impl SaveController {
             }
             ConfirmChoice::Approve => self.approve_and_apply(),
         }
+    }
+
+    pub fn on_external_change(&mut self) -> SaveFlowResult {
+        let baseline = match fyler_fsops::scan::rescan_preserving_ids(
+            &self.root,
+            &mut self.ids,
+            &self.baseline,
+        )
+        .context("外部変更後の実FS再スキャンに失敗しました")
+        {
+            Ok(baseline) => baseline,
+            Err(error) => return SaveFlowResult::ExternalChangeFailed(error.to_string()),
+        };
+
+        if baseline == self.baseline {
+            return SaveFlowResult::NoChanges;
+        }
+
+        if self.engine.snapshot().dirty {
+            return SaveFlowResult::ExternalChangeNotified(
+                "外部でファイルが変更されました。編集中のため表示は更新していません".to_owned(),
+            );
+        }
+
+        let lines = baseline_to_lines(&baseline);
+        if let Err(error) = self
+            .engine
+            .send(EditorCommand::SetLines(lines))
+            .context("外部変更後のバッファ行をエンジンへ送信できません")
+        {
+            return SaveFlowResult::ExternalChangeFailed(error.to_string());
+        }
+
+        self.baseline = baseline;
+        self.context = EditContext::default();
+        SaveFlowResult::ExternalChanged
     }
 
     #[cfg(test)]
@@ -214,6 +253,7 @@ pub(crate) fn baseline_to_lines(baseline: &BaselineTree) -> Vec<EditorLine> {
 mod tests {
     use std::fs;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use fyler_core::editor::EditorSnapshot;
     use fyler_core::id::EntryId;
@@ -227,6 +267,13 @@ mod tests {
     #[derive(Default)]
     struct RecordingEngine {
         commands: Mutex<Vec<EditorCommand>>,
+        dirty: AtomicBool,
+    }
+
+    impl RecordingEngine {
+        fn set_dirty(&self, dirty: bool) {
+            self.dirty.store(dirty, Ordering::Relaxed);
+        }
     }
 
     impl EditorEngine for RecordingEngine {
@@ -236,7 +283,9 @@ mod tests {
         }
 
         fn snapshot(&self) -> Arc<EditorSnapshot> {
-            Arc::new(EditorSnapshot::empty())
+            let mut snapshot = EditorSnapshot::empty();
+            snapshot.dirty = self.dirty.load(Ordering::Relaxed);
+            Arc::new(snapshot)
         }
     }
 
@@ -424,6 +473,68 @@ mod tests {
             controller.baseline.entries[0].path,
             TreePath::parse("a.txt")
         );
+        assert!(engine.commands.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn external_change_replaces_clean_buffer_and_updates_baseline() {
+        let temp_root = tempdir().unwrap();
+        fs::write(temp_root.path().join("a.txt"), b"a").unwrap();
+        let (mut controller, engine) = controller(temp_root.path());
+        fs::write(temp_root.path().join("b.txt"), b"b").unwrap();
+
+        let result = controller.on_external_change();
+
+        assert_eq!(result, SaveFlowResult::ExternalChanged);
+        assert!(
+            controller
+                .baseline
+                .entries
+                .iter()
+                .any(|entry| entry.path == TreePath::parse("b.txt"))
+        );
+        let commands = engine.commands.lock().unwrap();
+        assert!(matches!(
+            commands.as_slice(),
+            [EditorCommand::SetLines(lines)]
+                if lines.iter().any(|line| line.text.ends_with("b.txt"))
+        ));
+    }
+
+    #[test]
+    fn external_change_does_not_replace_dirty_buffer_or_baseline() {
+        let temp_root = tempdir().unwrap();
+        fs::write(temp_root.path().join("a.txt"), b"a").unwrap();
+        let (mut controller, engine) = controller(temp_root.path());
+        engine.set_dirty(true);
+        fs::write(temp_root.path().join("b.txt"), b"b").unwrap();
+
+        let result = controller.on_external_change();
+
+        assert!(matches!(
+            result,
+            SaveFlowResult::ExternalChangeNotified(ref message)
+                if message.contains("外部でファイルが変更されました")
+        ));
+        assert!(
+            controller
+                .baseline
+                .entries
+                .iter()
+                .all(|entry| entry.path != TreePath::parse("b.txt"))
+        );
+        assert!(engine.commands.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn external_change_matching_baseline_is_ignored() {
+        let temp_root = tempdir().unwrap();
+        fs::write(temp_root.path().join("a.txt"), b"a").unwrap();
+        let (mut controller, engine) = controller(temp_root.path());
+
+        let result = controller.on_external_change();
+
+        assert_eq!(result, SaveFlowResult::NoChanges);
         assert!(engine.commands.lock().unwrap().is_empty());
     }
 }

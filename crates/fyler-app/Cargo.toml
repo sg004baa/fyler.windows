@@ -18,5 +18,8 @@ fyler-gui.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 
+[build-dependencies]
+embed-manifest = "1.5"
+
 [dev-dependencies]
 tempfile = "3"

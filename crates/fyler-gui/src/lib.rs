@@ -11,6 +11,7 @@ pub mod app;
 pub mod cmdline;
 pub mod conceal;
 pub mod confirm;
+pub mod icon;
 pub mod input;
 pub mod modeline;
 pub mod tree_view;
