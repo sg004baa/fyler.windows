@@ -112,7 +112,7 @@ Idle
 - **承認 → Applying**: OperationPlanを実行
 - **Reconcile**: 実ファイルシステムを再スキャンし、バッファを実FSの状態から再構築、baselineを更新、`modified=false` に設定
 - **キャンセル / 全件失敗**: バッファを `modifiable=true` に戻し、dirtyのまま。baselineは更新しない
-- **部分失敗**: CommitReportで成功/失敗を操作単位で提示。成功した操作のみbaselineへ反映し、失敗分に対応する行はdirtyな差分として残す
+- **部分失敗**: CommitReportで成功/失敗を操作単位で提示し、実FSを再スキャンしてbaselineとバッファを実際の状態へreconcileする
 - `BufWriteCmd` に加えて `FileWriteCmd` / `FileAppendCmd`（部分書き込み・別名書き込み）、`BufFilePre`（`:file` / `:saveas`）もハンドルし、同一経路へ誘導またはエラーにする
 
 ## パイプライン

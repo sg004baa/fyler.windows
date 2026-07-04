@@ -17,3 +17,6 @@ fyler-fsops.workspace = true
 fyler-gui.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

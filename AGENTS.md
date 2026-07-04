@@ -62,8 +62,8 @@
 - [x] **M0 成立性スパイク** — `crates/m0-spike` で #1..#4 を実nvim(Windows実機)検証し ALL PASS。`docs/M0_RESULTS.md` 記録済み
 - [x] **M1 read-only表示** — nvim spawn/RPC/snapshot同期 + eframe描画 + クラッシュ検知を実装。Windows実機(nvim v0.11.6)でGUI目視OK・コンソール窓なし。headless RPCスモークpass(実nvim)
 - [x] **M2 rename限定dry-run** — `spec_m2.rs` 全pass(parse/validate/diff)。確認ダイアログ + 保存フロー配線(fyler-app/save_flow.rs、dry-run保証=承認しても実FS不可)。Windows実機で `:w`→`RENAME a→b` 表示・重複表示バグ修正を目視OK。SaveControllerテスト5件 + headless RPCスモークpass
-- [ ] M3 create / delete / rename 実行 ← いまここ
-- [ ] M4 構造編集(move / copy・クロスボリューム)
+- [x] **M3 create / delete / rename 実行** — 同一ボリュームapply(create/delete/rename) + 操作単位CommitReport + 実FS再スキャンreconcileを実装。Linuxでworkspace check/clippy警告ゼロ、対象テスト全pass。Windows実機動作確認は未実施
+- [ ] M4 構造編集(move / copy・クロスボリューム) ← 次
 - [ ] M5 統合・装飾
 
 各マイルストーンの完了条件は DESIGN.md「マイルストーン」章を参照。

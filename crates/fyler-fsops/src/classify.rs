@@ -23,6 +23,6 @@ pub enum MoveClass {
 /// 実装契約(Windows): ボリューム判定は `GetVolumePathNameW` 等で
 /// 実際のマウントポイントを比較する(ドライブレターの文字比較だけでは
 /// junction・マウントされたボリュームで誤判定する)。
-pub fn classify_move(from: &Path, to: &Path, kind: EntryKind) -> anyhow::Result<MoveClass> {
+pub fn classify_move(_from: &Path, _to: &Path, _kind: EntryKind) -> anyhow::Result<MoveClass> {
     todo!("M4: ボリューム判定(同一ボリューム限定のM3では常にSameVolumeRenameを前提としてよい)")
 }

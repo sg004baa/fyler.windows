@@ -1297,6 +1297,7 @@ dependencies = [
  "fyler-fsops",
  "fyler-gui",
  "fyler-pipeline",
+ "tempfile",
  "tokio",
 ]
 
@@ -1328,6 +1329,7 @@ dependencies = [
  "anyhow",
  "fyler-core",
  "notify",
+ "tempfile",
  "trash",
  "windows 0.62.2",
 ]

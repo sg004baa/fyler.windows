@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use anyhow::Context;
+
 /// ファイル/ディレクトリをごみ箱へ移動する。
 ///
 /// 実装契約:
@@ -10,5 +12,5 @@ use std::path::Path;
 ///   (tokioのワーカースレッドに直接投げられない。DESIGN.md「その他の対応事項」)。
 ///   置き換え時はこの関数のシグネチャは変えず内部実装だけ差し替えること
 pub fn delete_to_recycle_bin(path: &Path) -> anyhow::Result<()> {
-    todo!("M3: trash::delete による削除")
+    trash::delete(path).with_context(|| format!("ごみ箱へ移動できません: {}", path.display()))
 }

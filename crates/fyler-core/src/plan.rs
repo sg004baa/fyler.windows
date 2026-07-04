@@ -5,7 +5,7 @@ use crate::path::TreePath;
 use crate::tree::EntryKind;
 
 /// 1件のファイル操作。パスはすべて表示ルート相対の [`TreePath`]
-/// (実FSパス・`\\?\` への変換はfsops層の責務)。
+/// (実FSパス・OS固有形式への変換はfsops層の責務)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FsOperation {
     /// IDのない行 → 新規作成。

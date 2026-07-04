@@ -83,8 +83,7 @@ pub enum SaveEffect {
     ShowCommitReport(CommitReport),
     /// 実FSを再スキャンし、バッファを実FSの状態から再構築、baselineを更新、
     /// `modified=false` に設定する。
-    /// 部分失敗時: 成功した操作のみbaselineへ反映し、失敗分に対応する行は
-    /// dirtyな差分として残す。
+    /// 部分失敗時も実FSを正典としてbaselineとバッファを作り直す。
     ReconcileFromFs,
     /// キャンセル / 全件失敗: baselineは更新しない。バッファはdirtyのまま。
     KeepBufferDirty,

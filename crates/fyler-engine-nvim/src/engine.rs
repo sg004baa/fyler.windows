@@ -366,6 +366,9 @@ async fn handle_command(
                 .await
                 .map_err(|error| anyhow::anyhow!("テキスト入力RPCに失敗しました: {error}"))?;
         }
+        EngineCommand::Editor(EditorCommand::SetLines(editor_lines)) => {
+            replace_buffer_lines(nvim, buffer, editor_lines, "reconcile").await?;
+        }
         EngineCommand::Editor(EditorCommand::RequestCommit) => {
             nvim.command("write")
                 .await
@@ -382,34 +385,45 @@ async fn handle_command(
                 .map_err(|error| anyhow::anyhow!("redo RPCに失敗しました: {error}"))?;
         }
         EngineCommand::SetInitialLines(editor_lines) => {
-            let new_lines: Vec<String> = if editor_lines.is_empty() {
-                vec![String::new()]
-            } else {
-                editor_lines.into_iter().map(|line| line.text).collect()
-            };
-            buffer
-                .set_lines(0, -1, false, new_lines.clone())
-                .await
-                .map_err(|error| anyhow::anyhow!("初期バッファ行を設定できません: {error}"))?;
-            buffer
-                .set_option("modified", Value::Boolean(false))
-                .await
-                .map_err(|error| anyhow::anyhow!("初期バッファをcleanにできません: {error}"))?;
-
-            let first_column = new_lines
-                .first()
-                .map(|line| fyler_core::grammar::id_prefix_len(line))
-                .unwrap_or_default();
-            let window = nvim
-                .get_current_win()
-                .await
-                .map_err(|error| anyhow::anyhow!("初期ウィンドウを取得できません: {error}"))?;
-            window
-                .set_cursor((1, first_column as i64))
-                .await
-                .map_err(|error| anyhow::anyhow!("初期カーソルを設定できません: {error}"))?;
+            replace_buffer_lines(nvim, buffer, editor_lines, "初期化").await?;
         }
     }
+
+    Ok(())
+}
+
+async fn replace_buffer_lines(
+    nvim: &Nvim,
+    buffer: &Buffer<NvimWriter>,
+    editor_lines: Vec<EditorLine>,
+    purpose: &str,
+) -> anyhow::Result<()> {
+    let new_lines: Vec<String> = if editor_lines.is_empty() {
+        vec![String::new()]
+    } else {
+        editor_lines.into_iter().map(|line| line.text).collect()
+    };
+    buffer
+        .set_lines(0, -1, false, new_lines.clone())
+        .await
+        .map_err(|error| anyhow::anyhow!("{purpose}のバッファ行を設定できません: {error}"))?;
+    buffer
+        .set_option("modified", Value::Boolean(false))
+        .await
+        .map_err(|error| anyhow::anyhow!("{purpose}後にバッファをcleanにできません: {error}"))?;
+
+    let first_column = new_lines
+        .first()
+        .map(|line| fyler_core::grammar::id_prefix_len(line))
+        .unwrap_or_default();
+    let window = nvim
+        .get_current_win()
+        .await
+        .map_err(|error| anyhow::anyhow!("{purpose}対象のウィンドウを取得できません: {error}"))?;
+    window
+        .set_cursor((1, first_column as i64))
+        .await
+        .map_err(|error| anyhow::anyhow!("{purpose}後のカーソルを設定できません: {error}"))?;
 
     Ok(())
 }

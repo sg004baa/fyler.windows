@@ -1,12 +1,10 @@
-//! 確認ダイアログ(dry-run表示)とCommitReport表示。
+//! 確認ダイアログとCommitReport表示。
 //!
-//! **絶対ルール1**: ここでの承認なしに実FSへ触れない。M2のゴールは
-//! 「`i` でrenameを書いて `:w` するとダイアログに `RENAME a → b` が出る」
-//! (実行はしない)。
+//! **絶対ルール1**: ここでの承認なしに実FSへ触れない。
 
 use eframe::egui;
 use fyler_core::plan::{FsOperation, OperationPlan};
-use fyler_core::report::CommitReport;
+use fyler_core::report::{CommitReport, OpOutcome, OpResult};
 use fyler_core::validate::ValidateError;
 
 /// ユーザーの選択。
@@ -22,7 +20,7 @@ pub enum ConfirmChoice {
 /// - 操作を1件1行で人間可読に表示する(例: `RENAME a.txt → b.txt`、
 ///   `DELETE src/old.rs (ごみ箱へ)`、`COPY a.txt → b.txt`)
 /// - 表示中はGUIの入力ゲートでエンジンへの入力転送を止める
-/// - 選択結果はapp層の保存フローへ返す(M2のApproveはdry-run終了として扱う)
+/// - 選択結果はapp層の保存フローへ返す
 pub fn draw_plan(ui: &mut egui::Ui, plan: &OperationPlan) -> Option<ConfirmChoice> {
     egui::Modal::new(egui::Id::new("save-plan-confirmation"))
         .show(ui.ctx(), |ui| {
@@ -57,8 +55,49 @@ pub fn draw_validation_errors(ui: &mut egui::Ui, errors: &[ValidateError]) {
 
 /// CommitReportの表示。部分失敗時は操作単位の成功/失敗と、
 /// 非原子的操作の進捗(`OpOutcome::Failed.progress`)を明示する。
-pub fn draw_report(ui: &mut egui::Ui, report: &CommitReport) {
-    todo!("M3: CommitReport表示")
+/// 閉じるボタンが押されたら `true` を返す。
+pub fn draw_report(ui: &mut egui::Ui, report: &CommitReport) -> bool {
+    egui::Modal::new(egui::Id::new("save-commit-report"))
+        .show(ui.ctx(), |ui| {
+            ui.heading("実行結果");
+            ui.add_space(8.0);
+
+            for result in &report.results {
+                let label = report_label(result);
+                match &result.outcome {
+                    OpOutcome::Success => {
+                        ui.monospace(label);
+                    }
+                    OpOutcome::Failed { .. } => {
+                        ui.colored_label(ui.visuals().error_fg_color, label);
+                    }
+                    OpOutcome::Skipped { .. } => {
+                        ui.monospace(label);
+                    }
+                }
+            }
+
+            ui.add_space(12.0);
+            ui.button("閉じる").clicked()
+        })
+        .inner
+}
+
+fn report_label(result: &OpResult) -> String {
+    let operation = operation_label(&result.op);
+    match &result.outcome {
+        OpOutcome::Success => format!("OK  {operation}"),
+        OpOutcome::Failed { error, progress } => {
+            let progress = progress
+                .as_deref()
+                .map(|progress| format!(" / 進捗: {progress}"))
+                .unwrap_or_default();
+            format!("NG  {operation} (理由: {error}{progress})")
+        }
+        OpOutcome::Skipped { reason } => {
+            format!("--  SKIP {operation} (理由: {reason})")
+        }
+    }
 }
 
 fn operation_label(operation: &FsOperation) -> String {
@@ -119,6 +158,25 @@ mod tests {
         assert_eq!(
             validation_error_label(&error),
             "行1: IDプレフィックスが壊れています。undoで戻すか行を削除してください"
+        );
+    }
+
+    #[test]
+    fn report_labels_include_failure_progress() {
+        let result = OpResult {
+            op: FsOperation::Copy {
+                src: EntryId(1),
+                from: TreePath::parse("a.txt"),
+                to: TreePath::parse("b.txt"),
+            },
+            outcome: OpOutcome::Failed {
+                error: "copy failed".to_owned(),
+                progress: Some("2/3 files".to_owned()),
+            },
+        };
+        assert_eq!(
+            report_label(&result),
+            "NG  COPY a.txt → b.txt (理由: copy failed / 進捗: 2/3 files)"
         );
     }
 }

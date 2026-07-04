@@ -12,6 +12,6 @@ pub const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
 /// - 属性取得のみで判定する(データを読まない)
 /// - サイズ取得・プレビュー・ハッシュ等、**内容に触れる処理の前に必ずこれを確認**し、
 ///   プレースホルダに対しては不要なhydrationを発生させない
-pub fn is_cloud_placeholder(path: &Path) -> anyhow::Result<bool> {
+pub fn is_cloud_placeholder(_path: &Path) -> anyhow::Result<bool> {
     todo!("M5: GetFileAttributesW による属性確認")
 }

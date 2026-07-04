@@ -1,8 +1,8 @@
 //! ルート相対のツリー内パス。
 //!
-//! parse / validate / diff 層はOSのパス表現(`\` 区切り・`\\?\` 等)に依存しては
+//! parse / validate / diff 層はOSのパス表現(区切りや拡張長パス形式)に依存しては
 //! ならないため、コンポーネント列としてパスを扱う。実FSパスへの変換は
-//! [`TreePath::to_fs_path`] だけで行い、`\\?\` 変換はfsops層(long_path)の責務。
+//! [`TreePath::to_fs_path`] だけで行い、OS固有変換はfsops層(long_path)の責務。
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -77,7 +77,7 @@ impl TreePath {
         self.0.len() < other.0.len() && other.0[..self.0.len()] == self.0[..]
     }
 
-    /// 実FSパスへ変換する。`\\?\` 等の変換はここではしない(fsops::long_pathの責務)。
+    /// 実FSパスへ変換する。OS固有変換はここではしない(fsops::long_pathの責務)。
     pub fn to_fs_path(&self, root: &Path) -> PathBuf {
         self.0.iter().fold(root.to_path_buf(), |p, c| p.join(c))
     }

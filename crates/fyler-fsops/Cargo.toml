@@ -14,3 +14,6 @@ notify.workspace = true
 # windowsクレートに依存してよいのはこのクレートだけ(AGENTS.md 絶対ルール3の周辺)
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

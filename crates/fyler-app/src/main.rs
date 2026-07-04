@@ -9,14 +9,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::thread;
 
-use fyler_core::editor::{EditorEngine, EditorEvent, EditorLine, EditorMessage, MessageKind};
+use fyler_core::editor::{EditorEngine, EditorEvent, EditorMessage, MessageKind};
 use fyler_core::id::IdAllocator;
-use fyler_core::tree::EntryKind;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
 use fyler_gui::app::GuiEvent;
 use fyler_gui::confirm::ConfirmChoice;
 
-use crate::save_flow::{SaveController, SaveFlowResult};
+use crate::save_flow::{SaveController, SaveFlowResult, baseline_to_lines};
 
 enum AppEvent {
     Editor(EditorEvent),
@@ -49,26 +48,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut ids = IdAllocator::new();
     let baseline = fyler_fsops::scan::scan_baseline(&root, &mut ids)?;
-    let initial_lines = baseline
-        .entries
-        .iter()
-        .map(|entry| {
-            let indent = " "
-                .repeat(entry.path.depth().saturating_sub(1) * fyler_core::grammar::INDENT_WIDTH);
-            let directory_suffix = if entry.kind == EntryKind::Dir {
-                fyler_core::grammar::DIR_SUFFIX.to_string()
-            } else {
-                String::new()
-            };
-            EditorLine::new(format!(
-                "{}{}{}{}",
-                fyler_core::grammar::format_id_prefix(entry.id),
-                indent,
-                entry.path.name().unwrap_or_default(),
-                directory_suffix,
-            ))
-        })
-        .collect();
+    let initial_lines = baseline_to_lines(&baseline);
     engine.set_initial_lines(initial_lines)?;
 
     // tokioのengine channelとGUIのstd channelをapp内の1本へ集約する。
@@ -100,10 +80,12 @@ fn main() -> anyhow::Result<()> {
 
     // GUIクレートへtokio型を漏らさず、core型とConfirmChoiceだけを受け渡す。
     let (gui_event_tx, gui_event_rx) = mpsc::channel();
+    let save_root = root.clone();
+    let save_engine: Arc<dyn EditorEngine> = engine.clone();
     let event_bridge = thread::Builder::new()
         .name("fyler-app-events".to_owned())
         .spawn(move || {
-            let mut save_controller = SaveController::new(baseline);
+            let mut save_controller = SaveController::new(save_root, ids, baseline, save_engine);
             while let Ok(event) = app_event_rx.recv() {
                 match event {
                     AppEvent::Editor(EditorEvent::CommitRequested { changedtick, lines }) => {
@@ -151,6 +133,13 @@ fn send_save_result(
         SaveFlowResult::ShowValidationErrors(errors) => {
             gui_event_tx.send(GuiEvent::ShowValidationErrors(errors))
         }
+        SaveFlowResult::ShowReport(report) => gui_event_tx.send(GuiEvent::ShowReport(report)),
+        SaveFlowResult::ReconcileFailed { report, error } => {
+            gui_event_tx.send(GuiEvent::ShowReport(report))?;
+            gui_event_tx.send(GuiEvent::FatalError(format!(
+                "実行後の再読込に失敗しました。安全のため編集を停止します: {error}"
+            )))
+        }
         SaveFlowResult::NoChanges => {
             gui_event_tx.send(GuiEvent::Editor(EditorEvent::Message(EditorMessage {
                 kind: MessageKind::Info,
@@ -158,13 +147,6 @@ fn send_save_result(
             })))
         }
         SaveFlowResult::Cancelled => gui_event_tx.send(GuiEvent::CloseDialog),
-        SaveFlowResult::ApprovedDryRun => {
-            gui_event_tx.send(GuiEvent::CloseDialog)?;
-            gui_event_tx.send(GuiEvent::Editor(EditorEvent::Message(EditorMessage {
-                kind: MessageKind::Info,
-                text: "承認されました (実行はM3で実装)".to_owned(),
-            })))
-        }
         SaveFlowResult::Ignored => Ok(()),
     }
 }

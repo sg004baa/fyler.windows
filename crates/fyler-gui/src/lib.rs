@@ -7,9 +7,6 @@
 //! 依存境界: エンジンには `fyler_core::editor` のトレイト/型経由でのみ触れる。
 //! nvim固有概念をここに書いたら絶対ルール2違反。
 
-// scaffolding: todo!()スタブの引数警告を抑制。実装が入り次第このallowを削除する。
-#![allow(unused_variables)]
-
 pub mod app;
 pub mod cmdline;
 pub mod conceal;

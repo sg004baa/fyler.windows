@@ -1,5 +1,6 @@
 //! baselineスキャン: 実FS → BaselineTree(ID採番)。
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
@@ -28,6 +29,35 @@ use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 ///   collapsed move追従に必要)。ただし深い階層の遅延スキャンにするかはM1で判断し、
 ///   遅延にする場合はEditContext/diffの契約と整合させること
 pub fn scan_baseline(root: &Path, ids: &mut IdAllocator) -> anyhow::Result<BaselineTree> {
+    scan_with_id_resolver(root, |_: &TreePath| ids.allocate())
+}
+
+/// 実FSを再スキャンし、同じパスに存在し続けるエントリのIDを維持する。
+///
+/// 前回baselineにないパスだけを [`IdAllocator`] から新規採番する。走査順、
+/// symlink非潜行、エントリ種別の判定は [`scan_baseline`] と共通である。
+pub fn rescan_preserving_ids(
+    root: &Path,
+    ids: &mut IdAllocator,
+    previous: &BaselineTree,
+) -> anyhow::Result<BaselineTree> {
+    let previous_ids: HashMap<TreePath, _> = previous
+        .entries
+        .iter()
+        .map(|entry| (entry.path.clone(), entry.id))
+        .collect();
+    scan_with_id_resolver(root, |path| {
+        previous_ids
+            .get(path)
+            .copied()
+            .unwrap_or_else(|| ids.allocate())
+    })
+}
+
+fn scan_with_id_resolver(
+    root: &Path,
+    mut resolve_id: impl FnMut(&TreePath) -> fyler_core::id::EntryId,
+) -> anyhow::Result<BaselineTree> {
     let root_metadata = fs::symlink_metadata(root)
         .with_context(|| format!("表示ルートのメタデータを取得できません: {}", root.display()))?;
     if is_link_or_reparse(&root_metadata) {
@@ -41,14 +71,14 @@ pub fn scan_baseline(root: &Path, ids: &mut IdAllocator) -> anyhow::Result<Basel
     }
 
     let mut tree = BaselineTree::new(root);
-    scan_directory(root, &TreePath::root(), ids, &mut tree)?;
+    scan_directory(root, &TreePath::root(), &mut resolve_id, &mut tree)?;
     Ok(tree)
 }
 
 fn scan_directory(
     directory: &Path,
     relative: &TreePath,
-    ids: &mut IdAllocator,
+    resolve_id: &mut impl FnMut(&TreePath) -> fyler_core::id::EntryId,
     tree: &mut BaselineTree,
 ) -> anyhow::Result<()> {
     let mut stack = vec![ScanFrame {
@@ -89,7 +119,7 @@ fn scan_directory(
         };
 
         tree.insert(BaselineEntry {
-            id: ids.allocate(),
+            id: resolve_id(&path),
             path: path.clone(),
             kind,
         });
@@ -142,5 +172,56 @@ fn is_link_or_reparse(metadata: &Metadata) -> bool {
     #[cfg(not(windows))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn rescan_preserves_existing_ids_and_allocates_new_ones() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("kept.txt"), b"kept").unwrap();
+        fs::write(root.path().join("removed.txt"), b"removed").unwrap();
+        let mut ids = IdAllocator::new();
+        let previous = scan_baseline(root.path(), &mut ids).unwrap();
+        let kept_id = previous
+            .entries
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("kept.txt"))
+            .unwrap()
+            .id;
+
+        fs::remove_file(root.path().join("removed.txt")).unwrap();
+        fs::write(root.path().join("new.txt"), b"new").unwrap();
+        let rescanned = rescan_preserving_ids(root.path(), &mut ids, &previous).unwrap();
+
+        assert_eq!(
+            rescanned
+                .entries
+                .iter()
+                .find(|entry| entry.path == TreePath::parse("kept.txt"))
+                .unwrap()
+                .id,
+            kept_id
+        );
+        let new_id = rescanned
+            .entries
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("new.txt"))
+            .unwrap()
+            .id;
+        assert_ne!(new_id, kept_id);
+        assert!(
+            rescanned
+                .entries
+                .iter()
+                .all(|entry| entry.path != TreePath::parse("removed.txt"))
+        );
     }
 }

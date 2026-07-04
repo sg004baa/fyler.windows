@@ -1,12 +1,15 @@
-//! M2の保存フロー: parse → validate → diff → dry-run確認。
-//!
-//! 実ファイル操作はM3でのみ追加する。このモジュールには実行APIへの経路を持たせず、
-//! 承認時にも `Applying` へ遷移しない。
+//! 保存フロー: parse → validate → diff → confirm → apply → reconcile。
 
-use fyler_core::editor::EditorLine;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::Context;
+use fyler_core::editor::{EditorCommand, EditorEngine, EditorLine};
+use fyler_core::id::IdAllocator;
 use fyler_core::plan::OperationPlan;
+use fyler_core::report::CommitReport;
 use fyler_core::save::{self, SaveEffect, SaveEvent, SaveState};
-use fyler_core::tree::{BaselineTree, EditContext};
+use fyler_core::tree::{BaselineTree, EditContext, EntryKind};
 use fyler_core::validate::ValidateError;
 use fyler_gui::confirm::ConfirmChoice;
 
@@ -15,24 +18,36 @@ use fyler_gui::confirm::ConfirmChoice;
 pub enum SaveFlowResult {
     ShowPlan(OperationPlan),
     ShowValidationErrors(Vec<ValidateError>),
+    ShowReport(CommitReport),
+    ReconcileFailed { report: CommitReport, error: String },
     NoChanges,
     Cancelled,
-    ApprovedDryRun,
     Ignored,
 }
 
 pub struct SaveController {
     state: SaveState,
+    root: PathBuf,
+    ids: IdAllocator,
     baseline: BaselineTree,
     context: EditContext,
+    engine: Arc<dyn EditorEngine>,
 }
 
 impl SaveController {
-    pub fn new(baseline: BaselineTree) -> Self {
+    pub fn new(
+        root: PathBuf,
+        ids: IdAllocator,
+        baseline: BaselineTree,
+        engine: Arc<dyn EditorEngine>,
+    ) -> Self {
         Self {
             state: SaveState::Idle,
+            root,
+            ids,
             baseline,
             context: EditContext::default(),
+            engine,
         }
     }
 
@@ -76,19 +91,12 @@ impl SaveController {
             return SaveFlowResult::Ignored;
         }
 
-        // M2のApproveはdry-run完了を意味する。SaveEvent::ApprovedはApplyingへ進み
-        // ExecutePlanを返すため、M2では発火させない。Cancelと同じ安全な終了遷移で
-        // Idleへ戻し、baselineを更新せずbufferをdirtyのまま保つ。
-        let effects = self.apply_event(SaveEvent::Cancelled);
-        debug_assert!(
-            !effects
-                .iter()
-                .any(|effect| matches!(effect, SaveEffect::ExecutePlan))
-        );
-
         match choice {
-            ConfirmChoice::Approve => SaveFlowResult::ApprovedDryRun,
-            ConfirmChoice::Cancel => SaveFlowResult::Cancelled,
+            ConfirmChoice::Cancel => {
+                self.apply_event(SaveEvent::Cancelled);
+                SaveFlowResult::Cancelled
+            }
+            ConfirmChoice::Approve => self.approve_and_apply(),
         }
     }
 
@@ -110,6 +118,67 @@ impl SaveController {
             .unwrap_or(SaveFlowResult::Ignored)
     }
 
+    fn approve_and_apply(&mut self) -> SaveFlowResult {
+        let effects = self.apply_event(SaveEvent::Approved);
+        if !effects
+            .iter()
+            .any(|effect| matches!(effect, SaveEffect::ExecutePlan))
+        {
+            return SaveFlowResult::Ignored;
+        }
+
+        let plan = match &self.state {
+            SaveState::Applying { plan, .. } => plan.clone(),
+            _ => return SaveFlowResult::Ignored,
+        };
+
+        // 絶対ルール1: apply_planは、ApprovedでApplyingへ遷移した上の経路からだけ呼ぶ。
+        let report = fyler_fsops::apply::apply_plan(&self.root, &plan);
+        let effects = self.apply_event(SaveEvent::ApplyFinished {
+            report: report.clone(),
+        });
+        debug_assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, SaveEffect::ShowCommitReport(_)))
+        );
+
+        if effects
+            .iter()
+            .any(|effect| matches!(effect, SaveEffect::ReconcileFromFs))
+        {
+            if let Err(error) = self.reconcile_from_fs() {
+                return SaveFlowResult::ReconcileFailed {
+                    report,
+                    error: error.to_string(),
+                };
+            }
+        }
+
+        SaveFlowResult::ShowReport(report)
+    }
+
+    fn reconcile_from_fs(&mut self) -> anyhow::Result<()> {
+        let baseline =
+            fyler_fsops::scan::rescan_preserving_ids(&self.root, &mut self.ids, &self.baseline)
+                .context("実FSの再スキャンに失敗しました")?;
+        let lines = baseline_to_lines(&baseline);
+        self.engine
+            .send(EditorCommand::SetLines(lines))
+            .context("reconcile後のバッファ行をエンジンへ送信できません")?;
+
+        self.baseline = baseline;
+        self.context = EditContext::default();
+        let effects = self.apply_event(SaveEvent::ReconcileFinished);
+        debug_assert!(matches!(self.state, SaveState::Idle));
+        debug_assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, SaveEffect::SetModifiable(true)))
+        );
+        Ok(())
+    }
+
     fn apply_event(&mut self, event: SaveEvent) -> Vec<SaveEffect> {
         let state = std::mem::replace(&mut self.state, SaveState::Idle);
         let (state, effects) = save::transition(state, event);
@@ -118,26 +187,78 @@ impl SaveController {
     }
 }
 
+pub(crate) fn baseline_to_lines(baseline: &BaselineTree) -> Vec<EditorLine> {
+    baseline
+        .entries
+        .iter()
+        .map(|entry| {
+            let indent = " "
+                .repeat(entry.path.depth().saturating_sub(1) * fyler_core::grammar::INDENT_WIDTH);
+            let directory_suffix = if entry.kind == EntryKind::Dir {
+                fyler_core::grammar::DIR_SUFFIX.to_string()
+            } else {
+                String::new()
+            };
+            EditorLine::new(format!(
+                "{}{}{}{}",
+                fyler_core::grammar::format_id_prefix(entry.id),
+                indent,
+                entry.path.name().unwrap_or_default(),
+                directory_suffix,
+            ))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
 
+    use fyler_core::editor::EditorSnapshot;
     use fyler_core::id::EntryId;
     use fyler_core::path::TreePath;
     use fyler_core::plan::FsOperation;
     use fyler_core::tree::{BaselineEntry, EntryKind};
+    use tempfile::tempdir;
 
     use super::*;
 
-    fn baseline(root: impl Into<std::path::PathBuf>) -> BaselineTree {
+    #[derive(Default)]
+    struct RecordingEngine {
+        commands: Mutex<Vec<EditorCommand>>,
+    }
+
+    impl EditorEngine for RecordingEngine {
+        fn send(&self, command: EditorCommand) -> anyhow::Result<()> {
+            self.commands.lock().unwrap().push(command);
+            Ok(())
+        }
+
+        fn snapshot(&self) -> Arc<EditorSnapshot> {
+            Arc::new(EditorSnapshot::empty())
+        }
+    }
+
+    fn baseline(root: impl Into<PathBuf>) -> (BaselineTree, IdAllocator) {
+        let mut ids = IdAllocator::new();
+        let id = ids.allocate();
         let mut baseline = BaselineTree::new(root);
         baseline.insert(BaselineEntry {
-            id: EntryId(1),
+            id,
             path: TreePath::parse("a.txt"),
             kind: EntryKind::File,
         });
-        baseline
+        (baseline, ids)
+    }
+
+    fn controller(root: impl Into<PathBuf>) -> (SaveController, Arc<RecordingEngine>) {
+        let root = root.into();
+        let (baseline, ids) = baseline(&root);
+        let engine = Arc::new(RecordingEngine::default());
+        let controller =
+            SaveController::new(root, ids, baseline, Arc::<RecordingEngine>::clone(&engine));
+        (controller, engine)
     }
 
     fn lines(lines: &[&str]) -> Vec<EditorLine> {
@@ -146,7 +267,7 @@ mod tests {
 
     #[test]
     fn rename_returns_confirmation_plan() {
-        let mut controller = SaveController::new(baseline("C:/test-root"));
+        let (mut controller, _) = controller("C:/test-root");
 
         let result = controller.on_commit(7, &lines(&["/001 b.txt"]));
 
@@ -168,7 +289,7 @@ mod tests {
 
     #[test]
     fn reserved_character_returns_validation_errors() {
-        let mut controller = SaveController::new(baseline("C:/test-root"));
+        let (mut controller, _) = controller("C:/test-root");
 
         let result = controller.on_commit(1, &lines(&["/001 bad<name.txt"]));
 
@@ -185,7 +306,7 @@ mod tests {
 
     #[test]
     fn broken_prefix_returns_validation_errors() {
-        let mut controller = SaveController::new(baseline("C:/test-root"));
+        let (mut controller, _) = controller("C:/test-root");
 
         let result = controller.on_commit(1, &lines(&["/0"]));
 
@@ -199,7 +320,7 @@ mod tests {
 
     #[test]
     fn unchanged_buffer_skips_confirmation_and_returns_to_idle() {
-        let mut controller = SaveController::new(baseline("C:/test-root"));
+        let (mut controller, _) = controller("C:/test-root");
 
         let result = controller.on_commit(1, &lines(&["/001 a.txt"]));
 
@@ -208,18 +329,85 @@ mod tests {
     }
 
     #[test]
-    fn approve_is_dry_run_and_does_not_touch_filesystem() {
-        static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
-
-        let temp_root = std::env::temp_dir().join(format!(
-            "fyler-save-flow-{}-{}",
-            std::process::id(),
-            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+    fn approve_applies_rename_and_reconciles_buffer_from_filesystem() {
+        let temp_root = tempdir().unwrap();
+        fs::write(temp_root.path().join("a.txt"), b"content").unwrap();
+        let mut ids = IdAllocator::new();
+        let baseline = fyler_fsops::scan::scan_baseline(temp_root.path(), &mut ids).unwrap();
+        let original_id = baseline.entries[0].id;
+        let engine = Arc::new(RecordingEngine::default());
+        let mut controller = SaveController::new(
+            temp_root.path().to_path_buf(),
+            ids,
+            baseline,
+            Arc::<RecordingEngine>::clone(&engine),
+        );
+        let renamed_line = EditorLine::new(format!(
+            "{}b.txt",
+            fyler_core::grammar::format_id_prefix(original_id)
         ));
-        fs::create_dir(&temp_root).unwrap();
-        fs::write(temp_root.join("a.txt"), b"unchanged").unwrap();
+        assert!(matches!(
+            controller.on_commit(1, &[renamed_line]),
+            SaveFlowResult::ShowPlan(_)
+        ));
 
-        let mut controller = SaveController::new(baseline(&temp_root));
+        let result = controller.on_choice(ConfirmChoice::Approve);
+
+        assert!(matches!(
+            result,
+            SaveFlowResult::ShowReport(ref report) if report.all_succeeded()
+        ));
+        assert!(matches!(controller.state(), SaveState::Idle));
+        assert!(!temp_root.path().join("a.txt").exists());
+        assert_eq!(
+            fs::read(temp_root.path().join("b.txt")).unwrap(),
+            b"content"
+        );
+        assert!(
+            controller
+                .baseline
+                .entries
+                .iter()
+                .any(|entry| entry.path == TreePath::parse("b.txt"))
+        );
+        let commands = engine.commands.lock().unwrap();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            EditorCommand::SetLines(lines)
+                if lines.iter().any(|line| line.text.ends_with("b.txt"))
+                    && lines.iter().all(|line| !line.text.ends_with("a.txt"))
+        )));
+    }
+
+    #[test]
+    fn cancel_leaves_filesystem_and_baseline_unchanged() {
+        let temp_root = tempdir().unwrap();
+        fs::write(temp_root.path().join("a.txt"), b"content").unwrap();
+        let (mut controller, engine) = controller(temp_root.path());
+        assert!(matches!(
+            controller.on_commit(1, &lines(&["/001 b.txt"])),
+            SaveFlowResult::ShowPlan(_)
+        ));
+
+        assert_eq!(
+            controller.on_choice(ConfirmChoice::Cancel),
+            SaveFlowResult::Cancelled
+        );
+
+        assert!(matches!(controller.state(), SaveState::Idle));
+        assert!(temp_root.path().join("a.txt").exists());
+        assert!(!temp_root.path().join("b.txt").exists());
+        assert_eq!(
+            controller.baseline.entries[0].path,
+            TreePath::parse("a.txt")
+        );
+        assert!(engine.commands.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn all_failed_returns_report_without_reconciling() {
+        let temp_root = tempdir().unwrap();
+        let (mut controller, engine) = controller(temp_root.path());
         assert!(matches!(
             controller.on_commit(1, &lines(&["/001 b.txt"])),
             SaveFlowResult::ShowPlan(_)
@@ -227,12 +415,15 @@ mod tests {
 
         let result = controller.on_choice(ConfirmChoice::Approve);
 
-        assert_eq!(result, SaveFlowResult::ApprovedDryRun);
+        assert!(matches!(
+            result,
+            SaveFlowResult::ShowReport(ref report) if report.all_failed()
+        ));
         assert!(matches!(controller.state(), SaveState::Idle));
-        assert_eq!(fs::read(temp_root.join("a.txt")).unwrap(), b"unchanged");
-        assert!(!temp_root.join("b.txt").exists());
-
-        fs::remove_file(temp_root.join("a.txt")).unwrap();
-        fs::remove_dir(temp_root).unwrap();
+        assert_eq!(
+            controller.baseline.entries[0].path,
+            TreePath::parse("a.txt")
+        );
+        assert!(engine.commands.lock().unwrap().is_empty());
     }
 }

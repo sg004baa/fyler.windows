@@ -6,6 +6,7 @@ use std::thread;
 use eframe::egui;
 use fyler_core::editor::{CmdlineState, EditorEngine, EditorEvent, EditorMessage};
 use fyler_core::plan::OperationPlan;
+use fyler_core::report::CommitReport;
 use fyler_core::validate::ValidateError;
 
 use crate::confirm::ConfirmChoice;
@@ -16,13 +17,16 @@ use crate::{cmdline, confirm, input, modeline, tree_view};
 pub enum GuiEvent {
     Editor(EditorEvent),
     ShowPlan(OperationPlan),
+    ShowReport(CommitReport),
     ShowValidationErrors(Vec<ValidateError>),
+    FatalError(String),
     CloseDialog,
 }
 
 #[derive(Debug, Clone)]
 enum DialogState {
     Plan(OperationPlan),
+    Report(CommitReport),
     ValidationErrors(Vec<ValidateError>),
 }
 
@@ -89,8 +93,14 @@ impl FylerApp {
                 GuiEvent::ShowPlan(plan) => {
                     self.dialog = Some(DialogState::Plan(plan));
                 }
+                GuiEvent::ShowReport(report) => {
+                    self.dialog = Some(DialogState::Report(report));
+                }
                 GuiEvent::ShowValidationErrors(errors) => {
                     self.dialog = Some(DialogState::ValidationErrors(errors));
+                }
+                GuiEvent::FatalError(error) => {
+                    self.engine_error = Some(error);
                 }
                 GuiEvent::CloseDialog => self.dialog = None,
             }
@@ -133,9 +143,13 @@ impl eframe::App for FylerApp {
 
         let mut confirm_choice = None;
         let mut dismiss_errors = false;
+        let mut dismiss_report = false;
         match &self.dialog {
             Some(DialogState::Plan(plan)) => {
                 confirm_choice = confirm::draw_plan(ui, plan);
+            }
+            Some(DialogState::Report(report)) => {
+                dismiss_report = confirm::draw_report(ui, report);
             }
             Some(DialogState::ValidationErrors(errors)) => {
                 dismiss_errors = egui::Modal::new(egui::Id::new("save-validation-errors"))
@@ -152,6 +166,9 @@ impl eframe::App for FylerApp {
         }
 
         if dismiss_errors {
+            self.dialog = None;
+        }
+        if dismiss_report {
             self.dialog = None;
         }
         if let Some(choice) = confirm_choice

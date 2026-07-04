@@ -23,6 +23,6 @@ pub struct FsWatcher {
 ///   ユーザーの保存/破棄の判断を待つ(この判定はapp層の責務。watchは通知に徹する)
 /// - 自分自身のapply中の変更でイベントが再帰しないよう、apply中は抑制するか
 ///   イベントを間引く仕組みをapp層と取り決めること
-pub fn watch(root: &Path, tx: Sender<ExternalChange>) -> anyhow::Result<FsWatcher> {
+pub fn watch(_root: &Path, _tx: Sender<ExternalChange>) -> anyhow::Result<FsWatcher> {
     todo!("M5: notifyによる監視")
 }

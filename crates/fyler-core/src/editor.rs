@@ -32,6 +32,8 @@ pub enum EditorCommand {
     Text(String),
     /// ペースト(NvimEngineでは `nvim_paste` 経由)。
     Paste(String),
+    /// reconcile等でバッファ全体を差し替える。投入後は `dirty=false` に戻す。
+    SetLines(Vec<EditorLine>),
     /// `:w` 相当のトリガ(保存状態機械 [`crate::save`] の入口)。
     RequestCommit,
     Undo,
