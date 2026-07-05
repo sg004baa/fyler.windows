@@ -36,11 +36,7 @@ fn main() -> anyhow::Result<()> {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
-    let root = if root.is_absolute() {
-        root
-    } else {
-        std::env::current_dir()?.join(root)
-    };
+    let root = normalize_root(&root)?;
     let (config, config_warnings) = config::load();
     let scan_options = ScanOptions {
         show_hidden: config.show_hidden,
@@ -397,6 +393,20 @@ fn change_root_to(
     engine: &dyn EditorEngine,
     gui_event_tx: &mpsc::Sender<GuiEvent>,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
+    let new_root = match normalize_root(&new_root) {
+        Ok(new_root) => new_root,
+        Err(error) => {
+            return send_gui_message(
+                gui_event_tx,
+                MessageKind::Error,
+                format!(
+                    "表示ルートを正規化できません ({}): {error}",
+                    new_root.display()
+                ),
+            );
+        }
+    };
+
     if engine.snapshot().dirty {
         return send_gui_message(
             gui_event_tx,
@@ -473,6 +483,10 @@ fn change_root_to(
         )?;
     }
     Ok(())
+}
+
+fn normalize_root(root: &Path) -> std::io::Result<PathBuf> {
+    std::path::absolute(root)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -745,6 +759,13 @@ fn send_save_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_root_removes_joined_current_directory_component() {
+        let current_dir = std::env::current_dir().unwrap();
+
+        assert_eq!(normalize_root(&current_dir.join(".")).unwrap(), current_dir);
+    }
 
     #[test]
     fn bookmark_resolution_prefers_exact_then_unique_prefix_then_recent_index() {

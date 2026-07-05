@@ -6,11 +6,14 @@ use fyler_core::editor::{EditorCommand, EditorEngine, Key, KeyInput, Mode, Modif
 /// このフレームの入力イベントをエンジンへ転送する。
 ///
 /// 実装契約(DESIGN.md「EditorEngineトレイト」):
-/// - `egui::Event::Key` → `fyler_core::editor::KeyInput` に正規化して
-///   `EditorCommand::Key`。印字可能文字はShift適用済みの `Key::Char` にする
-/// - `egui::Event::Text`(**IME確定文字列・日本語入力を含む**)→
-///   `EditorCommand::Text`。Keyと二重送信しないこと(egui側でKeyとTextの両方が
-///   来る文字の扱いをM0スパイクで確定する)
+/// - 文字入力はキーボードレイアウト適用済みの `egui::Event::Text` を優先する。
+///   `Event::Key` の論理キーだけではShiftと記号の組み合わせを復元できないため、
+///   同一フレームのplain printableなKeyは二重送信せず捨てる
+/// - Insert / Replace / CmdlineではTextを `EditorCommand::Text`、Normal / Visual等
+///   ではTextの各文字を修飾なしの `EditorCommand::Key(Key::Char)` として送る
+/// - Textを伴わない `egui::Event::Key` は `fyler_core::editor::KeyInput` に正規化し、
+///   Ctrl組み合わせ・特殊キー・印字可能文字のfallbackとして送る
+/// - `egui::Event::Ime(Commit)` はモードを問わず `EditorCommand::Text` として送る
 /// - `egui::Event::Paste` → `EditorCommand::Paste`
 /// - 確認ダイアログ表示中はエンジンへ転送せずダイアログが入力を消費する
 /// - 送信は失敗し得る(エンジン停止)。失敗はエラー表示へ回す(panicしない)
@@ -20,6 +23,14 @@ pub fn forward_input(
     mode: &Mode,
 ) -> anyhow::Result<()> {
     let events = ctx.input(|input| input.events.clone());
+    for command in translate_events(&events, mode) {
+        engine.send(command)?;
+    }
+
+    Ok(())
+}
+
+fn translate_events(events: &[egui::Event], mode: &Mode) -> Vec<EditorCommand> {
     let text_mode = matches!(mode, Mode::Insert | Mode::Replace | Mode::Cmdline);
     let has_text = events.iter().any(|event| match event {
         egui::Event::Text(text) => !text.is_empty(),
@@ -41,46 +52,50 @@ pub fn forward_input(
             && !modifiers.alt
             && printable_char(*key, modifiers.shift).is_some()
     });
+    let mut commands = Vec::new();
 
     for event in events {
-        let command = match event {
+        match event {
             egui::Event::Key {
                 key,
                 pressed: true,
                 modifiers,
                 ..
             } => {
-                let Some(key_input) = key_input(key, modifiers) else {
+                let Some(key_input) = key_input(*key, *modifiers) else {
                     continue;
                 };
                 let is_plain_char = matches!(key_input.key, Key::Char(_))
                     && !key_input.mods.ctrl
                     && !key_input.mods.alt;
-                if text_mode && has_text && is_plain_char {
+                if has_text && has_plain_printable_key && is_plain_char {
                     // eframeは通常の文字キーでKeyとTextを同一フレームに出す。
-                    // 挿入系モードではText側だけを使い、IMEと同じliteral経路へ流す。
+                    // OSのキーボードレイアウトを反映したText側だけを使う。
                     continue;
                 }
-                EditorCommand::Key(key_input)
+                commands.push(EditorCommand::Key(key_input));
             }
             egui::Event::Text(text) if !text.is_empty() => {
-                if !text_mode && has_plain_printable_key {
-                    // Normal/Visual系ではKey側がVimコマンド。Textは重複なので捨てる。
-                    continue;
+                if text_mode {
+                    commands.push(EditorCommand::Text(text.clone()));
+                } else {
+                    commands.extend(text.chars().map(|character| {
+                        EditorCommand::Key(KeyInput {
+                            key: Key::Char(character),
+                            mods: Modifiers::default(),
+                        })
+                    }));
                 }
-                EditorCommand::Text(text)
             }
             egui::Event::Ime(egui::ImeEvent::Commit(text)) if !text.is_empty() => {
-                EditorCommand::Text(text)
+                commands.push(EditorCommand::Text(text.clone()));
             }
-            egui::Event::Paste(text) => EditorCommand::Paste(text),
+            egui::Event::Paste(text) => commands.push(EditorCommand::Paste(text.clone())),
             _ => continue,
-        };
-
-        engine.send(command)?;
+        }
     }
 
-    Ok(())
+    commands
 }
 
 fn key_input(key: egui::Key, modifiers: egui::Modifiers) -> Option<KeyInput> {
@@ -201,6 +216,112 @@ fn letter(lower: char, shift: bool) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn normal_mode_prefers_layout_aware_shifted_text() {
+        let events = [
+            key_event(
+                egui::Key::Num6,
+                egui::Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+            ),
+            egui::Event::Text("^".to_owned()),
+        ];
+
+        assert_eq!(
+            translate_events(&events, &Mode::Normal),
+            [EditorCommand::Key(KeyInput {
+                key: Key::Char('^'),
+                mods: Modifiers::default(),
+            })]
+        );
+    }
+
+    #[test]
+    fn normal_mode_sends_plain_text_once_as_a_key() {
+        let events = [
+            key_event(egui::Key::A, egui::Modifiers::default()),
+            egui::Event::Text("a".to_owned()),
+        ];
+
+        assert_eq!(
+            translate_events(&events, &Mode::Normal),
+            [EditorCommand::Key(KeyInput {
+                key: Key::Char('a'),
+                mods: Modifiers::default(),
+            })]
+        );
+    }
+
+    #[test]
+    fn normal_mode_sends_escape_key_without_text() {
+        let events = [key_event(egui::Key::Escape, egui::Modifiers::default())];
+
+        assert_eq!(
+            translate_events(&events, &Mode::Normal),
+            [EditorCommand::Key(KeyInput {
+                key: Key::Esc,
+                mods: Modifiers::default(),
+            })]
+        );
+    }
+
+    #[test]
+    fn normal_mode_keeps_control_modifier_without_text() {
+        let events = [key_event(
+            egui::Key::A,
+            egui::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        )];
+
+        assert_eq!(
+            translate_events(&events, &Mode::Normal),
+            [EditorCommand::Key(KeyInput {
+                key: Key::Char('a'),
+                mods: Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            })]
+        );
+    }
+
+    #[test]
+    fn insert_mode_keeps_text_input_path() {
+        let events = [
+            key_event(egui::Key::A, egui::Modifiers::default()),
+            egui::Event::Text("a".to_owned()),
+        ];
+
+        assert_eq!(
+            translate_events(&events, &Mode::Insert),
+            [EditorCommand::Text("a".to_owned())]
+        );
+    }
+
+    #[test]
+    fn normal_mode_keeps_ime_commit_as_text() {
+        let events = [egui::Event::Ime(egui::ImeEvent::Commit("あ".to_owned()))];
+
+        assert_eq!(
+            translate_events(&events, &Mode::Normal),
+            [EditorCommand::Text("あ".to_owned())]
+        );
+    }
 
     #[test]
     fn printable_letters_apply_shift_before_crossing_the_engine_boundary() {

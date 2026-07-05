@@ -188,9 +188,10 @@ impl NvimEngine {
             .get_lines(0, -1, false)
             .await
             .map_err(|error| anyhow::anyhow!("初期バッファ行を取得できません: {error}"))?;
+        let mut lines_arc = lines_to_arc(&lines);
         let status = query_status(&nvim).await?;
         let mut revision = 1;
-        let initial_snapshot = build_snapshot(revision, &lines, status);
+        let initial_snapshot = build_snapshot(revision, &lines_arc, status);
         let shared_snapshot = Arc::new(ArcSwap::from_pointee(initial_snapshot));
 
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
@@ -233,7 +234,7 @@ impl NvimEngine {
                         snapshot_pending = true;
                         match publish_pending_snapshot(
                             &nvim,
-                            &lines,
+                            &lines_arc,
                             &mut revision,
                             &task_snapshot,
                             &event_tx,
@@ -265,9 +266,14 @@ impl NvimEngine {
 
                         match notification.name.as_str() {
                             "nvim_buf_lines_event" => {
-                                if !apply_lines_notification(&notification.args, &mut lines) {
+                                if apply_lines_notification(&notification.args, &mut lines) {
+                                    lines_arc = lines_to_arc(&lines);
+                                } else {
                                     match buffer.get_lines(0, -1, false).await {
-                                        Ok(current_lines) => lines = current_lines,
+                                        Ok(current_lines) => {
+                                            lines = current_lines;
+                                            lines_arc = lines_to_arc(&lines);
+                                        }
                                         Err(error) => {
                                             send_message(
                                                 &event_tx,
@@ -369,7 +375,7 @@ impl NvimEngine {
 
                         match publish_pending_snapshot(
                             &nvim,
-                            &lines,
+                            &lines_arc,
                             &mut revision,
                             &task_snapshot,
                             &event_tx,
@@ -624,17 +630,21 @@ fn atomic_call(name: &str, args: Vec<Value>) -> Value {
     Value::Array(vec![Value::from(name), Value::Array(args)])
 }
 
-fn build_snapshot(revision: u64, lines: &[String], status: Status) -> EditorSnapshot {
+fn lines_to_arc(lines: &[String]) -> Arc<[EditorLine]> {
+    Arc::from(
+        lines
+            .iter()
+            .cloned()
+            .map(EditorLine::new)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn build_snapshot(revision: u64, lines: &Arc<[EditorLine]>, status: Status) -> EditorSnapshot {
     EditorSnapshot {
         revision,
         changedtick: status.changedtick,
-        lines: Arc::from(
-            lines
-                .iter()
-                .cloned()
-                .map(EditorLine::new)
-                .collect::<Vec<_>>(),
-        ),
+        lines: Arc::clone(lines),
         cursor: status.cursor,
         mode: status.mode,
         visual_start: status.visual_start,
@@ -648,7 +658,7 @@ fn build_snapshot(revision: u64, lines: &[String], status: Status) -> EditorSnap
 /// 戻って一括取得に成功したときだけフラグを落とす。
 async fn publish_pending_snapshot(
     nvim: &Nvim,
-    lines: &[String],
+    lines: &Arc<[EditorLine]>,
     revision: &mut u64,
     shared_snapshot: &ArcSwap<EditorSnapshot>,
     event_tx: &mpsc::UnboundedSender<EditorEvent>,
@@ -667,7 +677,7 @@ async fn publish_pending_snapshot(
 
 async fn publish_snapshot(
     nvim: &Nvim,
-    lines: &[String],
+    lines: &Arc<[EditorLine]>,
     revision: &mut u64,
     shared_snapshot: &ArcSwap<EditorSnapshot>,
     event_tx: &mpsc::UnboundedSender<EditorEvent>,
