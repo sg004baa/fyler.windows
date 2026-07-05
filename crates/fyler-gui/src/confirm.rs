@@ -14,6 +14,16 @@ pub enum ConfirmChoice {
     Cancel,
 }
 
+/// 保存確認ダイアログでの操作一覧の詳細度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConfirmDetail {
+    /// 全操作を1件ずつ表示する。
+    #[default]
+    Full,
+    /// 操作が多い場合に種別ごとの件数へ圧縮する。
+    Summary,
+}
+
 /// OperationPlanをモーダルで表示し、選択があれば返す。
 ///
 /// 実装契約:
@@ -28,6 +38,7 @@ pub fn draw_plan(
     ui: &mut egui::Ui,
     plan: &OperationPlan,
     warnings: &[String],
+    detail: ConfirmDetail,
 ) -> Option<ConfirmChoice> {
     let key_choice = ui.ctx().input(|input| {
         plan_choice_from_keys(
@@ -42,8 +53,8 @@ pub fn draw_plan(
             ui.heading("変更内容の確認");
             ui.add_space(8.0);
 
-            for operation in &plan.ops {
-                ui.monospace(operation_label(operation));
+            for label in plan_labels(plan, detail) {
+                ui.monospace(label);
             }
             if !warnings.is_empty() {
                 ui.add_space(8.0);
@@ -67,6 +78,40 @@ pub fn draw_plan(
             .inner
         })
         .inner
+}
+
+fn plan_labels(plan: &OperationPlan, detail: ConfirmDetail) -> Vec<String> {
+    if detail == ConfirmDetail::Full || plan.ops.len() <= 5 {
+        return plan.ops.iter().map(operation_label).collect();
+    }
+
+    let mut create = 0;
+    let mut rename = 0;
+    let mut move_count = 0;
+    let mut copy = 0;
+    let mut delete = 0;
+    for operation in &plan.ops {
+        match operation {
+            FsOperation::Create { .. } => create += 1,
+            FsOperation::Move { from, to, .. } if from.parent() == to.parent() => rename += 1,
+            FsOperation::Move { .. } => move_count += 1,
+            FsOperation::Copy { .. } => copy += 1,
+            FsOperation::Delete { .. } => delete += 1,
+        }
+    }
+
+    let summaries = [
+        (create, "CREATE", ""),
+        (rename, "RENAME", ""),
+        (move_count, "MOVE", ""),
+        (copy, "COPY", ""),
+        (delete, "DELETE", "(ごみ箱へ)"),
+    ]
+    .into_iter()
+    .filter(|(count, _, _)| *count > 0)
+    .map(|(count, kind, suffix)| format!("{kind} {count}件{suffix}"))
+    .collect::<Vec<_>>();
+    vec![summaries.join(" / ")]
 }
 
 /// validateエラーの表示(保存は中断済み)。行番号は0始まりなので表示時に+1する。
@@ -233,5 +278,61 @@ mod tests {
             Some(ConfirmChoice::Cancel)
         );
         assert_eq!(plan_choice_from_keys(false, false, false), None);
+    }
+
+    #[test]
+    fn summary_detail_counts_operation_kinds() {
+        let plan = OperationPlan {
+            ops: vec![
+                FsOperation::Move {
+                    id: EntryId(1),
+                    from: TreePath::parse("a.txt"),
+                    to: TreePath::parse("b.txt"),
+                },
+                FsOperation::Move {
+                    id: EntryId(2),
+                    from: TreePath::parse("c.txt"),
+                    to: TreePath::parse("d.txt"),
+                },
+                FsOperation::Delete {
+                    id: EntryId(3),
+                    path: TreePath::parse("old.txt"),
+                },
+                FsOperation::Copy {
+                    src: EntryId(4),
+                    from: TreePath::parse("src/a.txt"),
+                    to: TreePath::parse("dst/a.txt"),
+                },
+                FsOperation::Copy {
+                    src: EntryId(5),
+                    from: TreePath::parse("src/b.txt"),
+                    to: TreePath::parse("dst/b.txt"),
+                },
+                FsOperation::Copy {
+                    src: EntryId(6),
+                    from: TreePath::parse("src/c.txt"),
+                    to: TreePath::parse("dst/c.txt"),
+                },
+            ],
+        };
+
+        assert_eq!(
+            plan_labels(&plan, ConfirmDetail::Summary),
+            ["RENAME 2件 / COPY 3件 / DELETE 1件(ごみ箱へ)"]
+        );
+    }
+
+    #[test]
+    fn summary_detail_keeps_short_plans_expanded() {
+        let plan = OperationPlan {
+            ops: vec![FsOperation::Delete {
+                id: EntryId(1),
+                path: TreePath::parse("old.txt"),
+            }],
+        };
+        assert_eq!(
+            plan_labels(&plan, ConfirmDetail::Summary),
+            ["DELETE old.txt (ごみ箱へ)"]
+        );
     }
 }

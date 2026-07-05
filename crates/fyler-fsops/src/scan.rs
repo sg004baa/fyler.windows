@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use fyler_core::id::IdAllocator;
+use fyler_core::options::SortOrder;
 use fyler_core::path::TreePath;
 use fyler_core::tree::{BaselineEntry, BaselineTree, EntryKind};
 
@@ -21,6 +22,8 @@ use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 pub struct ScanOptions {
     /// `true`ならdotfileとWindowsのhidden属性を持つエントリもbaselineへ含める。
     pub show_hidden: bool,
+    /// ディレクトリ優先または種別混在のソート順。
+    pub sort: SortOrder,
 }
 
 /// ルート以下をスキャンしてBaselineTreeを構築する。
@@ -196,13 +199,18 @@ fn read_sorted_entries(
         });
     }
 
-    // read_dirの順序は未規定なので、ディレクトリ優先の自然順で表示とID採番を
+    // read_dirの順序は未規定なので、設定された自然順で表示とID採番を
     // セッションごとに安定させる。同値時は元のOsStringで順序を確定する。
     entries.sort_by(|left, right| {
-        let left_is_dir = kind_from_metadata(&left.metadata) == EntryKind::Dir;
-        let right_is_dir = kind_from_metadata(&right.metadata) == EntryKind::Dir;
-        right_is_dir
-            .cmp(&left_is_dir)
+        let kind_order = match options.sort {
+            SortOrder::DirsFirst => {
+                let left_is_dir = kind_from_metadata(&left.metadata) == EntryKind::Dir;
+                let right_is_dir = kind_from_metadata(&right.metadata) == EntryKind::Dir;
+                right_is_dir.cmp(&left_is_dir)
+            }
+            SortOrder::Mixed => Ordering::Equal,
+        };
+        kind_order
             .then_with(|| natural_cmp_case_insensitive(&left.file_name, &right.file_name))
             .then_with(|| left.file_name.cmp(&right.file_name))
     });
@@ -386,7 +394,10 @@ mod tests {
         let shown = scan_baseline_with(
             root.path(),
             &mut shown_ids,
-            &ScanOptions { show_hidden: true },
+            &ScanOptions {
+                show_hidden: true,
+                ..ScanOptions::default()
+            },
         )
         .unwrap();
         assert!(
@@ -428,6 +439,41 @@ mod tests {
                 TreePath::parse("1.txt"),
                 TreePath::parse("2.txt"),
                 TreePath::parse("10.txt"),
+            ]
+        );
+    }
+
+    #[test]
+    fn mixed_sort_interleaves_directories_and_files_in_natural_order() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("10.txt"), b"10").unwrap();
+        fs::create_dir(root.path().join("2-dir")).unwrap();
+        fs::write(root.path().join("1.txt"), b"1").unwrap();
+        fs::create_dir(root.path().join("20-dir")).unwrap();
+
+        let mut ids = IdAllocator::new();
+        let baseline = scan_baseline_with(
+            root.path(),
+            &mut ids,
+            &ScanOptions {
+                sort: SortOrder::Mixed,
+                ..ScanOptions::default()
+            },
+        )
+        .unwrap();
+        let paths = baseline
+            .entries()
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            [
+                TreePath::parse("1.txt"),
+                TreePath::parse("2-dir"),
+                TreePath::parse("10.txt"),
+                TreePath::parse("20-dir"),
             ]
         );
     }

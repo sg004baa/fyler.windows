@@ -4,6 +4,7 @@
 //! 「起動」「イベントの受け渡し」「ユーザー操作の各レイヤーへの配線」
 //! 「保存状態機械の副作用(SaveEffect)の実行」のみ。
 
+mod config;
 mod save_flow;
 
 use std::collections::VecDeque;
@@ -16,7 +17,8 @@ use fyler_core::grammar::PrefixParse;
 use fyler_core::id::IdAllocator;
 use fyler_core::tree::EntryKind;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
-use fyler_fsops::watch::ExternalChange;
+use fyler_fsops::scan::ScanOptions;
+use fyler_fsops::watch::{ExternalChange, FsWatcher};
 use fyler_gui::app::GuiEvent;
 use fyler_gui::confirm::ConfirmChoice;
 
@@ -39,6 +41,13 @@ fn main() -> anyhow::Result<()> {
     } else {
         std::env::current_dir()?.join(root)
     };
+    let (config, config_warnings) = config::load();
+    let scan_options = ScanOptions {
+        show_hidden: config.show_hidden,
+        sort: config.sort,
+    };
+    let confirm_detail = config.confirm_detail;
+    let bookmarks = config.bookmarks;
     let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
@@ -56,10 +65,15 @@ fn main() -> anyhow::Result<()> {
     let watcher = fyler_fsops::watch::watch(&root, watch_tx.clone())?;
 
     let mut ids = IdAllocator::new();
-    let baseline = fyler_fsops::scan::scan_baseline(&root, &mut ids)?;
+    let baseline = fyler_fsops::scan::scan_baseline_with(&root, &mut ids, &scan_options)?;
     let save_engine: Arc<dyn EditorEngine> = engine.clone();
-    let mut save_controller =
-        SaveController::new(root.clone(), ids, baseline, Arc::clone(&save_engine));
+    let mut save_controller = SaveController::new_with_scan_options(
+        root.clone(),
+        ids,
+        baseline,
+        Arc::clone(&save_engine),
+        scan_options,
+    );
     save_controller.collapse_all_dirs();
     engine.set_initial_lines(save_controller.visible_lines())?;
 
@@ -109,6 +123,13 @@ fn main() -> anyhow::Result<()> {
     let (gui_event_tx, gui_event_rx) = mpsc::channel();
     gui_event_tx.send(GuiEvent::RootChanged(root.clone()))?;
     send_decorations(&gui_event_tx, &save_controller)?;
+    if !config_warnings.is_empty() {
+        send_gui_message(
+            &gui_event_tx,
+            MessageKind::Warn,
+            format!("設定: {}", config_warnings.join(" / ")),
+        )?;
+    }
     let app_engine = Arc::clone(&save_engine);
     let event_bridge = thread::Builder::new()
         .name("fyler-app-events".to_owned())
@@ -116,6 +137,16 @@ fn main() -> anyhow::Result<()> {
             let mut root = root;
             let mut _watcher = watcher;
             let mut pending_events = VecDeque::new();
+            if let Err(error) = config::record_recent_root(&root)
+                && send_gui_message(
+                    &gui_event_tx,
+                    MessageKind::Warn,
+                    format!("最近使ったルートを記録できません: {error:#}"),
+                )
+                .is_err()
+            {
+                return;
+            }
             loop {
                 let event = match pending_events.pop_front() {
                     Some(event) => event,
@@ -158,22 +189,6 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     AppEvent::Editor(EditorEvent::NavigateParent) => {
-                        if app_engine.snapshot().dirty {
-                            if send_gui_message(
-                                &gui_event_tx,
-                                MessageKind::Info,
-                                "編集中です。保存または破棄してからディレクトリを移動してください",
-                            )
-                            .is_err()
-                            {
-                                return;
-                            }
-                            continue;
-                        }
-                        if !save_controller.is_idle() {
-                            continue;
-                        }
-
                         let Some(new_root) = root.parent().map(Path::to_path_buf) else {
                             if send_gui_message(
                                 &gui_event_tx,
@@ -187,88 +202,76 @@ fn main() -> anyhow::Result<()> {
                             continue;
                         };
 
-                        let mut new_ids = IdAllocator::new();
-                        let scan_options = save_controller.scan_options();
-                        let new_baseline = match fyler_fsops::scan::scan_baseline_with(
-                            &new_root,
-                            &mut new_ids,
-                            &scan_options,
-                        ) {
-                                Ok(baseline) => baseline,
-                                Err(error) => {
-                                    if send_gui_message(
-                                        &gui_event_tx,
-                                        MessageKind::Error,
-                                        format!("上のディレクトリを読み込めません: {error:#}"),
-                                    )
-                                    .is_err()
-                                    {
-                                        return;
-                                    }
-                                    continue;
-                                }
-                            };
-
-                        // 新しい監視の作成に失敗した場合、現在のroot/baseline/watcherを
-                        // そのまま維持できるよう、状態差し替え前に準備だけ済ませる。
-                        let new_watcher =
-                            match fyler_fsops::watch::watch(&new_root, watch_tx.clone()) {
-                                Ok(watcher) => watcher,
-                                Err(error) => {
-                                    if send_gui_message(
-                                        &gui_event_tx,
-                                        MessageKind::Error,
-                                        format!("上のディレクトリを監視できません: {error:#}"),
-                                    )
-                                    .is_err()
-                                    {
-                                        return;
-                                    }
-                                    continue;
-                                }
-                            };
-
-                        if let Err(error) =
-                            save_controller.change_root(new_root.clone(), new_ids, new_baseline)
+                        if change_root_to(
+                            new_root,
+                            &mut root,
+                            &mut _watcher,
+                            &watch_tx,
+                            &mut save_controller,
+                            app_engine.as_ref(),
+                            &gui_event_tx,
+                        )
+                        .is_err()
                         {
+                            return;
+                        }
+                    }
+                    AppEvent::Editor(EditorEvent::JumpBookmark { query }) => {
+                        let recent = config::load_recent_roots();
+                        let Some(query) = query else {
                             if send_gui_message(
                                 &gui_event_tx,
-                                MessageKind::Error,
-                                format!("表示ルートを変更できません: {error:#}"),
+                                MessageKind::Info,
+                                bookmark_list_message(&bookmarks, &recent),
                             )
                             .is_err()
                             {
                                 return;
                             }
                             continue;
-                        }
-                        save_controller.collapse_all_dirs();
-                        let new_lines = save_controller.visible_lines();
+                        };
 
-                        root = new_root;
-                        _watcher = new_watcher;
-                        if let Err(error) = app_engine.send(EditorCommand::SetLines {
-                            lines: new_lines,
-                            cursor_line: None,
-                        }) {
-                            if send_gui_message(
-                                &gui_event_tx,
-                                MessageKind::Error,
-                                format!("上のディレクトリを表示できません: {error:#}"),
-                            )
-                            .is_err()
-                            {
-                                return;
+                        match resolve_bookmark_query(&query, &bookmarks, &recent) {
+                            BookmarkResolution::Resolved(new_root) => {
+                                if change_root_to(
+                                    new_root,
+                                    &mut root,
+                                    &mut _watcher,
+                                    &watch_tx,
+                                    &mut save_controller,
+                                    app_engine.as_ref(),
+                                    &gui_event_tx,
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
                             }
-                        }
-                        if gui_event_tx
-                            .send(GuiEvent::RootChanged(root.clone()))
-                            .is_err()
-                        {
-                            return;
-                        }
-                        if send_decorations(&gui_event_tx, &save_controller).is_err() {
-                            return;
+                            BookmarkResolution::Ambiguous(names) => {
+                                if send_gui_message(
+                                    &gui_event_tx,
+                                    MessageKind::Error,
+                                    format!(
+                                        "ブックマーク名が曖昧です: {query} ({})",
+                                        names.join(", ")
+                                    ),
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            BookmarkResolution::NotFound => {
+                                if send_gui_message(
+                                    &gui_event_tx,
+                                    MessageKind::Error,
+                                    format!("ブックマークまたは最近使ったルートが見つかりません: {query}"),
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
                         }
                     }
                     AppEvent::Editor(EditorEvent::ToggleHidden) => {
@@ -372,13 +375,159 @@ fn main() -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("GUIイベント配線を開始できません: {error}"))?;
 
     let gui_engine: Arc<dyn EditorEngine> = engine;
-    let gui_result = fyler_gui::app::run(gui_engine, gui_event_rx, confirm_tx);
+    let gui_result = fyler_gui::app::run(gui_engine, gui_event_rx, confirm_tx, confirm_detail);
     let _ = app_event_tx.send(AppEvent::Shutdown);
     let _ = watch_bridge.join();
     let _ = event_bridge.join();
     let _ = confirm_bridge.join();
     let _ = editor_bridge.join();
     gui_result
+}
+
+fn change_root_to(
+    new_root: PathBuf,
+    root: &mut PathBuf,
+    watcher: &mut FsWatcher,
+    watch_tx: &mpsc::Sender<ExternalChange>,
+    save_controller: &mut SaveController,
+    engine: &dyn EditorEngine,
+    gui_event_tx: &mpsc::Sender<GuiEvent>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    if engine.snapshot().dirty {
+        return send_gui_message(
+            gui_event_tx,
+            MessageKind::Info,
+            "編集中です。保存または破棄してからディレクトリを移動してください",
+        );
+    }
+    if !save_controller.is_idle() {
+        return Ok(());
+    }
+
+    let mut new_ids = IdAllocator::new();
+    let scan_options = save_controller.scan_options();
+    let new_baseline =
+        match fyler_fsops::scan::scan_baseline_with(&new_root, &mut new_ids, &scan_options) {
+            Ok(baseline) => baseline,
+            Err(error) => {
+                return send_gui_message(
+                    gui_event_tx,
+                    MessageKind::Error,
+                    format!(
+                        "表示ルートを読み込めません ({}): {error:#}",
+                        new_root.display()
+                    ),
+                );
+            }
+        };
+
+    // 新しい監視の作成に失敗した場合、現在のroot/baseline/watcherを
+    // そのまま維持できるよう、状態差し替え前に準備だけ済ませる。
+    let new_watcher = match fyler_fsops::watch::watch(&new_root, watch_tx.clone()) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            return send_gui_message(
+                gui_event_tx,
+                MessageKind::Error,
+                format!(
+                    "表示ルートを監視できません ({}): {error:#}",
+                    new_root.display()
+                ),
+            );
+        }
+    };
+
+    if let Err(error) = save_controller.change_root(new_root.clone(), new_ids, new_baseline) {
+        return send_gui_message(
+            gui_event_tx,
+            MessageKind::Error,
+            format!("表示ルートを変更できません: {error:#}"),
+        );
+    }
+    save_controller.collapse_all_dirs();
+    let new_lines = save_controller.visible_lines();
+
+    *root = new_root;
+    *watcher = new_watcher;
+    if let Err(error) = engine.send(EditorCommand::SetLines {
+        lines: new_lines,
+        cursor_line: None,
+    }) {
+        send_gui_message(
+            gui_event_tx,
+            MessageKind::Error,
+            format!("新しいディレクトリを表示できません: {error:#}"),
+        )?;
+    }
+    gui_event_tx.send(GuiEvent::RootChanged(root.clone()))?;
+    send_decorations(gui_event_tx, save_controller)?;
+    if let Err(error) = config::record_recent_root(root) {
+        send_gui_message(
+            gui_event_tx,
+            MessageKind::Warn,
+            format!("最近使ったルートを記録できません: {error:#}"),
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BookmarkResolution {
+    Resolved(PathBuf),
+    Ambiguous(Vec<String>),
+    NotFound,
+}
+
+fn resolve_bookmark_query(
+    query: &str,
+    bookmarks: &[(String, PathBuf)],
+    recent: &[PathBuf],
+) -> BookmarkResolution {
+    if let Some((_, path)) = bookmarks.iter().find(|(name, _)| name == query) {
+        return BookmarkResolution::Resolved(path.clone());
+    }
+
+    let prefix_matches = bookmarks
+        .iter()
+        .filter(|(name, _)| name.starts_with(query))
+        .collect::<Vec<_>>();
+    if let [(_, path)] = prefix_matches.as_slice() {
+        return BookmarkResolution::Resolved((*path).clone());
+    }
+
+    if let Ok(index) = query.parse::<usize>()
+        && let Some(path) = index.checked_sub(1).and_then(|index| recent.get(index))
+    {
+        return BookmarkResolution::Resolved(path.clone());
+    }
+
+    if prefix_matches.len() > 1 {
+        return BookmarkResolution::Ambiguous(
+            prefix_matches
+                .into_iter()
+                .map(|(name, _)| name.clone())
+                .collect(),
+        );
+    }
+    BookmarkResolution::NotFound
+}
+
+fn bookmark_list_message(bookmarks: &[(String, PathBuf)], recent: &[PathBuf]) -> String {
+    let mut entries = bookmarks
+        .iter()
+        .map(|(name, path)| format!("b:{name}={}", path.display()))
+        .collect::<Vec<_>>();
+    entries.extend(
+        recent
+            .iter()
+            .enumerate()
+            .map(|(index, path)| format!("{}:{}", index + 1, path.display())),
+    );
+    if entries.is_empty() {
+        "ブックマークと最近使ったルートはありません".to_owned()
+    } else {
+        entries.join(" | ")
+    }
 }
 
 fn handle_activate_line(
@@ -585,5 +734,42 @@ fn send_save_result(
         }
         SaveFlowResult::Cancelled => gui_event_tx.send(GuiEvent::CloseDialog),
         SaveFlowResult::Ignored => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bookmark_resolution_prefers_exact_then_unique_prefix_then_recent_index() {
+        let bookmarks = vec![
+            ("project".to_owned(), PathBuf::from("/bookmark/project")),
+            ("profile".to_owned(), PathBuf::from("/bookmark/profile")),
+            ("docs".to_owned(), PathBuf::from("/bookmark/docs")),
+            ("1".to_owned(), PathBuf::from("/bookmark/numeric")),
+        ];
+        let recent = vec![PathBuf::from("/recent/one"), PathBuf::from("/recent/two")];
+
+        assert_eq!(
+            resolve_bookmark_query("1", &bookmarks, &recent),
+            BookmarkResolution::Resolved(PathBuf::from("/bookmark/numeric"))
+        );
+        assert_eq!(
+            resolve_bookmark_query("doc", &bookmarks, &recent),
+            BookmarkResolution::Resolved(PathBuf::from("/bookmark/docs"))
+        );
+        assert_eq!(
+            resolve_bookmark_query("2", &bookmarks, &recent),
+            BookmarkResolution::Resolved(PathBuf::from("/recent/two"))
+        );
+        assert_eq!(
+            resolve_bookmark_query("pro", &bookmarks, &recent),
+            BookmarkResolution::Ambiguous(vec!["project".to_owned(), "profile".to_owned()])
+        );
+        assert_eq!(
+            resolve_bookmark_query("missing", &bookmarks, &recent),
+            BookmarkResolution::NotFound
+        );
     }
 }

@@ -14,7 +14,7 @@ use fyler_core::plan::OperationPlan;
 use fyler_core::report::CommitReport;
 use fyler_core::validate::ValidateError;
 
-use crate::confirm::ConfirmChoice;
+use crate::confirm::{ConfirmChoice, ConfirmDetail};
 use crate::{cmdline, confirm, input, modeline, tree_view};
 
 /// app層からGUIへ渡す描画指示。
@@ -68,6 +68,7 @@ pub struct FylerApp {
     engine_error: Option<String>,
     dialog: Option<DialogState>,
     confirm_tx: mpsc::Sender<ConfirmChoice>,
+    confirm_detail: ConfirmDetail,
 }
 
 impl FylerApp {
@@ -75,6 +76,7 @@ impl FylerApp {
         engine: Arc<dyn EditorEngine>,
         gui_events: mpsc::Receiver<GuiEvent>,
         confirm_tx: mpsc::Sender<ConfirmChoice>,
+        confirm_detail: ConfirmDetail,
         repaint_context: egui::Context,
     ) -> anyhow::Result<Self> {
         let (event_tx, event_rx) = mpsc::channel();
@@ -102,6 +104,7 @@ impl FylerApp {
             engine_error: None,
             dialog: None,
             confirm_tx,
+            confirm_detail,
         })
     }
 
@@ -114,6 +117,7 @@ impl FylerApp {
                     EditorEvent::YankPath { .. } => {}
                     EditorEvent::NavigateParent => {}
                     EditorEvent::ToggleHidden => {}
+                    EditorEvent::JumpBookmark { .. } => {}
                     EditorEvent::CommitRequested { .. } => {}
                     EditorEvent::CmdlineShow(state) => self.cmdline = Some(state),
                     EditorEvent::CmdlineHide => self.cmdline = None,
@@ -189,7 +193,7 @@ impl eframe::App for FylerApp {
         let mut dismiss_report = false;
         match &self.dialog {
             Some(DialogState::Plan { plan, warnings }) => {
-                confirm_choice = confirm::draw_plan(ui, plan, warnings);
+                confirm_choice = confirm::draw_plan(ui, plan, warnings, self.confirm_detail);
             }
             Some(DialogState::Report(report)) => {
                 dismiss_report = confirm::draw_report(ui, report);
@@ -235,6 +239,7 @@ pub fn run(
     engine: Arc<dyn EditorEngine>,
     event_rx: mpsc::Receiver<GuiEvent>,
     confirm_tx: mpsc::Sender<ConfirmChoice>,
+    confirm_detail: ConfirmDetail,
 ) -> anyhow::Result<()> {
     let options = eframe::NativeOptions::default();
     eframe::run_native(
@@ -245,6 +250,7 @@ pub fn run(
                 Arc::clone(&engine),
                 event_rx,
                 confirm_tx,
+                confirm_detail,
                 creation_context.egui_ctx.clone(),
             )
             .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;

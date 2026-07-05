@@ -15,6 +15,7 @@ pub mod fileinfo;
 pub mod gitstatus;
 pub mod grammar;
 pub mod id;
+pub mod options;
 pub mod path;
 pub mod plan;
 pub mod report;

@@ -86,6 +86,22 @@ impl SaveController {
         }
     }
 
+    /// 初回スキャンに使った表示設定を保持して保存フローを作成する。
+    ///
+    /// 設定ファイル由来の隠しファイル表示とソート順を、再スキャン・ルート移動でも
+    /// 維持する必要がある場合に使う。既定設定では [`Self::new`] と同じである。
+    pub fn new_with_scan_options(
+        root: PathBuf,
+        ids: IdAllocator,
+        baseline: BaselineTree,
+        engine: Arc<dyn EditorEngine>,
+        scan_options: ScanOptions,
+    ) -> Self {
+        let mut controller = Self::new(root, ids, baseline, engine);
+        controller.scan_options = scan_options;
+        controller
+    }
+
     /// 保存状態機械がルート差し替え可能な`Idle`状態かを返す。
     ///
     /// 確認ダイアログ表示中やapply/reconcile中のナビゲーションは、この判定で
@@ -208,6 +224,7 @@ impl SaveController {
 
         let options = ScanOptions {
             show_hidden: !self.scan_options.show_hidden,
+            ..self.scan_options
         };
         let baseline = fyler_fsops::scan::rescan_preserving_ids_with(
             &self.root,

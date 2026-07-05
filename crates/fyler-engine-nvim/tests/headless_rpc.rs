@@ -177,6 +177,33 @@ async fn modifiable_blocks_normal_mode_edits_until_reenabled() -> anyhow::Result
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn bookmark_command_emits_jump_request() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.send(key_command(Key::Char(':')))?;
+    engine.send(EditorCommand::Text("FylerBookmark x".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            EditorEvent::JumpBookmark {
+                query: Some(query)
+            } if query == "x"
+        )
+    })
+    .await
+    .context(":FylerBookmark x did not emit JumpBookmark")?;
+
+    Ok(())
+}
+
 fn key_command(key: Key) -> EditorCommand {
     EditorCommand::Key(KeyInput {
         key,

@@ -182,6 +182,12 @@ pub enum EditorEvent {
     NavigateParent,
     /// ユーザーが隠しファイル表示の切り替えを要求した。
     ToggleHidden,
+    /// ユーザーがブックマークまたは最近使ったルートへのジャンプ、
+    /// あるいは候補一覧の表示を要求した。
+    JumpBookmark {
+        /// 指定名または番号。一覧表示要求の場合は`None`。
+        query: Option<String>,
+    },
     /// ユーザーが保存(`:w` 相当)を要求した。`lines` は保存要求時点のsnapshotに
     /// 属する行で、後続編集で更新されたsnapshotを誤ってplanしないため同梱する。
     /// [`crate::save::SaveEvent::CommitRequested`] へ接続する。
