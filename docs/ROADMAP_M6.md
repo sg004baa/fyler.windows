@@ -161,6 +161,25 @@
    `EditorCommand::SetModifiable(bool)` を追加し `nvim_set_option_value("modifiable")` に配線。
    確認ダイアログ中の「:wからダイアログ表示までの入力すり抜け」ウィンドウが閉じる
 
+## Windows実機フィードバック対応(2026-07-05)
+
+> **実装済み(2026-07-05)**。M8後の実機使用で報告された5件へ2セッションで対応。
+> Linuxゲート(fmt/test/clippy/クロスターゲット)pass、headless RPCスモーク5件pass(実nvim)。
+> Windows実機での再確認は未実施。
+
+1. **`ciw`等のフリーズ**(根本修正): `c`→`i`後のnvimは`vgetc()`で文字を同期待ちし、
+   deferred RPC(`nvim_call_atomic`)が応答されずエンジンのコマンドループがデッドロック。
+   snapshot取得前に`nvim_get_mode`(fast API)の`blocking`を確認して待ち中はスキップ+
+   入力完結後に再試行する方式へ。`f`/`t`/`r`/`"`等の文字待ちも同時に解消
+2. **展開の2〜3秒delay**(根本修正2件): `baseline_to_lines`のO(n・m)総当たりを
+   DFS順契約のskip prefix 1パスへ / `file_infos`の全ツリーstatを表示中エントリ限定へ
+3. **Visual選択範囲ハイライト**: `EditorSnapshot.visual_start` + `getpos("v")`で
+   charwise/linewise/blockwiseを半透明背景描画(conceal補正・UTF-8境界対応)
+4. **親移動キー変更**: `-` → `^`(ユーザー好み)
+5. **日本語フォント/nerdアイコン**: config.tomlの`font`(絶対パス)と
+   `icons = "ascii"|"nerd"`。未指定時はYuGothM→meiryo→msgothicを自動検出して
+   CJK fallback登録。アイコンはNerd Fontグリフを選択可(既定Ascii)
+
 ## 実装順序とリスク
 
 ```mermaid
