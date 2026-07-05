@@ -13,12 +13,12 @@ pub const MARKDOWN: &str = "M";
 pub const TEXT: &str = "T";
 pub const CONFIG: &str = "C";
 
-const NERD_DIRECTORY: &str = "\u{f4d3}";
-const NERD_FILE: &str = "\u{f4a5}";
-const NERD_RUST: &str = "\u{e7a8}";
-const NERD_MARKDOWN: &str = "\u{e73e}";
-const NERD_TEXT: &str = "\u{f15c}";
-const NERD_CONFIG: &str = "\u{e615}";
+const NERD_DIRECTORY: &str = " ";
+const NERD_FILE: &str = " ";
+const NERD_RUST: &str = " ";
+const NERD_MARKDOWN: &str = " ";
+const NERD_TEXT: &str = " ";
+const NERD_CONFIG: &str = " ";
 
 /// conceal済みの表示名に対応するASCIIアイコンを返す。
 ///
