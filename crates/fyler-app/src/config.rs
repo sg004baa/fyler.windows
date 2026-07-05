@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use fyler_core::options::SortOrder;
-use fyler_gui::confirm::ConfirmDetail;
+use fyler_gui::confirm::{ConfirmDetail, IconStyle};
 
 const CONFIG_FILE: &str = "config.toml";
 const RECENT_FILE: &str = "recent.toml";
@@ -28,6 +28,10 @@ pub struct Config {
     pub sort: SortOrder,
     /// 確認ダイアログの操作一覧詳細度。
     pub confirm_detail: ConfirmDetail,
+    /// 日本語fallbackフォントとして読み込むファイルの絶対パス。
+    pub font: Option<PathBuf>,
+    /// ツリーへ描画するファイルアイコンのスタイル。
+    pub icons: IconStyle,
     /// 名前と絶対パスのブックマーク。設定ファイルでの定義順を保持する。
     pub bookmarks: Vec<(String, PathBuf)>,
 }
@@ -38,6 +42,8 @@ impl Default for Config {
             show_hidden: false,
             sort: SortOrder::DirsFirst,
             confirm_detail: ConfirmDetail::Full,
+            font: None,
+            icons: IconStyle::Ascii,
             bookmarks: Vec::new(),
         }
     }
@@ -46,7 +52,7 @@ impl Default for Config {
 /// `config.toml`を読み込む。
 ///
 /// ファイルがなければ警告なしで既定値を返す。構文エラー、型不一致、未知キー、
-/// 相対パスのブックマークは起動を止めず、該当項目を無視して警告を返す。
+/// 相対パスのフォント・ブックマークは起動を止めず、該当項目を無視して警告を返す。
 pub fn load() -> (Config, Vec<String>) {
     let mut warnings = Vec::new();
     let directory = match config_dir() {
@@ -97,6 +103,29 @@ pub fn load() -> (Config, Vec<String>) {
                 .push("confirm_detailは\"full\"または\"summary\"で指定してください".to_owned()),
         }
     }
+    if let Some(value) = table.get("font") {
+        match value.as_str() {
+            Some(path) => {
+                let path = PathBuf::from(path);
+                if path.is_absolute() {
+                    config.font = Some(path);
+                } else {
+                    warnings.push(format!(
+                        "fontは絶対パスではないため無視します: {}",
+                        path.display()
+                    ));
+                }
+            }
+            None => warnings.push("fontは文字列で指定してください".to_owned()),
+        }
+    }
+    if let Some(value) = table.get("icons") {
+        match value.as_str() {
+            Some("ascii") => config.icons = IconStyle::Ascii,
+            Some("nerd") => config.icons = IconStyle::Nerd,
+            _ => warnings.push("iconsは\"ascii\"または\"nerd\"で指定してください".to_owned()),
+        }
+    }
     if let Some(value) = table.get("bookmarks") {
         match value.as_table() {
             Some(bookmarks) => {
@@ -133,7 +162,7 @@ pub fn load() -> (Config, Vec<String>) {
     for key in table.keys() {
         if !matches!(
             key.as_str(),
-            "show_hidden" | "sort" | "confirm_detail" | "bookmarks"
+            "show_hidden" | "sort" | "confirm_detail" | "font" | "icons" | "bookmarks"
         ) {
             warnings.push(format!("未知の設定キーを無視します: {key}"));
         }
@@ -332,13 +361,33 @@ mod tests {
                 .any(|warning| warning.contains("絶対パスではない"))
         );
 
+        fs::write(&path, "font = true\nicons = 1\n").unwrap();
+        let (config, warnings) = load();
+        assert_eq!(config.font, None);
+        assert_eq!(config.icons, IconStyle::Ascii);
+        assert!(warnings.iter().any(|warning| warning.contains("font")));
+        assert!(warnings.iter().any(|warning| warning.contains("icons")));
+
+        fs::write(&path, "font = 'relative/font.ttf'\nicons = 'ascii'\n").unwrap();
+        let (config, warnings) = load();
+        assert_eq!(config.font, None);
+        assert_eq!(config.icons, IconStyle::Ascii);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("絶対パスではない"))
+        );
+
         let first = directory.path().join("z-first");
         let second = directory.path().join("a-second");
+        let font = directory.path().join("JapaneseFont.ttf");
         fs::write(
             &path,
             format!(
                 "show_hidden = true\nsort = \"mixed\"\nconfirm_detail = \"summary\"\n\
+                 font = '{}'\nicons = \"nerd\"\n\
                  [bookmarks]\nzeta = '{}'\nalpha = '{}'\n",
+                font.display(),
                 first.display(),
                 second.display()
             ),
@@ -349,6 +398,8 @@ mod tests {
         assert!(config.show_hidden);
         assert_eq!(config.sort, SortOrder::Mixed);
         assert_eq!(config.confirm_detail, ConfirmDetail::Summary);
+        assert_eq!(config.font, Some(font));
+        assert_eq!(config.icons, IconStyle::Nerd);
         assert_eq!(
             config.bookmarks,
             [("zeta".to_owned(), first), ("alpha".to_owned(), second),]

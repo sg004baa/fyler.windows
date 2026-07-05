@@ -19,7 +19,7 @@ use fyler_core::tree::EntryKind;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
 use fyler_fsops::scan::ScanOptions;
 use fyler_fsops::watch::{ExternalChange, FsWatcher};
-use fyler_gui::app::GuiEvent;
+use fyler_gui::app::{GuiEvent, GuiOptions};
 use fyler_gui::confirm::ConfirmChoice;
 
 use crate::save_flow::{SaveController, SaveFlowResult, ToggleCollapseResult};
@@ -46,7 +46,11 @@ fn main() -> anyhow::Result<()> {
         show_hidden: config.show_hidden,
         sort: config.sort,
     };
-    let confirm_detail = config.confirm_detail;
+    let gui_options = GuiOptions {
+        confirm_detail: config.confirm_detail,
+        font_path: config.font,
+        icon_style: config.icons,
+    };
     let bookmarks = config.bookmarks;
     let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
         .map(PathBuf::from)
@@ -375,7 +379,7 @@ fn main() -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("GUIイベント配線を開始できません: {error}"))?;
 
     let gui_engine: Arc<dyn EditorEngine> = engine;
-    let gui_result = fyler_gui::app::run(gui_engine, gui_event_rx, confirm_tx, confirm_detail);
+    let gui_result = fyler_gui::app::run(gui_engine, gui_event_rx, confirm_tx, gui_options);
     let _ = app_event_tx.send(AppEvent::Shutdown);
     let _ = watch_bridge.join();
     let _ = event_bridge.join();
@@ -602,6 +606,7 @@ fn handle_activate_line(
                             format!("折りたたみ表示を更新できません: {error:#}"),
                         )?;
                     }
+                    gui_event_tx.send(GuiEvent::FileInfos(save_controller.visible_file_infos()))?;
                 }
                 ToggleCollapseResult::NotADirectory => {
                     send_gui_message(
@@ -676,7 +681,7 @@ fn send_gui_message(
     })))
 }
 
-/// 現在のbaselineに対応するGit装飾とファイル情報を再計算し、GUIへ送る。
+/// 現在のbaselineに対応するGit装飾と、表示中エントリのファイル情報を再計算して送る。
 ///
 /// Gitが利用できない場合とリポジトリ外では、空のmapを送って既存装飾を消す。
 /// ファイル情報の取得に失敗したエントリは送信するmapに含めない。
@@ -685,7 +690,7 @@ fn send_decorations(
     save_controller: &SaveController,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     gui_event_tx.send(GuiEvent::GitBadges(save_controller.git_badges()))?;
-    gui_event_tx.send(GuiEvent::FileInfos(save_controller.file_infos()))
+    gui_event_tx.send(GuiEvent::FileInfos(save_controller.visible_file_infos()))
 }
 
 fn send_save_result(

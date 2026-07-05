@@ -8,6 +8,7 @@ use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::EntryId;
 
+use crate::confirm::IconStyle;
 use crate::{conceal, icon};
 
 /// snapshotのバッファ行をツリーとして描画する。
@@ -19,7 +20,12 @@ use crate::{conceal, icon};
 /// - Visual系モードの選択範囲ハイライトもここ(M1はカーソルのみでよい)
 /// - アイコン・git status・インデントガイドはバッファ文字列に含まれない
 ///   Rust側装飾として描く(M5)
-pub fn draw(ui: &mut egui::Ui, snapshot: &EditorSnapshot, git_badges: &HashMap<EntryId, GitBadge>) {
+pub fn draw(
+    ui: &mut egui::Ui,
+    snapshot: &EditorSnapshot,
+    git_badges: &HashMap<EntryId, GitBadge>,
+    icon_style: IconStyle,
+) {
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
     let text_color = ui.visuals().text_color();
     let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
@@ -32,7 +38,10 @@ pub fn draw(ui: &mut egui::Ui, snapshot: &EditorSnapshot, git_badges: &HashMap<E
                 let concealed = conceal::conceal_line(&line.text);
                 let painter = ui.painter().clone();
                 let icon_galley = painter.layout_no_wrap(
-                    format!("{} ", icon::for_display_name(concealed.display)),
+                    format!(
+                        "{} ",
+                        icon::for_display_name_styled(concealed.display, icon_style)
+                    ),
                     font_id.clone(),
                     text_color,
                 );

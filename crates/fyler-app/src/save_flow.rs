@@ -15,7 +15,7 @@ use fyler_core::path::TreePath;
 use fyler_core::plan::OperationPlan;
 use fyler_core::report::CommitReport;
 use fyler_core::save::{self, SaveEffect, SaveEvent, SaveState};
-use fyler_core::tree::{BaselineTree, EditContext, EntryKind};
+use fyler_core::tree::{BaselineEntry, BaselineTree, EditContext, EntryKind};
 use fyler_core::validate::ValidateError;
 use fyler_fsops::scan::ScanOptions;
 use fyler_gui::confirm::ConfirmChoice;
@@ -155,13 +155,12 @@ impl SaveController {
             .collect()
     }
 
-    /// 現在のbaseline全エントリの表示用メタデータをIDへ対応付けて返す。
+    /// 現在表示中の行に対応するエントリの表示用メタデータをIDへ対応付けて返す。
     ///
     /// 取得に失敗したエントリは含めず、モードラインでは情報を表示しない。
-    pub fn file_infos(&self) -> HashMap<EntryId, FileInfo> {
-        self.baseline
-            .entries()
-            .iter()
+    pub fn visible_file_infos(&self) -> HashMap<EntryId, FileInfo> {
+        visible_entries(&self.baseline, &self.context)
+            .into_iter()
             .filter_map(|entry| {
                 let path = entry.path.to_fs_path(&self.root);
                 fyler_fsops::info::file_info(&path)
@@ -550,23 +549,36 @@ fn carry_collapsed_dirs(
     context
 }
 
-pub(crate) fn baseline_to_lines(baseline: &BaselineTree, context: &EditContext) -> Vec<EditorLine> {
-    let collapsed_paths = context
-        .collapsed_dirs
-        .iter()
-        .filter_map(|id| baseline.get(*id))
-        .filter(|entry| entry.kind == EntryKind::Dir)
-        .map(|entry| &entry.path)
-        .collect::<Vec<_>>();
+/// 折りたたみ状態を反映した表示対象エントリを1パスで列挙する。
+///
+/// baselineの表示順は親の直後に全子孫が連続するDFS順であることを前提とする。
+/// これは`fyler-fsops/src/scan.rs`の構築契約である。
+fn visible_entries<'a>(
+    baseline: &'a BaselineTree,
+    context: &EditContext,
+) -> Vec<&'a BaselineEntry> {
+    let mut visible = Vec::new();
+    let mut skip_prefix: Option<&TreePath> = None;
 
-    baseline
-        .entries()
-        .iter()
-        .filter(|entry| {
-            !collapsed_paths
-                .iter()
-                .any(|path| path.is_strict_ancestor_of(&entry.path))
-        })
+    for entry in baseline.entries() {
+        if let Some(prefix) = skip_prefix {
+            if prefix.is_strict_ancestor_of(&entry.path) {
+                continue;
+            }
+            skip_prefix = None;
+        }
+        if entry.kind == EntryKind::Dir && context.collapsed_dirs.contains(&entry.id) {
+            skip_prefix = Some(&entry.path);
+        }
+        visible.push(entry);
+    }
+
+    visible
+}
+
+pub(crate) fn baseline_to_lines(baseline: &BaselineTree, context: &EditContext) -> Vec<EditorLine> {
+    visible_entries(baseline, context)
+        .into_iter()
         .map(|entry| {
             let indent = " "
                 .repeat(entry.path.depth().saturating_sub(1) * fyler_core::grammar::INDENT_WIDTH);
@@ -688,6 +700,43 @@ mod tests {
 
     fn lines(lines: &[&str]) -> Vec<EditorLine> {
         lines.iter().map(|line| EditorLine::new(*line)).collect()
+    }
+
+    fn legacy_baseline_to_lines(baseline: &BaselineTree, context: &EditContext) -> Vec<EditorLine> {
+        let collapsed_paths = context
+            .collapsed_dirs
+            .iter()
+            .filter_map(|id| baseline.get(*id))
+            .filter(|entry| entry.kind == EntryKind::Dir)
+            .map(|entry| &entry.path)
+            .collect::<Vec<_>>();
+
+        baseline
+            .entries()
+            .iter()
+            .filter(|entry| {
+                !collapsed_paths
+                    .iter()
+                    .any(|path| path.is_strict_ancestor_of(&entry.path))
+            })
+            .map(|entry| {
+                let indent = " ".repeat(
+                    entry.path.depth().saturating_sub(1) * fyler_core::grammar::INDENT_WIDTH,
+                );
+                let directory_suffix = if entry.kind == EntryKind::Dir {
+                    fyler_core::grammar::DIR_SUFFIX.to_string()
+                } else {
+                    String::new()
+                };
+                EditorLine::new(format!(
+                    "{}{}{}{}",
+                    fyler_core::grammar::format_id_prefix(entry.id),
+                    indent,
+                    entry.path.name().unwrap_or_default(),
+                    directory_suffix,
+                ))
+            })
+            .collect()
     }
 
     fn modifiable_values(engine: &RecordingEngine) -> Vec<bool> {
@@ -1056,25 +1105,55 @@ mod tests {
     }
 
     #[test]
-    fn file_infos_returns_metadata_for_every_baseline_entry() {
+    fn visible_file_infos_excludes_collapsed_descendants_and_restores_them_after_expand() {
         let root = tempdir().unwrap();
         fs::create_dir(root.path().join("directory")).unwrap();
+        fs::write(root.path().join("directory").join("child.txt"), b"child").unwrap();
         fs::write(root.path().join("file.txt"), b"content").unwrap();
         let mut ids = IdAllocator::new();
         let baseline = fyler_fsops::scan::scan_baseline(root.path(), &mut ids).unwrap();
-        let expected_ids: Vec<_> = baseline.entries().iter().map(|entry| entry.id).collect();
+        let directory_id = baseline
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("directory"))
+            .unwrap()
+            .id;
+        let child_id = baseline
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("directory/child.txt"))
+            .unwrap()
+            .id;
+        let file_id = baseline
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("file.txt"))
+            .unwrap()
+            .id;
         let engine = Arc::new(RecordingEngine::default());
-        let controller = SaveController::new(
+        let mut controller = SaveController::new(
             root.path().to_path_buf(),
             ids,
             baseline,
             Arc::<RecordingEngine>::clone(&engine),
         );
+        controller.context.collapsed_dirs.insert(directory_id);
 
-        let infos = controller.file_infos();
+        let collapsed_infos = controller.visible_file_infos();
 
-        assert_eq!(infos.len(), expected_ids.len());
-        assert!(expected_ids.iter().all(|id| infos.contains_key(id)));
+        assert_eq!(collapsed_infos.len(), 2);
+        assert!(collapsed_infos.contains_key(&directory_id));
+        assert!(collapsed_infos.contains_key(&file_id));
+        assert!(!collapsed_infos.contains_key(&child_id));
+
+        let collapsed_lines = controller.visible_lines();
+        assert!(matches!(
+            controller.toggle_collapse(&collapsed_lines, 0),
+            ToggleCollapseResult::Toggled(_)
+        ));
+        let expanded_infos = controller.visible_file_infos();
+        assert_eq!(expanded_infos.len(), 3);
+        assert!(expanded_infos.contains_key(&child_id));
     }
 
     #[test]
@@ -1131,6 +1210,66 @@ mod tests {
             result => panic!("unexpected expand result: {result:?}"),
         };
         assert_eq!(expanded_again, expanded);
+    }
+
+    #[test]
+    fn visible_entries_matches_legacy_filter_for_nested_collapsed_dirs() {
+        let (controller, _) = hierarchy_controller("C:/test-root");
+        let context = EditContext {
+            collapsed_dirs: [EntryId(1), EntryId(2)].into(),
+        };
+
+        assert_eq!(
+            baseline_to_lines(&controller.baseline, &context),
+            legacy_baseline_to_lines(&controller.baseline, &context)
+        );
+    }
+
+    #[test]
+    fn visible_entries_matches_legacy_filter_after_parent_is_expanded() {
+        let (controller, _) = hierarchy_controller("C:/test-root");
+        let context = EditContext {
+            collapsed_dirs: [EntryId(2)].into(),
+        };
+
+        let actual = baseline_to_lines(&controller.baseline, &context);
+
+        assert_eq!(
+            actual,
+            legacy_baseline_to_lines(&controller.baseline, &context)
+        );
+        assert!(actual.iter().any(|line| line.text.ends_with("nested/")));
+        assert!(actual.iter().all(|line| !line.text.ends_with("leaf.txt")));
+    }
+
+    #[test]
+    fn visible_entries_matches_legacy_filter_for_deep_hierarchy() {
+        let mut baseline = BaselineTree::new("C:/test-root");
+        for (index, (path, kind)) in [
+            ("a", EntryKind::Dir),
+            ("a/b", EntryKind::Dir),
+            ("a/b/c", EntryKind::Dir),
+            ("a/b/c/d", EntryKind::Dir),
+            ("a/b/c/d/leaf.txt", EntryKind::File),
+            ("top.txt", EntryKind::File),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            baseline.insert(BaselineEntry {
+                id: EntryId(index as u64 + 1),
+                path: TreePath::parse(path),
+                kind,
+            });
+        }
+        let context = EditContext {
+            collapsed_dirs: [EntryId(3)].into(),
+        };
+
+        assert_eq!(
+            baseline_to_lines(&baseline, &context),
+            legacy_baseline_to_lines(&baseline, &context)
+        );
     }
 
     #[test]

@@ -24,6 +24,16 @@ pub enum ConfirmDetail {
     Summary,
 }
 
+/// ツリーへ描画するファイルアイコンのスタイル。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IconStyle {
+    /// eguiの既定フォントだけで表示できるASCII文字を使う。
+    #[default]
+    Ascii,
+    /// ユーザーが指定したNerd Fontのグリフを使う。
+    Nerd,
+}
+
 /// OperationPlanをモーダルで表示し、選択があれば返す。
 ///
 /// 実装契約:
