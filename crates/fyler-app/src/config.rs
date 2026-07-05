@@ -18,9 +18,10 @@ use fyler_gui::confirm::{ConfirmDetail, IconStyle};
 const CONFIG_FILE: &str = "config.toml";
 const RECENT_FILE: &str = "recent.toml";
 const MAX_RECENT_ROOTS: usize = 10;
+const DEFAULT_FONT_Y_OFFSET_FACTOR: f32 = 0.12;
 
 /// ユーザー設定。無指定または不正な項目には安全な既定値を使う。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// 起動時から隠しファイルを表示するか。
     pub show_hidden: bool,
@@ -30,6 +31,11 @@ pub struct Config {
     pub confirm_detail: ConfirmDetail,
     /// 日本語fallbackフォントとして読み込むファイルの絶対パス。
     pub font: Option<PathBuf>,
+    /// CJKフォントの上寄りを補正する、フォントサイズ比の下方向オフセット。
+    ///
+    /// CJKフォントはascent metricsが既定フォントと異なり上寄りに描画されるため、
+    /// フォントサイズ比で下方向へずらす。`0`で無効。
+    pub font_y_offset_factor: f32,
     /// ツリーへ描画するファイルアイコンのスタイル。
     pub icons: IconStyle,
     /// 名前と絶対パスのブックマーク。設定ファイルでの定義順を保持する。
@@ -43,6 +49,7 @@ impl Default for Config {
             sort: SortOrder::DirsFirst,
             confirm_detail: ConfirmDetail::Full,
             font: None,
+            font_y_offset_factor: DEFAULT_FONT_Y_OFFSET_FACTOR,
             icons: IconStyle::Ascii,
             bookmarks: Vec::new(),
         }
@@ -119,6 +126,12 @@ pub fn load() -> (Config, Vec<String>) {
             None => warnings.push("fontは文字列で指定してください".to_owned()),
         }
     }
+    if let Some(value) = table.get("font_y_offset_factor") {
+        match numeric_f32(value) {
+            Some(factor) => config.font_y_offset_factor = factor,
+            None => warnings.push("font_y_offset_factorは数値で指定してください".to_owned()),
+        }
+    }
     if let Some(value) = table.get("icons") {
         match value.as_str() {
             Some("ascii") => config.icons = IconStyle::Ascii,
@@ -162,13 +175,28 @@ pub fn load() -> (Config, Vec<String>) {
     for key in table.keys() {
         if !matches!(
             key.as_str(),
-            "show_hidden" | "sort" | "confirm_detail" | "font" | "icons" | "bookmarks"
+            "show_hidden"
+                | "sort"
+                | "confirm_detail"
+                | "font"
+                | "font_y_offset_factor"
+                | "icons"
+                | "bookmarks"
         ) {
             warnings.push(format!("未知の設定キーを無視します: {key}"));
         }
     }
 
     (config, warnings)
+}
+
+fn numeric_f32(value: &toml::Value) -> Option<f32> {
+    let value = match value {
+        toml::Value::Float(value) => *value as f32,
+        toml::Value::Integer(value) => *value as f32,
+        _ => return None,
+    };
+    value.is_finite().then_some(value)
 }
 
 /// `recent.toml`から最近使ったルートを新しい順で読む。
@@ -361,11 +389,21 @@ mod tests {
                 .any(|warning| warning.contains("絶対パスではない"))
         );
 
-        fs::write(&path, "font = true\nicons = 1\n").unwrap();
+        fs::write(
+            &path,
+            "font = true\nfont_y_offset_factor = 'low'\nicons = 1\n",
+        )
+        .unwrap();
         let (config, warnings) = load();
         assert_eq!(config.font, None);
+        assert_eq!(config.font_y_offset_factor, DEFAULT_FONT_Y_OFFSET_FACTOR);
         assert_eq!(config.icons, IconStyle::Ascii);
         assert!(warnings.iter().any(|warning| warning.contains("font")));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("font_y_offset_factor"))
+        );
         assert!(warnings.iter().any(|warning| warning.contains("icons")));
 
         fs::write(&path, "font = 'relative/font.ttf'\nicons = 'ascii'\n").unwrap();
@@ -385,7 +423,7 @@ mod tests {
             &path,
             format!(
                 "show_hidden = true\nsort = \"mixed\"\nconfirm_detail = \"summary\"\n\
-                 font = '{}'\nicons = \"nerd\"\n\
+                 font = '{}'\nfont_y_offset_factor = 0.25\nicons = \"nerd\"\n\
                  [bookmarks]\nzeta = '{}'\nalpha = '{}'\n",
                 font.display(),
                 first.display(),
@@ -399,6 +437,7 @@ mod tests {
         assert_eq!(config.sort, SortOrder::Mixed);
         assert_eq!(config.confirm_detail, ConfirmDetail::Summary);
         assert_eq!(config.font, Some(font));
+        assert_eq!(config.font_y_offset_factor, 0.25);
         assert_eq!(config.icons, IconStyle::Nerd);
         assert_eq!(
             config.bookmarks,
@@ -436,5 +475,12 @@ mod tests {
                 .len(),
             10
         );
+    }
+
+    #[test]
+    fn font_y_offset_factor_parser_accepts_numbers_and_rejects_other_types() {
+        assert_eq!(numeric_f32(&toml::Value::Float(0.25)), Some(0.25));
+        assert_eq!(numeric_f32(&toml::Value::Integer(0)), Some(0.0));
+        assert_eq!(numeric_f32(&toml::Value::String("0.25".to_owned())), None);
     }
 }

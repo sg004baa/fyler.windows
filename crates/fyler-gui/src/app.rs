@@ -7,7 +7,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 
 use eframe::egui;
-use fyler_core::editor::{CmdlineState, EditorEngine, EditorEvent, EditorMessage};
+use fyler_core::editor::{CmdlineState, EditorEngine, EditorEvent, EditorMessage, Mode};
 use fyler_core::fileinfo::FileInfo;
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::id::EntryId;
@@ -21,12 +21,17 @@ use crate::{cmdline, confirm, input, modeline, tree_view};
 const CJK_FONT_NAME: &str = "fyler-cjk";
 
 /// app層からGUI起動時に渡す表示設定。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GuiOptions {
     /// 保存確認ダイアログの操作一覧詳細度。
     pub confirm_detail: ConfirmDetail,
     /// ユーザーが明示した日本語fallbackフォントの絶対パス。
     pub font_path: Option<PathBuf>,
+    /// CJKフォントの上寄りを補正する、フォントサイズ比の下方向オフセット。
+    ///
+    /// CJKフォントはascent metricsが既定フォントと異なり上寄りに描画されるため、
+    /// フォントサイズ比で下方向へずらす。`0`で無効。
+    pub font_y_offset_factor: f32,
     /// ツリーへ描画するファイルアイコンのスタイル。
     pub icon_style: IconStyle,
 }
@@ -84,6 +89,8 @@ pub struct FylerApp {
     confirm_tx: mpsc::Sender<ConfirmChoice>,
     confirm_detail: ConfirmDetail,
     icon_style: IconStyle,
+    last_cursor_line: usize,
+    tree_viewport: Option<tree_view::TreeViewport>,
 }
 
 impl FylerApp {
@@ -122,6 +129,8 @@ impl FylerApp {
             confirm_tx,
             confirm_detail,
             icon_style,
+            last_cursor_line: 0,
+            tree_viewport: None,
         })
     }
 
@@ -197,13 +206,39 @@ impl eframe::App for FylerApp {
             }
         });
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            if let Some(error) = &self.engine_error {
-                ui.colored_label(ui.visuals().error_fg_color, error);
-            } else {
-                tree_view::draw(ui, &snapshot, &self.git_badges, self.icon_style);
+        let cursor_line_changed = snapshot.cursor.line != self.last_cursor_line;
+        let tree_output = egui::CentralPanel::default()
+            .show(ui, |ui| {
+                if let Some(error) = &self.engine_error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                    None
+                } else {
+                    Some(tree_view::draw(
+                        ui,
+                        &snapshot,
+                        &self.git_badges,
+                        self.icon_style,
+                        cursor_line_changed,
+                        self.tree_viewport,
+                    ))
+                }
+            })
+            .inner;
+        self.last_cursor_line = snapshot.cursor.line;
+        if let Some(output) = tree_output {
+            self.tree_viewport = Some(output.viewport);
+            if matches!(snapshot.mode, Mode::Insert | Mode::Replace | Mode::Cmdline)
+                && let Some(cursor_rect) = output.cursor_rect
+            {
+                ui.ctx().output_mut(|platform_output| {
+                    platform_output.ime = Some(egui::output::IMEOutput {
+                        rect: output.tree_rect,
+                        cursor_rect,
+                        should_interrupt_composition: false,
+                    });
+                });
             }
-        });
+        }
 
         let mut confirm_choice = None;
         let mut dismiss_errors = false;
@@ -266,9 +301,14 @@ pub fn run(
             let GuiOptions {
                 confirm_detail,
                 font_path,
+                font_y_offset_factor,
                 icon_style,
             } = gui_options;
-            install_fallback_font(&creation_context.egui_ctx, font_path.as_deref());
+            install_fallback_font(
+                &creation_context.egui_ctx,
+                font_path.as_deref(),
+                font_y_offset_factor,
+            );
             let app = FylerApp::new(
                 Arc::clone(&engine),
                 event_rx,
@@ -292,7 +332,7 @@ fn resolve_font_path(configured: Option<&Path>, candidates: &[PathBuf]) -> Optio
         .or_else(|| candidates.iter().find(|path| path.exists()).cloned())
 }
 
-fn install_fallback_font(context: &egui::Context, configured: Option<&Path>) {
+fn install_fallback_font(context: &egui::Context, configured: Option<&Path>, y_offset_factor: f32) {
     let candidates = default_font_candidates();
     let Some(path) = resolve_font_path(configured, &candidates) else {
         return;
@@ -304,7 +344,10 @@ fn install_fallback_font(context: &egui::Context, configured: Option<&Path>) {
     let mut definitions = egui::FontDefinitions::default();
     definitions.font_data.insert(
         CJK_FONT_NAME.to_owned(),
-        Arc::new(egui::FontData::from_owned(bytes)),
+        Arc::new(egui::FontData::from_owned(bytes).tweak(egui::FontTweak {
+            y_offset_factor,
+            ..Default::default()
+        })),
     );
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         definitions

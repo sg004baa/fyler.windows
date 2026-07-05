@@ -45,6 +45,7 @@ fn main() -> anyhow::Result<()> {
     let gui_options = GuiOptions {
         confirm_detail: config.confirm_detail,
         font_path: config.font,
+        font_y_offset_factor: config.font_y_offset_factor,
         icon_style: config.icons,
     };
     let bookmarks = config.bookmarks;
