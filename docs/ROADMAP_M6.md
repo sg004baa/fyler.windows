@@ -180,6 +180,27 @@
    `icons = "ascii"|"nerd"`。未指定時はYuGothM→meiryo→msgothicを自動検出して
    CJK fallback登録。アイコンはNerd Fontグリフを選択可(既定Ascii)
 
+## Windows実機フィードバック対応 第2弾(2026-07-05)
+
+> **実装済み(2026-07-05)**。第1弾の実機再確認(ciw ok / visual ok / 展開△ /
+> ^△ / フォント△)+新規3件へ2セッションで対応。Linuxゲートpass、
+> headless RPCスモーク5件pass(実nvim)。Windows実機での再確認は未実施。
+
+1. **US配列で`^`(Shift+6)が`6`になる**(根本修正): egui `Event::Key`は
+   レイアウト非依存の論理キーでShift+記号を復元できない。全モードで
+   レイアウト適用済み`Event::Text`優先へ反転(normal系は各文字を
+   `Key::Char`として送出)。`@#$%&*()_`等の記号shiftも同時に解消
+2. **大量file dirで全挙動が重い**(根本修正2件): キー入力毎の全行String clone
+   (1万行=1キー1万allocation)をlines_arcキャッシュでO(1)化 /
+   tree_viewの毎フレーム全行layoutを`show_rows`仮想化で可視行限定に
+3. **ルートパスの`\.`混入**: 起動時とルート変更時に`std::path::absolute`で正規化
+4. **カーソル追従スクロール**: cursor.line変化時のみ、可視範囲外ならvim風に
+   最小限スクロール(ホイール操作は上書きしない)
+5. **insert modeでIMEが起動しない**: 自前描画で`PlatformOutput.ime`未設定だった。
+   Insert/Replace/Cmdline時にカーソル矩形で`IMEOutput`を毎フレーム設定
+6. **CJKフォント上寄り**: `FontTweak.y_offset_factor`で下方向補正。
+   config.tomlの`font_y_offset_factor`(既定0.12、0で無効)で調整可能
+
 ## 実装順序とリスク
 
 ```mermaid
