@@ -173,6 +173,11 @@ pub enum EditorEvent {
     ActivateLine {
         line: usize,
     },
+    /// ユーザーが指定行のエントリの絶対パスをコピーするよう要求した。
+    /// `line`は0始まり。行の解釈とパス解決はapp層が行う。
+    YankPath {
+        line: usize,
+    },
     /// ユーザーが現在の表示ルートの親ディレクトリへの移動を要求した。
     NavigateParent,
     /// ユーザーが隠しファイル表示の切り替えを要求した。

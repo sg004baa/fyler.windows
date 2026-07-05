@@ -7,6 +7,7 @@ use std::thread;
 
 use eframe::egui;
 use fyler_core::editor::{CmdlineState, EditorEngine, EditorEvent, EditorMessage};
+use fyler_core::fileinfo::FileInfo;
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::id::EntryId;
 use fyler_core::plan::OperationPlan;
@@ -24,6 +25,10 @@ pub enum GuiEvent {
     RootChanged(PathBuf),
     /// baselineのエントリIDに対応するGit装飾を全件差し替える。
     GitBadges(HashMap<EntryId, GitBadge>),
+    /// baselineのエントリIDに対応する表示用メタデータを全件差し替える。
+    FileInfos(HashMap<EntryId, FileInfo>),
+    /// 指定された表示用パスをクリップボードへコピーする。
+    CopyPath(String),
     /// 保存planと実行前に確認すべき警告を表示する。
     ShowPlan {
         plan: OperationPlan,
@@ -58,6 +63,8 @@ pub struct FylerApp {
     message: Option<EditorMessage>,
     root: PathBuf,
     git_badges: HashMap<EntryId, GitBadge>,
+    file_infos: HashMap<EntryId, FileInfo>,
+    pending_copy: Option<String>,
     engine_error: Option<String>,
     dialog: Option<DialogState>,
     confirm_tx: mpsc::Sender<ConfirmChoice>,
@@ -90,6 +97,8 @@ impl FylerApp {
             message: None,
             root: PathBuf::new(),
             git_badges: HashMap::new(),
+            file_infos: HashMap::new(),
+            pending_copy: None,
             engine_error: None,
             dialog: None,
             confirm_tx,
@@ -102,6 +111,7 @@ impl FylerApp {
                 GuiEvent::Editor(event) => match event {
                     EditorEvent::SnapshotUpdated => {}
                     EditorEvent::ActivateLine { .. } => {}
+                    EditorEvent::YankPath { .. } => {}
                     EditorEvent::NavigateParent => {}
                     EditorEvent::ToggleHidden => {}
                     EditorEvent::CommitRequested { .. } => {}
@@ -114,6 +124,8 @@ impl FylerApp {
                 },
                 GuiEvent::RootChanged(root) => self.root = root,
                 GuiEvent::GitBadges(git_badges) => self.git_badges = git_badges,
+                GuiEvent::FileInfos(file_infos) => self.file_infos = file_infos,
+                GuiEvent::CopyPath(path) => self.pending_copy = Some(path),
                 GuiEvent::ShowPlan { plan, warnings } => {
                     self.dialog = Some(DialogState::Plan { plan, warnings });
                 }
@@ -133,8 +145,15 @@ impl FylerApp {
 }
 
 impl eframe::App for FylerApp {
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_events();
+        if let Some(path) = self.pending_copy.take() {
+            ctx.copy_text(path.clone());
+            self.message = Some(EditorMessage {
+                kind: fyler_core::editor::MessageKind::Info,
+                text: format!("コピーしました: {path}"),
+            });
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -149,7 +168,7 @@ impl eframe::App for FylerApp {
         }
 
         egui::Panel::bottom("modeline").show(ui, |ui| {
-            modeline::draw(ui, &snapshot, &self.root);
+            modeline::draw(ui, &snapshot, &self.root, &self.file_infos);
             if let Some(state) = &self.cmdline {
                 cmdline::draw_cmdline(ui, state);
             } else if let Some(message) = &self.message {

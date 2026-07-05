@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use fyler_core::editor::{EditorCommand, EditorEngine, EditorLine};
+use fyler_core::fileinfo::{FileInfo, human_readable_size};
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::{EntryId, IdAllocator};
@@ -134,6 +135,22 @@ impl SaveController {
             .filter_map(|entry| {
                 let relative = entry.path.to_fs_path(Path::new(""));
                 statuses.get(&relative).map(|badge| (entry.id, *badge))
+            })
+            .collect()
+    }
+
+    /// 現在のbaseline全エントリの表示用メタデータをIDへ対応付けて返す。
+    ///
+    /// 取得に失敗したエントリは含めず、モードラインでは情報を表示しない。
+    pub fn file_infos(&self) -> HashMap<EntryId, FileInfo> {
+        self.baseline
+            .entries()
+            .iter()
+            .filter_map(|entry| {
+                let path = entry.path.to_fs_path(&self.root);
+                fyler_fsops::info::file_info(&path)
+                    .ok()
+                    .map(|info| (entry.id, info))
             })
             .collect()
     }
@@ -491,17 +508,6 @@ fn plan_warnings(
             })
         })
         .collect()
-}
-
-fn human_readable_size(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    let bytes = bytes as f64;
-    if bytes >= MIB {
-        format!("{:.1} MB", bytes / MIB)
-    } else {
-        format!("{:.1} KB", bytes / KIB)
-    }
 }
 
 /// 再スキャン後も既存ディレクトリの折りたたみ状態を維持し、新規ディレクトリは
@@ -1030,6 +1036,28 @@ mod tests {
         );
         assert_eq!(controller.resolve_line(&buffer_lines, 2), None);
         assert_eq!(controller.resolve_line(&buffer_lines, 3), None);
+    }
+
+    #[test]
+    fn file_infos_returns_metadata_for_every_baseline_entry() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("directory")).unwrap();
+        fs::write(root.path().join("file.txt"), b"content").unwrap();
+        let mut ids = IdAllocator::new();
+        let baseline = fyler_fsops::scan::scan_baseline(root.path(), &mut ids).unwrap();
+        let expected_ids: Vec<_> = baseline.entries().iter().map(|entry| entry.id).collect();
+        let engine = Arc::new(RecordingEngine::default());
+        let controller = SaveController::new(
+            root.path().to_path_buf(),
+            ids,
+            baseline,
+            Arc::<RecordingEngine>::clone(&engine),
+        );
+
+        let infos = controller.file_infos();
+
+        assert_eq!(infos.len(), expected_ids.len());
+        assert!(expected_ids.iter().all(|id| infos.contains_key(id)));
     }
 
     #[test]

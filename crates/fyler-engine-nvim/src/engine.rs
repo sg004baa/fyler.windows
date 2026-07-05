@@ -102,7 +102,7 @@ impl NvimEngine {
     ///    `Paste` は `nvim_paste`、`RequestCommit` は `:w` 相当、
     ///    `Undo`/`Redo` は `u`/`<C-r>` 相当
     /// 7. **イベント**: BufWriteCmd等のrpcnotify → `EditorEvent::CommitRequested`、
-    ///    行アクション → `ActivateLine` / `NavigateParent` / `ToggleHidden`、ext_cmdline →
+    ///    行アクション → `ActivateLine` / `YankPath` / `NavigateParent` / `ToggleHidden`、ext_cmdline →
     ///    `CmdlineShow/CmdlineHide`、ext_messages → `Message`、プロセス終了検知 →
     ///    `EngineCrashed` として `event_tx` へ流す
     ///
@@ -340,6 +340,21 @@ impl NvimEngine {
                             }
                             "fyler_toggle_hidden" => {
                                 let _ = event_tx.send(EditorEvent::ToggleHidden);
+                            }
+                            "fyler_yank_path" => {
+                                let line = notification.args.first()
+                                    .and_then(value_as_u64)
+                                    .and_then(|line| usize::try_from(line).ok());
+                                match line {
+                                    Some(line) => {
+                                        let _ = event_tx.send(EditorEvent::YankPath { line });
+                                    }
+                                    None => send_message(
+                                        &event_tx,
+                                        MessageKind::Error,
+                                        "コピー対象の行番号を取得できません".to_owned(),
+                                    ),
+                                }
                             }
                             "fyler_action_blocked" => {
                                 send_message(

@@ -108,7 +108,7 @@ fn main() -> anyhow::Result<()> {
     // GUIクレートへtokio型を漏らさず、core型とConfirmChoiceだけを受け渡す。
     let (gui_event_tx, gui_event_rx) = mpsc::channel();
     gui_event_tx.send(GuiEvent::RootChanged(root.clone()))?;
-    send_git_badges(&gui_event_tx, &save_controller)?;
+    send_decorations(&gui_event_tx, &save_controller)?;
     let app_engine = Arc::clone(&save_engine);
     let event_bridge = thread::Builder::new()
         .name("fyler-app-events".to_owned())
@@ -134,6 +134,19 @@ fn main() -> anyhow::Result<()> {
                     AppEvent::Editor(EditorEvent::ActivateLine { line }) => {
                         if handle_activate_line(
                             &mut save_controller,
+                            app_engine.as_ref(),
+                            &root,
+                            line,
+                            &gui_event_tx,
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    AppEvent::Editor(EditorEvent::YankPath { line }) => {
+                        if handle_yank_path(
+                            &save_controller,
                             app_engine.as_ref(),
                             &root,
                             line,
@@ -254,7 +267,7 @@ fn main() -> anyhow::Result<()> {
                         {
                             return;
                         }
-                        if send_git_badges(&gui_event_tx, &save_controller).is_err() {
+                        if send_decorations(&gui_event_tx, &save_controller).is_err() {
                             return;
                         }
                     }
@@ -304,7 +317,7 @@ fn main() -> anyhow::Result<()> {
                                 return;
                             }
                         }
-                        if send_git_badges(&gui_event_tx, &save_controller).is_err() {
+                        if send_decorations(&gui_event_tx, &save_controller).is_err() {
                             return;
                         }
                     }
@@ -315,7 +328,7 @@ fn main() -> anyhow::Result<()> {
                     }
                     AppEvent::Confirm(choice) => {
                         let result = save_controller.on_choice(choice);
-                        let refresh_git_badges = matches!(
+                        let refresh_decorations = matches!(
                             &result,
                             SaveFlowResult::ShowReport(_)
                                 | SaveFlowResult::ReconcileFailed { .. }
@@ -323,8 +336,8 @@ fn main() -> anyhow::Result<()> {
                         if send_save_result(&gui_event_tx, result).is_err() {
                             return;
                         }
-                        if refresh_git_badges
-                            && send_git_badges(&gui_event_tx, &save_controller).is_err()
+                        if refresh_decorations
+                            && send_decorations(&gui_event_tx, &save_controller).is_err()
                         {
                             return;
                         }
@@ -348,7 +361,7 @@ fn main() -> anyhow::Result<()> {
                         {
                             return;
                         }
-                        if send_git_badges(&gui_event_tx, &save_controller).is_err() {
+                        if send_decorations(&gui_event_tx, &save_controller).is_err() {
                             return;
                         }
                     }
@@ -462,6 +475,47 @@ fn handle_activate_line(
     Ok(())
 }
 
+fn handle_yank_path(
+    save_controller: &SaveController,
+    engine: &dyn EditorEngine,
+    root: &Path,
+    line: usize,
+    gui_event_tx: &mpsc::Sender<GuiEvent>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    let snapshot = engine.snapshot();
+    let Some(editor_line) = snapshot.lines.get(line) else {
+        return send_gui_message(
+            gui_event_tx,
+            MessageKind::Error,
+            "コピー対象の行が見つかりません",
+        );
+    };
+
+    match fyler_core::grammar::split_id_prefix(&editor_line.text) {
+        PrefixParse::NoId { .. } => {
+            return send_gui_message(gui_event_tx, MessageKind::Info, "保存されていない行です");
+        }
+        PrefixParse::Broken => {
+            return send_gui_message(
+                gui_event_tx,
+                MessageKind::Error,
+                "壊れたIDプレフィックスの行はコピーできません",
+            );
+        }
+        PrefixParse::WithId { .. } => {}
+    }
+
+    let Some((path, _)) = save_controller.resolve_line(&snapshot.lines, line) else {
+        return send_gui_message(
+            gui_event_tx,
+            MessageKind::Error,
+            "行に対応するファイルが現在のツリーに見つかりません",
+        );
+    };
+    let path = path.to_fs_path(root);
+    gui_event_tx.send(GuiEvent::CopyPath(path.to_string_lossy().into_owned()))
+}
+
 fn send_gui_message(
     gui_event_tx: &mpsc::Sender<GuiEvent>,
     kind: MessageKind,
@@ -473,14 +527,16 @@ fn send_gui_message(
     })))
 }
 
-/// 現在のbaselineに対応するGit装飾を再計算し、GUIの保持mapを全件差し替える。
+/// 現在のbaselineに対応するGit装飾とファイル情報を再計算し、GUIへ送る。
 ///
 /// Gitが利用できない場合とリポジトリ外では、空のmapを送って既存装飾を消す。
-fn send_git_badges(
+/// ファイル情報の取得に失敗したエントリは送信するmapに含めない。
+fn send_decorations(
     gui_event_tx: &mpsc::Sender<GuiEvent>,
     save_controller: &SaveController,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
-    gui_event_tx.send(GuiEvent::GitBadges(save_controller.git_badges()))
+    gui_event_tx.send(GuiEvent::GitBadges(save_controller.git_badges()))?;
+    gui_event_tx.send(GuiEvent::FileInfos(save_controller.file_infos()))
 }
 
 fn send_save_result(

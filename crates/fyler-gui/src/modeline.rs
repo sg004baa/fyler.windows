@@ -1,15 +1,24 @@
 //! モードライン(NORMAL / INSERT / VISUAL ...)の描画。
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use eframe::egui;
 use fyler_core::editor::{EditorSnapshot, Mode};
+use fyler_core::fileinfo::{FileInfo, human_readable_size};
+use fyler_core::grammar::PrefixParse;
+use fyler_core::id::EntryId;
 
 use crate::conceal;
 
 /// モード名・dirtyインジケータ・現在ルート・カーソル位置などを描く。
 /// `Mode::Other(s)` は生文字列をそのまま表示する(隠さない)。
-pub fn draw(ui: &mut egui::Ui, snapshot: &EditorSnapshot, root: &Path) {
+pub fn draw(
+    ui: &mut egui::Ui,
+    snapshot: &EditorSnapshot,
+    root: &Path,
+    file_infos: &HashMap<EntryId, FileInfo>,
+) {
     let mode = match &snapshot.mode {
         Mode::Normal => "NORMAL",
         Mode::Insert => "INSERT",
@@ -22,6 +31,7 @@ pub fn draw(ui: &mut egui::Ui, snapshot: &EditorSnapshot, root: &Path) {
         Mode::Other(mode) => mode,
     };
     let dirty = if snapshot.dirty { " [+]" } else { "" };
+    let file_info = cursor_file_info(snapshot, file_infos);
 
     let (line, column) = snapshot
         .lines
@@ -43,6 +53,31 @@ pub fn draw(ui: &mut egui::Ui, snapshot: &EditorSnapshot, root: &Path) {
         ui.monospace(root.display().to_string());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.monospace(format!("{line}:{column}"));
+            if let Some(file_info) = &file_info {
+                ui.monospace(file_info);
+            }
         });
     });
+}
+
+fn cursor_file_info(
+    snapshot: &EditorSnapshot,
+    file_infos: &HashMap<EntryId, FileInfo>,
+) -> Option<String> {
+    let line = snapshot.lines.get(snapshot.cursor.line)?;
+    let PrefixParse::WithId { id, .. } = fyler_core::grammar::split_id_prefix(&line.text) else {
+        return None;
+    };
+    let info = file_infos.get(&id)?;
+    let mut parts = Vec::with_capacity(3);
+    if let Some(size) = info.size {
+        parts.push(human_readable_size(size));
+    }
+    if let Some(modified) = &info.modified {
+        parts.push(modified.clone());
+    }
+    if info.is_placeholder {
+        parts.push("[cloud]".to_owned());
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
