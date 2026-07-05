@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use eframe::egui;
-use fyler_core::editor::{EditorSnapshot, Mode};
+use fyler_core::editor::{Cursor, EditorSnapshot, Mode};
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::EntryId;
@@ -23,6 +23,7 @@ pub fn draw(ui: &mut egui::Ui, snapshot: &EditorSnapshot, git_badges: &HashMap<E
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
     let text_color = ui.visuals().text_color();
     let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+    let selection = display_selection(snapshot);
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -57,6 +58,19 @@ pub fn draw(ui: &mut egui::Ui, snapshot: &EditorSnapshot, git_badges: &HashMap<E
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
 
+                if let Some((start, cursor)) = selection {
+                    draw_selection(
+                        ui,
+                        rect,
+                        concealed.display,
+                        &snapshot.mode,
+                        start,
+                        cursor,
+                        line_index,
+                        &font_id,
+                        text_offset,
+                    );
+                }
                 painter.galley(rect.min, icon_galley, text_color);
                 painter.galley(
                     egui::pos2(rect.left() + icon_width, rect.top()),
@@ -82,6 +96,129 @@ pub fn draw(ui: &mut egui::Ui, snapshot: &EditorSnapshot, git_badges: &HashMap<E
                 }
             }
         });
+}
+
+fn display_selection(snapshot: &EditorSnapshot) -> Option<(Cursor, Cursor)> {
+    let start = snapshot.visual_start?;
+    let start_line = snapshot.lines.get(start.line)?;
+    let cursor_line = snapshot.lines.get(snapshot.cursor.line)?;
+    Some((
+        conceal::display_cursor(&start_line.text, start),
+        conceal::display_cursor(&cursor_line.text, snapshot.cursor),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_selection(
+    ui: &egui::Ui,
+    row_rect: egui::Rect,
+    display: &str,
+    mode: &Mode,
+    start: Cursor,
+    cursor: Cursor,
+    line_index: usize,
+    font_id: &egui::FontId,
+    text_offset: f32,
+) {
+    let Some((span_start, span_end)) = selection_span(mode, start, cursor, line_index, display)
+    else {
+        return;
+    };
+    let fill = translucent_selection_fill(ui.visuals());
+    let painter = ui.painter();
+
+    if matches!(mode, Mode::VisualLine) {
+        painter.rect_filled(row_rect, 0.0, fill);
+        return;
+    }
+
+    let before_width = painter
+        .layout_no_wrap(
+            display[..span_start].to_owned(),
+            font_id.clone(),
+            ui.visuals().text_color(),
+        )
+        .size()
+        .x;
+    let selected = &display[span_start..span_end];
+    let selected_width = painter
+        .layout_no_wrap(
+            if selected.is_empty() {
+                " ".to_owned()
+            } else {
+                selected.to_owned()
+            },
+            font_id.clone(),
+            ui.visuals().text_color(),
+        )
+        .size()
+        .x
+        .max(1.0);
+    let selection_rect = egui::Rect::from_min_size(
+        egui::pos2(row_rect.left() + text_offset + before_width, row_rect.top()),
+        egui::vec2(selected_width, row_rect.height()),
+    );
+    painter.rect_filled(selection_rect, 0.0, fill);
+}
+
+/// Visual系モードの各行について、表示文字列内の選択範囲を半開区間で返す。
+fn selection_span(
+    mode: &Mode,
+    start: Cursor,
+    cursor: Cursor,
+    line_index: usize,
+    line_display: &str,
+) -> Option<(usize, usize)> {
+    let first_line = start.line.min(cursor.line);
+    let last_line = start.line.max(cursor.line);
+    if !(first_line..=last_line).contains(&line_index) {
+        return None;
+    }
+
+    match mode {
+        Mode::VisualLine => Some((0, line_display.len())),
+        Mode::VisualBlock => {
+            let span_start = valid_byte_index(line_display, start.col.min(cursor.col));
+            let span_end = byte_after_character(line_display, start.col.max(cursor.col));
+            Some((span_start, span_end.max(span_start)))
+        }
+        Mode::Visual => {
+            let (first, last) = if (start.line, start.col) <= (cursor.line, cursor.col) {
+                (start, cursor)
+            } else {
+                (cursor, start)
+            };
+
+            if first.line == last.line {
+                let span_start = valid_byte_index(line_display, first.col);
+                let span_end = byte_after_character(line_display, last.col);
+                Some((span_start, span_end.max(span_start)))
+            } else if line_index == first.line {
+                Some((
+                    valid_byte_index(line_display, first.col),
+                    line_display.len(),
+                ))
+            } else if line_index == last.line {
+                Some((0, byte_after_character(line_display, last.col)))
+            } else {
+                Some((0, line_display.len()))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn byte_after_character(text: &str, requested: usize) -> usize {
+    let index = valid_byte_index(text, requested);
+    text[index..]
+        .chars()
+        .next()
+        .map_or(index, |character| index + character.len_utf8())
+}
+
+fn translucent_selection_fill(visuals: &egui::Visuals) -> egui::Color32 {
+    let color = visuals.selection.bg_fill;
+    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), color.a().min(96))
 }
 
 fn badge_for_line(raw: &str, git_badges: &HashMap<EntryId, GitBadge>) -> Option<GitBadge> {
@@ -224,5 +361,89 @@ mod tests {
         assert_eq!(valid_byte_index("新a", 1), 0);
         assert_eq!(valid_byte_index("新a", 3), 3);
         assert_eq!(valid_byte_index("新a", usize::MAX), 4);
+    }
+
+    #[test]
+    fn charwise_selection_normalizes_same_line_direction() {
+        let forward = selection_span(
+            &Mode::Visual,
+            Cursor { line: 2, col: 1 },
+            Cursor { line: 2, col: 3 },
+            2,
+            "abcde",
+        );
+        let reverse = selection_span(
+            &Mode::Visual,
+            Cursor { line: 2, col: 3 },
+            Cursor { line: 2, col: 1 },
+            2,
+            "abcde",
+        );
+
+        assert_eq!(forward, Some((1, 4)));
+        assert_eq!(reverse, forward);
+    }
+
+    #[test]
+    fn charwise_selection_spans_forward_and_reverse_multiple_lines() {
+        for (start, cursor) in [
+            (Cursor { line: 1, col: 2 }, Cursor { line: 3, col: 1 }),
+            (Cursor { line: 3, col: 1 }, Cursor { line: 1, col: 2 }),
+        ] {
+            assert_eq!(
+                selection_span(&Mode::Visual, start, cursor, 1, "abcde"),
+                Some((2, 5))
+            );
+            assert_eq!(
+                selection_span(&Mode::Visual, start, cursor, 2, "middle"),
+                Some((0, 6))
+            );
+            assert_eq!(
+                selection_span(&Mode::Visual, start, cursor, 3, "xyz"),
+                Some((0, 2))
+            );
+            assert_eq!(
+                selection_span(&Mode::Visual, start, cursor, 0, "outside"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn block_selection_normalizes_columns_and_clamps_utf8_boundaries() {
+        let start = Cursor { line: 4, col: 4 };
+        let cursor = Cursor { line: 1, col: 1 };
+
+        assert_eq!(
+            selection_span(&Mode::VisualBlock, start, cursor, 2, "abcdef"),
+            Some((1, 5))
+        );
+        assert_eq!(
+            selection_span(&Mode::VisualBlock, start, cursor, 2, "新ab"),
+            Some((0, 5))
+        );
+        assert_eq!(
+            selection_span(&Mode::VisualBlock, start, cursor, 0, "abcdef"),
+            None
+        );
+    }
+
+    #[test]
+    fn linewise_selection_covers_each_selected_row() {
+        let start = Cursor { line: 5, col: 8 };
+        let cursor = Cursor { line: 3, col: 1 };
+
+        assert_eq!(
+            selection_span(&Mode::VisualLine, start, cursor, 3, "abc"),
+            Some((0, 3))
+        );
+        assert_eq!(
+            selection_span(&Mode::VisualLine, start, cursor, 4, ""),
+            Some((0, 0))
+        );
+        assert_eq!(
+            selection_span(&Mode::VisualLine, start, cursor, 6, "outside"),
+            None
+        );
     }
 }

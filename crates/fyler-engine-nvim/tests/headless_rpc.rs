@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use fyler_core::editor::{
-    EditorCommand, EditorEngine, EditorEvent, EditorLine, Key, KeyInput, Modifiers,
+    EditorCommand, EditorEngine, EditorEvent, EditorLine, Key, KeyInput, Mode, Modifiers,
 };
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -26,12 +26,20 @@ async fn spawn_attach_and_edit_updates_snapshot() -> anyhow::Result<()> {
     engine.set_initial_lines(vec![EditorLine::new("/001 alpha")])?;
     wait_for(&engine, |line| line == "/001 alpha").await?;
 
+    engine.send(key_command(Key::Char('v')))?;
+    wait_for_mode(&engine, Mode::Visual).await?;
+    let visual_snapshot = engine.snapshot();
+    assert_eq!(visual_snapshot.visual_start, Some(visual_snapshot.cursor));
+    engine.send(key_command(Key::Esc))?;
+    wait_for_mode(&engine, Mode::Normal).await?;
+    assert_eq!(engine.snapshot().visual_start, None);
+
     engine.send(key_command(Key::Enter))?;
     wait_for_event(&mut events, |event| {
         matches!(event, EditorEvent::ActivateLine { line: 0 })
     })
     .await?;
-    engine.send(key_command(Key::Char('-')))?;
+    engine.send(key_command(Key::Char('^')))?;
     wait_for_event(&mut events, |event| {
         matches!(event, EditorEvent::NavigateParent)
     })
@@ -87,6 +95,39 @@ async fn spawn_attach_and_edit_updates_snapshot() -> anyhow::Result<()> {
         matches!(event, EditorEvent::EngineCrashed { .. })
     })
     .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn character_waiting_commands_do_not_block_following_input() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, _events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.set_initial_lines(vec![EditorLine::new("/001 alpha.txt")])?;
+    wait_for(&engine, |line| line == "/001 alpha.txt").await?;
+
+    engine.send(key_command(Key::Char('c')))?;
+    engine.send(key_command(Key::Char('i')))?;
+    engine.send(key_command(Key::Char('w')))?;
+    wait_for_mode(&engine, Mode::Insert)
+        .await
+        .context("ciw did not reach Insert mode")?;
+
+    engine.send(key_command(Key::Esc))?;
+    wait_for_mode(&engine, Mode::Normal).await?;
+
+    let revision = engine.snapshot().revision;
+    engine.send(key_command(Key::Char('f')))?;
+    engine.send(key_command(Key::Char('x')))?;
+    wait_for_revision_after(&engine, revision)
+        .await
+        .context("fx did not complete after character wait")?;
 
     Ok(())
 }
@@ -240,6 +281,19 @@ async fn wait_for_revision_after(engine: &NvimEngine, revision: u64) -> anyhow::
     })
     .await
     .map_err(|_| anyhow::anyhow!("snapshot revision update timed out"))
+}
+
+async fn wait_for_mode(engine: &NvimEngine, expected: Mode) -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if engine.snapshot().mode == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("snapshot mode did not become {expected:?}"))
 }
 
 async fn wait_for_event(

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use fyler_core::editor::{
     CmdlineState, Cursor, EditorCommand, EditorEngine, EditorEvent, EditorLine, EditorMessage,
-    EditorSnapshot, Key, MessageKind, Mode,
+    EditorSnapshot, MessageKind, Mode,
 };
 use nvim_rs::compat::tokio::Compat;
 use nvim_rs::create::tokio::new_child_cmd;
@@ -89,8 +89,9 @@ impl NvimEngine {
     ///    ([`crate::guard::BUFFER_URI_SCHEME`])、`buftype=acwrite`
     /// 3. **同期経路**:
     ///    - 行内容: `nvim_buf_attach` のプッシュ通知(`nvim_buf_lines_event`)
-    ///    - mode / cursor / changedtick: キー送信ごとに `nvim_call_atomic` で
-    ///      一括取得し、[`EditorSnapshot`] として原子的に更新(revisionはRust側で単調増加)
+    ///    - mode / cursor / changedtick: キー送信ごとに一括取得し、
+    ///      [`EditorSnapshot`] として原子的に更新(revisionはRust側で単調増加)。
+    ///      エンジンが追加入力を同期待ちしている間は状態取得を保留し、入力完結後に再試行する
     /// 4. **UI attach**: 起動後に `nvim_ui_attach` を最小グリッドサイズで後付け実行。
     ///    有効化するextは `ext_cmdline` と `ext_messages` の2つだけ
     ///    (ext_messagesがないと `E486` 等がgridに描かれて見えない)。
@@ -198,7 +199,8 @@ impl NvimEngine {
 
         tokio::spawn(async move {
             let mut cmdline_state = None;
-            let mut pending_normal_g = false;
+            let mut snapshot_pending = false;
+            let mut commit_pending = false;
             let crash_reason = loop {
                 tokio::select! {
                     child_status = child.wait() => {
@@ -221,33 +223,33 @@ impl NvimEngine {
                             return;
                         };
 
-                        let defer_snapshot = !pending_normal_g
-                            && is_normal_g_prefix(&command, &task_snapshot.load());
-                        let command_succeeded =
-                            if let Err(error) = handle_command(&nvim, &buffer, command).await {
-                                send_message(
-                                    &event_tx,
-                                    MessageKind::Error,
-                                    format!("エディタ入力に失敗しました: {error}"),
-                                );
-                                false
-                            } else {
-                                true
-                            };
-                        if defer_snapshot && command_succeeded {
-                            // `nvim_input("g")`直後に状態RPCを挟むと、nvimが後続キーを
-                            // 待つ間にRPCがmapping timeoutまで停止する。`g.`等の
-                            // 2キー操作を次の入力まで通し、完結後にsnapshotを更新する。
-                            pending_normal_g = true;
-                        } else {
-                            pending_normal_g = false;
-                            if let Err(error) = publish_snapshot(
-                                &nvim,
-                                &lines,
-                                &mut revision,
-                                &task_snapshot,
+                        if let Err(error) = handle_command(&nvim, &buffer, command).await {
+                            send_message(
                                 &event_tx,
-                            ).await {
+                                MessageKind::Error,
+                                format!("エディタ入力に失敗しました: {error}"),
+                            );
+                        }
+                        snapshot_pending = true;
+                        match publish_pending_snapshot(
+                            &nvim,
+                            &lines,
+                            &mut revision,
+                            &task_snapshot,
+                            &event_tx,
+                            &mut snapshot_pending,
+                        ).await {
+                            Ok(Some(snapshot)) => {
+                                if commit_pending {
+                                    let _ = event_tx.send(EditorEvent::CommitRequested {
+                                        changedtick: snapshot.changedtick,
+                                        lines: Arc::clone(&snapshot.lines),
+                                    });
+                                    commit_pending = false;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
                                 send_message(
                                     &event_tx,
                                     MessageKind::Error,
@@ -276,19 +278,7 @@ impl NvimEngine {
                                         }
                                     }
                                 }
-                                if let Err(error) = publish_snapshot(
-                                    &nvim,
-                                    &lines,
-                                    &mut revision,
-                                    &task_snapshot,
-                                    &event_tx,
-                                ).await {
-                                    send_message(
-                                        &event_tx,
-                                        MessageKind::Error,
-                                        format!("エディタ状態を更新できません: {error}"),
-                                    );
-                                }
+                                snapshot_pending = true;
                             }
                             "nvim_buf_detach_event" => {
                                 break "fylerバッファがNeovimからdetachされました".to_owned();
@@ -301,25 +291,8 @@ impl NvimEngine {
                                 );
                             }
                             "fyler_commit_requested" => {
-                                match publish_snapshot(
-                                    &nvim,
-                                    &lines,
-                                    &mut revision,
-                                    &task_snapshot,
-                                    &event_tx,
-                                ).await {
-                                    Ok(snapshot) => {
-                                        let _ = event_tx.send(EditorEvent::CommitRequested {
-                                            changedtick: snapshot.changedtick,
-                                            lines: Arc::clone(&snapshot.lines),
-                                        });
-                                    }
-                                    Err(error) => send_message(
-                                        &event_tx,
-                                        MessageKind::Error,
-                                        format!("保存要求時の状態取得に失敗しました: {error}"),
-                                    ),
-                                }
+                                commit_pending = true;
+                                snapshot_pending = true;
                             }
                             "fyler_open" => {
                                 let line = notification.args.first()
@@ -393,6 +366,33 @@ impl NvimEngine {
                             }
                             _ => {}
                         }
+
+                        match publish_pending_snapshot(
+                            &nvim,
+                            &lines,
+                            &mut revision,
+                            &task_snapshot,
+                            &event_tx,
+                            &mut snapshot_pending,
+                        ).await {
+                            Ok(Some(snapshot)) => {
+                                if commit_pending {
+                                    let _ = event_tx.send(EditorEvent::CommitRequested {
+                                        changedtick: snapshot.changedtick,
+                                        lines: Arc::clone(&snapshot.lines),
+                                    });
+                                    commit_pending = false;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                send_message(
+                                    &event_tx,
+                                    MessageKind::Error,
+                                    format!("エディタ状態を更新できません: {error}"),
+                                );
+                            }
+                        }
                     }
                 }
             };
@@ -409,18 +409,6 @@ impl NvimEngine {
         });
         Ok((engine, event_rx))
     }
-}
-
-fn is_normal_g_prefix(command: &EngineCommand, snapshot: &EditorSnapshot) -> bool {
-    matches!(
-        command,
-        EngineCommand::Editor(EditorCommand::Key(input))
-            if snapshot.mode == Mode::Normal
-                && input.key == Key::Char('g')
-                && !input.mods.ctrl
-                && !input.mods.alt
-                && !input.mods.shift
-    )
 }
 
 async fn handle_command(
@@ -541,6 +529,7 @@ struct Status {
     changedtick: u64,
     cursor: Cursor,
     mode: Mode,
+    visual_start: Option<Cursor>,
     dirty: bool,
 }
 
@@ -556,6 +545,10 @@ async fn query_status(nvim: &Nvim) -> anyhow::Result<Status> {
                 Value::Map(vec![(Value::from("buf"), Value::from(0))]),
             ],
         ),
+        atomic_call(
+            "nvim_call_function",
+            vec![Value::from("getpos"), Value::Array(vec![Value::from("v")])],
+        ),
     ];
     let response = nvim
         .call_atomic(calls)
@@ -569,9 +562,9 @@ async fn query_status(nvim: &Nvim) -> anyhow::Result<Status> {
     if let Some(error) = response.get(1).filter(|value| !value.is_nil()) {
         anyhow::bail!("nvim_call_atomic内の呼び出しに失敗しました: {error:?}");
     }
-    if results.len() != 4 {
+    if results.len() != 5 {
         anyhow::bail!(
-            "nvim_call_atomicのresults件数が不正です: expected 4, got {}",
+            "nvim_call_atomicのresults件数が不正です: expected 5, got {}",
             results.len()
         );
     }
@@ -594,6 +587,26 @@ async fn query_status(nvim: &Nvim) -> anyhow::Result<Status> {
     let dirty = results[3]
         .as_bool()
         .ok_or_else(|| anyhow::anyhow!("modified結果の形式が不正です"))?;
+    let mode = normalize_mode(mode_name);
+    let visual_start = if matches!(&mode, Mode::Visual | Mode::VisualLine | Mode::VisualBlock) {
+        let position = results[4]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("visual start結果の形式が不正です"))?;
+        let line = position
+            .get(1)
+            .and_then(value_as_u64)
+            .ok_or_else(|| anyhow::anyhow!("visual start lineの形式が不正です"))?;
+        let col = position
+            .get(2)
+            .and_then(value_as_u64)
+            .ok_or_else(|| anyhow::anyhow!("visual start colの形式が不正です"))?;
+        Some(Cursor {
+            line: line.saturating_sub(1) as usize,
+            col: col.saturating_sub(1) as usize,
+        })
+    } else {
+        None
+    };
 
     Ok(Status {
         changedtick,
@@ -601,7 +614,8 @@ async fn query_status(nvim: &Nvim) -> anyhow::Result<Status> {
             line: row.saturating_sub(1) as usize,
             col: col as usize,
         },
-        mode: normalize_mode(mode_name),
+        mode,
+        visual_start,
         dirty,
     })
 }
@@ -623,8 +637,32 @@ fn build_snapshot(revision: u64, lines: &[String], status: Status) -> EditorSnap
         ),
         cursor: status.cursor,
         mode: status.mode,
+        visual_start: status.visual_start,
         dirty: status.dirty,
     }
+}
+
+/// 保留中のsnapshot更新を試みる。
+///
+/// 追加入力待ちならfast APIの判定だけで戻り、保留フラグを維持する。通常状態へ
+/// 戻って一括取得に成功したときだけフラグを落とす。
+async fn publish_pending_snapshot(
+    nvim: &Nvim,
+    lines: &[String],
+    revision: &mut u64,
+    shared_snapshot: &ArcSwap<EditorSnapshot>,
+    event_tx: &mpsc::UnboundedSender<EditorEvent>,
+    snapshot_pending: &mut bool,
+) -> anyhow::Result<Option<Arc<EditorSnapshot>>> {
+    if !*snapshot_pending {
+        return Ok(None);
+    }
+
+    let snapshot = publish_snapshot(nvim, lines, revision, shared_snapshot, event_tx).await?;
+    if snapshot.is_some() {
+        *snapshot_pending = false;
+    }
+    Ok(snapshot)
 }
 
 async fn publish_snapshot(
@@ -633,13 +671,35 @@ async fn publish_snapshot(
     revision: &mut u64,
     shared_snapshot: &ArcSwap<EditorSnapshot>,
     event_tx: &mpsc::UnboundedSender<EditorEvent>,
-) -> anyhow::Result<Arc<EditorSnapshot>> {
+) -> anyhow::Result<Option<Arc<EditorSnapshot>>> {
+    if input_is_blocking(nvim).await? {
+        return Ok(None);
+    }
+
     let status = query_status(nvim).await?;
     *revision = revision.saturating_add(1);
     let snapshot = Arc::new(build_snapshot(*revision, lines, status));
     shared_snapshot.store(Arc::clone(&snapshot));
     let _ = event_tx.send(EditorEvent::SnapshotUpdated);
-    Ok(snapshot)
+    Ok(Some(snapshot))
+}
+
+/// 追加入力待ちかをfast APIだけで判定する。
+///
+/// ここでdeferred APIを呼ぶと、text objectや1文字引数の入力待ち中にコマンドループ
+/// 自身が停止するため、状態一括取得は必ずこのゲートの後で行う。
+async fn input_is_blocking(nvim: &Nvim) -> anyhow::Result<bool> {
+    let mode = nvim
+        .get_mode()
+        .await
+        .map_err(|error| anyhow::anyhow!("入力待ち状態を取得できません: {error}"))?;
+    mode.iter()
+        .find_map(|(key, value)| {
+            (key.as_str() == Some("blocking"))
+                .then(|| value.as_bool())
+                .flatten()
+        })
+        .ok_or_else(|| anyhow::anyhow!("入力待ち状態の形式が不正です"))
 }
 
 fn apply_lines_notification(args: &[Value], lines: &mut Vec<String>) -> bool {

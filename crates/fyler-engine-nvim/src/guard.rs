@@ -71,7 +71,7 @@ vim.keymap.set({ "n", "x" }, "<CR>", function()
   vim.rpcnotify(channel, "fyler_open", line)
 end, { buffer = buffer, silent = true, nowait = true })
 
-vim.keymap.set("n", "-", function()
+vim.keymap.set("n", "^", function()
   vim.rpcnotify(channel, "fyler_parent")
 end, { buffer = buffer, silent = true, nowait = true })
 

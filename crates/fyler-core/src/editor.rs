@@ -61,6 +61,8 @@ pub struct EditorSnapshot {
     pub lines: Arc<[EditorLine]>,
     pub cursor: Cursor,
     pub mode: Mode,
+    /// Visual系モード中の選択起点(0始まり)。Visual系モード以外では`None`。
+    pub visual_start: Option<Cursor>,
     /// 未保存の変更があるか(`modified` 相当)。
     pub dirty: bool,
 }
@@ -74,6 +76,7 @@ impl EditorSnapshot {
             lines: Arc::from(Vec::new()),
             cursor: Cursor::default(),
             mode: Mode::Normal,
+            visual_start: None,
             dirty: false,
         }
     }

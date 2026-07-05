@@ -45,6 +45,7 @@ struct EditorSnapshot {
     lines: Arc<[EditorLine]>,
     cursor: Cursor,
     mode: Mode,
+    visual_start: Option<Cursor>,
     dirty: bool,
 }
 
