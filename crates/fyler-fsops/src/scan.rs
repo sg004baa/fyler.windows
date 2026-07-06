@@ -814,6 +814,209 @@ mod tests {
     }
 
     #[test]
+    fn partial_rescan_matches_full_for_case_only_rename() {
+        let root = tempdir().unwrap();
+        let old = root.path().join("Foo.txt");
+        let new = root.path().join("foo.txt");
+        fs::write(&old, b"content").unwrap();
+        let mut ids = IdAllocator::new();
+        let previous = scan_baseline(root.path(), &mut ids).unwrap();
+        let old_id = previous
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("Foo.txt"))
+            .unwrap()
+            .id;
+
+        fs::rename(&old, &new).unwrap();
+        let partial = assert_partial_matches_full(root.path(), &previous, [old, new]);
+        assert!(
+            partial
+                .entries()
+                .iter()
+                .all(|entry| entry.path != TreePath::parse("Foo.txt"))
+        );
+        let renamed = partial
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("foo.txt"))
+            .unwrap();
+
+        assert_ne!(renamed.id, old_id);
+    }
+
+    #[test]
+    fn partial_rescan_matches_full_for_directory_move_between_siblings() {
+        let root = tempdir().unwrap();
+        let old = root.path().join("a").join("sub");
+        let new = root.path().join("b").join("sub");
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir(root.path().join("b")).unwrap();
+        fs::write(old.join("child.txt"), b"child").unwrap();
+        let mut ids = IdAllocator::new();
+        let previous = scan_baseline(root.path(), &mut ids).unwrap();
+        let old_directory_id = previous
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("a/sub"))
+            .unwrap()
+            .id;
+        let old_child_id = previous
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("a/sub/child.txt"))
+            .unwrap()
+            .id;
+
+        fs::rename(&old, &new).unwrap();
+        let partial = assert_partial_matches_full(root.path(), &previous, [old, new]);
+        assert!(partial.entries().iter().all(|entry| {
+            entry.path != TreePath::parse("a/sub")
+                && !TreePath::parse("a/sub").is_strict_ancestor_of(&entry.path)
+        }));
+        let moved_directory = partial
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("b/sub"))
+            .unwrap();
+        let moved_child = partial
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("b/sub/child.txt"))
+            .unwrap();
+
+        assert_ne!(moved_directory.id, old_directory_id);
+        assert_ne!(moved_child.id, old_child_id);
+    }
+
+    #[test]
+    fn partial_rescan_preserves_ids_across_consecutive_rescans() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("stable.txt"), b"stable").unwrap();
+        let mut ids = IdAllocator::new();
+        let initial = scan_baseline(root.path(), &mut ids).unwrap();
+        let stable_id = initial
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("stable.txt"))
+            .unwrap()
+            .id;
+
+        let first_path = root.path().join("first.txt");
+        fs::write(&first_path, b"first").unwrap();
+        let first = assert_partial_matches_full(root.path(), &initial, [first_path]);
+        let first_id = first
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("first.txt"))
+            .unwrap()
+            .id;
+
+        let second_path = root.path().join("second.txt");
+        fs::write(&second_path, b"second").unwrap();
+        let second = assert_partial_matches_full(root.path(), &first, [second_path]);
+        let stable_after_second = second
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("stable.txt"))
+            .unwrap();
+        let first_after_second = second
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("first.txt"))
+            .unwrap();
+
+        assert_eq!(stable_after_second.id, stable_id);
+        assert_eq!(first_after_second.id, first_id);
+        assert!(
+            second
+                .entries()
+                .iter()
+                .any(|entry| entry.path == TreePath::parse("second.txt"))
+        );
+    }
+
+    #[test]
+    fn partial_rescan_matches_full_with_hidden_entries_shown() {
+        let root = tempdir().unwrap();
+        let hidden = root.path().join(".hidden");
+        fs::create_dir(&hidden).unwrap();
+        fs::write(hidden.join("existing.txt"), b"existing").unwrap();
+        let options = ScanOptions {
+            show_hidden: true,
+            ..ScanOptions::default()
+        };
+        let mut ids = IdAllocator::new();
+        let previous = scan_baseline_with(root.path(), &mut ids, &options).unwrap();
+        let existing_id = previous
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse(".hidden/existing.txt"))
+            .unwrap()
+            .id;
+
+        let added = hidden.join("added.txt");
+        fs::write(&added, b"added").unwrap();
+        let changed_paths = BTreeSet::from([added]);
+        let mut partial_ids = allocator_after(&previous);
+        let mut full_ids = allocator_after(&previous);
+        let partial = rescan_changed_preserving_ids_with(
+            root.path(),
+            &mut partial_ids,
+            &previous,
+            &changed_paths,
+            &options,
+        )
+        .unwrap();
+        let full =
+            rescan_preserving_ids_with(root.path(), &mut full_ids, &previous, &options).unwrap();
+
+        assert_eq!(partial, full);
+        assert!(
+            partial
+                .entries()
+                .iter()
+                .any(|entry| entry.path == TreePath::parse(".hidden/added.txt"))
+        );
+        assert_eq!(
+            partial
+                .entries()
+                .iter()
+                .find(|entry| entry.path == TreePath::parse(".hidden/existing.txt"))
+                .unwrap()
+                .id,
+            existing_id
+        );
+    }
+
+    #[test]
+    fn partial_rescan_matches_full_when_root_itself_changed() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("removed.txt"), b"removed").unwrap();
+        fs::write(root.path().join("kept.txt"), b"kept").unwrap();
+        let mut ids = IdAllocator::new();
+        let previous = scan_baseline(root.path(), &mut ids).unwrap();
+
+        fs::remove_file(root.path().join("removed.txt")).unwrap();
+        fs::write(root.path().join("added.txt"), b"added").unwrap();
+        let partial =
+            assert_partial_matches_full(root.path(), &previous, [root.path().to_path_buf()]);
+
+        assert!(
+            partial
+                .entries()
+                .iter()
+                .all(|entry| entry.path != TreePath::parse("removed.txt"))
+        );
+        assert!(
+            partial
+                .entries()
+                .iter()
+                .any(|entry| entry.path == TreePath::parse("added.txt"))
+        );
+    }
+
+    #[test]
     fn scan_stores_metadata_for_files_and_directories() {
         let root = tempdir().unwrap();
         fs::create_dir(root.path().join("directory")).unwrap();
