@@ -13,7 +13,7 @@ use fyler_core::gitstatus::GitBadge;
 use fyler_core::id::EntryId;
 use fyler_core::path::TreePath;
 use fyler_core::plan::OperationPlan;
-use fyler_core::report::CommitReport;
+use fyler_core::report::{ApplyProgress, CommitReport};
 use fyler_core::validate::ValidateError;
 
 use crate::confirm::{ConfirmChoice, ConfirmDetail, IconStyle};
@@ -56,6 +56,15 @@ pub enum GuiEvent {
         /// 承認時に既存実体をごみ箱へ退避する移動先。plan順。
         overwrites: Vec<TreePath>,
     },
+    /// apply開始時に操作総数を設定して進捗ダイアログを表示する。
+    ShowApplyProgress {
+        /// 承認済みplanに含まれる操作総数。
+        total: usize,
+    },
+    /// apply workerから届いた操作単位の進捗を表示へ反映する。
+    ApplyProgress(ApplyProgress),
+    /// キャンセル要求を受理済みとして進捗ダイアログの操作を無効化する。
+    ApplyCancelRequested,
     ShowReport(CommitReport),
     ShowValidationErrors(Vec<ValidateError>),
     FatalError(String),
@@ -68,6 +77,13 @@ enum DialogState {
         plan: OperationPlan,
         warnings: Vec<String>,
         overwrites: Vec<TreePath>,
+    },
+    Progress {
+        completed: usize,
+        total: usize,
+        /// これから実行する操作の表示ラベル。
+        current: Option<String>,
+        cancel_requested: bool,
     },
     Report(CommitReport),
     ValidationErrors(Vec<ValidateError>),
@@ -173,6 +189,35 @@ impl FylerApp {
                         overwrites,
                     });
                 }
+                GuiEvent::ShowApplyProgress { total } => {
+                    self.dialog = Some(DialogState::Progress {
+                        completed: 0,
+                        total,
+                        current: None,
+                        cancel_requested: false,
+                    });
+                }
+                GuiEvent::ApplyProgress(progress) => {
+                    if let Some(DialogState::Progress {
+                        completed,
+                        total,
+                        current,
+                        ..
+                    }) = &mut self.dialog
+                    {
+                        *completed = progress.completed;
+                        *total = progress.total;
+                        *current = progress.current.as_ref().map(confirm::operation_label);
+                    }
+                }
+                GuiEvent::ApplyCancelRequested => {
+                    if let Some(DialogState::Progress {
+                        cancel_requested, ..
+                    }) = &mut self.dialog
+                    {
+                        *cancel_requested = true;
+                    }
+                }
                 GuiEvent::ShowReport(report) => {
                     self.dialog = Some(DialogState::Report(report));
                 }
@@ -255,6 +300,7 @@ impl eframe::App for FylerApp {
         }
 
         let mut confirm_choice = None;
+        let mut cancel_apply = false;
         let mut dismiss_errors = false;
         let mut dismiss_report = false;
         match &self.dialog {
@@ -268,6 +314,20 @@ impl eframe::App for FylerApp {
             }
             Some(DialogState::Report(report)) => {
                 dismiss_report = confirm::draw_report(ui, report);
+            }
+            Some(DialogState::Progress {
+                completed,
+                total,
+                current,
+                cancel_requested,
+            }) => {
+                cancel_apply = confirm::draw_apply_progress(
+                    ui,
+                    *completed,
+                    *total,
+                    current.as_deref(),
+                    *cancel_requested,
+                );
             }
             Some(DialogState::ValidationErrors(errors)) => {
                 let dismiss_from_keyboard = ui.ctx().input(|input| {
@@ -296,6 +356,9 @@ impl eframe::App for FylerApp {
             && self.confirm_tx.send(choice).is_err()
         {
             self.engine_error = Some("確認結果をアプリへ送信できません".to_owned());
+        }
+        if cancel_apply && self.confirm_tx.send(ConfirmChoice::Cancel).is_err() {
+            self.engine_error = Some("キャンセル要求をアプリへ送信できません".to_owned());
         }
     }
 }

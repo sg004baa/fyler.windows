@@ -3,11 +3,12 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, anyhow, bail};
 use fyler_core::path::TreePath;
 use fyler_core::plan::{FsOperation, OperationPlan};
-use fyler_core::report::{CommitReport, OpOutcome, OpResult};
+use fyler_core::report::{ApplyProgress, CommitReport, OpOutcome, OpResult};
 use fyler_core::tree::EntryKind;
 
 use crate::classify::MoveClass;
@@ -73,10 +74,48 @@ pub fn apply_plan_with_overwrites(
     plan: &OperationPlan,
     overwrites: &HashSet<TreePath>,
 ) -> CommitReport {
+    let cancel = AtomicBool::new(false);
+    apply_plan_cancellable(root, plan, overwrites, &cancel, &mut |_| {})
+}
+
+/// planを実行する。`cancel`が立った時点で残りの操作を実行せず
+/// [`OpOutcome::Skipped`]として報告する。実行中の1操作は完走し、
+/// キャンセルは次の操作との間でのみ反映する。
+///
+/// `on_progress`は各操作の実行開始前と全操作完了後に呼ぶ。最終通知の
+/// [`ApplyProgress::completed`]は、Skippedを除いて実際に実行を試みた操作数である。
+///
+/// 呼び出し契約は [`apply_plan`] と同じで、保存状態機械
+/// (`fyler_core::save`)の`Applying`状態からのみ呼ぶこと。
+pub fn apply_plan_cancellable(
+    root: &Path,
+    plan: &OperationPlan,
+    overwrites: &HashSet<TreePath>,
+    cancel: &AtomicBool,
+    on_progress: &mut dyn FnMut(ApplyProgress),
+) -> CommitReport {
     let mut results = Vec::with_capacity(plan.ops.len());
     let mut failed_directories = Vec::new();
+    let mut attempted = 0;
+    let total = plan.ops.len();
 
-    for operation in &plan.ops {
+    for (index, operation) in plan.ops.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            results.extend(plan.ops[index..].iter().cloned().map(|op| OpResult {
+                op,
+                outcome: OpOutcome::Skipped {
+                    reason: "ユーザーがキャンセルしました".to_owned(),
+                },
+            }));
+            break;
+        }
+
+        on_progress(ApplyProgress {
+            completed: index,
+            total,
+            current: Some(operation.clone()),
+        });
+
         if let Some(failed_parent) = failed_parent(operation, &failed_directories) {
             results.push(OpResult {
                 op: operation.clone(),
@@ -87,6 +126,7 @@ pub fn apply_plan_with_overwrites(
             continue;
         }
 
+        attempted += 1;
         let outcome = match execute_operation(root, operation, overwrites) {
             Ok(()) => OpOutcome::Success,
             Err(failure) => {
@@ -108,6 +148,12 @@ pub fn apply_plan_with_overwrites(
             outcome,
         });
     }
+
+    on_progress(ApplyProgress {
+        completed: attempted,
+        total,
+        current: None,
+    });
 
     CommitReport { results }
 }
@@ -553,6 +599,131 @@ mod tests {
             .collect::<Vec<_>>();
         names.sort();
         names
+    }
+
+    #[test]
+    fn pre_cancelled_plan_skips_every_operation_without_touching_filesystem() {
+        let root = tempdir().unwrap();
+        let plan = OperationPlan {
+            ops: vec![
+                FsOperation::Create {
+                    path: TreePath::parse("a.txt"),
+                    kind: EntryKind::File,
+                },
+                FsOperation::Create {
+                    path: TreePath::parse("b.txt"),
+                    kind: EntryKind::File,
+                },
+            ],
+        };
+        let cancel = AtomicBool::new(true);
+        let mut progress = Vec::new();
+
+        let report =
+            apply_plan_cancellable(root.path(), &plan, &HashSet::new(), &cancel, &mut |event| {
+                progress.push(event)
+            });
+
+        assert!(report.results.iter().all(|result| matches!(
+            &result.outcome,
+            OpOutcome::Skipped { reason } if reason.contains("ユーザーがキャンセルしました")
+        )));
+        assert!(!root.path().join("a.txt").exists());
+        assert!(!root.path().join("b.txt").exists());
+        assert_eq!(
+            progress,
+            [ApplyProgress {
+                completed: 0,
+                total: 2,
+                current: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn cancellation_requested_during_progress_stops_at_next_operation_boundary() {
+        let root = tempdir().unwrap();
+        let plan = OperationPlan {
+            ops: vec![
+                FsOperation::Create {
+                    path: TreePath::parse("a.txt"),
+                    kind: EntryKind::File,
+                },
+                FsOperation::Create {
+                    path: TreePath::parse("b.txt"),
+                    kind: EntryKind::File,
+                },
+                FsOperation::Create {
+                    path: TreePath::parse("c.txt"),
+                    kind: EntryKind::File,
+                },
+            ],
+        };
+        let cancel = AtomicBool::new(false);
+        let mut progress = Vec::new();
+
+        let report =
+            apply_plan_cancellable(root.path(), &plan, &HashSet::new(), &cancel, &mut |event| {
+                if event.completed == 0 && event.current.is_some() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                progress.push(event);
+            });
+
+        assert!(matches!(report.results[0].outcome, OpOutcome::Success));
+        assert!(
+            report.results[1..]
+                .iter()
+                .all(|result| matches!(result.outcome, OpOutcome::Skipped { .. }))
+        );
+        assert!(root.path().join("a.txt").is_file());
+        assert!(!root.path().join("b.txt").exists());
+        assert!(!root.path().join("c.txt").exists());
+        assert_eq!(
+            progress,
+            [
+                ApplyProgress {
+                    completed: 0,
+                    total: 3,
+                    current: Some(plan.ops[0].clone()),
+                },
+                ApplyProgress {
+                    completed: 1,
+                    total: 3,
+                    current: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn uncancelled_cancellable_apply_matches_overwrite_entrypoint_report() {
+        let first_root = tempdir().unwrap();
+        let second_root = tempdir().unwrap();
+        let plan = OperationPlan {
+            ops: vec![
+                FsOperation::Create {
+                    path: TreePath::parse("parent"),
+                    kind: EntryKind::Dir,
+                },
+                FsOperation::Create {
+                    path: TreePath::parse("parent/child.txt"),
+                    kind: EntryKind::File,
+                },
+            ],
+        };
+        let overwrites = HashSet::new();
+
+        let expected = apply_plan_with_overwrites(first_root.path(), &plan, &overwrites);
+        let actual = apply_plan_cancellable(
+            second_root.path(),
+            &plan,
+            &overwrites,
+            &AtomicBool::new(false),
+            &mut |_| {},
+        );
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

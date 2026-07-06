@@ -183,6 +183,49 @@ pub fn draw_report(ui: &mut egui::Ui, report: &CommitReport) -> bool {
         .inner
 }
 
+/// apply進捗ダイアログを描画する。
+///
+/// キャンセルボタンまたは`n`/`Esc`が押されたら`true`を返す。キャンセル要求後は
+/// ボタンを無効化し、実行中の操作が完了した後に停止することを表示する。
+pub fn draw_apply_progress(
+    ui: &mut egui::Ui,
+    completed: usize,
+    total: usize,
+    current: Option<&str>,
+    cancel_requested: bool,
+) -> bool {
+    let cancel_from_keyboard = !cancel_requested
+        && ui
+            .ctx()
+            .input(|input| input.key_pressed(egui::Key::N) || input.key_pressed(egui::Key::Escape));
+    let fraction = completed as f32 / total.max(1) as f32;
+
+    egui::Modal::new(egui::Id::new("save-apply-progress"))
+        .show(ui.ctx(), |ui| {
+            ui.heading("変更を実行しています");
+            ui.add_space(8.0);
+            ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)));
+            ui.label(format!("{completed} / {total} 件"));
+            if let Some(current) = current {
+                ui.add_space(4.0);
+                ui.monospace(current);
+            }
+
+            ui.add_space(12.0);
+            if cancel_requested {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "キャンセル待ち(実行中の操作の完了後に停止)",
+                );
+            }
+            let cancel_clicked = ui
+                .add_enabled(!cancel_requested, egui::Button::new("Cancel (n / Esc)"))
+                .clicked();
+            cancel_clicked || cancel_from_keyboard
+        })
+        .inner
+}
+
 /// plan確認キーの押下状態を、エンジン非依存の確認結果へ変換する。
 fn plan_choice_from_keys(y: bool, n: bool, esc: bool) -> Option<ConfirmChoice> {
     if y {
@@ -211,7 +254,8 @@ fn report_label(result: &OpResult) -> String {
     }
 }
 
-fn operation_label(operation: &FsOperation) -> String {
+/// 操作を確認・進捗・結果ダイアログで共通利用する表示ラベルへ変換する。
+pub(crate) fn operation_label(operation: &FsOperation) -> String {
     match operation {
         FsOperation::Create { path, .. } => format!("CREATE {path}"),
         FsOperation::Move { from, to, .. } if from.parent() == to.parent() => {

@@ -4,6 +4,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 use fyler_core::editor::{EditorCommand, EditorEngine, EditorLine};
@@ -21,7 +22,7 @@ use fyler_fsops::scan::ScanOptions;
 use fyler_gui::confirm::ConfirmChoice;
 
 /// 保存フローから配線層へ返す結果。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum SaveFlowResult {
     /// 確認対象のplanと、実行時に発生し得るクラウド取得等の警告を表示する。
     ShowPlan {
@@ -30,6 +31,20 @@ pub enum SaveFlowResult {
         /// 承認時に既存実体をごみ箱へ退避してから実行する移動先。plan順。
         overwrites: Vec<TreePath>,
     },
+    /// 承認済みplanをworkerスレッドで実行する。
+    ///
+    /// この結果は保存状態機械が`Applying`へ遷移済みであることを保証する。
+    /// 配線層は完了時に [`SaveController::on_apply_finished`] を呼ぶこと。
+    StartApply {
+        /// workerで実行する承認済みplan。
+        plan: OperationPlan,
+        /// ユーザーが承認した上書き対象。
+        overwrites: HashSet<TreePath>,
+        /// 操作間キャンセルをworkerへ通知する共有フラグ。
+        cancel: Arc<AtomicBool>,
+    },
+    /// apply実行中のキャンセル要求を受理した。残りの操作は操作間で停止する。
+    ApplyCancelRequested,
     ShowValidationErrors(Vec<ValidateError>),
     ShowReport(CommitReport),
     ReconcileFailed {
@@ -46,6 +61,68 @@ pub enum SaveFlowResult {
     Cancelled,
     Ignored,
 }
+
+impl PartialEq for SaveFlowResult {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::ShowPlan {
+                    plan: left_plan,
+                    warnings: left_warnings,
+                    overwrites: left_overwrites,
+                },
+                Self::ShowPlan {
+                    plan: right_plan,
+                    warnings: right_warnings,
+                    overwrites: right_overwrites,
+                },
+            ) => {
+                left_plan == right_plan
+                    && left_warnings == right_warnings
+                    && left_overwrites == right_overwrites
+            }
+            (
+                Self::StartApply {
+                    plan: left_plan,
+                    overwrites: left_overwrites,
+                    cancel: left_cancel,
+                },
+                Self::StartApply {
+                    plan: right_plan,
+                    overwrites: right_overwrites,
+                    cancel: right_cancel,
+                },
+            ) => {
+                left_plan == right_plan
+                    && left_overwrites == right_overwrites
+                    && Arc::ptr_eq(left_cancel, right_cancel)
+            }
+            (Self::ApplyCancelRequested, Self::ApplyCancelRequested)
+            | (Self::ExternalChanged, Self::ExternalChanged)
+            | (Self::NoChanges, Self::NoChanges)
+            | (Self::Cancelled, Self::Cancelled)
+            | (Self::Ignored, Self::Ignored) => true,
+            (Self::ShowValidationErrors(left), Self::ShowValidationErrors(right)) => left == right,
+            (Self::ShowReport(left), Self::ShowReport(right)) => left == right,
+            (
+                Self::ReconcileFailed {
+                    report: left_report,
+                    error: left_error,
+                },
+                Self::ReconcileFailed {
+                    report: right_report,
+                    error: right_error,
+                },
+            ) => left_report == right_report && left_error == right_error,
+            (Self::ExternalChangeNotified(left), Self::ExternalChangeNotified(right))
+            | (Self::ExternalChangeFailed(left), Self::ExternalChangeFailed(right))
+            | (Self::PlanInvalidated(left), Self::PlanInvalidated(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for SaveFlowResult {}
 
 /// ディレクトリ折りたたみ操作の結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +145,7 @@ pub struct SaveController {
     context: EditContext,
     scan_options: ScanOptions,
     pending_overwrites: HashSet<TreePath>,
+    apply_cancel: Option<Arc<AtomicBool>>,
     engine: Arc<dyn EditorEngine>,
 }
 
@@ -86,6 +164,7 @@ impl SaveController {
             context: EditContext::default(),
             scan_options: ScanOptions::default(),
             pending_overwrites: HashSet::new(),
+            apply_cancel: None,
             engine,
         }
     }
@@ -112,6 +191,13 @@ impl SaveController {
     /// 副作用を起こす前に拒否すること。
     pub fn is_idle(&self) -> bool {
         matches!(self.state, SaveState::Idle)
+    }
+
+    /// apply workerの実行中かを返す。
+    ///
+    /// app層はこの判定を使い、外部変更イベントをapply完了後まで遅延する。
+    pub fn is_applying(&self) -> bool {
+        matches!(self.state, SaveState::Applying { .. })
     }
 
     /// バッファの`line`に埋め込まれたIDを現在のbaselineへ解決する。
@@ -365,6 +451,16 @@ impl SaveController {
     }
 
     pub fn on_choice(&mut self, choice: ConfirmChoice) -> SaveFlowResult {
+        if matches!(self.state, SaveState::Applying { .. }) {
+            if matches!(choice, ConfirmChoice::Cancel)
+                && let Some(cancel) = &self.apply_cancel
+            {
+                cancel.store(true, Ordering::Relaxed);
+                return SaveFlowResult::ApplyCancelRequested;
+            }
+            return SaveFlowResult::Ignored;
+        }
+
         if !matches!(self.state, SaveState::AwaitingConfirmation { .. }) {
             return SaveFlowResult::Ignored;
         }
@@ -377,6 +473,44 @@ impl SaveController {
             }
             ConfirmChoice::Approve => self.approve_and_apply(),
         }
+    }
+
+    /// workerスレッドでのapply完了を状態機械へ反映し、必要ならreconcileする。
+    ///
+    /// `Applying`状態以外で呼ばれた場合は状態を変更せず
+    /// [`SaveFlowResult::Ignored`]を返す。
+    pub fn on_apply_finished(&mut self, report: CommitReport) -> SaveFlowResult {
+        if !matches!(self.state, SaveState::Applying { .. }) {
+            return SaveFlowResult::Ignored;
+        }
+
+        let effects = self.apply_event(SaveEvent::ApplyFinished {
+            report: report.clone(),
+        });
+        debug_assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, SaveEffect::ShowCommitReport(_)))
+        );
+
+        let result = if effects
+            .iter()
+            .any(|effect| matches!(effect, SaveEffect::ReconcileFromFs))
+        {
+            match self.reconcile_from_fs() {
+                Ok(()) => SaveFlowResult::ShowReport(report),
+                Err(error) => SaveFlowResult::ReconcileFailed {
+                    report,
+                    error: error.to_string(),
+                },
+            }
+        } else {
+            SaveFlowResult::ShowReport(report)
+        };
+
+        self.apply_cancel = None;
+        self.pending_overwrites.clear();
+        result
     }
 
     pub fn on_external_change(&mut self, changed_paths: &BTreeSet<PathBuf>) -> SaveFlowResult {
@@ -468,35 +602,13 @@ impl SaveController {
             _ => return SaveFlowResult::Ignored,
         };
 
-        // 絶対ルール1: applyは、ApprovedでApplyingへ遷移した上の経路からだけ呼ぶ。
-        let report = fyler_fsops::apply::apply_plan_with_overwrites(
-            &self.root,
-            &plan,
-            &self.pending_overwrites,
-        );
-        self.pending_overwrites.clear();
-        let effects = self.apply_event(SaveEvent::ApplyFinished {
-            report: report.clone(),
-        });
-        debug_assert!(
-            effects
-                .iter()
-                .any(|effect| matches!(effect, SaveEffect::ShowCommitReport(_)))
-        );
-
-        if effects
-            .iter()
-            .any(|effect| matches!(effect, SaveEffect::ReconcileFromFs))
-        {
-            if let Err(error) = self.reconcile_from_fs() {
-                return SaveFlowResult::ReconcileFailed {
-                    report,
-                    error: error.to_string(),
-                };
-            }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.apply_cancel = Some(Arc::clone(&cancel));
+        SaveFlowResult::StartApply {
+            plan,
+            overwrites: self.pending_overwrites.clone(),
+            cancel,
         }
-
-        SaveFlowResult::ShowReport(report)
     }
 
     fn reconcile_from_fs(&mut self) -> anyhow::Result<()> {
@@ -668,6 +780,7 @@ mod tests {
     use fyler_core::editor::EditorSnapshot;
     use fyler_core::path::TreePath;
     use fyler_core::plan::FsOperation;
+    use fyler_core::report::{OpOutcome, OpResult};
     use fyler_core::tree::{BaselineEntry, EntryKind};
     use tempfile::tempdir;
 
@@ -717,6 +830,23 @@ mod tests {
         let controller =
             SaveController::new(root, ids, baseline, Arc::<RecordingEngine>::clone(&engine));
         (controller, engine)
+    }
+
+    fn begin_rename_apply(
+        controller: &mut SaveController,
+    ) -> (OperationPlan, HashSet<TreePath>, Arc<AtomicBool>) {
+        assert!(matches!(
+            controller.on_commit(1, &lines(&["/001 b.txt"])),
+            SaveFlowResult::ShowPlan { .. }
+        ));
+        match controller.on_choice(ConfirmChoice::Approve) {
+            SaveFlowResult::StartApply {
+                plan,
+                overwrites,
+                cancel,
+            } => (plan, overwrites, cancel),
+            result => panic!("承認後にStartApplyが返りませんでした: {result:?}"),
+        }
     }
 
     fn hierarchy_controller(root: impl Into<PathBuf>) -> (SaveController, Arc<RecordingEngine>) {
@@ -970,8 +1100,23 @@ mod tests {
             SaveFlowResult::ShowPlan { .. }
         ));
 
-        let result = controller.on_choice(ConfirmChoice::Approve);
+        let start = controller.on_choice(ConfirmChoice::Approve);
+        let SaveFlowResult::StartApply {
+            plan,
+            overwrites,
+            cancel,
+        } = start
+        else {
+            panic!("承認後にStartApplyが返りませんでした");
+        };
 
+        assert!(matches!(controller.state(), SaveState::Applying { .. }));
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(temp_root.path().join("a.txt").exists());
+        assert!(!temp_root.path().join("b.txt").exists());
+        let report =
+            fyler_fsops::apply::apply_plan_with_overwrites(temp_root.path(), &plan, &overwrites);
+        let result = controller.on_apply_finished(report);
         assert!(matches!(
             result,
             SaveFlowResult::ShowReport(ref report) if report.all_succeeded()
@@ -1044,8 +1189,26 @@ mod tests {
             } if overwrites == &[TreePath::parse(".hidden")]
         ));
 
-        let apply_result = controller.on_choice(ConfirmChoice::Approve);
+        let start = controller.on_choice(ConfirmChoice::Approve);
+        let SaveFlowResult::StartApply {
+            plan,
+            overwrites,
+            cancel,
+        } = start
+        else {
+            panic!("承認後にStartApplyが返りませんでした");
+        };
 
+        assert!(matches!(controller.state(), SaveState::Applying { .. }));
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert_eq!(
+            fs::read(root.path().join("visible.txt")).unwrap(),
+            b"source"
+        );
+        assert_eq!(fs::read(root.path().join(".hidden")).unwrap(), b"existing");
+        let report =
+            fyler_fsops::apply::apply_plan_with_overwrites(root.path(), &plan, &overwrites);
+        let apply_result = controller.on_apply_finished(report);
         assert!(matches!(
             apply_result,
             SaveFlowResult::ShowReport(ref report) if report.all_succeeded()
@@ -1179,8 +1342,22 @@ mod tests {
             SaveFlowResult::ShowPlan { .. }
         ));
 
-        let result = controller.on_choice(ConfirmChoice::Approve);
+        let start = controller.on_choice(ConfirmChoice::Approve);
+        let SaveFlowResult::StartApply {
+            plan,
+            overwrites,
+            cancel,
+        } = start
+        else {
+            panic!("承認後にStartApplyが返りませんでした");
+        };
 
+        assert!(matches!(controller.state(), SaveState::Applying { .. }));
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(!temp_root.path().join("b.txt").exists());
+        let report =
+            fyler_fsops::apply::apply_plan_with_overwrites(temp_root.path(), &plan, &overwrites);
+        let result = controller.on_apply_finished(report);
         assert!(matches!(
             result,
             SaveFlowResult::ShowReport(ref report) if report.all_failed()
@@ -1191,6 +1368,85 @@ mod tests {
             TreePath::parse("a.txt")
         );
         assert_eq!(modifiable_values(&engine), [false, true]);
+    }
+
+    #[test]
+    fn all_skipped_apply_returns_idle_without_reconciling_baseline() {
+        let temp_root = tempdir().unwrap();
+        fs::write(temp_root.path().join("a.txt"), b"content").unwrap();
+        let (mut controller, engine) = controller(temp_root.path());
+        let (plan, _, _) = begin_rename_apply(&mut controller);
+        let report = CommitReport {
+            results: plan
+                .ops
+                .into_iter()
+                .map(|op| OpResult {
+                    op,
+                    outcome: OpOutcome::Skipped {
+                        reason: "ユーザーがキャンセルしました".to_owned(),
+                    },
+                })
+                .collect(),
+        };
+
+        let result = controller.on_apply_finished(report);
+
+        assert!(matches!(
+            result,
+            SaveFlowResult::ShowReport(ref report) if report.all_failed()
+        ));
+        assert!(matches!(controller.state(), SaveState::Idle));
+        assert_eq!(
+            controller.baseline.entries()[0].path,
+            TreePath::parse("a.txt")
+        );
+        assert!(temp_root.path().join("a.txt").is_file());
+        assert!(!temp_root.path().join("b.txt").exists());
+        assert_eq!(modifiable_values(&engine), [false, true]);
+    }
+
+    #[test]
+    fn cancel_while_applying_sets_worker_flag_and_keeps_applying() {
+        let temp_root = tempdir().unwrap();
+        fs::write(temp_root.path().join("a.txt"), b"content").unwrap();
+        let (mut controller, _) = controller(temp_root.path());
+        let (_, _, cancel) = begin_rename_apply(&mut controller);
+
+        let result = controller.on_choice(ConfirmChoice::Cancel);
+
+        assert_eq!(result, SaveFlowResult::ApplyCancelRequested);
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(controller.is_applying());
+    }
+
+    #[test]
+    fn approve_while_applying_is_ignored() {
+        let temp_root = tempdir().unwrap();
+        fs::write(temp_root.path().join("a.txt"), b"content").unwrap();
+        let (mut controller, _) = controller(temp_root.path());
+        let (_, _, cancel) = begin_rename_apply(&mut controller);
+
+        let result = controller.on_choice(ConfirmChoice::Approve);
+
+        assert_eq!(result, SaveFlowResult::Ignored);
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(controller.is_applying());
+    }
+
+    #[test]
+    fn commit_while_applying_is_ignored() {
+        let temp_root = tempdir().unwrap();
+        fs::write(temp_root.path().join("a.txt"), b"content").unwrap();
+        let (mut controller, _) = controller(temp_root.path());
+        begin_rename_apply(&mut controller);
+
+        let result = controller.on_commit(2, &lines(&["/001 c.txt"]));
+
+        assert_eq!(result, SaveFlowResult::Ignored);
+        assert!(controller.is_applying());
+        assert!(temp_root.path().join("a.txt").is_file());
+        assert!(!temp_root.path().join("b.txt").exists());
+        assert!(!temp_root.path().join("c.txt").exists());
     }
 
     #[test]
@@ -1324,8 +1580,23 @@ mod tests {
             controller.state(),
             SaveState::AwaitingConfirmation { .. }
         ));
+        let start = controller.on_choice(ConfirmChoice::Approve);
+        let SaveFlowResult::StartApply {
+            plan,
+            overwrites,
+            cancel,
+        } = start
+        else {
+            panic!("承認後にStartApplyが返りませんでした");
+        };
+        assert!(matches!(controller.state(), SaveState::Applying { .. }));
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(temp_root.path().join("a.txt").exists());
+        assert!(!temp_root.path().join("b.txt").exists());
+        let report =
+            fyler_fsops::apply::apply_plan_with_overwrites(temp_root.path(), &plan, &overwrites);
         assert!(matches!(
-            controller.on_choice(ConfirmChoice::Approve),
+            controller.on_apply_finished(report),
             SaveFlowResult::ShowReport(report) if report.all_succeeded()
         ));
         assert!(temp_root.path().join("b.txt").exists());

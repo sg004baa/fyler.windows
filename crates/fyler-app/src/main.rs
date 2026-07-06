@@ -7,7 +7,7 @@
 mod config;
 mod save_flow;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
@@ -17,6 +17,7 @@ use fyler_core::editor::{EditorCommand, EditorEngine, EditorEvent, EditorMessage
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::IdAllocator;
+use fyler_core::report::{ApplyProgress, CommitReport, OpOutcome, OpResult};
 use fyler_core::tree::EntryKind;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
 use fyler_fsops::scan::ScanOptions;
@@ -34,6 +35,8 @@ enum AppEvent {
         root: PathBuf,
         statuses: HashMap<PathBuf, GitBadge>,
     },
+    ApplyProgress(ApplyProgress),
+    ApplyFinished(CommitReport),
     Shutdown,
 }
 
@@ -182,12 +185,14 @@ fn main() -> anyhow::Result<()> {
     }
     let app_engine = Arc::clone(&save_engine);
     let git_event_tx = app_event_tx.clone();
+    let apply_event_tx = app_event_tx.clone();
     let event_bridge = thread::Builder::new()
         .name("fyler-app-events".to_owned())
         .spawn(move || {
             let mut root = root;
             let mut _watcher = watcher;
             let mut pending_events = VecDeque::new();
+            let mut deferred_changes = BTreeSet::new();
             let mut git = GitRefresher::new(git_event_tx);
             if send_file_infos(&gui_event_tx, &save_controller).is_err() {
                 return;
@@ -571,19 +576,117 @@ fn main() -> anyhow::Result<()> {
                     }
                     AppEvent::Confirm(choice) => {
                         let result = save_controller.on_choice(choice);
-                        let refresh_decorations = matches!(
-                            &result,
-                            SaveFlowResult::ShowReport(_)
-                                | SaveFlowResult::ReconcileFailed { .. }
-                        );
+                        match result {
+                            SaveFlowResult::StartApply {
+                                plan,
+                                overwrites,
+                                cancel,
+                            } => {
+                                if gui_event_tx
+                                    .send(GuiEvent::ShowApplyProgress {
+                                        total: plan.ops.len(),
+                                    })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+
+                                let worker_root = root.clone();
+                                let worker_plan = plan.clone();
+                                let worker_event_tx = apply_event_tx.clone();
+                                let spawn_result = thread::Builder::new()
+                                    .name("fyler-apply".to_owned())
+                                    .spawn(move || {
+                                        // 絶対ルール1: 保存状態機械がApplyingへ遷移済みの
+                                        // StartApplyからのみ起動し、applyの呼び出し契約を守る。
+                                        let report =
+                                            fyler_fsops::apply::apply_plan_cancellable(
+                                                &worker_root,
+                                                &worker_plan,
+                                                &overwrites,
+                                                &cancel,
+                                                &mut |progress| {
+                                                    let _ = worker_event_tx.send(
+                                                        AppEvent::ApplyProgress(progress),
+                                                    );
+                                                },
+                                            );
+                                        let _ =
+                                            worker_event_tx.send(AppEvent::ApplyFinished(report));
+                                    });
+                                match spawn_result {
+                                    Ok(handle) => drop(handle),
+                                    Err(error) => {
+                                        let error =
+                                            format!("apply workerを開始できません: {error}");
+                                        let report = CommitReport {
+                                            results: plan
+                                                .ops
+                                                .into_iter()
+                                                .map(|op| OpResult {
+                                                    op,
+                                                    outcome: OpOutcome::Failed {
+                                                        error: error.clone(),
+                                                        progress: None,
+                                                    },
+                                                })
+                                                .collect(),
+                                        };
+                                        if apply_event_tx
+                                            .send(AppEvent::ApplyFinished(report))
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            SaveFlowResult::ApplyCancelRequested => {
+                                if gui_event_tx
+                                    .send(GuiEvent::ApplyCancelRequested)
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            result => {
+                                if send_save_result(&gui_event_tx, result).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    AppEvent::ApplyProgress(progress) => {
+                        if gui_event_tx
+                            .send(GuiEvent::ApplyProgress(progress))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    AppEvent::ApplyFinished(report) => {
+                        let result = save_controller.on_apply_finished(report);
                         if send_save_result(&gui_event_tx, result).is_err() {
                             return;
                         }
-                        if refresh_decorations {
-                            if send_file_infos(&gui_event_tx, &save_controller).is_err() {
+                        if send_file_infos(&gui_event_tx, &save_controller).is_err() {
+                            return;
+                        }
+                        git.request(root.clone());
+
+                        if !deferred_changes.is_empty() {
+                            let changed_paths = std::mem::take(&mut deferred_changes);
+                            if handle_external_change(
+                                &changed_paths,
+                                &mut save_controller,
+                                &gui_event_tx,
+                                &mut git,
+                                &root,
+                            )
+                            .is_err()
+                            {
                                 return;
                             }
-                            git.request(root.clone());
                         }
                     }
                     AppEvent::ExternalChange(change) => {
@@ -596,16 +699,22 @@ fn main() -> anyhow::Result<()> {
                                 event => pending_events.push_back(event),
                             }
                         }
-                        let result = save_controller.on_external_change(&changed_paths);
-                        if !matches!(&result, SaveFlowResult::NoChanges)
-                            && send_save_result(&gui_event_tx, result).is_err()
+
+                        if save_controller.is_applying() {
+                            deferred_changes.extend(changed_paths);
+                            continue;
+                        }
+                        if handle_external_change(
+                            &changed_paths,
+                            &mut save_controller,
+                            &gui_event_tx,
+                            &mut git,
+                            &root,
+                        )
+                        .is_err()
                         {
                             return;
                         }
-                        if send_file_infos(&gui_event_tx, &save_controller).is_err() {
-                            return;
-                        }
-                        git.request(root.clone());
                     }
                     AppEvent::GitStatus {
                         root: status_root,
@@ -638,6 +747,23 @@ fn main() -> anyhow::Result<()> {
     let _ = confirm_bridge.join();
     let _ = editor_bridge.join();
     gui_result
+}
+
+/// 外部変更を再スキャン経路へ流し、表示メタデータとGit装飾の更新を要求する。
+fn handle_external_change(
+    changed_paths: &BTreeSet<PathBuf>,
+    save_controller: &mut SaveController,
+    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    git: &mut GitRefresher,
+    root: &Path,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    let result = save_controller.on_external_change(changed_paths);
+    if !matches!(&result, SaveFlowResult::NoChanges) {
+        send_save_result(gui_event_tx, result)?;
+    }
+    send_file_infos(gui_event_tx, save_controller)?;
+    git.request(root.to_path_buf());
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)] // ルート差し替えの全状態とカーソル復元対象を明示する。
@@ -1061,6 +1187,20 @@ fn send_save_result(
             })))
         }
         SaveFlowResult::Cancelled => gui_event_tx.send(GuiEvent::CloseDialog),
+        SaveFlowResult::StartApply { .. } => {
+            debug_assert!(
+                false,
+                "StartApplyはConfirm armで処理済みである必要があります"
+            );
+            Ok(())
+        }
+        SaveFlowResult::ApplyCancelRequested => {
+            debug_assert!(
+                false,
+                "ApplyCancelRequestedはConfirm armで処理済みである必要があります"
+            );
+            Ok(())
+        }
         SaveFlowResult::Ignored => Ok(()),
     }
 }
