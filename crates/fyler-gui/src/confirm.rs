@@ -3,6 +3,7 @@
 //! **絶対ルール1**: ここでの承認なしに実FSへ触れない。
 
 use eframe::egui;
+use fyler_core::path::TreePath;
 use fyler_core::plan::{FsOperation, OperationPlan};
 use fyler_core::report::{CommitReport, OpOutcome, OpResult};
 use fyler_core::validate::ValidateError;
@@ -39,6 +40,7 @@ pub enum IconStyle {
 /// 実装契約:
 /// - 操作を1件1行で人間可読に表示する(例: `RENAME a.txt → b.txt`、
 ///   `DELETE src/old.rs (ごみ箱へ)`、`COPY a.txt → b.txt`)
+/// - 上書き対象があれば、ごみ箱へ退避するパスを操作一覧の下へ警告色で表示する
 /// - 警告があれば操作一覧の下へ警告色で表示する
 /// - 表示中はGUIの入力ゲートでエンジンへの入力転送を止める
 /// - キーボード(`y` / `n` / `Esc`)でも選択できる。ダイアログ表示中はGUI側で
@@ -47,6 +49,7 @@ pub enum IconStyle {
 pub fn draw_plan(
     ui: &mut egui::Ui,
     plan: &OperationPlan,
+    overwrites: &[TreePath],
     warnings: &[String],
     detail: ConfirmDetail,
 ) -> Option<ConfirmChoice> {
@@ -66,6 +69,16 @@ pub fn draw_plan(
             for label in plan_labels(plan, detail) {
                 ui.monospace(label);
             }
+            if !overwrites.is_empty() {
+                ui.add_space(8.0);
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "以下の既存ファイルをごみ箱へ移して上書きします:",
+                );
+                for path in overwrites {
+                    ui.colored_label(ui.visuals().warn_fg_color, path.to_string());
+                }
+            }
             if !warnings.is_empty() {
                 ui.add_space(8.0);
                 for warning in warnings {
@@ -75,7 +88,12 @@ pub fn draw_plan(
 
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                let approve_clicked = ui.button("Approve (y)").clicked();
+                let approve_label = if overwrites.is_empty() {
+                    "Approve (y)"
+                } else {
+                    "上書きして実行"
+                };
+                let approve_clicked = ui.button(approve_label).clicked();
                 let cancel_clicked = ui.button("Cancel (n / Esc)").clicked();
                 if approve_clicked || key_choice == Some(ConfirmChoice::Approve) {
                     Some(ConfirmChoice::Approve)
@@ -215,7 +233,8 @@ fn validation_error_label(error: &ValidateError) -> String {
         | ValidateError::InvalidTrailing { line, .. } => Some(*line),
         ValidateError::DuplicateName { .. }
         | ValidateError::MoveIntoSelf { .. }
-        | ValidateError::MoveCycle { .. } => None,
+        | ValidateError::MoveCycle { .. }
+        | ValidateError::TargetOccupiedByDirectory { .. } => None,
     };
 
     let label = error.to_string();
@@ -251,6 +270,17 @@ mod tests {
         assert_eq!(
             validation_error_label(&error),
             "行1: IDプレフィックスが壊れています。undoで戻すか行を削除してください"
+        );
+    }
+
+    #[test]
+    fn displays_target_directory_conflict_without_line_rewrite() {
+        let error = ValidateError::TargetOccupiedByDirectory {
+            path: TreePath::parse(".hidden"),
+        };
+        assert_eq!(
+            validation_error_label(&error),
+            "移動先に既存のディレクトリがあります(上書きできません): .hidden"
         );
     }
 

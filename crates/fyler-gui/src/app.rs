@@ -11,6 +11,7 @@ use fyler_core::editor::{CmdlineState, EditorEngine, EditorEvent, EditorMessage,
 use fyler_core::fileinfo::FileInfo;
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::id::EntryId;
+use fyler_core::path::TreePath;
 use fyler_core::plan::OperationPlan;
 use fyler_core::report::CommitReport;
 use fyler_core::validate::ValidateError;
@@ -52,6 +53,8 @@ pub enum GuiEvent {
     ShowPlan {
         plan: OperationPlan,
         warnings: Vec<String>,
+        /// 承認時に既存実体をごみ箱へ退避する移動先。plan順。
+        overwrites: Vec<TreePath>,
     },
     ShowReport(CommitReport),
     ShowValidationErrors(Vec<ValidateError>),
@@ -64,6 +67,7 @@ enum DialogState {
     Plan {
         plan: OperationPlan,
         warnings: Vec<String>,
+        overwrites: Vec<TreePath>,
     },
     Report(CommitReport),
     ValidationErrors(Vec<ValidateError>),
@@ -158,8 +162,16 @@ impl FylerApp {
                 GuiEvent::GitBadges(git_badges) => self.git_badges = git_badges,
                 GuiEvent::FileInfos(file_infos) => self.file_infos = file_infos,
                 GuiEvent::CopyPath(path) => self.pending_copy = Some(path),
-                GuiEvent::ShowPlan { plan, warnings } => {
-                    self.dialog = Some(DialogState::Plan { plan, warnings });
+                GuiEvent::ShowPlan {
+                    plan,
+                    warnings,
+                    overwrites,
+                } => {
+                    self.dialog = Some(DialogState::Plan {
+                        plan,
+                        warnings,
+                        overwrites,
+                    });
                 }
                 GuiEvent::ShowReport(report) => {
                     self.dialog = Some(DialogState::Report(report));
@@ -246,8 +258,13 @@ impl eframe::App for FylerApp {
         let mut dismiss_errors = false;
         let mut dismiss_report = false;
         match &self.dialog {
-            Some(DialogState::Plan { plan, warnings }) => {
-                confirm_choice = confirm::draw_plan(ui, plan, warnings, self.confirm_detail);
+            Some(DialogState::Plan {
+                plan,
+                warnings,
+                overwrites,
+            }) => {
+                confirm_choice =
+                    confirm::draw_plan(ui, plan, overwrites, warnings, self.confirm_detail);
             }
             Some(DialogState::Report(report)) => {
                 dismiss_report = confirm::draw_report(ui, report);

@@ -1,5 +1,6 @@
 //! validateエラーの型(DESIGN.md「validateで弾くもの」)。
-//! 検出ロジックは fyler-pipeline::validate / parse にある。
+//! 検出ロジックは fyler-pipeline::validate / parse にある
+//! (`TargetOccupiedByDirectory`のみfyler-fsops::preflightで検出)。
 //!
 //! いずれか1件でも検出されたら**保存を中断**する(planを作らない・実行しない)。
 //! 曖昧な状態から操作を推測して実行しない。
@@ -52,4 +53,10 @@ pub enum ValidateError {
     /// 一時名なしでは安全に逐次実行できないMove循環。
     #[error("ファイル名の入れ替えは一度に実行できません: {path}")]
     MoveCycle { path: TreePath },
+
+    /// 移動先の実FSに既存のディレクトリが存在する(上書き不可)。
+    /// baselineに現れない実体(隠しファイル設定で非表示のディレクトリ等)との衝突。
+    /// 検出はfyler-fsopsのpreflight走査(plan確定時)で行う。
+    #[error("移動先に既存のディレクトリがあります(上書きできません): {path}")]
+    TargetOccupiedByDirectory { path: TreePath },
 }

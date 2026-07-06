@@ -1,5 +1,6 @@
 //! apply: 承認済みOperationPlanの実行。**実FS書き込みの入口はここだけ**(絶対ルール1)。
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -35,13 +36,27 @@ impl From<anyhow::Error> for OpFailure {
     }
 }
 
-/// planを実行し、操作単位の結果を返す。
+/// 上書き対象を伴わないplanを実行し、操作単位の結果を返す。
 ///
 /// 呼び出し契約: 保存状態機械(`fyler_core::save`)の `Applying` 状態
 /// (= 確認ダイアログで承認済み)からのみ呼ぶこと。M2まではdry-runのみで、
 /// この関数は呼ばれない。
 ///
-/// 実装契約:
+/// preflightで検出した既存ファイルを承認付きで上書きする場合は
+/// [`apply_plan_with_overwrites`]を使う。この関数は空の上書き対象を渡すため、
+/// 従来どおり既存の移動先を上書きせず失敗する。
+pub fn apply_plan(root: &Path, plan: &OperationPlan) -> CommitReport {
+    apply_plan_with_overwrites(root, plan, &HashSet::new())
+}
+
+/// 承認済みの上書き対象(preflightでユーザーへ提示済みの移動先)を伴ってplanを実行する。
+///
+/// `overwrites` に含まれる移動先は、操作の直前に実体を確認し、ファイル/シンボリック
+/// リンクであれば**ごみ箱へ退避**してから実行する。ディレクトリに変わっていた場合は
+/// 上書きせず操作失敗として報告する(TOCTOU防衛)。
+///
+/// 呼び出し契約と実装契約:
+/// - 保存状態機械(`fyler_core::save`)の `Applying` 状態からのみ呼ぶ
 /// - `plan.ops` を**並べ替えずに**上から順に実行する(順序はdiff層が保証済み)
 /// - `CommitReport.results` はopsと同順・同数で返す
 /// - エラーは操作単位で報告する。**全体ロールバックはしない**。部分成功を明示する
@@ -53,7 +68,11 @@ impl From<anyhow::Error> for OpFailure {
 /// - Deleteは必ず [`crate::recycle`] 経由(ごみ箱)。直接削除しない
 /// - case-onlyリネームは [`crate::case`] のtemp名経由2段renameを使う
 /// - パスは `TreePath::to_fs_path(root)` → 必要時のみ [`crate::long_path`] で変換
-pub fn apply_plan(root: &Path, plan: &OperationPlan) -> CommitReport {
+pub fn apply_plan_with_overwrites(
+    root: &Path,
+    plan: &OperationPlan,
+    overwrites: &HashSet<TreePath>,
+) -> CommitReport {
     let mut results = Vec::with_capacity(plan.ops.len());
     let mut failed_directories = Vec::new();
 
@@ -68,7 +87,7 @@ pub fn apply_plan(root: &Path, plan: &OperationPlan) -> CommitReport {
             continue;
         }
 
-        let outcome = match execute_operation(root, operation) {
+        let outcome = match execute_operation(root, operation, overwrites) {
             Ok(()) => OpOutcome::Success,
             Err(failure) => {
                 if let FsOperation::Create {
@@ -93,23 +112,39 @@ pub fn apply_plan(root: &Path, plan: &OperationPlan) -> CommitReport {
     CommitReport { results }
 }
 
-fn execute_operation(root: &Path, operation: &FsOperation) -> Result<(), OpFailure> {
+fn execute_operation(
+    root: &Path,
+    operation: &FsOperation,
+    overwrites: &HashSet<TreePath>,
+) -> Result<(), OpFailure> {
     match operation {
         FsOperation::Create { path, kind } => {
             let target = crate::long_path::to_fs(&path.to_fs_path(root));
             match kind {
                 // create_dir / create_new(true) は既存パスで必ず失敗する
-                // (fs::File::createの黙った切り詰めを防ぐ。preflight不要)。
-                EntryKind::Dir => fs::create_dir(&target)
-                    .with_context(|| format!("ディレクトリを作成できません: {}", target.display()))
-                    .map_err(OpFailure::from),
-                EntryKind::File => fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&target)
-                    .map(|_| ())
-                    .with_context(|| format!("ファイルを作成できません: {}", target.display()))
-                    .map_err(OpFailure::from),
+                // (fs::File::createの黙った切り詰めを防ぐ)。
+                EntryKind::Dir => {
+                    if overwrites.contains(path) {
+                        recycle_approved_target(&target)?;
+                    }
+                    fs::create_dir(&target)
+                        .with_context(|| {
+                            format!("ディレクトリを作成できません: {}", target.display())
+                        })
+                        .map_err(OpFailure::from)
+                }
+                EntryKind::File => {
+                    if overwrites.contains(path) {
+                        recycle_approved_target(&target)?;
+                    }
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&target)
+                        .map(|_| ())
+                        .with_context(|| format!("ファイルを作成できません: {}", target.display()))
+                        .map_err(OpFailure::from)
+                }
                 EntryKind::Symlink => Err(OpFailure::from(anyhow!("SYMLINKのCREATEは未実装"))),
             }
         }
@@ -133,6 +168,9 @@ fn execute_operation(root: &Path, operation: &FsOperation) -> Result<(), OpFailu
             if case_only_rename && !case_sensitive_directory {
                 crate::case::case_only_rename(&source, &target).map_err(OpFailure::from)
             } else {
+                if overwrites.contains(to) {
+                    recycle_approved_target(&target)?;
+                }
                 // fs::renameはWindows(MOVEFILE_REPLACE_EXISTING)でもUnixでも
                 // 既存の移動先ファイルを黙って上書きする。baseline取得後の外部変更
                 // (TOCTOU)でユーザーデータを消さないよう、直前に存在確認する。
@@ -166,6 +204,9 @@ fn execute_operation(root: &Path, operation: &FsOperation) -> Result<(), OpFailu
                     format!("コピー元のmetadataを取得できません: {}", source.display())
                 })
                 .map_err(OpFailure::from)?;
+            if overwrites.contains(to) {
+                recycle_approved_target(&target)?;
+            }
             // fs::copyも既存の移動先を黙って上書きするため、同様に存在確認する。
             ensure_target_vacant(&target)?;
             match crate::scan::kind_from_metadata(&metadata) {
@@ -183,6 +224,25 @@ fn execute_operation(root: &Path, operation: &FsOperation) -> Result<(), OpFailu
         FsOperation::Delete { path, .. } => {
             crate::recycle::delete_to_recycle_bin(&path.to_fs_path(root)).map_err(OpFailure::from)
         }
+    }
+}
+
+/// 承認済み移動先の現在の実体を確認し、非ディレクトリならごみ箱へ退避する。
+///
+/// preflight後にディレクトリへ変化していた場合は破壊せず失敗させる。
+fn recycle_approved_target(target: &Path) -> Result<(), OpFailure> {
+    match fs::symlink_metadata(crate::long_path::to_fs(target)) {
+        Ok(metadata) if crate::scan::kind_from_metadata(&metadata) == EntryKind::Dir => {
+            Err(OpFailure::from(anyhow!(
+                "移動先がディレクトリに変わっているため上書きを中止しました: {}",
+                target.display()
+            )))
+        }
+        Ok(_) => crate::recycle::delete_to_recycle_bin(target).map_err(OpFailure::from),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(OpFailure::from(anyhow::Error::from(error).context(
+            format!("上書き対象の存在確認に失敗しました: {}", target.display()),
+        ))),
     }
 }
 
@@ -450,7 +510,7 @@ fn remove_symlink(path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn is_case_only_rename(from: &TreePath, to: &TreePath) -> bool {
+pub(crate) fn is_case_only_rename(from: &TreePath, to: &TreePath) -> bool {
     let (Some(from_name), Some(to_name)) = (from.name(), to.name()) else {
         return false;
     };
@@ -612,6 +672,54 @@ mod tests {
         ));
         assert_eq!(fs::read(root.path().join("a.txt")).unwrap(), b"source");
         assert_eq!(fs::read(root.path().join("b.txt")).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn approved_move_recycles_existing_target_before_rename() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("src.txt"), b"source").unwrap();
+        fs::write(root.path().join("target.txt"), b"existing").unwrap();
+        let target = TreePath::parse("target.txt");
+        let plan = OperationPlan {
+            ops: vec![FsOperation::Move {
+                id: EntryId(1),
+                from: TreePath::parse("src.txt"),
+                to: target.clone(),
+            }],
+        };
+        let overwrites = HashSet::from([target]);
+
+        let report = apply_plan_with_overwrites(root.path(), &plan, &overwrites);
+
+        assert!(report.all_succeeded());
+        assert!(!root.path().join("src.txt").exists());
+        assert_eq!(fs::read(root.path().join("target.txt")).unwrap(), b"source");
+    }
+
+    #[test]
+    fn approved_move_stops_if_target_is_a_directory() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("src.txt"), b"source").unwrap();
+        fs::create_dir(root.path().join("target")).unwrap();
+        let target = TreePath::parse("target");
+        let plan = OperationPlan {
+            ops: vec![FsOperation::Move {
+                id: EntryId(1),
+                from: TreePath::parse("src.txt"),
+                to: target.clone(),
+            }],
+        };
+        let overwrites = HashSet::from([target]);
+
+        let report = apply_plan_with_overwrites(root.path(), &plan, &overwrites);
+
+        assert!(matches!(
+            &report.results[0].outcome,
+            OpOutcome::Failed { error, .. }
+                if error.contains("ディレクトリに変わっているため上書きを中止")
+        ));
+        assert_eq!(fs::read(root.path().join("src.txt")).unwrap(), b"source");
+        assert!(root.path().join("target").is_dir());
     }
 
     #[test]

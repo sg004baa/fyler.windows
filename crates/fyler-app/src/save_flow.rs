@@ -1,6 +1,6 @@
 //! 保存フロー: parse → validate → diff → confirm → apply → reconcile。
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,6 +27,8 @@ pub enum SaveFlowResult {
     ShowPlan {
         plan: OperationPlan,
         warnings: Vec<String>,
+        /// 承認時に既存実体をごみ箱へ退避してから実行する移動先。plan順。
+        overwrites: Vec<TreePath>,
     },
     ShowValidationErrors(Vec<ValidateError>),
     ShowReport(CommitReport),
@@ -65,6 +67,7 @@ pub struct SaveController {
     baseline: BaselineTree,
     context: EditContext,
     scan_options: ScanOptions,
+    pending_overwrites: HashSet<TreePath>,
     engine: Arc<dyn EditorEngine>,
 }
 
@@ -82,6 +85,7 @@ impl SaveController {
             baseline,
             context: EditContext::default(),
             scan_options: ScanOptions::default(),
+            pending_overwrites: HashSet::new(),
             engine,
         }
     }
@@ -327,6 +331,18 @@ impl SaveController {
             Ok(plan) => plan,
             Err(errors) => return self.validation_failed(errors),
         };
+        let conflicts = fyler_fsops::preflight::scan_plan_conflicts(&self.root, &plan);
+        if !conflicts.blocked.is_empty() {
+            return self.validation_failed(
+                conflicts
+                    .blocked
+                    .into_iter()
+                    .map(|path| ValidateError::TargetOccupiedByDirectory { path })
+                    .collect(),
+            );
+        }
+        let overwrites = conflicts.overwritable;
+        self.pending_overwrites = overwrites.iter().cloned().collect();
         let display_plan = plan.clone();
         let warnings = plan_warnings(
             &self.root,
@@ -341,6 +357,7 @@ impl SaveController {
             SaveFlowResult::ShowPlan {
                 plan: display_plan,
                 warnings,
+                overwrites,
             }
         } else {
             SaveFlowResult::NoChanges
@@ -355,6 +372,7 @@ impl SaveController {
         match choice {
             ConfirmChoice::Cancel => {
                 self.apply_event(SaveEvent::Cancelled);
+                self.pending_overwrites.clear();
                 SaveFlowResult::Cancelled
             }
             ConfirmChoice::Approve => self.approve_and_apply(),
@@ -387,6 +405,7 @@ impl SaveController {
         // ここでキャンセル扱いにしてダイアログを閉じ、ユーザーへ通知する。
         if matches!(self.state, SaveState::AwaitingConfirmation { .. }) {
             self.apply_event(SaveEvent::Cancelled);
+            self.pending_overwrites.clear();
             return SaveFlowResult::PlanInvalidated(
                 "外部でファイルが変更されたため、保存を中断しました。内容を確認して再度 :w してください"
                     .to_owned(),
@@ -449,8 +468,13 @@ impl SaveController {
             _ => return SaveFlowResult::Ignored,
         };
 
-        // 絶対ルール1: apply_planは、ApprovedでApplyingへ遷移した上の経路からだけ呼ぶ。
-        let report = fyler_fsops::apply::apply_plan(&self.root, &plan);
+        // 絶対ルール1: applyは、ApprovedでApplyingへ遷移した上の経路からだけ呼ぶ。
+        let report = fyler_fsops::apply::apply_plan_with_overwrites(
+            &self.root,
+            &plan,
+            &self.pending_overwrites,
+        );
+        self.pending_overwrites.clear();
         let effects = self.apply_event(SaveEvent::ApplyFinished {
             report: report.clone(),
         });
@@ -836,6 +860,7 @@ mod tests {
                     }],
                 },
                 warnings: Vec::new(),
+                overwrites: Vec::new(),
             }
         );
         assert!(matches!(
@@ -981,6 +1006,143 @@ mod tests {
                 .collect::<Vec<_>>(),
             [false, true]
         );
+    }
+
+    #[test]
+    fn hidden_file_conflict_is_approved_and_recycled_end_to_end() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("visible.txt"), b"source").unwrap();
+        fs::write(root.path().join(".hidden"), b"existing").unwrap();
+        let options = ScanOptions {
+            show_hidden: false,
+            ..ScanOptions::default()
+        };
+        let mut ids = IdAllocator::new();
+        let baseline =
+            fyler_fsops::scan::scan_baseline_with(root.path(), &mut ids, &options).unwrap();
+        let visible_id = baseline.entries()[0].id;
+        let engine = Arc::new(RecordingEngine::default());
+        let mut controller = SaveController::new_with_scan_options(
+            root.path().to_path_buf(),
+            ids,
+            baseline,
+            Arc::<RecordingEngine>::clone(&engine),
+            options,
+        );
+        let renamed_line = EditorLine::new(format!(
+            "{}.hidden",
+            fyler_core::grammar::format_id_prefix(visible_id)
+        ));
+
+        let plan_result = controller.on_commit(1, &[renamed_line]);
+
+        assert!(matches!(
+            plan_result,
+            SaveFlowResult::ShowPlan {
+                ref overwrites,
+                ..
+            } if overwrites == &[TreePath::parse(".hidden")]
+        ));
+
+        let apply_result = controller.on_choice(ConfirmChoice::Approve);
+
+        assert!(matches!(
+            apply_result,
+            SaveFlowResult::ShowReport(ref report) if report.all_succeeded()
+        ));
+        assert!(!root.path().join("visible.txt").exists());
+        assert_eq!(fs::read(root.path().join(".hidden")).unwrap(), b"source");
+        assert!(controller.pending_overwrites.is_empty());
+    }
+
+    #[test]
+    fn hidden_directory_conflict_returns_validation_error_and_keeps_dirty_buffer() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("visible.txt"), b"source").unwrap();
+        fs::create_dir(root.path().join(".d")).unwrap();
+        let options = ScanOptions {
+            show_hidden: false,
+            ..ScanOptions::default()
+        };
+        let mut ids = IdAllocator::new();
+        let baseline =
+            fyler_fsops::scan::scan_baseline_with(root.path(), &mut ids, &options).unwrap();
+        let visible_id = baseline.entries()[0].id;
+        let engine = Arc::new(RecordingEngine::default());
+        engine.set_dirty(true);
+        let mut controller = SaveController::new_with_scan_options(
+            root.path().to_path_buf(),
+            ids,
+            baseline,
+            Arc::<RecordingEngine>::clone(&engine),
+            options,
+        );
+        let renamed_line = EditorLine::new(format!(
+            "{}.d",
+            fyler_core::grammar::format_id_prefix(visible_id)
+        ));
+
+        let result = controller.on_commit(1, &[renamed_line]);
+
+        assert_eq!(
+            result,
+            SaveFlowResult::ShowValidationErrors(vec![ValidateError::TargetOccupiedByDirectory {
+                path: TreePath::parse(".d"),
+            },])
+        );
+        assert!(matches!(controller.state(), SaveState::Idle));
+        assert!(engine.snapshot().dirty);
+        assert!(root.path().join("visible.txt").is_file());
+        assert!(root.path().join(".d").is_dir());
+        assert_eq!(modifiable_values(&engine), [false, true]);
+    }
+
+    #[test]
+    fn cancel_clears_pending_overwrites_and_recomputes_them_on_next_commit() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("visible.txt"), b"source").unwrap();
+        fs::write(root.path().join(".hidden"), b"existing").unwrap();
+        let options = ScanOptions {
+            show_hidden: false,
+            ..ScanOptions::default()
+        };
+        let mut ids = IdAllocator::new();
+        let baseline =
+            fyler_fsops::scan::scan_baseline_with(root.path(), &mut ids, &options).unwrap();
+        let visible_id = baseline.entries()[0].id;
+        let engine = Arc::new(RecordingEngine::default());
+        let mut controller = SaveController::new_with_scan_options(
+            root.path().to_path_buf(),
+            ids,
+            baseline,
+            engine,
+            options,
+        );
+        let renamed_line = EditorLine::new(format!(
+            "{}.hidden",
+            fyler_core::grammar::format_id_prefix(visible_id)
+        ));
+        assert!(matches!(
+            controller.on_commit(1, std::slice::from_ref(&renamed_line)),
+            SaveFlowResult::ShowPlan {
+                ref overwrites,
+                ..
+            } if overwrites == &[TreePath::parse(".hidden")]
+        ));
+
+        assert_eq!(
+            controller.on_choice(ConfirmChoice::Cancel),
+            SaveFlowResult::Cancelled
+        );
+        assert!(controller.pending_overwrites.is_empty());
+
+        assert!(matches!(
+            controller.on_commit(2, &[renamed_line]),
+            SaveFlowResult::ShowPlan {
+                ref overwrites,
+                ..
+            } if overwrites == &[TreePath::parse(".hidden")]
+        ));
     }
 
     #[test]
@@ -1540,6 +1702,7 @@ mod tests {
                     }],
                 },
                 warnings: Vec::new(),
+                overwrites: Vec::new(),
             }
         );
     }

@@ -1015,9 +1015,15 @@ fn send_save_result(
     result: SaveFlowResult,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     match result {
-        SaveFlowResult::ShowPlan { plan, warnings } => {
-            gui_event_tx.send(GuiEvent::ShowPlan { plan, warnings })
-        }
+        SaveFlowResult::ShowPlan {
+            plan,
+            warnings,
+            overwrites,
+        } => gui_event_tx.send(GuiEvent::ShowPlan {
+            plan,
+            warnings,
+            overwrites,
+        }),
         SaveFlowResult::ShowValidationErrors(errors) => {
             gui_event_tx.send(GuiEvent::ShowValidationErrors(errors))
         }
