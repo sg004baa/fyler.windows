@@ -55,7 +55,9 @@
   アプリの実行は `cargo run -p fyler-app`(M1以降)。
 - Neovim本体と nvim-rs のバージョンは**固定**(nvim-rsはAPI unstable宣言。DESIGN.md参照)。
   安易に `cargo update` しない。`Cargo.lock` はコミット対象。
-- CIは `.github/workflows/ci.yml`。Linuxで fmt + 純粋ロジックのテスト、Windowsで全体check。
+- CIは `.github/workflows/ci.yml`。Linuxで fmt + clippy(-D warnings)+ 全テスト + Windows GNUクロスターゲットclippy、Windowsネイティブで check + 全テスト。
+  リリースは `release.yml`(`v*` タグpushでタグ⇔ワークスペースバージョン照合 → Windowsでテスト → `fyler.exe` をzip + sha256でGitHub Releaseへ)。
+  依存更新は dependabot(週次、nvim-rsはignore固定)+ patch/minor自動マージ(`dependabot-automerge.yml`)。
 
 ## マイルストーン現況
 
@@ -73,6 +75,7 @@
 - [x] **M7-4 git status装飾** — porcelain v1のGit状態取得とサブディレクトリ基準のパス解決、EntryIdへの対応付け、GUI装飾列と更新配線を実装。Linuxで指定テスト128件・workspace clippy警告ゼロ、Windows GNUクロスターゲットでclippy pass。Windows実機でテスト・挙動確認OK(2026-07-05)
 - [x] **M8 快適性** — ファイル情報表示/確認ダイアログのキー操作/パスコピー/ブックマーク・最近使ったルート/設定ファイル/確認中のバッファロックを実装。`config.toml`から隠し表示・ソート・確認詳細度・ブックマークを読み込み、`:b`ジャンプと`recent.toml`の最大10件記録を配線。Linuxで指定テスト141件・workspace clippy警告ゼロ、Windows GNUクロスターゲットでclippy pass、headless RPCスモーク4件pass(nvim v0.12.2)。Windows実機動作確認は未実施
 - [x] **性能改善セッション(2026-07-06)** — 大量fileを含むdirをrootにした際のFS層ボトルネックを根本対応(3コミット): (1) スキャンのエントリ毎2syscall(symlink_metadata+GetFileAttributesW)を`DirEntry::metadata()`のfind-data由来metadataへ統一し追加syscallゼロ化。hidden/placeholder判定も同属性ビットから導出、ソートキー事前計算で比較毎のString確保も排除、(2) BaselineTreeにEntryMetaサイドカー(size/mtime/placeholder、PartialEq非対象)を追加し`visible_file_infos`の表示中エントリ全statをインメモリ参照化、(3) `rescan_changed_preserving_ids_with`: watchティックの全ツリー再スキャンを廃止し、変更パスの影響dirだけ実FS列挙(全再スキャンとentries・順序・ID採番まで完全一致が契約。ルート外・非UTF-8・列挙レースは全再スキャンへフォールバック)。Linux実測50kエントリでwatchティック437ms→60ms、(4) git statusサブプロセスをappイベントスレッド外のworkerへ(同時実行1本+coalesce、rootミスマッチのstale badge破棄)。Linuxで対象テスト191件・workspace clippy警告ゼロ、Windows GNUクロスターゲットでcheck/clippy pass、headless RPCスモーク5件pass(実nvim)。Windows実機動作確認は未実施
+- [x] **M9 常用ファイラー化(2026-07-06)** — 「移動する・探す・衝突を裁く」の欠落を埋める(3セッション、docs/ROADMAP_M9.md): (1) **M9-1/M9-2 ナビゲーション**: `gd`でカーソル行ディレクトリを新ルート化(NavigateInto)、`:cd <path>`で絶対/相対/`~`パス移動(ChangeDirectory、cnoreabbrevで`:cd`乗っ取り・`:cdo`温存)、Windowsドライブ一覧(GetLogicalDrives、drives.rs新設)、`^`親移動後の子ディレクトリへのカーソル復元。すべて読み取り専用(実FS書き込みなし)。(2) **M9-3 上書きpreflight**: plan確定時に実FS衝突をpreflight走査(preflight.rs、読み取り専用・plan順シミュレーション・case-fold vacated除外)、既存ディレクトリ衝突はValidateError::TargetOccupiedByDirectoryで中断、既存ファイル/symlink衝突は確認ダイアログで警告し承認後ごみ箱退避して上書き(apply_plan_with_overwrites)。(3) **M9-4 apply非同期化**: apply_plan_cancellable(操作間キャンセル+進捗通知)、承認はStartApplyを返しfyler-applyワーカーで実行、進捗ダイアログ+キャンセルボタン、apply中の外部変更は遅延flush。fyler_core::save状態機械は無変更。Linuxで対象テスト185件・workspace clippy警告ゼロ、Windows GNUクロスターゲットでclippy pass、headless RPCスモーク6件pass(実nvim)。Windows実機動作確認は未実施
 
 各マイルストーンの完了条件は DESIGN.md「マイルストーン」章を参照。
 完了したらこのチェックリストを更新すること。
