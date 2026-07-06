@@ -7,12 +7,13 @@
 mod config;
 mod save_flow;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::thread;
 
 use fyler_core::editor::{EditorCommand, EditorEngine, EditorEvent, EditorMessage, MessageKind};
+use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::IdAllocator;
 use fyler_core::tree::EntryKind;
@@ -28,7 +29,55 @@ enum AppEvent {
     Editor(EditorEvent),
     Confirm(ConfirmChoice),
     ExternalChange(ExternalChange),
+    GitStatus {
+        root: PathBuf,
+        statuses: HashMap<PathBuf, GitBadge>,
+    },
     Shutdown,
+}
+
+/// git statusサブプロセスをappイベントスレッド外で実行し、結果をAppEventで返す。
+///
+/// 常に同時実行1本まで。実行中に再要求されたら完了後に1回だけ再実行する。
+struct GitRefresher {
+    event_tx: mpsc::Sender<AppEvent>,
+    inflight: bool,
+    queued: Option<PathBuf>,
+}
+
+impl GitRefresher {
+    fn new(event_tx: mpsc::Sender<AppEvent>) -> Self {
+        Self {
+            event_tx,
+            inflight: false,
+            queued: None,
+        }
+    }
+
+    fn request(&mut self, root: PathBuf) {
+        let Some(root) = self.prepare_request(root) else {
+            return;
+        };
+        let event_tx = self.event_tx.clone();
+        drop(thread::spawn(move || {
+            let statuses = fyler_fsops::gitstatus::status_badges(&root).unwrap_or_default();
+            let _ = event_tx.send(AppEvent::GitStatus { root, statuses });
+        }));
+    }
+
+    fn prepare_request(&mut self, root: PathBuf) -> Option<PathBuf> {
+        if self.inflight {
+            self.queued = Some(root);
+            return None;
+        }
+        self.inflight = true;
+        Some(root)
+    }
+
+    fn on_finished(&mut self) -> Option<PathBuf> {
+        self.inflight = false;
+        self.queued.take()
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -123,7 +172,6 @@ fn main() -> anyhow::Result<()> {
     // GUIクレートへtokio型を漏らさず、core型とConfirmChoiceだけを受け渡す。
     let (gui_event_tx, gui_event_rx) = mpsc::channel();
     gui_event_tx.send(GuiEvent::RootChanged(root.clone()))?;
-    send_decorations(&gui_event_tx, &save_controller)?;
     if !config_warnings.is_empty() {
         send_gui_message(
             &gui_event_tx,
@@ -132,12 +180,18 @@ fn main() -> anyhow::Result<()> {
         )?;
     }
     let app_engine = Arc::clone(&save_engine);
+    let git_event_tx = app_event_tx.clone();
     let event_bridge = thread::Builder::new()
         .name("fyler-app-events".to_owned())
         .spawn(move || {
             let mut root = root;
             let mut _watcher = watcher;
             let mut pending_events = VecDeque::new();
+            let mut git = GitRefresher::new(git_event_tx);
+            if send_file_infos(&gui_event_tx, &save_controller).is_err() {
+                return;
+            }
+            git.request(root.clone());
             if let Err(error) = config::record_recent_root(&root)
                 && send_gui_message(
                     &gui_event_tx,
@@ -203,7 +257,7 @@ fn main() -> anyhow::Result<()> {
                             continue;
                         };
 
-                        if change_root_to(
+                        let root_changed = match change_root_to(
                             new_root,
                             &mut root,
                             &mut _watcher,
@@ -211,10 +265,19 @@ fn main() -> anyhow::Result<()> {
                             &mut save_controller,
                             app_engine.as_ref(),
                             &gui_event_tx,
-                        )
-                        .is_err()
-                        {
-                            return;
+                        ) {
+                            Ok(root_changed) => root_changed,
+                            Err(_) => return,
+                        };
+                        if root_changed {
+                            if gui_event_tx
+                                .send(GuiEvent::GitBadges(HashMap::new()))
+                                .is_err()
+                                || send_file_infos(&gui_event_tx, &save_controller).is_err()
+                            {
+                                return;
+                            }
+                            git.request(root.clone());
                         }
                     }
                     AppEvent::Editor(EditorEvent::JumpBookmark { query }) => {
@@ -234,7 +297,7 @@ fn main() -> anyhow::Result<()> {
 
                         match resolve_bookmark_query(&query, &bookmarks, &recent) {
                             BookmarkResolution::Resolved(new_root) => {
-                                if change_root_to(
+                                let root_changed = match change_root_to(
                                     new_root,
                                     &mut root,
                                     &mut _watcher,
@@ -242,10 +305,19 @@ fn main() -> anyhow::Result<()> {
                                     &mut save_controller,
                                     app_engine.as_ref(),
                                     &gui_event_tx,
-                                )
-                                .is_err()
-                                {
-                                    return;
+                                ) {
+                                    Ok(root_changed) => root_changed,
+                                    Err(_) => return,
+                                };
+                                if root_changed {
+                                    if gui_event_tx
+                                        .send(GuiEvent::GitBadges(HashMap::new()))
+                                        .is_err()
+                                        || send_file_infos(&gui_event_tx, &save_controller).is_err()
+                                    {
+                                        return;
+                                    }
+                                    git.request(root.clone());
                                 }
                             }
                             BookmarkResolution::Ambiguous(names) => {
@@ -321,9 +393,10 @@ fn main() -> anyhow::Result<()> {
                                 return;
                             }
                         }
-                        if send_decorations(&gui_event_tx, &save_controller).is_err() {
+                        if send_file_infos(&gui_event_tx, &save_controller).is_err() {
                             return;
                         }
+                        git.request(root.clone());
                     }
                     AppEvent::Editor(event) => {
                         if gui_event_tx.send(GuiEvent::Editor(event)).is_err() {
@@ -340,10 +413,11 @@ fn main() -> anyhow::Result<()> {
                         if send_save_result(&gui_event_tx, result).is_err() {
                             return;
                         }
-                        if refresh_decorations
-                            && send_decorations(&gui_event_tx, &save_controller).is_err()
-                        {
-                            return;
+                        if refresh_decorations {
+                            if send_file_infos(&gui_event_tx, &save_controller).is_err() {
+                                return;
+                            }
+                            git.request(root.clone());
                         }
                     }
                     AppEvent::ExternalChange(change) => {
@@ -362,7 +436,25 @@ fn main() -> anyhow::Result<()> {
                         {
                             return;
                         }
-                        if send_decorations(&gui_event_tx, &save_controller).is_err() {
+                        if send_file_infos(&gui_event_tx, &save_controller).is_err() {
+                            return;
+                        }
+                        git.request(root.clone());
+                    }
+                    AppEvent::GitStatus {
+                        root: status_root,
+                        statuses,
+                    } => {
+                        if let Some(next_root) = git.on_finished() {
+                            git.request(next_root);
+                        }
+                        if status_root == root
+                            && gui_event_tx
+                                .send(GuiEvent::GitBadges(
+                                    save_controller.map_git_badges(&statuses),
+                                ))
+                                .is_err()
+                        {
                             return;
                         }
                     }
@@ -390,30 +482,32 @@ fn change_root_to(
     save_controller: &mut SaveController,
     engine: &dyn EditorEngine,
     gui_event_tx: &mpsc::Sender<GuiEvent>,
-) -> Result<(), mpsc::SendError<GuiEvent>> {
+) -> Result<bool, mpsc::SendError<GuiEvent>> {
     let new_root = match normalize_root(&new_root) {
         Ok(new_root) => new_root,
         Err(error) => {
-            return send_gui_message(
+            send_gui_message(
                 gui_event_tx,
                 MessageKind::Error,
                 format!(
                     "表示ルートを正規化できません ({}): {error}",
                     new_root.display()
                 ),
-            );
+            )?;
+            return Ok(false);
         }
     };
 
     if engine.snapshot().dirty {
-        return send_gui_message(
+        send_gui_message(
             gui_event_tx,
             MessageKind::Info,
             "編集中です。保存または破棄してからディレクトリを移動してください",
-        );
+        )?;
+        return Ok(false);
     }
     if !save_controller.is_idle() {
-        return Ok(());
+        return Ok(false);
     }
 
     let mut new_ids = IdAllocator::new();
@@ -422,14 +516,15 @@ fn change_root_to(
         match fyler_fsops::scan::scan_baseline_with(&new_root, &mut new_ids, &scan_options) {
             Ok(baseline) => baseline,
             Err(error) => {
-                return send_gui_message(
+                send_gui_message(
                     gui_event_tx,
                     MessageKind::Error,
                     format!(
                         "表示ルートを読み込めません ({}): {error:#}",
                         new_root.display()
                     ),
-                );
+                )?;
+                return Ok(false);
             }
         };
 
@@ -438,23 +533,25 @@ fn change_root_to(
     let new_watcher = match fyler_fsops::watch::watch(&new_root, watch_tx.clone()) {
         Ok(watcher) => watcher,
         Err(error) => {
-            return send_gui_message(
+            send_gui_message(
                 gui_event_tx,
                 MessageKind::Error,
                 format!(
                     "表示ルートを監視できません ({}): {error:#}",
                     new_root.display()
                 ),
-            );
+            )?;
+            return Ok(false);
         }
     };
 
     if let Err(error) = save_controller.change_root(new_root.clone(), new_ids, new_baseline) {
-        return send_gui_message(
+        send_gui_message(
             gui_event_tx,
             MessageKind::Error,
             format!("表示ルートを変更できません: {error:#}"),
-        );
+        )?;
+        return Ok(false);
     }
     save_controller.collapse_all_dirs();
     let new_lines = save_controller.visible_lines();
@@ -472,7 +569,6 @@ fn change_root_to(
         )?;
     }
     gui_event_tx.send(GuiEvent::RootChanged(root.clone()))?;
-    send_decorations(gui_event_tx, save_controller)?;
     if let Err(error) = config::record_recent_root(root) {
         send_gui_message(
             gui_event_tx,
@@ -480,7 +576,7 @@ fn change_root_to(
             format!("最近使ったルートを記録できません: {error:#}"),
         )?;
     }
-    Ok(())
+    Ok(true)
 }
 
 fn normalize_root(root: &Path) -> std::io::Result<PathBuf> {
@@ -693,15 +789,11 @@ fn send_gui_message(
     })))
 }
 
-/// 現在のbaselineに対応するGit装飾と、表示中エントリのファイル情報を再計算して送る。
-///
-/// Gitが利用できない場合とリポジトリ外では、空のmapを送って既存装飾を消す。
-/// ファイル情報の取得に失敗したエントリは送信するmapに含めない。
-fn send_decorations(
+/// 表示中エントリのインメモリなファイル情報をGUIへ送る。
+fn send_file_infos(
     gui_event_tx: &mpsc::Sender<GuiEvent>,
     save_controller: &SaveController,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
-    gui_event_tx.send(GuiEvent::GitBadges(save_controller.git_badges()))?;
     gui_event_tx.send(GuiEvent::FileInfos(save_controller.visible_file_infos()))
 }
 
@@ -763,6 +855,28 @@ mod tests {
         let current_dir = std::env::current_dir().unwrap();
 
         assert_eq!(normalize_root(&current_dir.join(".")).unwrap(), current_dir);
+    }
+
+    #[test]
+    fn git_refresher_coalesces_inflight_requests_to_latest_root() {
+        let (event_tx, _event_rx) = mpsc::channel();
+        let mut git = GitRefresher::new(event_tx);
+        let first = PathBuf::from("first");
+        let second = PathBuf::from("second");
+        let latest = PathBuf::from("latest");
+
+        assert_eq!(git.prepare_request(first.clone()), Some(first));
+        assert!(git.inflight);
+        assert_eq!(git.prepare_request(second), None);
+        assert_eq!(git.prepare_request(latest.clone()), None);
+        assert_eq!(git.queued, Some(latest.clone()));
+
+        assert_eq!(git.on_finished(), Some(latest.clone()));
+        assert!(!git.inflight);
+        assert_eq!(git.prepare_request(latest.clone()), Some(latest));
+        assert!(git.inflight);
+        assert_eq!(git.on_finished(), None);
+        assert!(!git.inflight);
     }
 
     #[test]

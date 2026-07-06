@@ -139,12 +139,17 @@ impl SaveController {
         self.scan_options
     }
 
-    /// 現在の表示ルートのGit状態を、baselineのエントリIDへ対応付けて返す。
+    /// 表示ルート相対のGit状態を、現在のbaselineのエントリIDへ対応付けて返す。
     ///
-    /// Gitが利用できない場合やリポジトリ外では空のmapを返す。Gitがディレクトリ単位で
-    /// 報告した状態は同じパスのエントリだけへ付け、子孫や親ディレクトリへ伝播しない。
-    pub fn git_badges(&self) -> HashMap<EntryId, GitBadge> {
-        let statuses = fyler_fsops::gitstatus::status_badges(&self.root).unwrap_or_default();
+    /// Gitがディレクトリ単位で報告した状態は同じパスのエントリだけへ付け、子孫や
+    /// 親ディレクトリへ伝播しない。対応するエントリがない状態は無視する。
+    pub fn map_git_badges(
+        &self,
+        statuses: &HashMap<PathBuf, GitBadge>,
+    ) -> HashMap<EntryId, GitBadge> {
+        if statuses.is_empty() {
+            return HashMap::new();
+        }
         self.baseline
             .entries()
             .iter()
@@ -763,6 +768,36 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn map_git_badges_matches_exact_root_relative_paths_only() {
+        let (controller, _) = controller("C:/test-root");
+        let entry_id = controller.baseline.entries()[0].id;
+        let statuses = HashMap::from([
+            (PathBuf::from("a.txt"), GitBadge::Modified),
+            (PathBuf::from("other/a.txt"), GitBadge::Added),
+        ]);
+
+        assert_eq!(
+            controller.map_git_badges(&statuses),
+            HashMap::from([(entry_id, GitBadge::Modified)])
+        );
+    }
+
+    #[test]
+    fn map_git_badges_returns_empty_for_empty_statuses() {
+        let (controller, _) = controller("C:/test-root");
+
+        assert!(controller.map_git_badges(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn map_git_badges_ignores_unmatched_paths() {
+        let (controller, _) = controller("C:/test-root");
+        let statuses = HashMap::from([(PathBuf::from("missing.txt"), GitBadge::Untracked)]);
+
+        assert!(controller.map_git_badges(&statuses).is_empty());
     }
 
     #[test]
