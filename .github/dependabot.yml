@@ -1,0 +1,29 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 5
+    ignore:
+      # nvim-rsはAPI unstable宣言のため完全固定(AGENTS.md / DESIGN.md)。手動でのみ上げる。
+      - dependency-name: nvim-rs
+    groups:
+      # patch/minorはまとめて1PRに(automerge対象)
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: Asia/Tokyo
+    groups:
+      actions:
+        patterns:
+          - "*"

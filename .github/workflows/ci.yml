@@ -2,32 +2,62 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  # 純粋ロジック(fyler-core / fyler-pipeline)はどのOSでもテスト可能
-  logic-linux:
+  # fmt + clippy(警告ゼロがプロジェクトルール)
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # Linuxで走るテストはすべて実行(nvim必須テストは #[ignore] 済み)
+  test-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Format check
-        run: cargo fmt --all --check
-      - name: Test pure logic crates
-        run: cargo test -p fyler-core -p fyler-pipeline
+      - name: Test workspace
+        run: cargo test --workspace --locked
 
-  # 本来のターゲット。ワークスペース全体がWindowsでコンパイルできることを保証する
-  check-windows:
+  # cfg(windows)ブロックの型・lintエラーをLinux上で検出(AGENTS.md M5以降の恒常ゲート)
+  cross-windows-gnu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy cfg(windows) code (deny warnings)
+        run: cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-gnu -- -D warnings
+
+  # 本来のターゲット。Windowsネイティブでビルド+テスト
+  test-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Check workspace
-        run: cargo check --workspace --all-targets
-      - name: Test pure logic crates
-        run: cargo test -p fyler-core -p fyler-pipeline
+        run: cargo check --workspace --all-targets --locked
+      - name: Test workspace
+        run: cargo test --workspace --locked
