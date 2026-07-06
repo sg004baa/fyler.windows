@@ -356,10 +356,7 @@ fn main() -> anyhow::Result<()> {
                                 event => pending_events.push_back(event),
                             }
                         }
-                        // M7では全再スキャンするため、集合は将来の部分再スキャンまで使わない。
-                        drop(changed_paths);
-
-                        let result = save_controller.on_external_change();
+                        let result = save_controller.on_external_change(&changed_paths);
                         if !matches!(&result, SaveFlowResult::NoChanges)
                             && send_save_result(&gui_event_tx, result).is_err()
                         {

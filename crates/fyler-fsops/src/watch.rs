@@ -15,7 +15,7 @@ const DEBOUNCE_WINDOW: Duration = Duration::from_millis(200);
 /// 外部プロセスによるファイルシステム変更の通知。
 ///
 /// 1回の通知には固定debounceウィンドウ内で検知した全パスを重複なく保持する。
-/// app層は現時点では全再スキャンに使い、将来は部分再スキャンの対象判定に使う。
+/// app層は部分再スキャンの対象ディレクトリ判定に使う。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalChange {
     /// 同一のdebounceウィンドウ内で変更を検知したパスの集合。

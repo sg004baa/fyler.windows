@@ -23,12 +23,18 @@ pub enum EntryKind {
 /// - `fyler-fsops::scan` が実FSから構築し、IDを採番する
 /// - diff(fyler-pipeline)はこのbaselineとDesiredTreeを比較する
 /// - reconcile(保存成功後)で更新される。部分失敗時は成功した操作のみ反映する
+///
+/// メタデータ([`crate::fileinfo::EntryMeta`])はスキャン時に列挙情報から
+/// 収集する表示用の付帯情報であり、ツリー構造の同一性判定([`PartialEq`])には
+/// **含めない**。外部変更でサイズ・更新日時だけが変わってもバッファ行の
+/// 再設定を誘発しないためである。
 #[derive(Debug, Clone)]
 pub struct BaselineTree {
     /// 表示ルートの実FSパス。
     pub root: PathBuf,
     entries: Vec<BaselineEntry>,
     index: HashMap<EntryId, usize>,
+    meta: HashMap<EntryId, crate::fileinfo::EntryMeta>,
 }
 
 impl PartialEq for BaselineTree {
@@ -46,6 +52,7 @@ impl BaselineTree {
             root: root.into(),
             entries: Vec::new(),
             index: HashMap::new(),
+            meta: HashMap::new(),
         }
     }
 
@@ -62,6 +69,18 @@ impl BaselineTree {
         let position = self.entries.len();
         self.index.insert(entry.id, position);
         self.entries.push(entry);
+    }
+
+    /// エントリと表示用メタデータを同時に追加する。
+    pub fn insert_with_meta(&mut self, entry: BaselineEntry, meta: crate::fileinfo::EntryMeta) {
+        let id = entry.id;
+        self.insert(entry);
+        self.meta.insert(id, meta);
+    }
+
+    /// IDに対応する表示用メタデータを返す。スキャン以外で構築したbaselineはNone。
+    pub fn meta(&self, id: EntryId) -> Option<&crate::fileinfo::EntryMeta> {
+        self.meta.get(&id)
     }
 
     /// IDに対応するエントリをO(1)で返す。

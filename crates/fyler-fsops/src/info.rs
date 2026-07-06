@@ -1,36 +1,29 @@
-//! モードラインへ表示するファイルメタデータの収集。
+//! モードラインへ表示するファイル更新日時の整形。
 
-use std::fs::Metadata;
-use std::path::Path;
+use std::time::SystemTime;
 
-use anyhow::Context;
-use fyler_core::fileinfo::FileInfo;
-
-/// パスの表示用メタデータを収集する。
-///
-/// プレースホルダ判定を最初に属性だけで行い、ファイル内容は読まない。
-/// メタデータはリンク先へ潜らず取得し、ディレクトリのサイズは返さない。
-pub fn file_info(path: &Path) -> anyhow::Result<FileInfo> {
-    let is_placeholder = crate::onedrive::is_cloud_placeholder(path)?;
-    let fs_path = crate::long_path::to_fs(path);
-    let metadata = std::fs::symlink_metadata(&fs_path)
-        .with_context(|| format!("表示用メタデータを取得できません: {}", path.display()))?;
-
-    Ok(FileInfo {
-        size: (!metadata.is_dir()).then_some(metadata.len()),
-        modified: format_modified(&metadata),
-        is_placeholder,
-    })
-}
-
+/// スキャン時に取得した更新日時をローカル時刻の表示文字列へ整形する。
 #[cfg(windows)]
-fn format_modified(metadata: &Metadata) -> Option<String> {
-    use std::os::windows::fs::MetadataExt;
+pub fn format_modified_time(modified: SystemTime) -> Option<String> {
+    use std::time::UNIX_EPOCH;
 
     use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
     use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 
-    let last_write_time = metadata.last_write_time();
+    const WINDOWS_EPOCH_OFFSET_TICKS: i64 = 116_444_736_000_000_000;
+    const TICKS_PER_SECOND: i64 = 10_000_000;
+
+    let duration_ticks = |duration: std::time::Duration| {
+        let seconds = i64::try_from(duration.as_secs()).ok()?;
+        seconds
+            .checked_mul(TICKS_PER_SECOND)?
+            .checked_add(i64::from(duration.subsec_nanos() / 100))
+    };
+    let ticks = match modified.duration_since(UNIX_EPOCH) {
+        Ok(duration) => WINDOWS_EPOCH_OFFSET_TICKS.checked_add(duration_ticks(duration)?)?,
+        Err(error) => WINDOWS_EPOCH_OFFSET_TICKS.checked_sub(duration_ticks(error.duration())?)?,
+    };
+    let last_write_time = u64::try_from(ticks).ok()?;
     let file_time = FILETIME {
         dwLowDateTime: last_write_time as u32,
         dwHighDateTime: (last_write_time >> 32) as u32,
@@ -48,11 +41,11 @@ fn format_modified(metadata: &Metadata) -> Option<String> {
     ))
 }
 
+/// スキャン時に取得した更新日時をUTCの表示文字列へ整形する。
 #[cfg(not(windows))]
-fn format_modified(metadata: &Metadata) -> Option<String> {
+pub fn format_modified_time(modified: SystemTime) -> Option<String> {
     use std::time::UNIX_EPOCH;
 
-    let modified = metadata.modified().ok()?;
     let unix_seconds = match modified.duration_since(UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_secs()).ok()?,
         Err(error) => {
@@ -91,35 +84,29 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
-    use tempfile::tempdir;
-
     use super::*;
 
     #[test]
-    fn ordinary_file_has_size_and_modified_time_without_placeholder() {
-        let root = tempdir().unwrap();
-        let path = root.path().join("ordinary.txt");
-        fs::write(&path, b"content").unwrap();
-
-        let info = file_info(&path).unwrap();
-
-        assert_eq!(info.size, Some(7));
-        assert!(info.modified.is_some());
-        assert!(!info.is_placeholder);
+    fn current_system_time_can_be_formatted() {
+        assert!(format_modified_time(SystemTime::now()).is_some());
     }
 
+    #[cfg(not(windows))]
     #[test]
-    fn directory_has_no_size() {
-        let root = tempdir().unwrap();
-        let path = root.path().join("directory");
-        fs::create_dir(&path).unwrap();
+    fn unix_epoch_uses_existing_output_format() {
+        assert_eq!(
+            format_modified_time(std::time::UNIX_EPOCH).as_deref(),
+            Some("1970-01-01 00:00")
+        );
+    }
 
-        let info = file_info(&path).unwrap();
-
-        assert_eq!(info.size, None);
-        assert!(info.modified.is_some());
-        assert!(!info.is_placeholder);
+    #[cfg(not(windows))]
+    #[test]
+    fn time_before_unix_epoch_is_supported() {
+        let modified = std::time::UNIX_EPOCH - std::time::Duration::from_secs(60);
+        assert_eq!(
+            format_modified_time(modified).as_deref(),
+            Some("1969-12-31 23:59")
+        );
     }
 }

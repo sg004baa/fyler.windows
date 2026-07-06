@@ -1,6 +1,6 @@
 //! 保存フロー: parse → validate → diff → confirm → apply → reconcile。
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -157,15 +157,24 @@ impl SaveController {
 
     /// 現在表示中の行に対応するエントリの表示用メタデータをIDへ対応付けて返す。
     ///
-    /// 取得に失敗したエントリは含めず、モードラインでは情報を表示しない。
+    /// スキャン由来のメタデータを持たないエントリは含めず、モードラインでは
+    /// 情報を表示しない。ここでは実FSへ問い合わせない。
     pub fn visible_file_infos(&self) -> HashMap<EntryId, FileInfo> {
         visible_entries(&self.baseline, &self.context)
             .into_iter()
             .filter_map(|entry| {
-                let path = entry.path.to_fs_path(&self.root);
-                fyler_fsops::info::file_info(&path)
-                    .ok()
-                    .map(|info| (entry.id, info))
+                self.baseline.meta(entry.id).map(|meta| {
+                    (
+                        entry.id,
+                        FileInfo {
+                            size: meta.size,
+                            modified: meta
+                                .modified
+                                .and_then(fyler_fsops::info::format_modified_time),
+                            is_placeholder: meta.is_placeholder,
+                        },
+                    )
+                })
             })
             .collect()
     }
@@ -328,11 +337,12 @@ impl SaveController {
         }
     }
 
-    pub fn on_external_change(&mut self) -> SaveFlowResult {
-        let baseline = match fyler_fsops::scan::rescan_preserving_ids_with(
+    pub fn on_external_change(&mut self, changed_paths: &BTreeSet<PathBuf>) -> SaveFlowResult {
+        let baseline = match fyler_fsops::scan::rescan_changed_preserving_ids_with(
             &self.root,
             &mut self.ids,
             &self.baseline,
+            changed_paths,
             &self.scan_options,
         )
         .context("外部変更後の実FS再スキャンに失敗しました")
@@ -342,6 +352,9 @@ impl SaveController {
         };
 
         if baseline == self.baseline {
+            // 構造とIDが同一なら表示中planの前提は変わらない。メタデータだけは
+            // 最新スキャン結果へ差し替え、サイズ・更新日時の表示を鮮度維持する。
+            self.baseline = baseline;
             return SaveFlowResult::NoChanges;
         }
 
@@ -971,7 +984,7 @@ mod tests {
         let (mut controller, engine) = controller(temp_root.path());
         fs::write(temp_root.path().join("b.txt"), b"b").unwrap();
 
-        let result = controller.on_external_change();
+        let result = controller.on_external_change(&BTreeSet::new());
 
         assert_eq!(result, SaveFlowResult::ExternalChanged);
         assert!(
@@ -997,7 +1010,7 @@ mod tests {
         engine.set_dirty(true);
         fs::write(temp_root.path().join("b.txt"), b"b").unwrap();
 
-        let result = controller.on_external_change();
+        let result = controller.on_external_change(&BTreeSet::new());
 
         assert!(matches!(
             result,
@@ -1020,9 +1033,29 @@ mod tests {
         fs::write(temp_root.path().join("a.txt"), b"a").unwrap();
         let (mut controller, engine) = controller(temp_root.path());
 
-        let result = controller.on_external_change();
+        let result = controller.on_external_change(&BTreeSet::new());
 
         assert_eq!(result, SaveFlowResult::NoChanges);
+        assert!(engine.commands.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn metadata_only_external_change_refreshes_visible_file_info() {
+        let temp_root = tempdir().unwrap();
+        let file = temp_root.path().join("a.txt");
+        fs::write(&file, b"a").unwrap();
+        let (mut controller, engine) = controller(temp_root.path());
+        fs::write(&file, b"longer content").unwrap();
+        let changed_paths = BTreeSet::from([file]);
+
+        let result = controller.on_external_change(&changed_paths);
+
+        assert_eq!(result, SaveFlowResult::NoChanges);
+        let id = controller.baseline.entries()[0].id;
+        assert_eq!(
+            controller.visible_file_infos().get(&id).unwrap().size,
+            Some(14)
+        );
         assert!(engine.commands.lock().unwrap().is_empty());
     }
 
@@ -1039,7 +1072,7 @@ mod tests {
         ));
         fs::write(temp_root.path().join("c.txt"), b"c").unwrap();
 
-        let result = controller.on_external_change();
+        let result = controller.on_external_change(&BTreeSet::new());
 
         assert!(matches!(
             &result,
@@ -1068,7 +1101,7 @@ mod tests {
             SaveFlowResult::ShowPlan { .. }
         ));
 
-        let result = controller.on_external_change();
+        let result = controller.on_external_change(&BTreeSet::new());
 
         assert_eq!(result, SaveFlowResult::NoChanges);
         assert!(matches!(
@@ -1463,7 +1496,7 @@ mod tests {
         fs::write(root.path().join("new.txt"), b"new").unwrap();
 
         assert_eq!(
-            controller.on_external_change(),
+            controller.on_external_change(&BTreeSet::new()),
             SaveFlowResult::ExternalChanged
         );
 

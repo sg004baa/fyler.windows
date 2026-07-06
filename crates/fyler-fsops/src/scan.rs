@@ -1,12 +1,13 @@
 //! baselineスキャン: 実FS → BaselineTree(ID採番)。
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use fyler_core::fileinfo::EntryMeta;
 use fyler_core::id::IdAllocator;
 use fyler_core::options::SortOrder;
 use fyler_core::path::TreePath;
@@ -87,11 +88,215 @@ pub fn rescan_preserving_ids_with(
     })
 }
 
+/// watcherが報告した変更パスから影響ディレクトリだけを再スキャンする。
+///
+/// 影響外のエントリ・ID・メタデータは`previous`から引き継ぐ。新規パスは必ず
+/// 実FSを列挙する領域にだけ現れ、部分再構築でも全再スキャンと同じDFS順で到達する。
+/// したがって新規IDの採番順も[`rescan_preserving_ids_with`]と一致する。
+///
+/// 変更パスをルート相対UTF-8パスへ変換できない場合や、部分再構築中の列挙が
+/// ファイルシステムとの競合で失敗した場合は、安全のため全再スキャンへ戻る。
+pub fn rescan_changed_preserving_ids_with(
+    root: &Path,
+    ids: &mut IdAllocator,
+    previous: &BaselineTree,
+    changed_paths: &BTreeSet<PathBuf>,
+    options: &ScanOptions,
+) -> anyhow::Result<BaselineTree> {
+    if changed_paths.is_empty() {
+        return rescan_preserving_ids_with(root, ids, previous, options);
+    }
+
+    let Some(changed_paths) = changed_paths
+        .iter()
+        .map(|path| to_relative_tree_path(root, path))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return rescan_preserving_ids_with(root, ids, previous, options);
+    };
+
+    match rebuild_changed(root, ids, previous, &changed_paths, options) {
+        Ok(tree) => Ok(tree),
+        Err(_) => rescan_preserving_ids_with(root, ids, previous, options),
+    }
+}
+
+fn to_relative_tree_path(root: &Path, path: &Path) -> Option<TreePath> {
+    let relative = path.strip_prefix(root).ok()?;
+    relative
+        .components()
+        .map(|component| component.as_os_str().to_str().map(ToOwned::to_owned))
+        .collect::<Option<Vec<_>>>()
+        .map(TreePath::from_components)
+}
+
+fn rebuild_changed(
+    root: &Path,
+    ids: &mut IdAllocator,
+    previous: &BaselineTree,
+    changed_paths: &[TreePath],
+    options: &ScanOptions,
+) -> anyhow::Result<BaselineTree> {
+    validate_root(root)?;
+
+    let previous_by_path = previous
+        .entries()
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.path.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let mut children_of: HashMap<TreePath, Vec<usize>> = HashMap::new();
+    for (index, entry) in previous.entries().iter().enumerate() {
+        children_of
+            .entry(entry.path.parent().unwrap_or_else(TreePath::root))
+            .or_default()
+            .push(index);
+    }
+
+    let mut affected = HashSet::new();
+    for path in changed_paths {
+        let mut ancestor = path.parent().unwrap_or_else(TreePath::root);
+        loop {
+            let is_existing_dir = previous_by_path
+                .get(&ancestor)
+                .is_some_and(|index| previous.entries()[*index].kind == EntryKind::Dir);
+            if ancestor.is_root() || is_existing_dir {
+                affected.insert(ancestor);
+                break;
+            }
+            ancestor = ancestor.parent().unwrap_or_else(TreePath::root);
+        }
+
+        if previous_by_path
+            .get(path)
+            .is_some_and(|index| previous.entries()[*index].kind == EntryKind::Dir)
+        {
+            affected.insert(path.clone());
+        }
+    }
+
+    let mut tree = BaselineTree::new(root);
+    rebuild_directory(
+        root,
+        &TreePath::root(),
+        ids,
+        previous,
+        &previous_by_path,
+        &children_of,
+        &affected,
+        options,
+        &mut tree,
+    )?;
+    Ok(tree)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rebuild_directory(
+    root: &Path,
+    relative: &TreePath,
+    ids: &mut IdAllocator,
+    previous: &BaselineTree,
+    previous_by_path: &HashMap<TreePath, usize>,
+    children_of: &HashMap<TreePath, Vec<usize>>,
+    affected: &HashSet<TreePath>,
+    options: &ScanOptions,
+    tree: &mut BaselineTree,
+) -> anyhow::Result<()> {
+    let was_directory = relative.is_root()
+        || previous_by_path
+            .get(relative)
+            .is_some_and(|index| previous.entries()[*index].kind == EntryKind::Dir);
+    let should_scan = affected.contains(relative) || !was_directory;
+
+    if should_scan {
+        let directory = relative.to_fs_path(root);
+        for entry in read_sorted_entries(&directory, options)? {
+            let name = entry.file_name.to_str().with_context(|| {
+                format!(
+                    "UTF-8として表現できないファイル名です: {}",
+                    entry.path.display()
+                )
+            })?;
+            let path = relative.child(name);
+            let id = previous_by_path
+                .get(&path)
+                .map(|index| previous.entries()[*index].id)
+                .unwrap_or_else(|| ids.allocate());
+            let kind = entry.kind;
+            let child_directory = entry.path;
+            tree.insert_with_meta(
+                BaselineEntry {
+                    id,
+                    path: path.clone(),
+                    kind,
+                },
+                entry.meta,
+            );
+
+            if kind == EntryKind::Dir {
+                rebuild_directory(
+                    root,
+                    &path,
+                    ids,
+                    previous,
+                    previous_by_path,
+                    children_of,
+                    affected,
+                    options,
+                    tree,
+                )
+                .with_context(|| {
+                    format!(
+                        "変更ディレクトリの再構築に失敗しました: {}",
+                        child_directory.display()
+                    )
+                })?;
+            }
+        }
+    } else if let Some(children) = children_of.get(relative) {
+        for index in children {
+            let entry = previous.entries()[*index].clone();
+            let id = entry.id;
+            let kind = entry.kind;
+            let path = entry.path.clone();
+            if let Some(meta) = previous.meta(id).copied() {
+                tree.insert_with_meta(entry, meta);
+            } else {
+                tree.insert(entry);
+            }
+
+            if kind == EntryKind::Dir {
+                rebuild_directory(
+                    root,
+                    &path,
+                    ids,
+                    previous,
+                    previous_by_path,
+                    children_of,
+                    affected,
+                    options,
+                    tree,
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn scan_with_id_resolver(
     root: &Path,
     options: &ScanOptions,
     mut resolve_id: impl FnMut(&TreePath) -> fyler_core::id::EntryId,
 ) -> anyhow::Result<BaselineTree> {
+    validate_root(root)?;
+
+    let mut tree = BaselineTree::new(root);
+    scan_directory(root, &TreePath::root(), options, &mut resolve_id, &mut tree)?;
+    Ok(tree)
+}
+
+fn validate_root(root: &Path) -> anyhow::Result<()> {
     let root_metadata = fs::symlink_metadata(crate::long_path::to_fs(root))
         .with_context(|| format!("表示ルートのメタデータを取得できません: {}", root.display()))?;
     if is_link_or_reparse(&root_metadata) {
@@ -103,10 +308,7 @@ fn scan_with_id_resolver(
     if !root_metadata.is_dir() {
         bail!("表示ルートがディレクトリではありません: {}", root.display());
     }
-
-    let mut tree = BaselineTree::new(root);
-    scan_directory(root, &TreePath::root(), options, &mut resolve_id, &mut tree)?;
-    Ok(tree)
+    Ok(())
 }
 
 fn scan_directory(
@@ -117,19 +319,15 @@ fn scan_directory(
     tree: &mut BaselineTree,
 ) -> anyhow::Result<()> {
     let mut stack = vec![ScanFrame {
-        entries: read_sorted_entries(directory, options)?,
-        index: 0,
+        entries: read_sorted_entries(directory, options)?.into_iter(),
         relative: relative.clone(),
     }];
 
     while let Some(frame) = stack.last_mut() {
-        if frame.index >= frame.entries.len() {
+        let Some(entry) = frame.entries.next() else {
             stack.pop();
             continue;
-        }
-
-        let entry = frame.entries[frame.index].clone();
-        frame.index += 1;
+        };
 
         let name = entry.file_name.to_str().with_context(|| {
             format!(
@@ -138,18 +336,20 @@ fn scan_directory(
             )
         })?;
         let path = frame.relative.child(name);
-        let kind = kind_from_metadata(&entry.metadata);
+        let kind = entry.kind;
 
-        tree.insert(BaselineEntry {
-            id: resolve_id(&path),
-            path: path.clone(),
-            kind,
-        });
+        tree.insert_with_meta(
+            BaselineEntry {
+                id: resolve_id(&path),
+                path: path.clone(),
+                kind,
+            },
+            entry.meta,
+        );
 
         if kind == EntryKind::Dir {
             stack.push(ScanFrame {
-                entries: read_sorted_entries(&entry.path, options)?,
-                index: 0,
+                entries: read_sorted_entries(&entry.path, options)?.into_iter(),
                 relative: path,
             });
         }
@@ -159,16 +359,16 @@ fn scan_directory(
 }
 
 struct ScanFrame {
-    entries: Vec<ScannedEntry>,
-    index: usize,
+    entries: std::vec::IntoIter<ScannedEntry>,
     relative: TreePath,
 }
 
-#[derive(Clone)]
 struct ScannedEntry {
     path: PathBuf,
     file_name: OsString,
-    metadata: Metadata,
+    sort_key: String,
+    kind: EntryKind,
+    meta: EntryMeta,
 }
 
 fn read_sorted_entries(
@@ -187,15 +387,24 @@ fn read_sorted_entries(
         })?;
         let path = entry.path();
         let file_name = entry.file_name();
-        if !options.show_hidden && is_hidden(&path, &file_name)? {
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("エントリのメタデータを取得できません: {}", path.display()))?;
+        if !options.show_hidden && is_hidden(&file_name, &metadata) {
             continue;
         }
-        let metadata = fs::symlink_metadata(crate::long_path::to_fs(&path))
-            .with_context(|| format!("エントリのメタデータを取得できません: {}", path.display()))?;
+        let name = file_name.to_str().with_context(|| {
+            format!("UTF-8として表現できないファイル名です: {}", path.display())
+        })?;
+        let sort_key = name.to_lowercase();
+        let kind = kind_from_metadata(&metadata);
+        let meta = meta_from_metadata(&metadata);
         entries.push(ScannedEntry {
             path,
             file_name,
-            metadata,
+            sort_key,
+            kind,
+            meta,
         });
     }
 
@@ -204,37 +413,38 @@ fn read_sorted_entries(
     entries.sort_by(|left, right| {
         let kind_order = match options.sort {
             SortOrder::DirsFirst => {
-                let left_is_dir = kind_from_metadata(&left.metadata) == EntryKind::Dir;
-                let right_is_dir = kind_from_metadata(&right.metadata) == EntryKind::Dir;
+                let left_is_dir = left.kind == EntryKind::Dir;
+                let right_is_dir = right.kind == EntryKind::Dir;
                 right_is_dir.cmp(&left_is_dir)
             }
             SortOrder::Mixed => Ordering::Equal,
         };
         kind_order
-            .then_with(|| natural_cmp_case_insensitive(&left.file_name, &right.file_name))
+            .then_with(|| natural_cmp_bytes(left.sort_key.as_bytes(), right.sort_key.as_bytes()))
             .then_with(|| left.file_name.cmp(&right.file_name))
     });
     Ok(entries)
 }
 
-fn is_hidden(path: &Path, file_name: &OsStr) -> anyhow::Result<bool> {
-    if file_name.to_string_lossy().starts_with('.') {
-        return Ok(true);
+fn is_hidden(file_name: &OsStr, metadata: &Metadata) -> bool {
+    if file_name.as_encoded_bytes().first() == Some(&b'.') {
+        return true;
     }
 
     #[cfg(windows)]
     {
         const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
-        Ok(crate::winattr::get(path)? & FILE_ATTRIBUTE_HIDDEN != 0)
+        metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0
     }
 
     #[cfg(not(windows))]
     {
-        let _ = path;
-        Ok(false)
+        let _ = metadata;
+        false
     }
 }
 
+#[cfg(test)]
 fn natural_cmp_case_insensitive(left: &OsStr, right: &OsStr) -> Ordering {
     let left = left.to_string_lossy().to_lowercase();
     let right = right.to_string_lossy().to_lowercase();
@@ -295,6 +505,31 @@ fn natural_cmp_bytes(mut left: &[u8], mut right: &[u8]) -> Ordering {
     left.len().cmp(&right.len())
 }
 
+fn meta_from_metadata(metadata: &Metadata) -> EntryMeta {
+    EntryMeta {
+        size: (!metadata.is_dir()).then_some(metadata.len()),
+        modified: metadata.modified().ok(),
+        is_placeholder: is_placeholder(metadata),
+    }
+}
+
+fn is_placeholder(metadata: &Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        let attributes = metadata.file_attributes();
+        let placeholder_attributes = crate::onedrive::FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+            | crate::onedrive::FILE_ATTRIBUTE_RECALL_ON_OPEN
+            | crate::onedrive::FILE_ATTRIBUTE_OFFLINE;
+        attributes & placeholder_attributes != 0
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
 fn is_link_or_reparse(metadata: &Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return true;
@@ -323,11 +558,52 @@ pub(crate) fn kind_from_metadata(metadata: &Metadata) -> EntryKind {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs;
 
     use tempfile::tempdir;
 
     use super::*;
+
+    fn allocator_after(previous: &BaselineTree) -> IdAllocator {
+        let next = previous
+            .entries()
+            .iter()
+            .map(|entry| entry.id.0)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let mut ids = IdAllocator::new();
+        for _ in 1..next {
+            ids.allocate();
+        }
+        ids
+    }
+
+    fn assert_partial_matches_full(
+        root: &Path,
+        previous: &BaselineTree,
+        changed_paths: impl IntoIterator<Item = PathBuf>,
+    ) -> BaselineTree {
+        let changed_paths = changed_paths.into_iter().collect::<BTreeSet<_>>();
+        let mut partial_ids = allocator_after(previous);
+        let mut full_ids = allocator_after(previous);
+
+        let partial = rescan_changed_preserving_ids_with(
+            root,
+            &mut partial_ids,
+            previous,
+            &changed_paths,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        let full =
+            rescan_preserving_ids_with(root, &mut full_ids, previous, &ScanOptions::default())
+                .unwrap();
+
+        assert_eq!(partial, full);
+        partial
+    }
 
     #[test]
     fn rescan_preserves_existing_ids_and_allocates_new_ones() {
@@ -372,6 +648,198 @@ mod tests {
     }
 
     #[test]
+    fn partial_rescan_matches_full_for_file_content_change() {
+        let root = tempdir().unwrap();
+        let file = root.path().join("file.txt");
+        fs::write(&file, b"old").unwrap();
+        let mut ids = IdAllocator::new();
+        let previous = scan_baseline(root.path(), &mut ids).unwrap();
+
+        fs::write(&file, b"new content").unwrap();
+        let partial = assert_partial_matches_full(root.path(), &previous, [file]);
+        let entry = partial
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("file.txt"))
+            .unwrap();
+
+        assert_eq!(partial.meta(entry.id).unwrap().size, Some(11));
+    }
+
+    #[test]
+    fn partial_rescan_matches_full_for_new_nested_directory_tree() {
+        let root = tempdir().unwrap();
+        let parent = root.path().join("parent");
+        fs::create_dir(&parent).unwrap();
+        fs::write(root.path().join("sibling.txt"), b"sibling").unwrap();
+        let mut ids = IdAllocator::new();
+        let previous = scan_baseline(root.path(), &mut ids).unwrap();
+
+        let leaf = parent.join("new").join("nested").join("leaf.txt");
+        fs::create_dir_all(leaf.parent().unwrap()).unwrap();
+        fs::write(&leaf, b"leaf").unwrap();
+        let partial = assert_partial_matches_full(root.path(), &previous, [leaf]);
+
+        assert!(
+            partial
+                .entries()
+                .iter()
+                .any(|entry| entry.path == TreePath::parse("parent/new/nested/leaf.txt"))
+        );
+    }
+
+    #[test]
+    fn partial_rescan_matches_full_for_directory_tree_deletion() {
+        let root = tempdir().unwrap();
+        let deleted = root.path().join("deleted");
+        fs::create_dir_all(deleted.join("nested")).unwrap();
+        fs::write(deleted.join("nested").join("child.txt"), b"child").unwrap();
+        fs::write(root.path().join("kept.txt"), b"kept").unwrap();
+        let mut ids = IdAllocator::new();
+        let previous = scan_baseline(root.path(), &mut ids).unwrap();
+
+        fs::remove_dir_all(&deleted).unwrap();
+        let partial = assert_partial_matches_full(root.path(), &previous, [deleted]);
+
+        assert!(partial.entries().iter().all(|entry| {
+            !TreePath::parse("deleted").is_strict_ancestor_of(&entry.path)
+                && entry.path != TreePath::parse("deleted")
+        }));
+    }
+
+    #[test]
+    fn partial_rescan_matches_full_for_rename_inside_directory() {
+        let root = tempdir().unwrap();
+        let directory = root.path().join("directory");
+        fs::create_dir(&directory).unwrap();
+        let old = directory.join("old.txt");
+        let new = directory.join("new.txt");
+        fs::write(&old, b"content").unwrap();
+        let mut ids = IdAllocator::new();
+        let previous = scan_baseline(root.path(), &mut ids).unwrap();
+
+        fs::rename(&old, &new).unwrap();
+        let partial = assert_partial_matches_full(root.path(), &previous, [old, new]);
+
+        assert!(
+            partial
+                .entries()
+                .iter()
+                .any(|entry| entry.path == TreePath::parse("directory/new.txt"))
+        );
+    }
+
+    #[test]
+    fn partial_rescan_matches_full_for_file_to_directory_kind_change() {
+        let root = tempdir().unwrap();
+        let changed = root.path().join("changed");
+        fs::write(&changed, b"file").unwrap();
+        let mut ids = IdAllocator::new();
+        let previous = scan_baseline(root.path(), &mut ids).unwrap();
+        let previous_id = previous.entries()[0].id;
+
+        fs::remove_file(&changed).unwrap();
+        fs::create_dir(&changed).unwrap();
+        fs::write(changed.join("child.txt"), b"child").unwrap();
+        let partial = assert_partial_matches_full(root.path(), &previous, [changed]);
+        let changed = partial
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("changed"))
+            .unwrap();
+
+        assert_eq!(changed.id, previous_id);
+        assert_eq!(changed.kind, EntryKind::Dir);
+        assert!(
+            partial
+                .entries()
+                .iter()
+                .any(|entry| entry.path == TreePath::parse("changed/child.txt"))
+        );
+    }
+
+    #[test]
+    fn partial_rescan_matches_full_for_change_below_excluded_hidden_directory() {
+        let root = tempdir().unwrap();
+        let hidden = root.path().join(".hidden");
+        fs::create_dir(&hidden).unwrap();
+        fs::write(hidden.join("old.txt"), b"old").unwrap();
+        fs::write(root.path().join("visible.txt"), b"visible").unwrap();
+        let mut ids = IdAllocator::new();
+        let previous = scan_baseline(root.path(), &mut ids).unwrap();
+
+        let changed = hidden.join("new.txt");
+        fs::write(&changed, b"new").unwrap();
+        let partial = assert_partial_matches_full(root.path(), &previous, [changed]);
+
+        assert_eq!(partial, previous);
+    }
+
+    #[test]
+    fn partial_rescan_falls_back_for_path_outside_root() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("old.txt"), b"old").unwrap();
+        let mut ids = IdAllocator::new();
+        let previous = scan_baseline(root.path(), &mut ids).unwrap();
+        fs::write(root.path().join("new.txt"), b"new").unwrap();
+        let outside = tempdir().unwrap();
+
+        let partial =
+            assert_partial_matches_full(root.path(), &previous, [outside.path().join("event")]);
+
+        assert!(
+            partial
+                .entries()
+                .iter()
+                .any(|entry| entry.path == TreePath::parse("new.txt"))
+        );
+    }
+
+    #[test]
+    fn partial_rescan_falls_back_for_empty_change_set() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("old.txt"), b"old").unwrap();
+        let mut ids = IdAllocator::new();
+        let previous = scan_baseline(root.path(), &mut ids).unwrap();
+        fs::write(root.path().join("new.txt"), b"new").unwrap();
+
+        let partial = assert_partial_matches_full(root.path(), &previous, []);
+
+        assert!(
+            partial
+                .entries()
+                .iter()
+                .any(|entry| entry.path == TreePath::parse("new.txt"))
+        );
+    }
+
+    #[test]
+    fn scan_stores_metadata_for_files_and_directories() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("directory")).unwrap();
+        fs::write(root.path().join("file.txt"), b"content").unwrap();
+        let mut ids = IdAllocator::new();
+
+        let baseline = scan_baseline(root.path(), &mut ids).unwrap();
+        let directory = baseline
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("directory"))
+            .unwrap();
+        let file = baseline
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("file.txt"))
+            .unwrap();
+
+        assert_eq!(baseline.meta(directory.id).unwrap().size, None);
+        assert!(baseline.meta(directory.id).unwrap().modified.is_some());
+        assert_eq!(baseline.meta(file.id).unwrap().size, Some(7));
+        assert!(baseline.meta(file.id).unwrap().modified.is_some());
+        assert!(!baseline.meta(file.id).unwrap().is_placeholder);
+    }
+
+    #[test]
     fn hidden_dot_entries_follow_scan_options() {
         let root = tempdir().unwrap();
         fs::write(root.path().join("visible.txt"), b"visible").unwrap();
@@ -412,6 +880,21 @@ mod tests {
                 .iter()
                 .any(|entry| entry.path == TreePath::parse(".hidden-dir/child.txt"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn excluded_hidden_non_utf8_name_does_not_fail_scan() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = tempdir().unwrap();
+        let hidden_non_utf8 = OsString::from_vec(vec![b'.', 0xff]);
+        fs::write(root.path().join(hidden_non_utf8), b"hidden").unwrap();
+        let mut ids = IdAllocator::new();
+
+        let baseline = scan_baseline(root.path(), &mut ids).unwrap();
+
+        assert!(baseline.entries().is_empty());
     }
 
     #[test]
