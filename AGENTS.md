@@ -72,6 +72,7 @@
 - [x] **M7-2 watchのdebounce/coalesce** — notifyイベントを200ms固定ウィンドウでパス集合へ集約し、watcher drop時のスレッド終了とapp層の二段coalesceを実装。Linuxで指定テスト100件・workspace clippy警告ゼロ、Windows GNUクロスターゲットでclippy pass。Windows実機でテスト・挙動確認OK(2026-07-05)
 - [x] **M7-4 git status装飾** — porcelain v1のGit状態取得とサブディレクトリ基準のパス解決、EntryIdへの対応付け、GUI装飾列と更新配線を実装。Linuxで指定テスト128件・workspace clippy警告ゼロ、Windows GNUクロスターゲットでclippy pass。Windows実機でテスト・挙動確認OK(2026-07-05)
 - [x] **M8 快適性** — ファイル情報表示/確認ダイアログのキー操作/パスコピー/ブックマーク・最近使ったルート/設定ファイル/確認中のバッファロックを実装。`config.toml`から隠し表示・ソート・確認詳細度・ブックマークを読み込み、`:b`ジャンプと`recent.toml`の最大10件記録を配線。Linuxで指定テスト141件・workspace clippy警告ゼロ、Windows GNUクロスターゲットでclippy pass、headless RPCスモーク4件pass(nvim v0.12.2)。Windows実機動作確認は未実施
+- [x] **性能改善セッション(2026-07-06)** — 大量fileを含むdirをrootにした際のFS層ボトルネックを根本対応(3コミット): (1) スキャンのエントリ毎2syscall(symlink_metadata+GetFileAttributesW)を`DirEntry::metadata()`のfind-data由来metadataへ統一し追加syscallゼロ化。hidden/placeholder判定も同属性ビットから導出、ソートキー事前計算で比較毎のString確保も排除、(2) BaselineTreeにEntryMetaサイドカー(size/mtime/placeholder、PartialEq非対象)を追加し`visible_file_infos`の表示中エントリ全statをインメモリ参照化、(3) `rescan_changed_preserving_ids_with`: watchティックの全ツリー再スキャンを廃止し、変更パスの影響dirだけ実FS列挙(全再スキャンとentries・順序・ID採番まで完全一致が契約。ルート外・非UTF-8・列挙レースは全再スキャンへフォールバック)。Linux実測50kエントリでwatchティック437ms→60ms、(4) git statusサブプロセスをappイベントスレッド外のworkerへ(同時実行1本+coalesce、rootミスマッチのstale badge破棄)。Linuxで対象テスト191件・workspace clippy警告ゼロ、Windows GNUクロスターゲットでcheck/clippy pass、headless RPCスモーク5件pass(実nvim)。Windows実機動作確認は未実施
 
 各マイルストーンの完了条件は DESIGN.md「マイルストーン」章を参照。
 完了したらこのチェックリストを更新すること。
