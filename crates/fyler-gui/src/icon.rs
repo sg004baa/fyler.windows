@@ -18,7 +18,7 @@ const NERD_FILE: &str = " ";
 const NERD_RUST: &str = " ";
 const NERD_MARKDOWN: &str = " ";
 const NERD_TEXT: &str = " ";
-const NERD_CONFIG: &str = " ";
+const NERD_TOML: &str = " ";
 
 /// conceal済みの表示名に対応するASCIIアイコンを返す。
 ///
@@ -62,7 +62,7 @@ pub fn for_display_name_styled(display_name: &str, style: IconStyle) -> &'static
         Some(extension) if extension.eq_ignore_ascii_case("rs") => NERD_RUST,
         Some(extension) if extension.eq_ignore_ascii_case("md") => NERD_MARKDOWN,
         Some(extension) if extension.eq_ignore_ascii_case("txt") => NERD_TEXT,
-        Some(extension) if extension.eq_ignore_ascii_case("toml") => NERD_CONFIG,
+        Some(extension) if extension.eq_ignore_ascii_case("toml") => NERD_TOML,
         _ => NERD_FILE,
     }
 }
@@ -127,7 +127,7 @@ mod tests {
         );
         assert_eq!(
             for_display_name_styled("Cargo.toml", IconStyle::Nerd),
-            NERD_CONFIG
+            NERD_TOML
         );
         assert_eq!(
             for_display_name_styled("archive.zip", IconStyle::Nerd),
