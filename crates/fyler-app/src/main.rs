@@ -8,6 +8,7 @@ mod config;
 mod save_flow;
 
 use std::collections::{HashMap, VecDeque};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -230,6 +231,101 @@ fn main() -> anyhow::Result<()> {
                             return;
                         }
                     }
+                    AppEvent::Editor(EditorEvent::NavigateInto { line }) => {
+                        let snapshot = app_engine.snapshot();
+                        let Some(editor_line) = snapshot.lines.get(line) else {
+                            if send_gui_message(
+                                &gui_event_tx,
+                                MessageKind::Error,
+                                "移動対象の行が見つかりません",
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        };
+
+                        match fyler_core::grammar::split_id_prefix(&editor_line.text) {
+                            PrefixParse::NoId { .. } => {
+                                if send_gui_message(
+                                    &gui_event_tx,
+                                    MessageKind::Info,
+                                    "保存されていない行です",
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                                continue;
+                            }
+                            PrefixParse::Broken => {
+                                if send_gui_message(
+                                    &gui_event_tx,
+                                    MessageKind::Error,
+                                    "壊れたIDプレフィックスの行は移動できません",
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                                continue;
+                            }
+                            PrefixParse::WithId { .. } => {}
+                        }
+
+                        let Some((path, kind)) =
+                            save_controller.resolve_line(&snapshot.lines, line)
+                        else {
+                            if send_gui_message(
+                                &gui_event_tx,
+                                MessageKind::Error,
+                                "行に対応するディレクトリが現在のツリーに見つかりません",
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        };
+                        if kind != EntryKind::Dir {
+                            if send_gui_message(
+                                &gui_event_tx,
+                                MessageKind::Info,
+                                "ディレクトリ行ではありません",
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+
+                        let root_changed = match change_root_to(
+                            path.to_fs_path(&root),
+                            None,
+                            &mut root,
+                            &mut _watcher,
+                            &watch_tx,
+                            &mut save_controller,
+                            app_engine.as_ref(),
+                            &gui_event_tx,
+                        ) {
+                            Ok(root_changed) => root_changed,
+                            Err(_) => return,
+                        };
+                        if root_changed
+                            && after_root_change(
+                                &gui_event_tx,
+                                &save_controller,
+                                &mut git,
+                                &root,
+                            )
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
                     AppEvent::Editor(EditorEvent::YankPath { line }) => {
                         if handle_yank_path(
                             &save_controller,
@@ -244,11 +340,21 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     AppEvent::Editor(EditorEvent::NavigateParent) => {
+                        let cursor_target = root.file_name().map(OsStr::to_owned);
                         let Some(new_root) = root.parent().map(Path::to_path_buf) else {
+                            let drives = fyler_fsops::drives::list_drives();
+                            let message = if drives.len() >= 2 {
+                                format!(
+                                    "これ以上、上のディレクトリはありません | ドライブ: {} (:cd で移動)",
+                                    format_drive_paths(&drives)
+                                )
+                            } else {
+                                "これ以上、上のディレクトリはありません".to_owned()
+                            };
                             if send_gui_message(
                                 &gui_event_tx,
                                 MessageKind::Info,
-                                "これ以上、上のディレクトリはありません",
+                                message,
                             )
                             .is_err()
                             {
@@ -259,6 +365,7 @@ fn main() -> anyhow::Result<()> {
 
                         let root_changed = match change_root_to(
                             new_root,
+                            cursor_target.as_deref(),
                             &mut root,
                             &mut _watcher,
                             &watch_tx,
@@ -269,15 +376,72 @@ fn main() -> anyhow::Result<()> {
                             Ok(root_changed) => root_changed,
                             Err(_) => return,
                         };
-                        if root_changed {
-                            if gui_event_tx
-                                .send(GuiEvent::GitBadges(HashMap::new()))
-                                .is_err()
-                                || send_file_infos(&gui_event_tx, &save_controller).is_err()
+                        if root_changed
+                            && after_root_change(
+                                &gui_event_tx,
+                                &save_controller,
+                                &mut git,
+                                &root,
+                            )
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    AppEvent::Editor(EditorEvent::ChangeDirectory { query }) => {
+                        let Some(query) = query else {
+                            let drives = fyler_fsops::drives::list_drives();
+                            let message = if drives.len() >= 2 {
+                                format!(
+                                    "現在: {} | ドライブ: {}",
+                                    root.display(),
+                                    format_drive_paths(&drives)
+                                )
+                            } else {
+                                format!("現在: {}", root.display())
+                            };
+                            if send_gui_message(&gui_event_tx, MessageKind::Info, message).is_err() {
+                                return;
+                            }
+                            continue;
+                        };
+
+                        let home = std::env::home_dir();
+                        let Some(new_root) = resolve_cd_target(&query, &root, home.as_deref()) else {
+                            if send_gui_message(
+                                &gui_event_tx,
+                                MessageKind::Error,
+                                format!("パスを解決できません: {query}"),
+                            )
+                            .is_err()
                             {
                                 return;
                             }
-                            git.request(root.clone());
+                            continue;
+                        };
+                        let root_changed = match change_root_to(
+                            new_root,
+                            None,
+                            &mut root,
+                            &mut _watcher,
+                            &watch_tx,
+                            &mut save_controller,
+                            app_engine.as_ref(),
+                            &gui_event_tx,
+                        ) {
+                            Ok(root_changed) => root_changed,
+                            Err(_) => return,
+                        };
+                        if root_changed
+                            && after_root_change(
+                                &gui_event_tx,
+                                &save_controller,
+                                &mut git,
+                                &root,
+                            )
+                            .is_err()
+                        {
+                            return;
                         }
                     }
                     AppEvent::Editor(EditorEvent::JumpBookmark { query }) => {
@@ -299,6 +463,7 @@ fn main() -> anyhow::Result<()> {
                             BookmarkResolution::Resolved(new_root) => {
                                 let root_changed = match change_root_to(
                                     new_root,
+                                    None,
                                     &mut root,
                                     &mut _watcher,
                                     &watch_tx,
@@ -309,15 +474,16 @@ fn main() -> anyhow::Result<()> {
                                     Ok(root_changed) => root_changed,
                                     Err(_) => return,
                                 };
-                                if root_changed {
-                                    if gui_event_tx
-                                        .send(GuiEvent::GitBadges(HashMap::new()))
-                                        .is_err()
-                                        || send_file_infos(&gui_event_tx, &save_controller).is_err()
-                                    {
-                                        return;
-                                    }
-                                    git.request(root.clone());
+                                if root_changed
+                                    && after_root_change(
+                                        &gui_event_tx,
+                                        &save_controller,
+                                        &mut git,
+                                        &root,
+                                    )
+                                    .is_err()
+                                {
+                                    return;
                                 }
                             }
                             BookmarkResolution::Ambiguous(names) => {
@@ -474,8 +640,10 @@ fn main() -> anyhow::Result<()> {
     gui_result
 }
 
+#[allow(clippy::too_many_arguments)] // ルート差し替えの全状態とカーソル復元対象を明示する。
 fn change_root_to(
     new_root: PathBuf,
+    cursor_target: Option<&OsStr>,
     root: &mut PathBuf,
     watcher: &mut FsWatcher,
     watch_tx: &mpsc::Sender<ExternalChange>,
@@ -554,13 +722,14 @@ fn change_root_to(
         return Ok(false);
     }
     save_controller.collapse_all_dirs();
+    let cursor_line = cursor_target.and_then(|name| save_controller.find_top_level_line(name));
     let new_lines = save_controller.visible_lines();
 
     *root = new_root;
     *watcher = new_watcher;
     if let Err(error) = engine.send(EditorCommand::SetLines {
         lines: new_lines,
-        cursor_line: None,
+        cursor_line,
     }) {
         send_gui_message(
             gui_event_tx,
@@ -579,8 +748,52 @@ fn change_root_to(
     Ok(true)
 }
 
+fn after_root_change(
+    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    save_controller: &SaveController,
+    git: &mut GitRefresher,
+    root: &Path,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    gui_event_tx.send(GuiEvent::GitBadges(HashMap::new()))?;
+    send_file_infos(gui_event_tx, save_controller)?;
+    git.request(root.to_path_buf());
+    Ok(())
+}
+
 fn normalize_root(root: &Path) -> std::io::Result<PathBuf> {
     std::path::absolute(root)
+}
+
+/// `:cd`の引数を移動先の絶対パスへ解決する。
+///
+/// 絶対パスはそのまま返し、`~`単独と`~/...`はホームディレクトリ基準に
+/// 展開する。それ以外は現在ルートからの相対パスとして解決する。
+/// `~user`形式と、ホームディレクトリ不明時の`~`は解決できない。
+fn resolve_cd_target(query: &str, root: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    if query == "~" {
+        return home.map(Path::to_path_buf);
+    }
+    if let Some(relative) = query.strip_prefix("~/") {
+        return home.map(|home| home.join(relative));
+    }
+    if query.starts_with('~') {
+        return None;
+    }
+
+    let path = Path::new(query);
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    })
+}
+
+fn format_drive_paths(drives: &[PathBuf]) -> String {
+    drives
+        .iter()
+        .map(|drive| drive.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -855,6 +1068,55 @@ mod tests {
         let current_dir = std::env::current_dir().unwrap();
 
         assert_eq!(normalize_root(&current_dir.join(".")).unwrap(), current_dir);
+    }
+
+    #[test]
+    fn resolve_cd_target_keeps_absolute_paths() {
+        let absolute = std::env::current_dir().unwrap().join("absolute-target");
+
+        assert_eq!(
+            resolve_cd_target(&absolute.to_string_lossy(), Path::new("ignored"), None),
+            Some(absolute)
+        );
+    }
+
+    #[test]
+    fn resolve_cd_target_expands_home_paths() {
+        let home = Path::new("home");
+
+        assert_eq!(
+            resolve_cd_target("~", Path::new("root"), Some(home)),
+            Some(PathBuf::from("home"))
+        );
+        assert_eq!(
+            resolve_cd_target("~/sub", Path::new("root"), Some(home)),
+            Some(PathBuf::from("home").join("sub"))
+        );
+        assert_eq!(resolve_cd_target("~", Path::new("root"), None), None);
+        assert_eq!(
+            resolve_cd_target("~user", Path::new("root"), Some(home)),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_cd_target_joins_relative_paths_to_root_without_normalizing() {
+        let root = Path::new("root").join("current");
+
+        assert_eq!(resolve_cd_target("..", &root, None), Some(root.join("..")));
+        assert_eq!(
+            resolve_cd_target("sub/dir", &root, None),
+            Some(root.join("sub").join("dir"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_cd_target_recognizes_windows_absolute_paths() {
+        assert_eq!(
+            resolve_cd_target(r"C:\x", Path::new(r"D:\root"), None),
+            Some(PathBuf::from(r"C:\x"))
+        );
     }
 
     #[test]

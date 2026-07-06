@@ -131,6 +131,25 @@ impl SaveController {
         baseline_to_lines(&self.baseline, &self.context)
     }
 
+    /// 現在の表示行から、指定した名前のトップレベルエントリの行indexを探す。
+    ///
+    /// 親ディレクトリへ移動した直後に、元いた子ディレクトリへカーソルを合わせる用途。
+    /// 見つからない場合(隠しファイル設定で非表示等)は`None`。
+    pub fn find_top_level_line(&self, name: &std::ffi::OsStr) -> Option<usize> {
+        self.visible_lines().iter().position(|line| {
+            let PrefixParse::WithId { rest, .. } = fyler_core::grammar::split_id_prefix(&line.text)
+            else {
+                return false;
+            };
+            let (indent, name_with_suffix) = fyler_core::grammar::split_indent(rest);
+            if indent != 0 {
+                return false;
+            }
+            let (entry_name, _) = fyler_core::grammar::split_dir_suffix(name_with_suffix);
+            std::ffi::OsStr::new(entry_name) == name
+        })
+    }
+
     /// 現在のスキャンオプションを返す。
     ///
     /// 別ルートを先にスキャンしてから [`Self::change_root`] する配線では、この値を
@@ -1170,6 +1189,28 @@ mod tests {
         );
         assert_eq!(controller.resolve_line(&buffer_lines, 2), None);
         assert_eq!(controller.resolve_line(&buffer_lines, 3), None);
+    }
+
+    #[test]
+    fn find_top_level_line_ignores_children_and_missing_names() {
+        let (controller, _) = hierarchy_controller("C:/test-root");
+
+        assert_eq!(
+            controller.find_top_level_line(std::ffi::OsStr::new("a")),
+            Some(0)
+        );
+        assert_eq!(
+            controller.find_top_level_line(std::ffi::OsStr::new("top.txt")),
+            Some(4)
+        );
+        assert_eq!(
+            controller.find_top_level_line(std::ffi::OsStr::new("nested")),
+            None
+        );
+        assert_eq!(
+            controller.find_top_level_line(std::ffi::OsStr::new("missing")),
+            None
+        );
     }
 
     #[test]

@@ -245,6 +245,52 @@ async fn bookmark_command_emits_jump_request() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn navigate_into_and_cd_commands_emit_root_change_requests() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.set_initial_lines(vec![EditorLine::new("/001 directory/")])?;
+    wait_for(&engine, |line| line == "/001 directory/").await?;
+    engine.send(key_command(Key::Char('g')))?;
+    engine.send(key_command(Key::Char('d')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::NavigateInto { line: 0 })
+    })
+    .await
+    .context("gd did not emit NavigateInto")?;
+
+    engine.send(key_command(Key::Char(':')))?;
+    engine.send(EditorCommand::Text("FylerCd ../target".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            EditorEvent::ChangeDirectory {
+                query: Some(query)
+            } if query == "../target"
+        )
+    })
+    .await
+    .context(":FylerCd ../target did not emit ChangeDirectory")?;
+
+    engine.send(key_command(Key::Char(':')))?;
+    engine.send(EditorCommand::Text("FylerCd".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::ChangeDirectory { query: None })
+    })
+    .await
+    .context(":FylerCd did not emit ChangeDirectory without a query")?;
+
+    Ok(())
+}
+
 fn key_command(key: Key) -> EditorCommand {
     EditorCommand::Key(KeyInput {
         key,

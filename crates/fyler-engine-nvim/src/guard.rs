@@ -83,10 +83,19 @@ vim.keymap.set("n", "gy", function()
   vim.rpcnotify(channel, "fyler_yank_path", vim.api.nvim_win_get_cursor(0)[1] - 1)
 end, { buffer = buffer, silent = true, nowait = true })
 
+vim.keymap.set("n", "gd", function()
+  vim.rpcnotify(channel, "fyler_navigate_into", vim.api.nvim_win_get_cursor(0)[1] - 1)
+end, { buffer = buffer, silent = true, nowait = true })
+
 vim.api.nvim_buf_create_user_command(buffer, "FylerBookmark", function(opts)
   vim.rpcnotify(channel, "fyler_bookmark", opts.args)
 end, { nargs = "?" })
 vim.cmd([[cnoreabbrev <buffer> <expr> b (getcmdtype() == ':' && getcmdline() ==# 'b') ? 'FylerBookmark' : 'b']])
+
+vim.api.nvim_buf_create_user_command(buffer, "FylerCd", function(opts)
+  vim.rpcnotify(channel, "fyler_cd", opts.args)
+end, { nargs = "?", complete = "dir" })
+vim.cmd([[cnoreabbrev <buffer> <expr> cd (getcmdtype() == ':' && getcmdline() ==# 'cd') ? 'FylerCd' : 'cd']])
 
 for _, lhs in ipairs({ "gf", "gF", "<C-]>" }) do
   vim.keymap.set({ "n", "x" }, lhs, function()

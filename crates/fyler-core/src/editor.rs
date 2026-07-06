@@ -181,8 +181,19 @@ pub enum EditorEvent {
     YankPath {
         line: usize,
     },
+    /// ユーザーが指定行のディレクトリを新しい表示ルートにするよう要求した。
+    /// `line`は0始まり。行の解釈とパス解決はapp層が行う。
+    NavigateInto {
+        line: usize,
+    },
     /// ユーザーが現在の表示ルートの親ディレクトリへの移動を要求した。
     NavigateParent,
+    /// ユーザーがパス指定での表示ルート変更を要求した。
+    /// `query`は生パス文字列。`None`は現在ルートと候補の表示要求。
+    /// パスの解決(絶対/相対/`~`)はapp層が行う。
+    ChangeDirectory {
+        query: Option<String>,
+    },
     /// ユーザーが隠しファイル表示の切り替えを要求した。
     ToggleHidden,
     /// ユーザーがブックマークまたは最近使ったルートへのジャンプ、

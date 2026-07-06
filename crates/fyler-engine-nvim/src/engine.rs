@@ -103,8 +103,9 @@ impl NvimEngine {
     ///    `Paste` は `nvim_paste`、`RequestCommit` は `:w` 相当、
     ///    `Undo`/`Redo` は `u`/`<C-r>` 相当
     /// 7. **イベント**: BufWriteCmd等のrpcnotify → `EditorEvent::CommitRequested`、
-    ///    行アクション → `ActivateLine` / `YankPath` / `NavigateParent` / `ToggleHidden`、
-    ///    ルート選択 → `JumpBookmark`、ext_cmdline → `CmdlineShow/CmdlineHide`、
+    ///    行アクション → `ActivateLine` / `YankPath` / `NavigateInto` / `NavigateParent` /
+    ///    `ToggleHidden`、ルート選択 → `ChangeDirectory` / `JumpBookmark`、
+    ///    ext_cmdline → `CmdlineShow/CmdlineHide`、
     ///    ext_messages → `Message`、プロセス終了検知 →
     ///    `EngineCrashed` として `event_tx` へ流す
     ///
@@ -318,8 +319,33 @@ impl NvimEngine {
                             "fyler_parent" => {
                                 let _ = event_tx.send(EditorEvent::NavigateParent);
                             }
+                            "fyler_navigate_into" => {
+                                let line = notification.args.first()
+                                    .and_then(value_as_u64)
+                                    .and_then(|line| usize::try_from(line).ok());
+                                match line {
+                                    Some(line) => {
+                                        let _ = event_tx.send(EditorEvent::NavigateInto { line });
+                                    }
+                                    None => send_message(
+                                        &event_tx,
+                                        MessageKind::Error,
+                                        "移動対象の行番号を取得できません".to_owned(),
+                                    ),
+                                }
+                            }
                             "fyler_toggle_hidden" => {
                                 let _ = event_tx.send(EditorEvent::ToggleHidden);
+                            }
+                            "fyler_cd" => {
+                                let query = notification
+                                    .args
+                                    .first()
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|query| !query.is_empty())
+                                    .map(str::to_owned);
+                                let _ = event_tx.send(EditorEvent::ChangeDirectory { query });
                             }
                             "fyler_bookmark" => {
                                 let query = notification

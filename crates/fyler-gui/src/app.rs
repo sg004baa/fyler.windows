@@ -141,7 +141,9 @@ impl FylerApp {
                     EditorEvent::SnapshotUpdated => {}
                     EditorEvent::ActivateLine { .. } => {}
                     EditorEvent::YankPath { .. } => {}
+                    EditorEvent::NavigateInto { .. } => {}
                     EditorEvent::NavigateParent => {}
+                    EditorEvent::ChangeDirectory { .. } => {}
                     EditorEvent::ToggleHidden => {}
                     EditorEvent::JumpBookmark { .. } => {}
                     EditorEvent::CommitRequested { .. } => {}
