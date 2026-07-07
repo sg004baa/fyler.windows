@@ -104,10 +104,7 @@ fn run_debounce(rx: Receiver<Vec<PathBuf>>, tx: Sender<ExternalChange>) {
         pending.extend(first_paths);
         let mut source_disconnected = false;
 
-        loop {
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                break;
-            };
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             if remaining.is_zero() {
                 break;
             }
