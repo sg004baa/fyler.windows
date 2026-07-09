@@ -20,6 +20,8 @@ pub struct ParsedLine {
     pub id_broken: bool,
     /// tabインデントの深さ。
     pub indent_depth: usize,
+    /// tabインデントの後にスペースが残っている。
+    pub indent_broken: bool,
     /// 表示名。末尾のディレクトリサフィックス `/` は除去済み。
     pub name: String,
     pub is_dir: bool,
@@ -48,6 +50,7 @@ pub fn parse(lines: &[EditorLine]) -> Vec<ParsedLine> {
                 PrefixParse::Broken => (None, true, editor_line.text.as_str()),
             };
             let (indent_depth, name) = grammar::split_indent(rest);
+            let indent_broken = name.starts_with(' ');
             let (name, is_dir) = grammar::split_dir_suffix(name);
 
             Some(ParsedLine {
@@ -55,6 +58,7 @@ pub fn parse(lines: &[EditorLine]) -> Vec<ParsedLine> {
                 id,
                 id_broken,
                 indent_depth,
+                indent_broken,
                 name: name.to_owned(),
                 is_dir,
             })
@@ -69,7 +73,7 @@ pub fn parse(lines: &[EditorLine]) -> Vec<ParsedLine> {
 ///   直前のより浅い行のうち最も近いディレクトリが親
 /// - 以下はエラー(全行分を集めて返し、保存を中断する):
 ///   - `id_broken` な行 → `BrokenIdPrefix`
-///   - 親を飛ばした深いインデント・親がファイル → `InvalidIndent`
+///   - tabではない先頭スペース・親を飛ばした深いインデント・親がファイル → `InvalidIndent`
 /// - 同一IDの複数出現はここでは**エラーにしない**(COPY表現。diff層が解釈する)
 /// - 名前の妥当性(予約文字等)もここでは見ない(validate層の責務)
 pub fn to_desired_tree(parsed: &[ParsedLine]) -> Result<DesiredTree, Vec<ValidateError>> {
@@ -82,6 +86,12 @@ pub fn to_desired_tree(parsed: &[ParsedLine]) -> Result<DesiredTree, Vec<Validat
 
         if parsed_line.id_broken {
             errors.push(ValidateError::BrokenIdPrefix {
+                line: parsed_line.line,
+            });
+            line_is_valid = false;
+        }
+        if parsed_line.indent_broken {
+            errors.push(ValidateError::InvalidIndent {
                 line: parsed_line.line,
             });
             line_is_valid = false;

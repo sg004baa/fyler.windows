@@ -129,6 +129,15 @@ fn to_desired_tree_rejects_broken_prefix_and_bad_indent() {
             .iter()
             .any(|e| matches!(e, ValidateError::InvalidIndent { line: 1 }))
     );
+
+    // expandtab等でtabインデントがスペース化した行は、名前へ畳み込まずInvalidIndent。
+    let buf = lines(&["/001 a/", "/002   spaced.txt"]);
+    let errors = parse::to_desired_tree(&parse::parse(&buf)).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, ValidateError::InvalidIndent { line: 1 }))
+    );
 }
 
 // ---- validate(DESIGN.md「validateで弾くもの」) ----

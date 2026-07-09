@@ -63,6 +63,7 @@ local buffer, channel, write_events = ...
 vim.bo[buffer].buftype = "acwrite"
 vim.bo[buffer].bufhidden = "hide"
 vim.bo[buffer].swapfile = false
+vim.bo[buffer].expandtab = false
 
 local group = vim.api.nvim_create_augroup("fyler_guards", { clear = true })
 

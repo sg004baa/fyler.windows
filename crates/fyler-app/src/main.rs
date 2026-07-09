@@ -86,18 +86,18 @@ impl GitRefresher {
     }
 }
 
-fn default_root() -> PathBuf {
+fn default_root() -> anyhow::Result<PathBuf> {
     std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
-        .expect("home directory is not set")
+        .ok_or_else(|| anyhow::anyhow!("home directory is not set"))
 }
 
 fn main() -> anyhow::Result<()> {
-    let root = std::env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(default_root);
+    let root = match std::env::args_os().nth(1) {
+        Some(root) => PathBuf::from(root),
+        None => default_root()?,
+    };
     let root = normalize_root(&root)?;
     let (config, config_warnings) = config::load();
     let scan_options = ScanOptions {
