@@ -7,6 +7,7 @@ use fyler_core::grammar;
 use crate::confirm::IconStyle;
 
 pub const DIRECTORY: &str = "D";
+pub const DIRECTORY_OPEN: &str = "O";
 pub const FILE: &str = "F";
 pub const RUST: &str = "R";
 pub const MARKDOWN: &str = "M";
@@ -14,6 +15,7 @@ pub const TEXT: &str = "T";
 pub const CONFIG: &str = "C";
 
 const NERD_DIRECTORY: &str = " ";
+const NERD_DIRECTORY_OPEN: &str = " ";
 const NERD_FILE: &str = " ";
 const NERD_RUST: &str = " ";
 const NERD_MARKDOWN: &str = " ";
@@ -67,6 +69,24 @@ pub fn for_display_name_styled(display_name: &str, style: IconStyle) -> &'static
     }
 }
 
+/// conceal済みの表示名と展開状態、指定スタイルに対応するアイコンを返す。
+pub fn for_display_name_styled_with_expanded(
+    display_name: &str,
+    style: IconStyle,
+    expanded: bool,
+) -> &'static str {
+    let (_, is_dir) = grammar::split_dir_suffix(display_name);
+    if !is_dir {
+        return for_display_name_styled(display_name, style);
+    }
+    match (style, expanded) {
+        (IconStyle::Ascii, true) => DIRECTORY_OPEN,
+        (IconStyle::Ascii, false) => DIRECTORY,
+        (IconStyle::Nerd, true) => NERD_DIRECTORY_OPEN,
+        (IconStyle::Nerd, false) => NERD_DIRECTORY,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,6 +108,22 @@ mod tests {
     fn selects_general_file_icon_for_other_files() {
         assert_eq!(for_display_name("archive.zip"), FILE);
         assert_eq!(for_display_name("LICENSE"), FILE);
+    }
+
+    #[test]
+    fn expanded_directory_icon_changes_by_state() {
+        assert_eq!(
+            for_display_name_styled_with_expanded("src/", IconStyle::Ascii, false),
+            DIRECTORY
+        );
+        assert_eq!(
+            for_display_name_styled_with_expanded("src/", IconStyle::Ascii, true),
+            DIRECTORY_OPEN
+        );
+        assert_eq!(
+            for_display_name_styled_with_expanded("main.rs", IconStyle::Ascii, true),
+            RUST
+        );
     }
 
     #[test]

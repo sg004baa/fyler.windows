@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use fyler_core::editor::{
     CmdlineState, Cursor, EditorCommand, EditorEngine, EditorEvent, EditorLine, EditorMessage,
-    EditorSnapshot, MessageKind, Mode,
+    EditorSnapshot, MessageKind, Mode, SearchHighlight,
 };
 use nvim_rs::compat::tokio::Compat;
 use nvim_rs::create::tokio::new_child_cmd;
@@ -175,6 +175,20 @@ impl NvimEngine {
             .await
             .map_err(|error| anyhow::anyhow!("Neovim UI attachに失敗しました: {error}"))?;
 
+        // `/` 検索の大文字小文字挙動(smartcase)と、検索状態の露出を有効化する。
+        // ハイライトはGUIがsnapshotの `search` から自前描画するが、`v:hlsearch` が
+        // ハイライトのON/OFFゲート(`:noh` 後に0)になるため hlsearch も有効化する。
+        for (name, value) in [
+            ("ignorecase", true),
+            ("smartcase", true),
+            ("hlsearch", true),
+            ("incsearch", true),
+        ] {
+            nvim.set_option_value(name, Value::Boolean(value), Vec::new())
+                .await
+                .map_err(|error| anyhow::anyhow!("{name}オプションを設定できません: {error}"))?;
+        }
+
         guard::install_guards(&nvim, &buffer, channel_id).await?;
 
         let attached = buffer
@@ -192,7 +206,7 @@ impl NvimEngine {
         let mut lines_arc = lines_to_arc(&lines);
         let status = query_status(&nvim).await?;
         let mut revision = 1;
-        let initial_snapshot = build_snapshot(revision, &lines_arc, status);
+        let initial_snapshot = build_snapshot(revision, &lines_arc, status, None);
         let shared_snapshot = Arc::new(ArcSwap::from_pointee(initial_snapshot));
 
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
@@ -240,6 +254,7 @@ impl NvimEngine {
                             &task_snapshot,
                             &event_tx,
                             &mut snapshot_pending,
+                            cmdline_state.as_ref(),
                         ).await {
                             Ok(Some(snapshot)) => {
                                 if commit_pending {
@@ -291,11 +306,15 @@ impl NvimEngine {
                                 break "fylerバッファがNeovimからdetachされました".to_owned();
                             }
                             "redraw" => {
-                                handle_redraw(
+                                // cmdline系イベントが来たら検索パターンが変わりうるので
+                                // snapshotを再発行する(incsearchプレビュー追従)。
+                                if handle_redraw(
                                     &notification.args,
                                     &event_tx,
                                     &mut cmdline_state,
-                                );
+                                ) {
+                                    snapshot_pending = true;
+                                }
                             }
                             "fyler_commit_requested" => {
                                 commit_pending = true;
@@ -336,6 +355,9 @@ impl NvimEngine {
                             }
                             "fyler_toggle_hidden" => {
                                 let _ = event_tx.send(EditorEvent::ToggleHidden);
+                            }
+                            "fyler_help" => {
+                                let _ = event_tx.send(EditorEvent::ShowHelp);
                             }
                             "fyler_cd" => {
                                 let query = notification
@@ -406,6 +428,7 @@ impl NvimEngine {
                             &task_snapshot,
                             &event_tx,
                             &mut snapshot_pending,
+                            cmdline_state.as_ref(),
                         ).await {
                             Ok(Some(snapshot)) => {
                                 if commit_pending {
@@ -563,6 +586,21 @@ struct Status {
     mode: Mode,
     visual_start: Option<Cursor>,
     dirty: bool,
+    /// 検索状態の生値。パターンの実効解決は [`resolve_search`] で行う。
+    search: SearchRaw,
+}
+
+/// nvimから読んだ検索状態の生値(未解決)。
+#[derive(Debug)]
+struct SearchRaw {
+    /// `@/` レジスタ(直近の検索パターン)。
+    register: String,
+    /// `v:hlsearch`(ハイライトが有効か。`:noh` 後は偽)。
+    hlsearch: bool,
+    /// `&ignorecase`。
+    ignorecase: bool,
+    /// `&smartcase`。
+    smartcase: bool,
 }
 
 async fn query_status(nvim: &Nvim) -> anyhow::Result<Status> {
@@ -581,6 +619,12 @@ async fn query_status(nvim: &Nvim) -> anyhow::Result<Status> {
             "nvim_call_function",
             vec![Value::from("getpos"), Value::Array(vec![Value::from("v")])],
         ),
+        atomic_call(
+            "nvim_eval",
+            vec![Value::from(
+                "[getreg('/'), v:hlsearch, &ignorecase, &smartcase]",
+            )],
+        ),
     ];
     let response = nvim
         .call_atomic(calls)
@@ -594,9 +638,9 @@ async fn query_status(nvim: &Nvim) -> anyhow::Result<Status> {
     if let Some(error) = response.get(1).filter(|value| !value.is_nil()) {
         anyhow::bail!("nvim_call_atomic内の呼び出しに失敗しました: {error:?}");
     }
-    if results.len() != 5 {
+    if results.len() != 6 {
         anyhow::bail!(
-            "nvim_call_atomicのresults件数が不正です: expected 5, got {}",
+            "nvim_call_atomicのresults件数が不正です: expected 6, got {}",
             results.len()
         );
     }
@@ -640,6 +684,21 @@ async fn query_status(nvim: &Nvim) -> anyhow::Result<Status> {
         None
     };
 
+    let search_values = results[5]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("検索状態結果の形式が不正です"))?;
+    let search = SearchRaw {
+        register: search_values
+            .first()
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        // v:hlsearch / &ignorecase / &smartcase は数値(0/1)で返る。
+        hlsearch: search_values.get(1).and_then(value_as_u64).unwrap_or(0) != 0,
+        ignorecase: search_values.get(2).and_then(value_as_u64).unwrap_or(0) != 0,
+        smartcase: search_values.get(3).and_then(value_as_u64).unwrap_or(0) != 0,
+    };
+
     Ok(Status {
         changedtick,
         cursor: Cursor {
@@ -649,6 +708,7 @@ async fn query_status(nvim: &Nvim) -> anyhow::Result<Status> {
         mode,
         visual_start,
         dirty,
+        search,
     })
 }
 
@@ -666,7 +726,13 @@ fn lines_to_arc(lines: &[String]) -> Arc<[EditorLine]> {
     )
 }
 
-fn build_snapshot(revision: u64, lines: &Arc<[EditorLine]>, status: Status) -> EditorSnapshot {
+fn build_snapshot(
+    revision: u64,
+    lines: &Arc<[EditorLine]>,
+    status: Status,
+    cmdline: Option<&CmdlineState>,
+) -> EditorSnapshot {
+    let search = resolve_search(&status.search, cmdline);
     EditorSnapshot {
         revision,
         changedtick: status.changedtick,
@@ -675,7 +741,26 @@ fn build_snapshot(revision: u64, lines: &Arc<[EditorLine]>, status: Status) -> E
         mode: status.mode,
         visual_start: status.visual_start,
         dirty: status.dirty,
+        search,
     }
+}
+
+/// 検索ハイライトの実効値を解決する。
+///
+/// - `/` または `?` のcmdline入力中(incsearch): その内容を生パターンにする。
+///   `v:hlsearch` に関係なくハイライトする(vimのincsearchプレビュー相当)
+/// - それ以外: `v:hlsearch` が真のときだけ `@/` レジスタをハイライトする
+///   (`:noh` 後・検索なしは `None`)
+fn resolve_search(raw: &SearchRaw, cmdline: Option<&CmdlineState>) -> Option<SearchHighlight> {
+    let live_pattern = cmdline
+        .filter(|state| matches!(state.prompt, '/' | '?'))
+        .map(|state| state.content.as_str());
+    let pattern = match live_pattern {
+        Some(pattern) => pattern,
+        None if raw.hlsearch => raw.register.as_str(),
+        None => return None,
+    };
+    SearchHighlight::resolve(pattern, raw.ignorecase, raw.smartcase)
 }
 
 /// 保留中のsnapshot更新を試みる。
@@ -689,12 +774,14 @@ async fn publish_pending_snapshot(
     shared_snapshot: &ArcSwap<EditorSnapshot>,
     event_tx: &mpsc::UnboundedSender<EditorEvent>,
     snapshot_pending: &mut bool,
+    cmdline: Option<&CmdlineState>,
 ) -> anyhow::Result<Option<Arc<EditorSnapshot>>> {
     if !*snapshot_pending {
         return Ok(None);
     }
 
-    let snapshot = publish_snapshot(nvim, lines, revision, shared_snapshot, event_tx).await?;
+    let snapshot =
+        publish_snapshot(nvim, lines, revision, shared_snapshot, event_tx, cmdline).await?;
     if snapshot.is_some() {
         *snapshot_pending = false;
     }
@@ -707,6 +794,7 @@ async fn publish_snapshot(
     revision: &mut u64,
     shared_snapshot: &ArcSwap<EditorSnapshot>,
     event_tx: &mpsc::UnboundedSender<EditorEvent>,
+    cmdline: Option<&CmdlineState>,
 ) -> anyhow::Result<Option<Arc<EditorSnapshot>>> {
     if input_is_blocking(nvim).await? {
         return Ok(None);
@@ -714,7 +802,7 @@ async fn publish_snapshot(
 
     let status = query_status(nvim).await?;
     *revision = revision.saturating_add(1);
-    let snapshot = Arc::new(build_snapshot(*revision, lines, status));
+    let snapshot = Arc::new(build_snapshot(*revision, lines, status, cmdline));
     shared_snapshot.store(Arc::clone(&snapshot));
     let _ = event_tx.send(EditorEvent::SnapshotUpdated);
     Ok(Some(snapshot))
@@ -775,7 +863,8 @@ fn handle_redraw(
     args: &[Value],
     event_tx: &mpsc::UnboundedSender<EditorEvent>,
     cmdline_state: &mut Option<CmdlineState>,
-) {
+) -> bool {
+    let mut cmdline_changed = false;
     for batch in args {
         let Some(batch) = batch.as_array() else {
             continue;
@@ -790,6 +879,7 @@ fn handle_redraw(
                     if let Some(state) = parse_cmdline(update) {
                         *cmdline_state = Some(state.clone());
                         let _ = event_tx.send(EditorEvent::CmdlineShow(state));
+                        cmdline_changed = true;
                     }
                 }
             }
@@ -806,12 +896,14 @@ fn handle_redraw(
                     if let Some(state) = cmdline_state {
                         state.cursor = cursor;
                         let _ = event_tx.send(EditorEvent::CmdlineShow(state.clone()));
+                        cmdline_changed = true;
                     }
                 }
             }
             "cmdline_hide" => {
                 *cmdline_state = None;
                 let _ = event_tx.send(EditorEvent::CmdlineHide);
+                cmdline_changed = true;
             }
             "msg_show" => {
                 for update in &batch[1..] {
@@ -825,6 +917,7 @@ fn handle_redraw(
             }
         }
     }
+    cmdline_changed
 }
 
 fn parse_cmdline(value: &Value) -> Option<CmdlineState> {

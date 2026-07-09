@@ -4,6 +4,7 @@ use std::time::Duration;
 use anyhow::Context;
 use fyler_core::editor::{
     EditorCommand, EditorEngine, EditorEvent, EditorLine, Key, KeyInput, Mode, Modifiers,
+    SearchHighlight,
 };
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -291,6 +292,105 @@ async fn navigate_into_and_cd_commands_emit_root_change_requests() -> anyhow::Re
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn search_state_surfaces_smartcase_and_hlsearch() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.set_initial_lines(vec![
+        EditorLine::new("/001 alpha"),
+        EditorLine::new("/002 Alpha"),
+    ])?;
+    wait_for(&engine, |line| line == "/001 alpha").await?;
+
+    // 1. all-lowercase pattern: smartcase + ignorecase => case-insensitive.
+    engine.send(key_command(Key::Char('/')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::CmdlineShow(_))
+    })
+    .await
+    .context("/ did not open the search cmdline")?;
+    engine.send(EditorCommand::Text("alpha".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_search(&engine, |search| {
+        search.is_some_and(|s| s.pattern == "alpha" && !s.case_sensitive)
+    })
+    .await
+    .context("lowercase search did not surface as case-insensitive")?;
+    let lower_snapshot = engine.snapshot();
+    let lower = lower_snapshot
+        .search
+        .as_ref()
+        .context("search should be Some after /alpha")?;
+    assert_eq!(lower.pattern, "alpha");
+    assert!(
+        !lower.case_sensitive,
+        "all-lowercase pattern with smartcase+ignorecase must be case-insensitive"
+    );
+
+    // 2. pattern with an uppercase char: smartcase => case-sensitive.
+    engine.send(key_command(Key::Char('/')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::CmdlineShow(_))
+    })
+    .await
+    .context("/ did not open the search cmdline for uppercase search")?;
+    engine.send(EditorCommand::Text("Alpha".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_search(&engine, |search| {
+        search.is_some_and(|s| s.pattern == "Alpha" && s.case_sensitive)
+    })
+    .await
+    .context("uppercase search did not surface as case-sensitive")?;
+    let upper_snapshot = engine.snapshot();
+    let upper = upper_snapshot
+        .search
+        .as_ref()
+        .context("search should be Some after /Alpha")?;
+    assert_eq!(upper.pattern, "Alpha");
+    assert!(
+        upper.case_sensitive,
+        "pattern containing an uppercase char with smartcase must be case-sensitive"
+    );
+
+    // 3. `:noh` clears v:hlsearch, so the snapshot exposes no highlight.
+    engine.send(key_command(Key::Char(':')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::CmdlineShow(_))
+    })
+    .await
+    .context(": did not open the command cmdline for :noh")?;
+    engine.send(EditorCommand::Text("noh".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_search(&engine, |search| search.is_none())
+        .await
+        .context(":noh did not clear the surfaced search highlight")?;
+    assert!(
+        engine.snapshot().search.is_none(),
+        "after :noh (v:hlsearch cleared) search must be None"
+    );
+
+    // 4. Teardown.
+    engine.send(key_command(Key::Char(':')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::CmdlineShow(_))
+    })
+    .await?;
+    engine.send(EditorCommand::Text("qa!".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::EngineCrashed { .. })
+    })
+    .await?;
+
+    Ok(())
+}
+
 fn key_command(key: Key) -> EditorCommand {
     EditorCommand::Key(KeyInput {
         key,
@@ -340,6 +440,22 @@ async fn wait_for_mode(engine: &NvimEngine, expected: Mode) -> anyhow::Result<()
     })
     .await
     .map_err(|_| anyhow::anyhow!("snapshot mode did not become {expected:?}"))
+}
+
+async fn wait_for_search(
+    engine: &NvimEngine,
+    predicate: impl Fn(Option<&SearchHighlight>) -> bool,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if predicate(engine.snapshot().search.as_ref()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("snapshot search state did not match predicate"))
 }
 
 async fn wait_for_event(

@@ -293,6 +293,14 @@ impl SaveController {
             .collect()
     }
 
+    /// 現在折りたたまれているディレクトリのID集合を返す。
+    ///
+    /// GUIの展開/折りたたみアイコン判定に使う。子を持たない空ディレクトリは
+    /// 表示行だけからは展開状態を判別できないため、この正典を渡す必要がある。
+    pub fn collapsed_dirs(&self) -> HashSet<EntryId> {
+        self.context.collapsed_dirs.clone()
+    }
+
     /// すべてのディレクトリを折りたたみ状態へ初期化する。
     ///
     /// 展開は [`Self::toggle_collapse`] で1階層ずつ行う。baseline自体は全階層を
@@ -753,8 +761,8 @@ pub(crate) fn baseline_to_lines(baseline: &BaselineTree, context: &EditContext) 
     visible_entries(baseline, context)
         .into_iter()
         .map(|entry| {
-            let indent = " "
-                .repeat(entry.path.depth().saturating_sub(1) * fyler_core::grammar::INDENT_WIDTH);
+            let indent =
+                fyler_core::grammar::INDENT_UNIT.repeat(entry.path.depth().saturating_sub(1));
             let directory_suffix = if entry.kind == EntryKind::Dir {
                 fyler_core::grammar::DIR_SUFFIX.to_string()
             } else {
@@ -911,9 +919,8 @@ mod tests {
                     .any(|path| path.is_strict_ancestor_of(&entry.path))
             })
             .map(|entry| {
-                let indent = " ".repeat(
-                    entry.path.depth().saturating_sub(1) * fyler_core::grammar::INDENT_WIDTH,
-                );
+                let indent =
+                    fyler_core::grammar::INDENT_UNIT.repeat(entry.path.depth().saturating_sub(1));
                 let directory_suffix = if entry.kind == EntryKind::Dir {
                     fyler_core::grammar::DIR_SUFFIX.to_string()
                 } else {

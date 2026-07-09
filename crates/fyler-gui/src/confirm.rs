@@ -63,7 +63,7 @@ pub fn draw_plan(
 
     egui::Modal::new(egui::Id::new("save-plan-confirmation"))
         .show(ui.ctx(), |ui| {
-            ui.heading("変更内容の確認");
+            ui.heading("Confirm changes");
             ui.add_space(8.0);
 
             for label in plan_labels(plan, detail) {
@@ -73,7 +73,7 @@ pub fn draw_plan(
                 ui.add_space(8.0);
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
-                    "以下の既存ファイルをごみ箱へ移して上書きします:",
+                    "These existing files will be moved to the recycle bin before overwrite:",
                 );
                 for path in overwrites {
                     ui.colored_label(ui.visuals().warn_fg_color, path.to_string());
@@ -91,7 +91,7 @@ pub fn draw_plan(
                 let approve_label = if overwrites.is_empty() {
                     "Approve (y)"
                 } else {
-                    "上書きして実行"
+                    "Overwrite and apply (y)"
                 };
                 let approve_clicked = ui.button(approve_label).clicked();
                 let cancel_clicked = ui.button("Cancel (n / Esc)").clicked();
@@ -133,11 +133,11 @@ fn plan_labels(plan: &OperationPlan, detail: ConfirmDetail) -> Vec<String> {
         (rename, "RENAME", ""),
         (move_count, "MOVE", ""),
         (copy, "COPY", ""),
-        (delete, "DELETE", "(ごみ箱へ)"),
+        (delete, "DELETE", "(to recycle bin)"),
     ]
     .into_iter()
     .filter(|(count, _, _)| *count > 0)
-    .map(|(count, kind, suffix)| format!("{kind} {count}件{suffix}"))
+    .map(|(count, kind, suffix)| format!("{kind} {count}{suffix}"))
     .collect::<Vec<_>>();
     vec![summaries.join(" / ")]
 }
@@ -159,7 +159,7 @@ pub fn draw_report(ui: &mut egui::Ui, report: &CommitReport) -> bool {
 
     egui::Modal::new(egui::Id::new("save-commit-report"))
         .show(ui.ctx(), |ui| {
-            ui.heading("実行結果");
+            ui.heading("Apply result");
             ui.add_space(8.0);
 
             for result in &report.results {
@@ -178,7 +178,7 @@ pub fn draw_report(ui: &mut egui::Ui, report: &CommitReport) -> bool {
             }
 
             ui.add_space(12.0);
-            ui.button("閉じる (Enter / Esc)").clicked() || dismiss_from_keyboard
+            ui.button("Close (Enter / Esc)").clicked() || dismiss_from_keyboard
         })
         .inner
 }
@@ -202,10 +202,10 @@ pub fn draw_apply_progress(
 
     egui::Modal::new(egui::Id::new("save-apply-progress"))
         .show(ui.ctx(), |ui| {
-            ui.heading("変更を実行しています");
+            ui.heading("Applying changes");
             ui.add_space(8.0);
             ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)));
-            ui.label(format!("{completed} / {total} 件"));
+            ui.label(format!("{completed} / {total}"));
             if let Some(current) = current {
                 ui.add_space(4.0);
                 ui.monospace(current);
@@ -215,7 +215,7 @@ pub fn draw_apply_progress(
             if cancel_requested {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
-                    "キャンセル待ち(実行中の操作の完了後に停止)",
+                    "Cancel requested; stopping after the current operation finishes",
                 );
             }
             let cancel_clicked = ui
@@ -244,12 +244,12 @@ fn report_label(result: &OpResult) -> String {
         OpOutcome::Failed { error, progress } => {
             let progress = progress
                 .as_deref()
-                .map(|progress| format!(" / 進捗: {progress}"))
+                .map(|progress| format!(" / progress: {progress}"))
                 .unwrap_or_default();
-            format!("NG  {operation} (理由: {error}{progress})")
+            format!("NG  {operation} (reason: {error}{progress})")
         }
         OpOutcome::Skipped { reason } => {
-            format!("--  SKIP {operation} (理由: {reason})")
+            format!("--  SKIP {operation} (reason: {reason})")
         }
     }
 }
@@ -263,7 +263,7 @@ pub(crate) fn operation_label(operation: &FsOperation) -> String {
         }
         FsOperation::Move { from, to, .. } => format!("MOVE {from} → {to}"),
         FsOperation::Copy { from, to, .. } => format!("COPY {from} → {to}"),
-        FsOperation::Delete { path, .. } => format!("DELETE {path} (ごみ箱へ)"),
+        FsOperation::Delete { path, .. } => format!("DELETE {path} (to recycle bin)"),
     }
 }
 
@@ -284,8 +284,8 @@ fn validation_error_label(error: &ValidateError) -> String {
     let label = error.to_string();
     match line {
         Some(line) => label.replacen(
-            &format!("行{line}"),
-            &format!("行{}", line.saturating_add(1)),
+            &format!("line {line}"),
+            &format!("line {}", line.saturating_add(1)),
             1,
         ),
         None => label,
@@ -313,7 +313,7 @@ mod tests {
         let error = ValidateError::BrokenIdPrefix { line: 0 };
         assert_eq!(
             validation_error_label(&error),
-            "行1: IDプレフィックスが壊れています。undoで戻すか行を削除してください"
+            "line 1: broken ID prefix; undo or delete this line"
         );
     }
 
@@ -324,7 +324,7 @@ mod tests {
         };
         assert_eq!(
             validation_error_label(&error),
-            "移動先に既存のディレクトリがあります(上書きできません): .hidden"
+            "target is occupied by an existing directory and cannot be overwritten: .hidden"
         );
     }
 
@@ -343,7 +343,7 @@ mod tests {
         };
         assert_eq!(
             report_label(&result),
-            "NG  COPY a.txt → b.txt (理由: copy failed / 進捗: 2/3 files)"
+            "NG  COPY a.txt → b.txt (reason: copy failed / progress: 2/3 files)"
         );
     }
 
@@ -402,7 +402,7 @@ mod tests {
 
         assert_eq!(
             plan_labels(&plan, ConfirmDetail::Summary),
-            ["RENAME 2件 / COPY 3件 / DELETE 1件(ごみ箱へ)"]
+            ["RENAME 2 / COPY 3 / DELETE 1(to recycle bin)"]
         );
     }
 
@@ -416,7 +416,7 @@ mod tests {
         };
         assert_eq!(
             plan_labels(&plan, ConfirmDetail::Summary),
-            ["DELETE old.txt (ごみ箱へ)"]
+            ["DELETE old.txt (to recycle bin)"]
         );
     }
 }

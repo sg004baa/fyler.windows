@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 //! fyler — エントリポイント。各レイヤーの配線だけを行う(ロジックを書かない)。
 //!
 //! 各レイヤーの役割はAGENTS.mdの依存境界表を参照。ここに書いてよいのは
@@ -84,11 +86,54 @@ impl GitRefresher {
     }
 }
 
-fn main() -> anyhow::Result<()> {
-    let root = std::env::args_os()
-        .nth(1)
+fn default_root() -> anyhow::Result<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
-        .unwrap_or(std::env::current_dir()?);
+        .ok_or_else(|| anyhow::anyhow!("home directory is not set"))
+}
+
+fn main() {
+    // `windows_subsystem = "windows"` によりコンソールが無いため、`run` が
+    // GUI起動前に返す早期エラー(nvim未検出・scan失敗等)は放置すると無音で
+    // 終了してしまう。ネイティブダイアログとログファイルで必ず可視化する。
+    if let Err(error) = run() {
+        report_startup_error(&error);
+        std::process::exit(1);
+    }
+}
+
+/// 早期起動エラーを標準エラー・ログファイル・ネイティブダイアログへ出す。
+fn report_startup_error(error: &anyhow::Error) {
+    // 標準エラーは非Windows/開発時にのみ見える(Windows GUIでは出力先が無い)。
+    eprintln!("fyler: {error:#}");
+
+    let log_path = write_startup_error_log(error);
+    let mut message = format!("fyler could not start.\n\n{error:#}");
+    if let Some(path) = &log_path {
+        message.push_str(&format!("\n\nLog: {}", path.display()));
+    }
+    fyler_fsops::dialog::show_error_dialog("fyler failed to start", &message);
+}
+
+/// 早期起動エラーをログファイルへ書き出し、そのパスを返す。書けなければ`None`。
+///
+/// 保存先は `%LOCALAPPDATA%\fyler`(無ければOSの一時ディレクトリ)。
+fn write_startup_error_log(error: &anyhow::Error) -> Option<PathBuf> {
+    let dir = std::env::var_os("LOCALAPPDATA")
+        .map(|base| PathBuf::from(base).join("fyler"))
+        .unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("fyler-startup-error.log");
+    std::fs::write(&path, format!("fyler startup error:\n{error:#}\n")).ok()?;
+    Some(path)
+}
+
+fn run() -> anyhow::Result<()> {
+    let root = match std::env::args_os().nth(1) {
+        Some(root) => PathBuf::from(root),
+        None => default_root()?,
+    };
     let root = normalize_root(&root)?;
     let (config, config_warnings) = config::load();
     let scan_options = ScanOptions {
@@ -194,7 +239,7 @@ fn main() -> anyhow::Result<()> {
             let mut pending_events = VecDeque::new();
             let mut deferred_changes = BTreeSet::new();
             let mut git = GitRefresher::new(git_event_tx);
-            if send_file_infos(&gui_event_tx, &save_controller).is_err() {
+            if send_view_state(&gui_event_tx, &save_controller).is_err() {
                 return;
             }
             git.request(root.clone());
@@ -564,7 +609,7 @@ fn main() -> anyhow::Result<()> {
                                 return;
                             }
                         }
-                        if send_file_infos(&gui_event_tx, &save_controller).is_err() {
+                        if send_view_state(&gui_event_tx, &save_controller).is_err() {
                             return;
                         }
                         git.request(root.clone());
@@ -669,7 +714,7 @@ fn main() -> anyhow::Result<()> {
                         if send_save_result(&gui_event_tx, result).is_err() {
                             return;
                         }
-                        if send_file_infos(&gui_event_tx, &save_controller).is_err() {
+                        if send_view_state(&gui_event_tx, &save_controller).is_err() {
                             return;
                         }
                         git.request(root.clone());
@@ -761,7 +806,7 @@ fn handle_external_change(
     if !matches!(&result, SaveFlowResult::NoChanges) {
         send_save_result(gui_event_tx, result)?;
     }
-    send_file_infos(gui_event_tx, save_controller)?;
+    send_view_state(gui_event_tx, save_controller)?;
     git.request(root.to_path_buf());
     Ok(())
 }
@@ -881,7 +926,7 @@ fn after_root_change(
     root: &Path,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     gui_event_tx.send(GuiEvent::GitBadges(HashMap::new()))?;
-    send_file_infos(gui_event_tx, save_controller)?;
+    send_view_state(gui_event_tx, save_controller)?;
     git.request(root.to_path_buf());
     Ok(())
 }
@@ -1053,7 +1098,7 @@ fn handle_activate_line(
                             format!("折りたたみ表示を更新できません: {error:#}"),
                         )?;
                     }
-                    gui_event_tx.send(GuiEvent::FileInfos(save_controller.visible_file_infos()))?;
+                    send_view_state(gui_event_tx, save_controller)?;
                 }
                 ToggleCollapseResult::NotADirectory => {
                     send_gui_message(
@@ -1128,12 +1173,16 @@ fn send_gui_message(
     })))
 }
 
-/// 表示中エントリのインメモリなファイル情報をGUIへ送る。
-fn send_file_infos(
+/// 表示行に対応する表示状態(ファイル情報・折りたたみ集合)をGUIへ送る。
+///
+/// 可視行の集合が変わるたびに呼ぶ。折りたたみ集合は展開/折りたたみアイコンの
+/// 正典で、子を持たない空ディレクトリの展開状態も正しく描画するために必要。
+fn send_view_state(
     gui_event_tx: &mpsc::Sender<GuiEvent>,
     save_controller: &SaveController,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
-    gui_event_tx.send(GuiEvent::FileInfos(save_controller.visible_file_infos()))
+    gui_event_tx.send(GuiEvent::FileInfos(save_controller.visible_file_infos()))?;
+    gui_event_tx.send(GuiEvent::CollapsedDirs(save_controller.collapsed_dirs()))
 }
 
 fn send_save_result(

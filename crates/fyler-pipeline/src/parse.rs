@@ -1,7 +1,7 @@
 //! parse: バッファ行 → 行の構造化 → DesiredTree。
 
 use fyler_core::editor::EditorLine;
-use fyler_core::grammar::{self, INDENT_WIDTH, PrefixParse};
+use fyler_core::grammar::{self, PrefixParse};
 use fyler_core::id::EntryId;
 use fyler_core::path::TreePath;
 use fyler_core::tree::{DesiredEntry, DesiredTree, EntryKind};
@@ -18,9 +18,10 @@ pub struct ParsedLine {
     /// (`grammar::split_id_prefix` が `Broken` を返した)。
     /// [`to_desired_tree`] で `ValidateError::BrokenIdPrefix` になり保存は中断される。
     pub id_broken: bool,
-    /// インデントの半角スペース数(生の値。2で割る前)。
-    /// `INDENT_WIDTH` の倍数でない場合は [`to_desired_tree`] でInvalidIndentになる。
-    pub indent_spaces: usize,
+    /// tabインデントの深さ。
+    pub indent_depth: usize,
+    /// tabインデントの後にスペースが残っている。
+    pub indent_broken: bool,
     /// 表示名。末尾のディレクトリサフィックス `/` は除去済み。
     pub name: String,
     pub is_dir: bool,
@@ -39,7 +40,7 @@ pub fn parse(lines: &[EditorLine]) -> Vec<ParsedLine> {
         .iter()
         .enumerate()
         .filter_map(|(line, editor_line)| {
-            if editor_line.text.trim_matches(' ').is_empty() {
+            if editor_line.text.trim_matches([' ', '\t']).is_empty() {
                 return None;
             }
 
@@ -48,14 +49,16 @@ pub fn parse(lines: &[EditorLine]) -> Vec<ParsedLine> {
                 PrefixParse::NoId { rest } => (None, false, rest),
                 PrefixParse::Broken => (None, true, editor_line.text.as_str()),
             };
-            let (indent_spaces, name) = grammar::split_indent(rest);
+            let (indent_depth, name) = grammar::split_indent(rest);
+            let indent_broken = name.starts_with(' ');
             let (name, is_dir) = grammar::split_dir_suffix(name);
 
             Some(ParsedLine {
                 line,
                 id,
                 id_broken,
-                indent_spaces,
+                indent_depth,
+                indent_broken,
                 name: name.to_owned(),
                 is_dir,
             })
@@ -66,11 +69,11 @@ pub fn parse(lines: &[EditorLine]) -> Vec<ParsedLine> {
 /// 構造化済みの行列からDesiredTreeを組み立てる。
 ///
 /// 実装契約:
-/// - インデント(spaces / INDENT_WIDTH)で親子関係を決める。
+/// - tabインデントの深さで親子関係を決める。
 ///   直前のより浅い行のうち最も近いディレクトリが親
 /// - 以下はエラー(全行分を集めて返し、保存を中断する):
 ///   - `id_broken` な行 → `BrokenIdPrefix`
-///   - 奇数スペース・親を飛ばした深いインデント・親がファイル → `InvalidIndent`
+///   - tabではない先頭スペース・親を飛ばした深いインデント・親がファイル → `InvalidIndent`
 /// - 同一IDの複数出現はここでは**エラーにしない**(COPY表現。diff層が解釈する)
 /// - 名前の妥当性(予約文字等)もここでは見ない(validate層の責務)
 pub fn to_desired_tree(parsed: &[ParsedLine]) -> Result<DesiredTree, Vec<ValidateError>> {
@@ -87,16 +90,14 @@ pub fn to_desired_tree(parsed: &[ParsedLine]) -> Result<DesiredTree, Vec<Validat
             });
             line_is_valid = false;
         }
-
-        if parsed_line.indent_spaces % INDENT_WIDTH != 0 {
+        if parsed_line.indent_broken {
             errors.push(ValidateError::InvalidIndent {
                 line: parsed_line.line,
             });
-            ancestors.truncate(parsed_line.indent_spaces / INDENT_WIDTH);
-            continue;
+            line_is_valid = false;
         }
 
-        let depth = parsed_line.indent_spaces / INDENT_WIDTH;
+        let depth = parsed_line.indent_depth;
         ancestors.truncate(depth);
 
         let parent = if depth == 0 {
