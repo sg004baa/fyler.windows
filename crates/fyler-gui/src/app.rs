@@ -1,6 +1,6 @@
 //! eframeアプリ本体。毎フレーム、エンジンのsnapshotだけを描画する。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
@@ -47,6 +47,9 @@ pub enum GuiEvent {
     GitBadges(HashMap<EntryId, GitBadge>),
     /// 表示中のエントリIDに対応する表示用メタデータを全件差し替える。
     FileInfos(HashMap<EntryId, FileInfo>),
+    /// 現在折りたたまれているディレクトリのID集合を差し替える。
+    /// 展開/折りたたみアイコンの判定に使う(空ディレクトリの展開も正しく描く)。
+    CollapsedDirs(HashSet<EntryId>),
     /// 指定された表示用パスをクリップボードへコピーする。
     CopyPath(String),
     /// 保存planと実行前に確認すべき警告を表示する。
@@ -104,6 +107,7 @@ pub struct FylerApp {
     root: PathBuf,
     git_badges: HashMap<EntryId, GitBadge>,
     file_infos: HashMap<EntryId, FileInfo>,
+    collapsed_dirs: HashSet<EntryId>,
     pending_copy: Option<String>,
     engine_error: Option<String>,
     dialog: Option<DialogState>,
@@ -144,6 +148,7 @@ impl FylerApp {
             root: PathBuf::new(),
             git_badges: HashMap::new(),
             file_infos: HashMap::new(),
+            collapsed_dirs: HashSet::new(),
             pending_copy: None,
             engine_error: None,
             dialog: None,
@@ -179,6 +184,7 @@ impl FylerApp {
                 GuiEvent::RootChanged(root) => self.root = root,
                 GuiEvent::GitBadges(git_badges) => self.git_badges = git_badges,
                 GuiEvent::FileInfos(file_infos) => self.file_infos = file_infos,
+                GuiEvent::CollapsedDirs(collapsed_dirs) => self.collapsed_dirs = collapsed_dirs,
                 GuiEvent::CopyPath(path) => self.pending_copy = Some(path),
                 GuiEvent::ShowPlan {
                     plan,
@@ -278,6 +284,7 @@ impl eframe::App for FylerApp {
                         ui,
                         &snapshot,
                         &self.git_badges,
+                        &self.collapsed_dirs,
                         self.icon_style,
                         cursor_line_changed,
                         self.tree_viewport,

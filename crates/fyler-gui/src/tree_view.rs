@@ -1,6 +1,6 @@
 //! ツリー本体の描画。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use eframe::egui;
 use fyler_core::editor::{Cursor, EditorSnapshot, Mode};
@@ -44,6 +44,7 @@ pub fn draw(
     ui: &mut egui::Ui,
     snapshot: &EditorSnapshot,
     git_badges: &HashMap<EntryId, GitBadge>,
+    collapsed_dirs: &HashSet<EntryId>,
     icon_style: IconStyle,
     follow_cursor: bool,
     previous_viewport: Option<TreeViewport>,
@@ -86,7 +87,7 @@ pub fn draw(
                     icon::for_display_name_styled_with_expanded(
                         concealed.display,
                         icon_style,
-                        line_is_expanded_dir(snapshot, line_index),
+                        line_is_expanded_dir(&line.text, collapsed_dirs),
                     )
                 ),
                 font_id.clone(),
@@ -160,31 +161,20 @@ pub fn draw(
     }
 }
 
-fn line_is_expanded_dir(snapshot: &EditorSnapshot, line_index: usize) -> bool {
-    let Some(line) = snapshot.lines.get(line_index) else {
+/// 行がディレクトリで、かつ展開状態(= 折りたたみ集合に含まれない)かを返す。
+///
+/// 展開状態の正典は app 層の `collapsed_dirs`。子の有無に依存しないため、
+/// 子を持たない空ディレクトリを展開しても正しく開アイコンになる
+/// (バッファの次行だけからは空展開と折りたたみを区別できない)。
+fn line_is_expanded_dir(raw: &str, collapsed_dirs: &HashSet<EntryId>) -> bool {
+    let PrefixParse::WithId { id, rest } = fyler_core::grammar::split_id_prefix(raw) else {
         return false;
     };
-    let (PrefixParse::WithId { rest, .. } | PrefixParse::NoId { rest }) =
-        fyler_core::grammar::split_id_prefix(&line.text)
-    else {
-        return false;
-    };
-    let (depth, name) = fyler_core::grammar::split_indent(rest);
+    let (_, name) = fyler_core::grammar::split_indent(rest);
     if !fyler_core::grammar::split_dir_suffix(name).1 {
         return false;
     }
-    let Some(next_line) = snapshot.lines.get(line_index + 1) else {
-        return false;
-    };
-    let (PrefixParse::WithId {
-        rest: next_rest, ..
-    }
-    | PrefixParse::NoId { rest: next_rest }) =
-        fyler_core::grammar::split_id_prefix(&next_line.text)
-    else {
-        return false;
-    };
-    fyler_core::grammar::split_indent(next_rest).0 > depth
+    !collapsed_dirs.contains(&id)
 }
 
 fn display_selection(snapshot: &EditorSnapshot) -> Option<(Cursor, Cursor)> {
@@ -448,6 +438,21 @@ mod tests {
         assert_eq!(badge_character(GitBadge::Renamed), "R");
         assert_eq!(badge_character(GitBadge::Untracked), "?");
         assert_eq!(badge_character(GitBadge::Conflicted), "!");
+    }
+
+    #[test]
+    fn expanded_dir_is_decided_by_collapsed_set_not_child_presence() {
+        let collapsed = HashSet::from([EntryId(2)]);
+
+        // 子を持たない空dirでも、折りたたみ集合に無ければ展開(開アイコン)。
+        // これが旧「次行が深いか」ヒューリスティックで壊れていたケース。
+        assert!(line_is_expanded_dir("/001 empty/", &collapsed));
+        // 折りたたみ集合にあるdirは折りたたみ。
+        assert!(!line_is_expanded_dir("/002 collapsed/", &collapsed));
+        // ファイル行はディレクトリではない。
+        assert!(!line_is_expanded_dir("/003 main.rs", &collapsed));
+        // ID未割当(新規作成)行は展開扱いにしない。
+        assert!(!line_is_expanded_dir("newdir/", &collapsed));
     }
 
     #[test]

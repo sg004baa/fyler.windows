@@ -293,6 +293,14 @@ impl SaveController {
             .collect()
     }
 
+    /// 現在折りたたまれているディレクトリのID集合を返す。
+    ///
+    /// GUIの展開/折りたたみアイコン判定に使う。子を持たない空ディレクトリは
+    /// 表示行だけからは展開状態を判別できないため、この正典を渡す必要がある。
+    pub fn collapsed_dirs(&self) -> HashSet<EntryId> {
+        self.context.collapsed_dirs.clone()
+    }
+
     /// すべてのディレクトリを折りたたみ状態へ初期化する。
     ///
     /// 展開は [`Self::toggle_collapse`] で1階層ずつ行う。baseline自体は全階層を

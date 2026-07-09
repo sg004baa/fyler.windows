@@ -203,7 +203,7 @@ fn main() -> anyhow::Result<()> {
             let mut pending_events = VecDeque::new();
             let mut deferred_changes = BTreeSet::new();
             let mut git = GitRefresher::new(git_event_tx);
-            if send_file_infos(&gui_event_tx, &save_controller).is_err() {
+            if send_view_state(&gui_event_tx, &save_controller).is_err() {
                 return;
             }
             git.request(root.clone());
@@ -573,7 +573,7 @@ fn main() -> anyhow::Result<()> {
                                 return;
                             }
                         }
-                        if send_file_infos(&gui_event_tx, &save_controller).is_err() {
+                        if send_view_state(&gui_event_tx, &save_controller).is_err() {
                             return;
                         }
                         git.request(root.clone());
@@ -678,7 +678,7 @@ fn main() -> anyhow::Result<()> {
                         if send_save_result(&gui_event_tx, result).is_err() {
                             return;
                         }
-                        if send_file_infos(&gui_event_tx, &save_controller).is_err() {
+                        if send_view_state(&gui_event_tx, &save_controller).is_err() {
                             return;
                         }
                         git.request(root.clone());
@@ -770,7 +770,7 @@ fn handle_external_change(
     if !matches!(&result, SaveFlowResult::NoChanges) {
         send_save_result(gui_event_tx, result)?;
     }
-    send_file_infos(gui_event_tx, save_controller)?;
+    send_view_state(gui_event_tx, save_controller)?;
     git.request(root.to_path_buf());
     Ok(())
 }
@@ -890,7 +890,7 @@ fn after_root_change(
     root: &Path,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     gui_event_tx.send(GuiEvent::GitBadges(HashMap::new()))?;
-    send_file_infos(gui_event_tx, save_controller)?;
+    send_view_state(gui_event_tx, save_controller)?;
     git.request(root.to_path_buf());
     Ok(())
 }
@@ -1062,7 +1062,7 @@ fn handle_activate_line(
                             format!("折りたたみ表示を更新できません: {error:#}"),
                         )?;
                     }
-                    gui_event_tx.send(GuiEvent::FileInfos(save_controller.visible_file_infos()))?;
+                    send_view_state(gui_event_tx, save_controller)?;
                 }
                 ToggleCollapseResult::NotADirectory => {
                     send_gui_message(
@@ -1137,12 +1137,16 @@ fn send_gui_message(
     })))
 }
 
-/// 表示中エントリのインメモリなファイル情報をGUIへ送る。
-fn send_file_infos(
+/// 表示行に対応する表示状態(ファイル情報・折りたたみ集合)をGUIへ送る。
+///
+/// 可視行の集合が変わるたびに呼ぶ。折りたたみ集合は展開/折りたたみアイコンの
+/// 正典で、子を持たない空ディレクトリの展開状態も正しく描画するために必要。
+fn send_view_state(
     gui_event_tx: &mpsc::Sender<GuiEvent>,
     save_controller: &SaveController,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
-    gui_event_tx.send(GuiEvent::FileInfos(save_controller.visible_file_infos()))
+    gui_event_tx.send(GuiEvent::FileInfos(save_controller.visible_file_infos()))?;
+    gui_event_tx.send(GuiEvent::CollapsedDirs(save_controller.collapsed_dirs()))
 }
 
 fn send_save_result(
