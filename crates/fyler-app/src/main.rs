@@ -93,7 +93,43 @@ fn default_root() -> anyhow::Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("home directory is not set"))
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
+    // `windows_subsystem = "windows"` によりコンソールが無いため、`run` が
+    // GUI起動前に返す早期エラー(nvim未検出・scan失敗等)は放置すると無音で
+    // 終了してしまう。ネイティブダイアログとログファイルで必ず可視化する。
+    if let Err(error) = run() {
+        report_startup_error(&error);
+        std::process::exit(1);
+    }
+}
+
+/// 早期起動エラーを標準エラー・ログファイル・ネイティブダイアログへ出す。
+fn report_startup_error(error: &anyhow::Error) {
+    // 標準エラーは非Windows/開発時にのみ見える(Windows GUIでは出力先が無い)。
+    eprintln!("fyler: {error:#}");
+
+    let log_path = write_startup_error_log(error);
+    let mut message = format!("fyler could not start.\n\n{error:#}");
+    if let Some(path) = &log_path {
+        message.push_str(&format!("\n\nLog: {}", path.display()));
+    }
+    fyler_fsops::dialog::show_error_dialog("fyler failed to start", &message);
+}
+
+/// 早期起動エラーをログファイルへ書き出し、そのパスを返す。書けなければ`None`。
+///
+/// 保存先は `%LOCALAPPDATA%\fyler`(無ければOSの一時ディレクトリ)。
+fn write_startup_error_log(error: &anyhow::Error) -> Option<PathBuf> {
+    let dir = std::env::var_os("LOCALAPPDATA")
+        .map(|base| PathBuf::from(base).join("fyler"))
+        .unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("fyler-startup-error.log");
+    std::fs::write(&path, format!("fyler startup error:\n{error:#}\n")).ok()?;
+    Some(path)
+}
+
+fn run() -> anyhow::Result<()> {
     let root = match std::env::args_os().nth(1) {
         Some(root) => PathBuf::from(root),
         None => default_root()?,

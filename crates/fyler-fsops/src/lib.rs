@@ -10,6 +10,7 @@
 pub mod apply;
 pub mod case;
 pub mod classify;
+pub mod dialog;
 pub mod drives;
 pub mod gitstatus;
 pub mod info;
