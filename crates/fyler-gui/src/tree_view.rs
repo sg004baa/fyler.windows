@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use eframe::egui;
-use fyler_core::editor::{Cursor, EditorSnapshot, Mode};
+use fyler_core::editor::{Cursor, EditorSnapshot, Mode, SearchHighlight};
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::EntryId;
@@ -99,8 +99,13 @@ pub fn draw(
                 font_id.clone(),
                 badge_color(ui.visuals(), badge),
             );
-            let text_galley =
-                painter.layout_no_wrap(concealed.display.to_owned(), font_id.clone(), text_color);
+            let text_galley = layout_line_text(
+                &painter,
+                concealed.display,
+                &font_id,
+                text_color,
+                snapshot.search.as_ref(),
+            );
             let icon_width = icon_galley.size().x;
             let badge_width = badge_galley.size().x;
             let text_offset = icon_width + badge_width;
@@ -159,6 +164,52 @@ pub fn draw(
             height: output.inner_rect.height(),
         },
     }
+}
+
+/// 行の表示テキストのgalleyを作る。検索マッチがあればその範囲に背景色を敷く
+/// (nvimの `hlsearch` はRust描画に届かないため、ここで再現する)。
+///
+/// マッチなし(検索なし・`:noh` 後)は素の `layout_no_wrap` を使う(高速パス)。
+/// マッチはVim既定の Search 配色に倣い、黒文字 + 黄背景でテーマ非依存に見せる。
+fn layout_line_text(
+    painter: &egui::Painter,
+    display: &str,
+    font_id: &egui::FontId,
+    text_color: egui::Color32,
+    search: Option<&SearchHighlight>,
+) -> std::sync::Arc<egui::Galley> {
+    let spans = search
+        .map(|search| search.match_spans(display))
+        .unwrap_or_default();
+    if spans.is_empty() {
+        return painter.layout_no_wrap(display.to_owned(), font_id.clone(), text_color);
+    }
+
+    let normal = egui::TextFormat {
+        font_id: font_id.clone(),
+        color: text_color,
+        ..Default::default()
+    };
+    let matched = egui::TextFormat {
+        font_id: font_id.clone(),
+        color: egui::Color32::BLACK,
+        background: egui::Color32::from_rgb(240, 220, 90),
+        ..Default::default()
+    };
+
+    let mut job = egui::text::LayoutJob::default();
+    let mut cursor = 0;
+    for (start, end) in spans {
+        if start > cursor {
+            job.append(&display[cursor..start], 0.0, normal.clone());
+        }
+        job.append(&display[start..end], 0.0, matched.clone());
+        cursor = end;
+    }
+    if cursor < display.len() {
+        job.append(&display[cursor..], 0.0, normal);
+    }
+    painter.layout_job(job)
 }
 
 /// 行がディレクトリで、かつ展開状態(= 折りたたみ集合に含まれない)かを返す。
