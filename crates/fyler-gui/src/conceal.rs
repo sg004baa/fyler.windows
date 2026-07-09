@@ -69,11 +69,11 @@ mod tests {
 
     #[test]
     fn conceal_line_keeps_indent_in_display() {
-        // 隠すのはプレフィックスのみ。インデント2空白は名前側なので display に残る。
+        // 隠すのはプレフィックスのみ。tabインデントは名前側なので display に残る。
         assert_eq!(
-            conceal_line("/013   main.rs"),
+            conceal_line("/013 	main.rs"),
             ConcealedLine {
-                display: "  main.rs",
+                display: "\tmain.rs",
                 concealed_bytes: 5,
             }
         );

@@ -87,6 +87,7 @@ enum DialogState {
     },
     Report(CommitReport),
     ValidationErrors(Vec<ValidateError>),
+    Help,
 }
 
 /// fylerのGUIアプリケーション。
@@ -166,12 +167,13 @@ impl FylerApp {
                     EditorEvent::ChangeDirectory { .. } => {}
                     EditorEvent::ToggleHidden => {}
                     EditorEvent::JumpBookmark { .. } => {}
+                    EditorEvent::ShowHelp => self.dialog = Some(DialogState::Help),
                     EditorEvent::CommitRequested { .. } => {}
                     EditorEvent::CmdlineShow(state) => self.cmdline = Some(state),
                     EditorEvent::CmdlineHide => self.cmdline = None,
                     EditorEvent::Message(message) => self.message = Some(message),
                     EditorEvent::EngineCrashed { reason } => {
-                        self.engine_error = Some(format!("編集エンジンが停止しました: {reason}"));
+                        self.engine_error = Some(format!("Editor engine stopped: {reason}"));
                     }
                 },
                 GuiEvent::RootChanged(root) => self.root = root,
@@ -240,7 +242,7 @@ impl eframe::App for FylerApp {
             ctx.copy_text(path.clone());
             self.message = Some(EditorMessage {
                 kind: fyler_core::editor::MessageKind::Info,
-                text: format!("コピーしました: {path}"),
+                text: format!("Copied: {path}"),
             });
         }
     }
@@ -253,7 +255,7 @@ impl eframe::App for FylerApp {
             && self.dialog.is_none()
             && let Err(error) = input::forward_input(ui.ctx(), self.engine.as_ref(), &snapshot.mode)
         {
-            self.engine_error = Some(format!("編集エンジンへ入力を送信できません: {error}"));
+            self.engine_error = Some(format!("Failed to send input to editor engine: {error}"));
         }
 
         egui::Panel::bottom("modeline").show(ui, |ui| {
@@ -329,13 +331,16 @@ impl eframe::App for FylerApp {
                     *cancel_requested,
                 );
             }
+            Some(DialogState::Help) => {
+                dismiss_errors = draw_help(ui);
+            }
             Some(DialogState::ValidationErrors(errors)) => {
                 let dismiss_from_keyboard = ui.ctx().input(|input| {
                     input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape)
                 });
                 dismiss_errors = egui::Modal::new(egui::Id::new("save-validation-errors"))
                     .show(ui.ctx(), |ui| {
-                        ui.heading("保存できません");
+                        ui.heading("Cannot save");
                         ui.add_space(8.0);
                         confirm::draw_validation_errors(ui, errors);
                         ui.add_space(12.0);
@@ -355,12 +360,40 @@ impl eframe::App for FylerApp {
         if let Some(choice) = confirm_choice
             && self.confirm_tx.send(choice).is_err()
         {
-            self.engine_error = Some("確認結果をアプリへ送信できません".to_owned());
+            self.engine_error = Some("Failed to send confirmation result to app".to_owned());
         }
         if cancel_apply && self.confirm_tx.send(ConfirmChoice::Cancel).is_err() {
-            self.engine_error = Some("キャンセル要求をアプリへ送信できません".to_owned());
+            self.engine_error = Some("Failed to send cancel request to app".to_owned());
         }
     }
+}
+
+fn draw_help(ui: &mut egui::Ui) -> bool {
+    let dismiss_from_keyboard = ui
+        .ctx()
+        .input(|input| input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape));
+
+    egui::Modal::new(egui::Id::new("fyler-help"))
+        .show(ui.ctx(), |ui| {
+            ui.heading("Help");
+            ui.add_space(8.0);
+            for line in [
+                "<CR>  Toggle directory / open file",
+                "gd    Enter directory",
+                "^     Go to parent",
+                "g.    Toggle hidden files",
+                "gy    Copy path",
+                ":w    Save changes",
+                ":cd   Change root",
+                ":b    Bookmarks and recent roots",
+                "?     Show this help",
+            ] {
+                ui.monospace(line);
+            }
+            ui.add_space(12.0);
+            ui.button("Dismiss (Enter / Esc)").clicked() || dismiss_from_keyboard
+        })
+        .inner
 }
 
 /// GUIを起動する(メインスレッドで呼ぶこと。eframeの制約)。

@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 //! fyler — エントリポイント。各レイヤーの配線だけを行う(ロジックを書かない)。
 //!
 //! 各レイヤーの役割はAGENTS.mdの依存境界表を参照。ここに書いてよいのは
@@ -84,11 +86,18 @@ impl GitRefresher {
     }
 }
 
+fn default_root() -> PathBuf {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .expect("home directory is not set")
+}
+
 fn main() -> anyhow::Result<()> {
     let root = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or(std::env::current_dir()?);
+        .unwrap_or_else(default_root);
     let root = normalize_root(&root)?;
     let (config, config_warnings) = config::load();
     let scan_options = ScanOptions {

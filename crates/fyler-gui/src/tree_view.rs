@@ -83,7 +83,11 @@ pub fn draw(
             let icon_galley = painter.layout_no_wrap(
                 format!(
                     "{} ",
-                    icon::for_display_name_styled(concealed.display, icon_style)
+                    icon::for_display_name_styled_with_expanded(
+                        concealed.display,
+                        icon_style,
+                        line_is_expanded_dir(snapshot, line_index),
+                    )
                 ),
                 font_id.clone(),
                 text_color,
@@ -154,6 +158,33 @@ pub fn draw(
             height: output.inner_rect.height(),
         },
     }
+}
+
+fn line_is_expanded_dir(snapshot: &EditorSnapshot, line_index: usize) -> bool {
+    let Some(line) = snapshot.lines.get(line_index) else {
+        return false;
+    };
+    let (PrefixParse::WithId { rest, .. } | PrefixParse::NoId { rest }) =
+        fyler_core::grammar::split_id_prefix(&line.text)
+    else {
+        return false;
+    };
+    let (depth, name) = fyler_core::grammar::split_indent(rest);
+    if !fyler_core::grammar::split_dir_suffix(name).1 {
+        return false;
+    }
+    let Some(next_line) = snapshot.lines.get(line_index + 1) else {
+        return false;
+    };
+    let (PrefixParse::WithId {
+        rest: next_rest, ..
+    }
+    | PrefixParse::NoId { rest: next_rest }) =
+        fyler_core::grammar::split_id_prefix(&next_line.text)
+    else {
+        return false;
+    };
+    fyler_core::grammar::split_indent(next_rest).0 > depth
 }
 
 fn display_selection(snapshot: &EditorSnapshot) -> Option<(Cursor, Cursor)> {

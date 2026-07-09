@@ -337,6 +337,9 @@ impl NvimEngine {
                             "fyler_toggle_hidden" => {
                                 let _ = event_tx.send(EditorEvent::ToggleHidden);
                             }
+                            "fyler_help" => {
+                                let _ = event_tx.send(EditorEvent::ShowHelp);
+                            }
                             "fyler_cd" => {
                                 let query = notification
                                     .args

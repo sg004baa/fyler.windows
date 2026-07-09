@@ -9,7 +9,7 @@
 //! ```text
 //! line      = [ id-prefix ] indent name
 //! id-prefix = "/" digits " "     ; 行頭のみ。数字1桁以上 + 半角スペース1個
-//! indent    = ("  ")*            ; 半角スペース2個 = 1階層
+//! indent    = "\t"*              ; tab 1個 = 1階層
 //! name      = 編集可能な名前。ディレクトリは末尾 "/"
 //! 空行      = 無視(警告なしでスキップ)
 //! ```
@@ -18,7 +18,7 @@
 //!
 //! ```text
 //! /012 src/
-//! /013   main.rs
+//! /013 \tmain.rs
 //! /014   lib.rs
 //! 新規ファイル.txt
 //! ```
@@ -30,8 +30,8 @@
 
 use crate::id::EntryId;
 
-/// 1階層ぶんのインデント幅(半角スペース数)。
-pub const INDENT_WIDTH: usize = 2;
+/// 1階層ぶんのインデント文字列。
+pub const INDENT_UNIT: &str = "\t";
 
 /// ディレクトリを表す名前の末尾サフィックス。
 pub const DIR_SUFFIX: char = '/';
@@ -93,11 +93,10 @@ pub fn id_prefix_len(line: &str) -> usize {
     }
 }
 
-/// 先頭のインデント(半角スペース)を分離する。`(スペース数, 残り)` を返す。
-/// スペース数が [`INDENT_WIDTH`] の倍数でない行の扱い(InvalidIndent)はparse層の責務。
+/// 先頭のインデント(tab)を分離する。`(深さ, 残り)` を返す。
 pub fn split_indent(s: &str) -> (usize, &str) {
-    let spaces = s.len() - s.trim_start_matches(' ').len();
-    (spaces, &s[spaces..])
+    let tabs = s.len() - s.trim_start_matches('\t').len();
+    (tabs, &s[tabs..])
 }
 
 /// 名前末尾のディレクトリサフィックスを分離する。`(名前, is_dir)` を返す。
@@ -126,14 +125,14 @@ mod tests {
 
     #[test]
     fn with_id_indented_line() {
-        let PrefixParse::WithId { id, rest } = split_id_prefix("/013   main.rs") else {
+        let PrefixParse::WithId { id, rest } = split_id_prefix("/013 	main.rs") else {
             panic!("expected WithId");
         };
         assert_eq!(id, EntryId(13));
-        // プレフィックス終端スペースの後にインデント2個が残る
-        assert_eq!(rest, "  main.rs");
-        let (spaces, name) = split_indent(rest);
-        assert_eq!(spaces, INDENT_WIDTH);
+        // プレフィックス終端スペースの後にtabインデントが残る
+        assert_eq!(rest, "\tmain.rs");
+        let (depth, name) = split_indent(rest);
+        assert_eq!(depth, 1);
         assert_eq!(name, "main.rs");
     }
 
@@ -146,9 +145,9 @@ mod tests {
             }
         );
         assert_eq!(
-            split_id_prefix("  child.txt"),
+            split_id_prefix("	child.txt"),
             PrefixParse::NoId {
-                rest: "  child.txt"
+                rest: "\tchild.txt"
             }
         );
     }

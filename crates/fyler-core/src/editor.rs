@@ -202,6 +202,8 @@ pub enum EditorEvent {
         /// 指定名または番号。一覧表示要求の場合は`None`。
         query: Option<String>,
     },
+    /// ユーザーがヘルプ表示を要求した。
+    ShowHelp,
     /// ユーザーが保存(`:w` 相当)を要求した。`lines` は保存要求時点のsnapshotに
     /// 属する行で、後続編集で更新されたsnapshotを誤ってplanしないため同梱する。
     /// [`crate::save::SaveEvent::CommitRequested`] へ接続する。

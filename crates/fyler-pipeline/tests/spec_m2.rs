@@ -58,8 +58,8 @@ fn collapsed(ids: &[u64]) -> EditContext {
 fn parse_design_doc_example() {
     let buf = lines(&[
         "/012 src/",
-        "/013   main.rs",
-        "/014   lib.rs",
+        "/013 	main.rs",
+        "/014 	lib.rs",
         "新規ファイル.txt",
     ]);
     let parsed = parse::parse(&buf);
@@ -67,12 +67,12 @@ fn parse_design_doc_example() {
     assert_eq!(parsed.len(), 4);
 
     assert_eq!(parsed[0].id, Some(EntryId(12)));
-    assert_eq!(parsed[0].indent_spaces, 0);
+    assert_eq!(parsed[0].indent_depth, 0);
     assert_eq!(parsed[0].name, "src");
     assert!(parsed[0].is_dir);
 
     assert_eq!(parsed[1].id, Some(EntryId(13)));
-    assert_eq!(parsed[1].indent_spaces, 2);
+    assert_eq!(parsed[1].indent_depth, 1);
     assert_eq!(parsed[1].name, "main.rs");
     assert!(!parsed[1].is_dir);
 
@@ -101,7 +101,7 @@ fn parse_flags_broken_id_prefix() {
 
 #[test]
 fn to_desired_tree_builds_nested_paths() {
-    let buf = lines(&["/012 src/", "/013   main.rs", "新規.txt"]);
+    let buf = lines(&["/012 src/", "/013 	main.rs", "新規.txt"]);
     let tree = parse::to_desired_tree(&parse::parse(&buf)).unwrap();
 
     assert_eq!(tree.entries.len(), 3);
@@ -122,7 +122,7 @@ fn to_desired_tree_rejects_broken_prefix_and_bad_indent() {
     ));
 
     // 親を飛ばした深いインデント → InvalidIndent
-    let buf = lines(&["/001 a/", "/002     too_deep.txt"]); // depth 0 → depth 2
+    let buf = lines(&["/001 a/", "/002 		too_deep.txt"]); // depth 0 → depth 2
     let errors = parse::to_desired_tree(&parse::parse(&buf)).unwrap_err();
     assert!(
         errors

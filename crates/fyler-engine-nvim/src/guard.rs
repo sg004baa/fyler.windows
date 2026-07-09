@@ -87,6 +87,10 @@ vim.keymap.set("n", "gd", function()
   vim.rpcnotify(channel, "fyler_navigate_into", vim.api.nvim_win_get_cursor(0)[1] - 1)
 end, { buffer = buffer, silent = true, nowait = true })
 
+vim.keymap.set("n", "?", function()
+  vim.rpcnotify(channel, "fyler_help")
+end, { buffer = buffer, silent = true, nowait = true })
+
 vim.api.nvim_buf_create_user_command(buffer, "FylerBookmark", function(opts)
   vim.rpcnotify(channel, "fyler_bookmark", opts.args)
 end, { nargs = "?" })
