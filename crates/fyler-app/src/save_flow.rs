@@ -403,36 +403,6 @@ impl SaveController {
         Ok(lines)
     }
 
-    /// 表示ルートとID採番器、baselineを新しいスキャン結果へ差し替える。
-    ///
-    /// 保存状態機械が`Idle`のときだけ成功する。成功時はルート固有の編集文脈も
-    /// リセットする。`baseline.root`が`root`と一致しない入力は拒否し、既存状態を
-    /// 変更しない。
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn change_root(
-        &mut self,
-        root: PathBuf,
-        ids: IdAllocator,
-        baseline: BaselineTree,
-    ) -> anyhow::Result<()> {
-        if !self.is_idle() {
-            anyhow::bail!("保存処理中は表示ルートを変更できません");
-        }
-        if baseline.root != root {
-            anyhow::bail!(
-                "表示ルートとbaselineのルートが一致しません: root={}, baseline={}",
-                root.display(),
-                baseline.root.display()
-            );
-        }
-
-        self.root = root;
-        self.ids = Arc::new(Mutex::new(ids));
-        self.baseline = baseline;
-        self.context = EditContext::default();
-        Ok(())
-    }
-
     /// 共有ID採番器を維持したまま表示ルートとbaselineを差し替える。
     pub fn change_root_preserving_allocator(
         &mut self,
@@ -1777,10 +1747,10 @@ mod tests {
     fn change_root_succeeds_only_while_idle() {
         let (mut controller, _) = controller("C:/old-root");
         let new_root = PathBuf::from("C:/new-root");
-        let (new_baseline, new_ids) = baseline(&new_root);
+        let (new_baseline, _) = baseline(&new_root);
 
         controller
-            .change_root(new_root.clone(), new_ids, new_baseline)
+            .change_root_preserving_allocator(new_root.clone(), new_baseline)
             .unwrap();
 
         assert_eq!(controller.root, new_root);
@@ -1795,11 +1765,11 @@ mod tests {
             SaveFlowResult::ShowPlan { .. }
         ));
         let rejected_root = PathBuf::from("C:/rejected-root");
-        let (rejected_baseline, rejected_ids) = baseline(&rejected_root);
+        let (rejected_baseline, _) = baseline(&rejected_root);
 
         assert!(
             controller
-                .change_root(rejected_root, rejected_ids, rejected_baseline)
+                .change_root_preserving_allocator(rejected_root, rejected_baseline)
                 .is_err()
         );
         assert_eq!(controller.root, new_root);

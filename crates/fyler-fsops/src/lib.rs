@@ -23,3 +23,6 @@ pub mod scan;
 pub mod watch;
 
 mod winattr;
+
+pub use apply::apply_transfer_plan_cancellable;
+pub use preflight::{TransferPreflight, preflight_transfer};

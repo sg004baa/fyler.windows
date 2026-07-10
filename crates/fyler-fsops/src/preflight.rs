@@ -5,10 +5,11 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use fyler_core::path::TreePath;
 use fyler_core::plan::{FsOperation, OperationPlan};
+use fyler_core::transfer::{TransferKind, TransferPlan};
 
 /// preflight走査の結果。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -18,6 +19,15 @@ pub struct PreflightConflicts {
     pub overwritable: Vec<TreePath>,
     /// 移動先に既存のディレクトリがある操作の移動先パス。上書き不可。plan順。
     pub blocked: Vec<TreePath>,
+}
+
+/// pane間transferのpreflight結果。パスはすべて絶対パス。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransferPreflight {
+    /// 既存のファイル/シンボリックリンクで、承認後にごみ箱へ退避できる移動先。
+    pub overwritable: Vec<PathBuf>,
+    /// 実行不能な操作に関係するパス。plan順で、同じパスは1回だけ格納する。
+    pub blocked: Vec<PathBuf>,
 }
 
 /// planの各操作の移動先を実FSと照合し、衝突を分類して返す。
@@ -74,6 +84,163 @@ pub fn scan_plan_conflicts(root: &Path, plan: &OperationPlan) -> PreflightConfli
     conflicts
 }
 
+/// pane間transferを絶対パスへ展開し、実FSとplan内の干渉を検査する。
+///
+/// 読み取り専用であり、実体確認は`fs::symlink_metadata`だけを使って
+/// OneDriveプレースホルダのhydrationを誘発しない。先行Moveで空くパスは
+/// 対象ディレクトリのcase sensitivityを反映した絶対パスキーで追跡する。
+pub fn preflight_transfer(plan: &TransferPlan) -> TransferPreflight {
+    let from_root = absolute_path(&plan.from_root);
+    let to_root = absolute_path(&plan.to_root);
+    let paths = plan
+        .ops
+        .iter()
+        .map(|op| (op.from.to_fs_path(&from_root), op.to.to_fs_path(&to_root)))
+        .collect::<Vec<_>>();
+    let mut result = TransferPreflight::default();
+    let mut vacated = HashSet::new();
+
+    for (index, op) in plan.ops.iter().enumerate() {
+        let (source, target) = &paths[index];
+
+        match fs::symlink_metadata(crate::long_path::to_fs(source)) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                push_unique(&mut result.blocked, source.clone());
+            }
+            Err(_) => push_unique(&mut result.blocked, source.clone()),
+        }
+
+        let case_only = is_case_only_path_change(source, target)
+            && !target.parent().is_some_and(directory_is_case_sensitive);
+        let same_path = paths_equal(source, target) && !case_only;
+        if same_path {
+            push_unique(&mut result.blocked, target.clone());
+        }
+        if op.entry_kind == fyler_core::tree::EntryKind::Dir && is_strict_ancestor(source, target) {
+            push_unique(&mut result.blocked, target.clone());
+        }
+        if op.kind == TransferKind::Move
+            && (paths_equal(source, &to_root) || is_strict_ancestor(source, &to_root))
+        {
+            push_unique(&mut result.blocked, source.clone());
+        }
+
+        if op.kind == TransferKind::Move {
+            vacated.insert(absolute_case_key(source));
+        }
+
+        if same_path || case_only || vacated.contains(&absolute_case_key(target)) {
+            continue;
+        }
+
+        match fs::symlink_metadata(crate::long_path::to_fs(target)) {
+            Ok(metadata)
+                if crate::scan::kind_from_metadata(&metadata)
+                    == fyler_core::tree::EntryKind::Dir =>
+            {
+                push_unique(&mut result.blocked, target.clone());
+            }
+            Ok(_) => push_unique(&mut result.overwritable, target.clone()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // 判定不能な対象は承認可能にせず、破壊を避ける。
+            Err(_) => push_unique(&mut result.blocked, target.clone()),
+        }
+    }
+
+    // v1はop間依存を持たない。from/toの同一・祖先・子孫関係は、実行順に
+    // よって意味が変わるため、関係する両操作をblockedにする。
+    for left in 0..paths.len() {
+        for right in left + 1..paths.len() {
+            let (left_from, left_to) = &paths[left];
+            let (right_from, right_to) = &paths[right];
+            let interferes = [left_from, left_to].into_iter().any(|left_path| {
+                [right_from, right_to]
+                    .into_iter()
+                    .any(|right_path| paths_overlap(left_path, right_path))
+            });
+            if interferes {
+                push_unique(&mut result.blocked, left_to.clone());
+                push_unique(&mut result.blocked, right_to.clone());
+            }
+        }
+    }
+
+    result
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| paths_equal(existing, &path)) {
+        paths.push(path);
+    }
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    paths_equal(left, right) || is_strict_ancestor(left, right) || is_strict_ancestor(right, left)
+}
+
+fn is_strict_ancestor(ancestor: &Path, descendant: &Path) -> bool {
+    ancestor.components().count() < descendant.components().count()
+        && descendant
+            .ancestors()
+            .skip(1)
+            .any(|candidate| paths_equal(ancestor, candidate))
+}
+
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    absolute_case_key(left) == absolute_case_key(right)
+}
+
+fn absolute_case_key(path: &Path) -> String {
+    let text = normalized_path_text(path);
+    if path.parent().is_some_and(directory_is_case_sensitive) {
+        text
+    } else {
+        text.to_lowercase()
+    }
+}
+
+fn normalized_path_text(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("\0")
+}
+
+fn directory_is_case_sensitive(directory: &Path) -> bool {
+    nearest_existing_directory(directory)
+        .and_then(|path| crate::case::dir_is_case_sensitive(&path).ok())
+        .unwrap_or(false)
+}
+
+fn nearest_existing_directory(start: &Path) -> Option<PathBuf> {
+    start.ancestors().find_map(|candidate| {
+        fs::symlink_metadata(crate::long_path::to_fs(candidate))
+            .ok()
+            .filter(|metadata| {
+                crate::scan::kind_from_metadata(metadata) == fyler_core::tree::EntryKind::Dir
+            })
+            .map(|_| candidate.to_path_buf())
+    })
+}
+
+fn is_case_only_path_change(from: &Path, to: &Path) -> bool {
+    from.parent()
+        .zip(to.parent())
+        .is_some_and(|(left, right)| paths_equal(left, right))
+        && from.file_name() != to.file_name()
+        && from
+            .file_name()
+            .zip(to.file_name())
+            .is_some_and(|(left, right)| {
+                left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
+            })
+}
+
 fn case_folded_key(path: &TreePath) -> String {
     path.to_string().to_lowercase()
 }
@@ -81,6 +248,7 @@ fn case_folded_key(path: &TreePath) -> String {
 #[cfg(test)]
 mod tests {
     use fyler_core::id::EntryId;
+    use fyler_core::transfer::{TransferKind, TransferOp, TransferPlan};
     use fyler_core::tree::EntryKind;
     use tempfile::tempdir;
 
@@ -199,6 +367,183 @@ mod tests {
         assert_eq!(
             scan_plan_conflicts(root.path(), &plan),
             PreflightConflicts::default()
+        );
+    }
+
+    fn transfer_plan(from_root: &Path, to_root: &Path, ops: Vec<TransferOp>) -> TransferPlan {
+        TransferPlan {
+            from_root: from_root.to_path_buf(),
+            to_root: to_root.to_path_buf(),
+            ops,
+        }
+    }
+
+    fn transfer_op(kind: TransferKind, from: &str, to: &str, entry_kind: EntryKind) -> TransferOp {
+        TransferOp {
+            kind,
+            from: TreePath::parse(from),
+            to: TreePath::parse(to),
+            entry_kind,
+        }
+    }
+
+    #[test]
+    fn transfer_classifies_file_and_symlink_as_overwritable_and_directory_as_blocked() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(source.join("a.txt"), b"a").unwrap();
+        fs::write(source.join("b.txt"), b"b").unwrap();
+        fs::write(source.join("c.txt"), b"c").unwrap();
+        fs::write(target.join("file.txt"), b"existing").unwrap();
+        fs::create_dir(target.join("directory")).unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("file.txt", target.join("link")).unwrap();
+        #[cfg(not(unix))]
+        fs::write(target.join("link"), b"link stand-in").unwrap();
+
+        let plan = transfer_plan(
+            &source,
+            &target,
+            vec![
+                transfer_op(TransferKind::Copy, "a.txt", "file.txt", EntryKind::File),
+                transfer_op(TransferKind::Copy, "b.txt", "link", EntryKind::File),
+                transfer_op(TransferKind::Copy, "c.txt", "directory", EntryKind::File),
+            ],
+        );
+
+        let result = preflight_transfer(&plan);
+
+        assert_eq!(
+            result.overwritable,
+            [
+                absolute_path(&target.join("file.txt")),
+                absolute_path(&target.join("link"))
+            ]
+        );
+        assert_eq!(result.blocked, [absolute_path(&target.join("directory"))]);
+    }
+
+    #[test]
+    fn transfer_blocks_missing_source() {
+        let root = tempdir().unwrap();
+        let plan = transfer_plan(
+            root.path(),
+            root.path(),
+            vec![transfer_op(
+                TransferKind::Copy,
+                "missing.txt",
+                "new.txt",
+                EntryKind::File,
+            )],
+        );
+
+        let result = preflight_transfer(&plan);
+
+        assert_eq!(
+            result.blocked,
+            [absolute_path(&root.path().join("missing.txt"))]
+        );
+    }
+
+    #[test]
+    fn transfer_blocks_directory_move_and_copy_into_own_descendant() {
+        for kind in [TransferKind::Move, TransferKind::Copy] {
+            let root = tempdir().unwrap();
+            fs::create_dir(root.path().join("directory")).unwrap();
+            let target = root.path().join("directory/child/copy");
+            let plan = transfer_plan(
+                root.path(),
+                root.path(),
+                vec![transfer_op(
+                    kind,
+                    "directory",
+                    "directory/child/copy",
+                    EntryKind::Dir,
+                )],
+            );
+
+            assert!(
+                preflight_transfer(&plan)
+                    .blocked
+                    .contains(&absolute_path(&target))
+            );
+        }
+    }
+
+    #[test]
+    fn transfer_blocks_move_that_contains_target_root() {
+        let outer = tempdir().unwrap();
+        let source = outer.path().join("source");
+        let target_root = source.join("target-pane");
+        fs::create_dir_all(&target_root).unwrap();
+        let plan = transfer_plan(
+            outer.path(),
+            &target_root,
+            vec![transfer_op(
+                TransferKind::Move,
+                "source",
+                "moved",
+                EntryKind::Dir,
+            )],
+        );
+
+        let result = preflight_transfer(&plan);
+
+        assert!(result.blocked.contains(&absolute_path(&source)));
+    }
+
+    #[test]
+    fn transfer_vacated_path_is_not_reported_as_overwritable() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("a.txt"), b"a").unwrap();
+        fs::write(root.path().join("b.txt"), b"b").unwrap();
+        let plan = transfer_plan(
+            root.path(),
+            root.path(),
+            vec![
+                transfer_op(TransferKind::Move, "b.txt", "c.txt", EntryKind::File),
+                transfer_op(TransferKind::Move, "a.txt", "b.txt", EntryKind::File),
+            ],
+        );
+
+        assert!(preflight_transfer(&plan).overwritable.is_empty());
+    }
+
+    #[test]
+    fn transfer_blocks_interference_between_flat_operations() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("first")).unwrap();
+        fs::write(root.path().join("first/file.txt"), b"first").unwrap();
+        fs::write(root.path().join("second.txt"), b"second").unwrap();
+        let plan = transfer_plan(
+            root.path(),
+            root.path(),
+            vec![
+                transfer_op(
+                    TransferKind::Move,
+                    "second.txt",
+                    "first/new.txt",
+                    EntryKind::File,
+                ),
+                transfer_op(TransferKind::Copy, "first", "copied", EntryKind::Dir),
+            ],
+        );
+
+        let result = preflight_transfer(&plan);
+
+        assert!(
+            result
+                .blocked
+                .contains(&absolute_path(&root.path().join("first/new.txt")))
+        );
+        assert!(
+            result
+                .blocked
+                .contains(&absolute_path(&root.path().join("copied")))
         );
     }
 }
