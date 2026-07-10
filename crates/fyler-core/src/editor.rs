@@ -357,6 +357,12 @@ pub enum EditorEvent {
     ActivateLine {
         line: usize,
     },
+    /// ユーザーが指定行のファイルを開くアプリ選択を要求した。`line` は0始まり。
+    ///
+    /// 行テキストの解釈、候補列挙、実際の起動はapp層が行う。
+    OpenWith {
+        line: usize,
+    },
     /// ユーザーが指定行のエントリの絶対パスをコピーするよう要求した。
     /// `line`は0始まり。行の解釈とパス解決はapp層が行う。
     YankPath {

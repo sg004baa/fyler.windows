@@ -23,6 +23,7 @@ use fyler_core::options::SortKey;
 use fyler_core::report::{ApplyProgress, CommitReport, OpOutcome, OpResult};
 use fyler_core::tree::EntryKind;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
+use fyler_fsops::openwith::OpenWithHandler;
 use fyler_fsops::scan::ScanOptions;
 use fyler_fsops::watch::{ExternalChange, FsWatcher};
 use fyler_gui::app::{GuiEvent, GuiOptions};
@@ -241,6 +242,7 @@ fn run() -> anyhow::Result<()> {
             let mut _watcher = watcher;
             let mut pending_events = VecDeque::new();
             let mut deferred_changes = BTreeSet::new();
+            let mut pending_open_with: Option<(PathBuf, Vec<OpenWithHandler>)> = None;
             let mut git = GitRefresher::new(git_event_tx);
             if send_view_state(&gui_event_tx, &save_controller).is_err() {
                 return;
@@ -282,6 +284,22 @@ fn run() -> anyhow::Result<()> {
                         .is_err()
                         {
                             return;
+                        }
+                    }
+                    AppEvent::Editor(EditorEvent::OpenWith { line }) => {
+                        if !save_controller.is_idle() || pending_open_with.is_some() {
+                            continue;
+                        }
+                        match handle_open_with(
+                            &save_controller,
+                            app_engine.as_ref(),
+                            &root,
+                            line,
+                            &gui_event_tx,
+                        ) {
+                            Ok(Some(pending)) => pending_open_with = Some(pending),
+                            Ok(None) => {}
+                            Err(_) => return,
                         }
                     }
                     AppEvent::Editor(EditorEvent::NavigateInto { line }) => {
@@ -755,6 +773,41 @@ fn run() -> anyhow::Result<()> {
                         }
                     }
                     AppEvent::Confirm(choice) => {
+                        match choice {
+                            ConfirmChoice::OpenWithSelected(index) => {
+                                let Some((path, handlers)) = pending_open_with.take() else {
+                                    continue;
+                                };
+                                let result = if index < handlers.len() {
+                                    fyler_fsops::openwith::open_with_handler(
+                                        &path,
+                                        &handlers[index].key,
+                                    )
+                                } else if index == handlers.len() {
+                                    fyler_fsops::openwith::open_with_system_dialog(&path)
+                                } else {
+                                    Err(anyhow::anyhow!(
+                                        "open-with候補の選択位置が範囲外です: {index}"
+                                    ))
+                                };
+                                if let Err(error) = result
+                                    && send_gui_message(
+                                        &gui_event_tx,
+                                        MessageKind::Error,
+                                        format!("指定アプリで開けません: {error:#}"),
+                                    )
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                continue;
+                            }
+                            ConfirmChoice::Cancel if pending_open_with.is_some() => {
+                                pending_open_with = None;
+                                continue;
+                            }
+                            ConfirmChoice::Approve | ConfirmChoice::Cancel => {}
+                        }
                         let result = save_controller.on_choice(choice);
                         match result {
                             SaveFlowResult::StartApply {
@@ -1289,6 +1342,89 @@ fn handle_activate_line(
     Ok(())
 }
 
+fn handle_open_with(
+    save_controller: &SaveController,
+    engine: &dyn EditorEngine,
+    root: &Path,
+    line: usize,
+    gui_event_tx: &mpsc::Sender<GuiEvent>,
+) -> Result<Option<(PathBuf, Vec<OpenWithHandler>)>, mpsc::SendError<GuiEvent>> {
+    let snapshot = engine.snapshot();
+    let Some(editor_line) = snapshot.lines.get(line) else {
+        send_gui_message(
+            gui_event_tx,
+            MessageKind::Error,
+            "open-with対象の行が見つかりません",
+        )?;
+        return Ok(None);
+    };
+
+    match fyler_core::grammar::split_id_prefix(&editor_line.text) {
+        PrefixParse::NoId { .. } => {
+            send_gui_message(gui_event_tx, MessageKind::Info, "保存されていない行です")?;
+            return Ok(None);
+        }
+        PrefixParse::Broken => {
+            send_gui_message(
+                gui_event_tx,
+                MessageKind::Error,
+                "壊れたIDプレフィックスの行はopen-withできません",
+            )?;
+            return Ok(None);
+        }
+        PrefixParse::WithId { .. } => {}
+    }
+
+    let Some((path, kind)) = save_controller.resolve_line(&snapshot.lines, line) else {
+        send_gui_message(
+            gui_event_tx,
+            MessageKind::Error,
+            "行に対応するファイルが現在のツリーに見つかりません",
+        )?;
+        return Ok(None);
+    };
+
+    if kind == EntryKind::Dir {
+        send_gui_message(
+            gui_event_tx,
+            MessageKind::Info,
+            "Open-with is for files only",
+        )?;
+        return Ok(None);
+    }
+
+    let path = path.to_fs_path(root);
+    let handlers = match fyler_fsops::openwith::enumerate_handlers(&path) {
+        Ok(handlers) => handlers,
+        Err(error) => {
+            send_gui_message(
+                gui_event_tx,
+                MessageKind::Error,
+                format!("open-with候補を列挙できません: {error:#}"),
+            )?;
+            return Ok(None);
+        }
+    };
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    gui_event_tx.send(GuiEvent::ShowOpenWith {
+        file_name,
+        choices: open_with_choices(&handlers),
+    })?;
+    Ok(Some((path, handlers)))
+}
+
+fn open_with_choices(handlers: &[OpenWithHandler]) -> Vec<String> {
+    let mut choices = handlers
+        .iter()
+        .map(|handler| handler.display_name.clone())
+        .collect::<Vec<_>>();
+    choices.push("Open with... (Windows dialog)".to_owned());
+    choices
+}
+
 fn handle_yank_path(
     save_controller: &SaveController,
     engine: &dyn EditorEngine,
@@ -1493,6 +1629,31 @@ mod tests {
         assert_eq!(
             sort_state_message(SortKey::Size, true),
             "sort: size (reverse)"
+        );
+    }
+
+    #[test]
+    fn open_with_choices_always_appends_system_dialog() {
+        assert_eq!(
+            open_with_choices(&[]),
+            ["Open with... (Windows dialog)".to_owned()]
+        );
+        assert_eq!(
+            open_with_choices(&[
+                OpenWithHandler {
+                    display_name: "Editor".to_owned(),
+                    key: "editor.exe".to_owned(),
+                },
+                OpenWithHandler {
+                    display_name: "Viewer".to_owned(),
+                    key: "viewer.exe".to_owned(),
+                },
+            ]),
+            [
+                "Editor".to_owned(),
+                "Viewer".to_owned(),
+                "Open with... (Windows dialog)".to_owned(),
+            ]
         );
     }
 

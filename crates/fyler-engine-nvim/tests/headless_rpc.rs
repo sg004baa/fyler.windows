@@ -59,6 +59,13 @@ async fn spawn_attach_and_edit_updates_snapshot() -> anyhow::Result<()> {
     })
     .await
     .context("gy did not emit YankPath")?;
+    engine.send(key_command(Key::Char('g')))?;
+    engine.send(key_command(Key::Char('o')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::OpenWith { line: 0 })
+    })
+    .await
+    .context("go did not emit OpenWith")?;
 
     engine.send(EditorCommand::Key(KeyInput {
         key: Key::Char('i'),

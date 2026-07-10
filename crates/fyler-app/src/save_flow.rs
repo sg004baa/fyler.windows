@@ -674,6 +674,7 @@ impl SaveController {
                 SaveFlowResult::Cancelled
             }
             ConfirmChoice::Approve => self.approve_and_apply(),
+            ConfirmChoice::OpenWithSelected(_) => SaveFlowResult::Ignored,
         }
     }
 

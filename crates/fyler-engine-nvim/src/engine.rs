@@ -103,7 +103,7 @@ impl NvimEngine {
     ///    `Paste` は `nvim_paste`、`RequestCommit` は `:w` 相当、
     ///    `Undo`/`Redo` は `u`/`<C-r>` 相当
     /// 7. **イベント**: BufWriteCmd等のrpcnotify → `EditorEvent::CommitRequested`、
-    ///    行アクション → `ActivateLine` / `YankPath` / `NavigateInto` / `NavigateParent` /
+    ///    行アクション → `ActivateLine` / `OpenWith` / `YankPath` / `NavigateInto` / `NavigateParent` /
     ///    `ToggleHidden` / `Fold`、ルート選択 → `ChangeDirectory` / `JumpBookmark`、
     ///    ext_cmdline → `CmdlineShow/CmdlineHide`、補完UI → `Popupmenu*`、
     ///    ext_messages → `Message`、プロセス終了検知 →
@@ -333,6 +333,21 @@ impl NvimEngine {
                                         &event_tx,
                                         MessageKind::Error,
                                         "開く対象の行番号を取得できません".to_owned(),
+                                    ),
+                                }
+                            }
+                            "fyler_open_with" => {
+                                let line = notification.args.first()
+                                    .and_then(value_as_u64)
+                                    .and_then(|line| usize::try_from(line).ok());
+                                match line {
+                                    Some(line) => {
+                                        let _ = event_tx.send(EditorEvent::OpenWith { line });
+                                    }
+                                    None => send_message(
+                                        &event_tx,
+                                        MessageKind::Error,
+                                        "open-with対象の行番号を取得できません".to_owned(),
                                     ),
                                 }
                             }

@@ -54,6 +54,11 @@ pub enum GuiEvent {
     CollapsedDirs(HashSet<EntryId>),
     /// 指定された表示用パスをクリップボードへコピーする。
     CopyPath(String),
+    /// open-with候補を表示する。
+    ShowOpenWith {
+        file_name: String,
+        choices: Vec<String>,
+    },
     /// 保存planと実行前に確認すべき警告を表示する。
     ShowPlan {
         plan: OperationPlan,
@@ -92,6 +97,11 @@ enum DialogState {
     },
     Report(CommitReport),
     ValidationErrors(Vec<ValidateError>),
+    OpenWith {
+        file_name: String,
+        choices: Vec<String>,
+        selected: usize,
+    },
     Help,
 }
 
@@ -170,6 +180,7 @@ impl FylerApp {
                 GuiEvent::Editor(event) => match event {
                     EditorEvent::SnapshotUpdated => {}
                     EditorEvent::ActivateLine { .. } => {}
+                    EditorEvent::OpenWith { .. } => {}
                     EditorEvent::YankPath { .. } => {}
                     EditorEvent::NavigateInto { .. } => {}
                     EditorEvent::NavigateParent => {}
@@ -202,6 +213,13 @@ impl FylerApp {
                 GuiEvent::FileInfos(file_infos) => self.file_infos = file_infos,
                 GuiEvent::CollapsedDirs(collapsed_dirs) => self.collapsed_dirs = collapsed_dirs,
                 GuiEvent::CopyPath(path) => self.pending_copy = Some(path),
+                GuiEvent::ShowOpenWith { file_name, choices } => {
+                    self.dialog = Some(DialogState::OpenWith {
+                        file_name,
+                        choices,
+                        selected: 0,
+                    });
+                }
                 GuiEvent::ShowPlan {
                     plan,
                     warnings,
@@ -331,7 +349,8 @@ impl eframe::App for FylerApp {
         let mut cancel_apply = false;
         let mut dismiss_errors = false;
         let mut dismiss_report = false;
-        match &self.dialog {
+        let mut open_with_choice = None;
+        match &mut self.dialog {
             Some(DialogState::Plan {
                 plan,
                 warnings,
@@ -374,6 +393,18 @@ impl eframe::App for FylerApp {
                     })
                     .inner;
             }
+            Some(DialogState::OpenWith {
+                file_name,
+                choices,
+                selected,
+            }) => {
+                let (choice, next_selected) =
+                    confirm::draw_open_with(ui, file_name, choices, *selected);
+                if let Some(next_selected) = next_selected {
+                    *selected = next_selected;
+                }
+                open_with_choice = choice;
+            }
             None => {}
         }
 
@@ -387,6 +418,12 @@ impl eframe::App for FylerApp {
             && self.confirm_tx.send(choice).is_err()
         {
             self.engine_error = Some("Failed to send confirmation result to app".to_owned());
+        }
+        if let Some(choice) = open_with_choice {
+            self.dialog = None;
+            if self.confirm_tx.send(choice).is_err() {
+                self.engine_error = Some("Failed to send open-with result to app".to_owned());
+            }
         }
         if cancel_apply && self.confirm_tx.send(ConfirmChoice::Cancel).is_err() {
             self.engine_error = Some("Failed to send cancel request to app".to_owned());
@@ -409,6 +446,7 @@ fn draw_help(ui: &mut egui::Ui) -> bool {
                 "^     Go to parent",
                 "g.    Toggle hidden files",
                 "gy    Copy path",
+                "go    Open with",
                 ":w    Save changes",
                 ":cd   Change root",
                 ":b    Bookmarks and recent roots",

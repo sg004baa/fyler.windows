@@ -17,6 +17,7 @@ pub mod info;
 pub mod long_path;
 pub mod onedrive;
 pub mod open;
+pub mod openwith;
 pub mod preflight;
 pub mod recycle;
 pub mod scan;

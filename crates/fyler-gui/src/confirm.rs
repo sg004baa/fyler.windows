@@ -13,6 +13,7 @@ use fyler_core::validate::ValidateError;
 pub enum ConfirmChoice {
     Approve,
     Cancel,
+    OpenWithSelected(usize),
 }
 
 /// 保存確認ダイアログでの操作一覧の詳細度。
@@ -226,6 +227,88 @@ pub fn draw_apply_progress(
         .inner
 }
 
+/// open-with候補をモーダルで表示し、選択があれば返す。
+///
+/// `choices` はapp層が構築した表示名の一覧で、末尾にOS標準ダイアログ項目を
+/// 含めたものをそのまま描画する。選択行の更新値は戻り値の2要素目で返す。
+pub fn draw_open_with(
+    ui: &mut egui::Ui,
+    file_name: &str,
+    choices: &[String],
+    selected: usize,
+) -> (Option<ConfirmChoice>, Option<usize>) {
+    let key_input = ui.ctx().input(|input| {
+        let down = input.key_pressed(egui::Key::J) || input.key_pressed(egui::Key::ArrowDown);
+        let up = input.key_pressed(egui::Key::K) || input.key_pressed(egui::Key::ArrowUp);
+        let confirm = input.key_pressed(egui::Key::Enter);
+        let cancel = input.key_pressed(egui::Key::Escape) || input.key_pressed(egui::Key::Q);
+        (down, up, confirm, cancel)
+    });
+    let mut next_selected = None;
+    if key_input.0 {
+        next_selected = Some(open_with_selection_step(choices.len(), selected, 1));
+    } else if key_input.1 {
+        next_selected = Some(open_with_selection_step(choices.len(), selected, -1));
+    }
+    let effective_selected = next_selected.unwrap_or(selected);
+    let keyboard_choice = if key_input.2 && !choices.is_empty() {
+        Some(ConfirmChoice::OpenWithSelected(effective_selected))
+    } else if key_input.3 {
+        Some(ConfirmChoice::Cancel)
+    } else {
+        None
+    };
+
+    let choice = egui::Modal::new(egui::Id::new("open-with-selection"))
+        .show(ui.ctx(), |ui| {
+            ui.heading("Open with");
+            ui.add_space(4.0);
+            ui.monospace(file_name);
+            ui.add_space(8.0);
+
+            let mut clicked_choice = None;
+            for (index, choice) in choices.iter().enumerate() {
+                let response = ui.selectable_label(index == effective_selected, choice);
+                if response.hovered() {
+                    next_selected = Some(index);
+                }
+                if response.clicked() {
+                    clicked_choice = Some(ConfirmChoice::OpenWithSelected(index));
+                }
+            }
+
+            ui.add_space(12.0);
+            let open_clicked = ui
+                .add_enabled(!choices.is_empty(), egui::Button::new("Open (Enter)"))
+                .clicked();
+            let cancel_clicked = ui.button("Cancel (Esc / q)").clicked();
+            clicked_choice
+                .or_else(|| {
+                    open_clicked.then_some(ConfirmChoice::OpenWithSelected(effective_selected))
+                })
+                .or_else(|| cancel_clicked.then_some(ConfirmChoice::Cancel))
+                .or(keyboard_choice)
+        })
+        .inner;
+
+    (choice, next_selected)
+}
+
+/// open-with候補の選択位置を上下移動する。端では止まり、wrapしない。
+pub fn open_with_selection_step(len: usize, selected: usize, delta: i32) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let selected = selected.min(len - 1);
+    if delta < 0 {
+        selected.saturating_sub(delta.unsigned_abs() as usize)
+    } else {
+        selected
+            .saturating_add(delta as usize)
+            .min(len.saturating_sub(1))
+    }
+}
+
 /// plan確認キーの押下状態を、エンジン非依存の確認結果へ変換する。
 fn plan_choice_from_keys(y: bool, n: bool, esc: bool) -> Option<ConfirmChoice> {
     if y {
@@ -362,6 +445,16 @@ mod tests {
             Some(ConfirmChoice::Cancel)
         );
         assert_eq!(plan_choice_from_keys(false, false, false), None);
+    }
+
+    #[test]
+    fn open_with_selection_step_saturates_without_wrapping() {
+        assert_eq!(open_with_selection_step(3, 0, -1), 0);
+        assert_eq!(open_with_selection_step(3, 2, 1), 2);
+        assert_eq!(open_with_selection_step(3, 1, 1), 2);
+        assert_eq!(open_with_selection_step(3, 1, -1), 0);
+        assert_eq!(open_with_selection_step(0, 10, 1), 0);
+        assert_eq!(open_with_selection_step(3, 10, -1), 1);
     }
 
     #[test]

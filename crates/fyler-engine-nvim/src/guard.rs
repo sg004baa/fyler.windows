@@ -90,6 +90,10 @@ vim.keymap.set("n", "gy", function()
   vim.rpcnotify(channel, "fyler_yank_path", vim.api.nvim_win_get_cursor(0)[1] - 1)
 end, { buffer = buffer, silent = true, nowait = true })
 
+vim.keymap.set("n", "go", function()
+  vim.rpcnotify(channel, "fyler_open_with", vim.api.nvim_win_get_cursor(0)[1] - 1)
+end, { buffer = buffer, silent = true, nowait = true })
+
 vim.keymap.set("n", "gd", function()
   vim.rpcnotify(channel, "fyler_navigate_into", vim.api.nvim_win_get_cursor(0)[1] - 1)
 end, { buffer = buffer, silent = true, nowait = true })
