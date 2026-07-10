@@ -241,6 +241,7 @@ impl FylerApp {
                     EditorEvent::ChangeDirectory { .. } => {}
                     EditorEvent::ToggleHidden => {}
                     EditorEvent::JumpBookmark { .. } => {}
+                    EditorEvent::OpenFilePicker => {}
                     EditorEvent::ShowHelp => self.dialog = Some(DialogState::Help),
                     EditorEvent::PaneAction(_) => {}
                     EditorEvent::TransferRequested { .. } => {}

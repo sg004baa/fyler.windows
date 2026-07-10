@@ -131,6 +131,27 @@ async fn pane_keymap_emits_split_action() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a compatible nvim executable"]
+async fn file_picker_keymap_emits_open_request() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.send(key_command(Key::Char('g')))?;
+    engine.send(key_command(Key::Char('/')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::OpenFilePicker)
+    })
+    .await
+    .context("g/ did not emit OpenFilePicker")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
 async fn transfer_keymaps_emit_normal_and_visual_requests() -> anyhow::Result<()> {
     let _serial = NVIM_TEST_SERIAL.lock().await;
     let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")

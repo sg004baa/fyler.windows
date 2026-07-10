@@ -137,6 +137,19 @@ pub enum ToggleCollapseResult {
     Busy,
 }
 
+/// 折りたたまれた祖先を展開して、指定エントリを表示する結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevealResult {
+    /// 対象は既に表示されている。`line`は0始まりの表示行index。
+    AlreadyVisible { line: usize },
+    /// 祖先を展開した。バッファへ設定すべき全行と対象の0始まり行index。
+    Revealed { lines: Vec<EditorLine>, line: usize },
+    /// 対象IDを現在のbaselineへ解決できない。
+    NotFound,
+    /// 保存状態機械が`Idle`ではないため、状態を変更しなかった。
+    Busy,
+}
+
 pub struct SaveController {
     state: SaveState,
     root: PathBuf,
@@ -245,6 +258,50 @@ impl SaveController {
     /// 現在のbaselineと折りたたみ文脈から、バッファへ表示する全行を生成する。
     pub fn visible_lines(&self) -> Vec<EditorLine> {
         baseline_to_lines(&self.baseline, &self.context)
+    }
+
+    /// 指定IDのエントリを隠している折りたたみ祖先をすべて展開する。
+    ///
+    /// 展開後はbaselineから全行を再生成し、その行列と1:1対応する0始まりindexを
+    /// 返す。dirtyバッファへ全行差し替えを行うと編集を失うため、dirty判定は
+    /// [`Self::toggle_collapse`] と同様に呼び出し元のapp層が先に行うこと。
+    pub fn reveal_entry(&mut self, id: EntryId) -> RevealResult {
+        if !self.is_idle() {
+            return RevealResult::Busy;
+        }
+        let Some(target_path) = self.baseline.get(id).map(|entry| entry.path.clone()) else {
+            return RevealResult::NotFound;
+        };
+
+        if let Some(line) = visible_entries(&self.baseline, &self.context)
+            .iter()
+            .position(|entry| entry.id == id)
+        {
+            return RevealResult::AlreadyVisible { line };
+        }
+
+        let collapsed_ancestors = self
+            .baseline
+            .entries()
+            .iter()
+            .filter(|entry| {
+                entry.kind == EntryKind::Dir
+                    && self.context.collapsed_dirs.contains(&entry.id)
+                    && entry.path.is_strict_ancestor_of(&target_path)
+            })
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        for ancestor in collapsed_ancestors {
+            self.context.collapsed_dirs.remove(&ancestor);
+        }
+
+        let visible = visible_entries(&self.baseline, &self.context);
+        let Some(line) = visible.iter().position(|entry| entry.id == id) else {
+            return RevealResult::NotFound;
+        };
+        let lines = baseline_to_lines(&self.baseline, &self.context);
+        debug_assert_eq!(visible.len(), lines.len());
+        RevealResult::Revealed { lines, line }
     }
 
     /// 現在の表示行から、指定した名前のトップレベルエントリの行indexを探す。
@@ -1808,6 +1865,85 @@ mod tests {
             result => panic!("unexpected expand result: {result:?}"),
         };
         assert_eq!(expanded_again, expanded);
+    }
+
+    #[test]
+    fn reveal_entry_returns_the_correct_line_when_already_visible() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+
+        assert_eq!(
+            controller.reveal_entry(EntryId(3)),
+            RevealResult::AlreadyVisible { line: 2 }
+        );
+    }
+
+    #[test]
+    fn reveal_entry_expands_one_collapsed_ancestor() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        let expanded = controller.visible_lines();
+        assert!(matches!(
+            controller.toggle_collapse(&expanded, 0),
+            ToggleCollapseResult::Toggled(_)
+        ));
+
+        let RevealResult::Revealed { lines, line } = controller.reveal_entry(EntryId(4)) else {
+            panic!("collapsed child was not revealed");
+        };
+
+        assert_eq!(line, 3);
+        assert_eq!(lines, controller.visible_lines());
+        assert!(matches!(
+            fyler_core::grammar::split_id_prefix(&lines[line].text),
+            PrefixParse::WithId { id: EntryId(4), .. }
+        ));
+    }
+
+    #[test]
+    fn reveal_entry_expands_every_collapsed_ancestor() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        controller.collapse_all_dirs();
+
+        let RevealResult::Revealed { lines, line } = controller.reveal_entry(EntryId(3)) else {
+            panic!("deeply collapsed entry was not revealed");
+        };
+
+        assert_eq!(line, 2);
+        assert_eq!(lines, controller.visible_lines());
+        assert!(!controller.context.collapsed_dirs.contains(&EntryId(1)));
+        assert!(!controller.context.collapsed_dirs.contains(&EntryId(2)));
+        assert!(matches!(
+            fyler_core::grammar::split_id_prefix(&lines[line].text),
+            PrefixParse::WithId { id: EntryId(3), .. }
+        ));
+    }
+
+    #[test]
+    fn reveal_entry_returns_not_found_without_changing_collapsed_state() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        controller.collapse_all_dirs();
+        let collapsed = controller.collapsed_dirs();
+
+        assert_eq!(
+            controller.reveal_entry(EntryId(999)),
+            RevealResult::NotFound
+        );
+        assert_eq!(controller.collapsed_dirs(), collapsed);
+    }
+
+    #[test]
+    fn reveal_entry_returns_busy_during_save_flow() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        controller.collapse_all_dirs();
+        let mut edited = controller.visible_lines();
+        edited[1].text = edited[1].text.replace("top.txt", "renamed.txt");
+        assert!(matches!(
+            controller.on_commit(7, &edited),
+            SaveFlowResult::ShowPlan { .. }
+        ));
+        let collapsed = controller.collapsed_dirs();
+
+        assert_eq!(controller.reveal_entry(EntryId(3)), RevealResult::Busy);
+        assert_eq!(controller.collapsed_dirs(), collapsed);
     }
 
     #[test]

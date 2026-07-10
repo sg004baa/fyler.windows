@@ -44,6 +44,9 @@ pub enum EditorCommand {
         lines: Vec<EditorLine>,
         cursor_line: Option<usize>,
     },
+    /// バッファ内容を変更せず、カーソルを0始まりの指定行へ移動する。
+    /// 行数を超える指定は最終行へクランプする。
+    SetCursorLine(usize),
     /// バッファの `modifiable` を設定する。保存フロー中のユーザー編集すり抜けを
     /// 防ぐ(状態機械 [`crate::save`] の`SetModifiable`効果の実行系)。
     SetModifiable(bool),
@@ -367,6 +370,8 @@ pub enum EditorEvent {
         /// 指定名または番号。一覧表示要求の場合は`None`。
         query: Option<String>,
     },
+    /// ファイルpickerを開くよう要求した。
+    OpenFilePicker,
     /// ユーザーがヘルプ表示を要求した。
     ShowHelp,
     /// ユーザーがpaneの分割・focus移動・closeを要求した。

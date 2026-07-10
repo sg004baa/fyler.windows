@@ -17,6 +17,8 @@ pub mod grammar;
 pub mod id;
 pub mod options;
 pub mod pane;
+pub mod search;
+
 pub mod path;
 pub mod plan;
 pub mod report;

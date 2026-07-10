@@ -8,7 +8,7 @@
 
 mod config;
 mod pane_runtime;
-mod save_flow;
+pub mod save_flow;
 mod transfer_flow;
 
 use std::collections::{BTreeSet, HashMap};
