@@ -5,6 +5,10 @@
 > issue #6 コメントの対応方針を4クレート実地調査で机上検証した結果、大筋妥当。
 > 本書は検証で見つかった補正を織り込んだ実装計画。
 
+> **2026-07-10 実装済み**(3セッション、codex実装。コミット: aa2423d / cc85f2c / 77804cd)。
+> Linuxゲート: cargo test --workspace 275件pass、workspace clippy(-D warnings)警告ゼロ、
+> headless RPCスモーク9件pass(実nvim v0.12.3)。**Windows実機動作確認は未実施**。
+
 ## 方針検証の結論(2026-07-10)
 
 ### 採用(コメント通り)
