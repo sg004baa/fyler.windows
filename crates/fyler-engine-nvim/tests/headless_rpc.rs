@@ -281,6 +281,37 @@ async fn bookmark_command_emits_jump_request() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a compatible nvim executable"]
+async fn sort_command_completion_emits_popupmenu() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.send(key_command(Key::Char(':')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::CmdlineShow(_))
+    })
+    .await
+    .context(": did not open the command line")?;
+    engine.send(EditorCommand::Text("FylerSort ".to_owned()))?;
+    engine.send(key_command(Key::Tab))?;
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            EditorEvent::PopupmenuShow(state)
+                if state.items.iter().any(|item| item.word == "date")
+        )
+    })
+    .await
+    .context(":FylerSort <Tab> did not emit popupmenu with date")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
 async fn navigate_into_and_cd_commands_emit_root_change_requests() -> anyhow::Result<()> {
     let _serial = NVIM_TEST_SERIAL.lock().await;
     let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")

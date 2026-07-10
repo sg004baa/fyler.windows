@@ -12,6 +12,7 @@ use fyler_core::fileinfo::{FileInfo, human_readable_size};
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::{EntryId, IdAllocator};
+use fyler_core::options::SortKey;
 use fyler_core::path::TreePath;
 use fyler_core::plan::OperationPlan;
 use fyler_core::report::CommitReport;
@@ -262,6 +263,13 @@ impl SaveController {
     /// 引き継いで隠しファイル表示設定を維持すること。
     pub fn scan_options(&self) -> ScanOptions {
         self.scan_options
+    }
+
+    /// 現在のソート条件を返す。
+    ///
+    /// `:sort`引数なしの表示で使う。第1要素がソートキー、第2要素が降順フラグである。
+    pub fn sort_state(&self) -> (SortKey, bool) {
+        (self.scan_options.key, self.scan_options.reverse)
     }
 
     /// 表示ルート相対のGit状態を、現在のbaselineのエントリIDへ対応付けて返す。
@@ -515,6 +523,40 @@ impl SaveController {
             &options,
         )
         .context("隠しファイル表示切り替え後の実FS再スキャンに失敗しました")?;
+        let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
+        let lines = baseline_to_lines(&baseline, &context);
+
+        self.baseline = baseline;
+        self.context = context;
+        self.scan_options = options;
+        Ok(lines)
+    }
+
+    /// ソート条件を変更して現在のルートを再スキャンする。
+    ///
+    /// 保存状態機械が`Idle`のときだけ実行し、IDと折りたたみ状態を維持する。
+    /// 戻り値はバッファへ設定すべき全行である。
+    pub fn change_sort(&mut self, key: SortKey, reverse: bool) -> anyhow::Result<Vec<EditorLine>> {
+        if !self.is_idle() {
+            anyhow::bail!("保存処理中はソート条件を変更できません");
+        }
+
+        let options = ScanOptions {
+            key,
+            reverse,
+            ..self.scan_options
+        };
+        if options == self.scan_options {
+            return Ok(self.visible_lines());
+        }
+
+        let baseline = fyler_fsops::scan::rescan_preserving_ids_with(
+            &self.root,
+            &mut self.ids,
+            &self.baseline,
+            &options,
+        )
+        .context("ソート条件変更後の実FS再スキャンに失敗しました")?;
         let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
         let lines = baseline_to_lines(&baseline, &context);
 
@@ -961,6 +1003,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use fyler_core::editor::{EditorSnapshot, FoldOp};
+    use fyler_core::options::{SortKey, SortOrder};
     use fyler_core::path::TreePath;
     use fyler_core::plan::FsOperation;
     use fyler_core::report::{OpOutcome, OpResult};
@@ -1012,6 +1055,23 @@ mod tests {
         let engine = Arc::new(RecordingEngine::default());
         let controller =
             SaveController::new(root, ids, baseline, Arc::<RecordingEngine>::clone(&engine));
+        (controller, engine)
+    }
+
+    fn scanned_controller(
+        root: &Path,
+        options: ScanOptions,
+    ) -> (SaveController, Arc<RecordingEngine>) {
+        let mut ids = IdAllocator::new();
+        let baseline = fyler_fsops::scan::scan_baseline_with(root, &mut ids, &options).unwrap();
+        let engine = Arc::new(RecordingEngine::default());
+        let controller = SaveController::new_with_scan_options(
+            root.to_path_buf(),
+            ids,
+            baseline,
+            Arc::<RecordingEngine>::clone(&engine),
+            options,
+        );
         (controller, engine)
     }
 
@@ -1160,6 +1220,58 @@ mod tests {
         let statuses = HashMap::from([(PathBuf::from("missing.txt"), GitBadge::Untracked)]);
 
         assert!(controller.map_git_badges(&statuses).is_empty());
+    }
+
+    #[test]
+    fn change_sort_rescans_and_preserves_collapsed_dirs() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("dir")).unwrap();
+        fs::write(root.path().join("dir").join("child.txt"), b"child").unwrap();
+        fs::write(root.path().join("small.txt"), b"1").unwrap();
+        fs::write(root.path().join("large.txt"), b"12345").unwrap();
+        let options = ScanOptions {
+            sort: SortOrder::Mixed,
+            ..ScanOptions::default()
+        };
+        let (mut controller, _) = scanned_controller(root.path(), options);
+        controller.collapse_all_dirs();
+        let dir_id = controller
+            .baseline
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("dir"))
+            .unwrap()
+            .id;
+
+        let lines = controller.change_sort(SortKey::Size, false).unwrap();
+
+        assert_eq!(controller.sort_state(), (SortKey::Size, false));
+        assert!(controller.collapsed_dirs().contains(&dir_id));
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].text.ends_with("small.txt"));
+        assert!(lines[1].text.ends_with("large.txt"));
+        assert!(lines[2].text.ends_with("dir/"));
+    }
+
+    #[test]
+    fn change_sort_requires_idle_state() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("a.txt"), b"content").unwrap();
+        let (mut controller, _) = scanned_controller(root.path(), ScanOptions::default());
+        let entry_id = controller.baseline.entries()[0].id;
+        let renamed_line = EditorLine::new(format!(
+            "{}b.txt",
+            fyler_core::grammar::format_id_prefix(entry_id)
+        ));
+        assert!(matches!(
+            controller.on_commit(1, &[renamed_line]),
+            SaveFlowResult::ShowPlan { .. }
+        ));
+
+        let error = controller.change_sort(SortKey::Date, false).unwrap_err();
+
+        assert!(error.to_string().contains("保存処理中"));
+        assert_eq!(controller.sort_state(), (SortKey::Name, false));
     }
 
     #[test]

@@ -19,6 +19,7 @@ use fyler_core::editor::{EditorCommand, EditorEngine, EditorEvent, EditorMessage
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::IdAllocator;
+use fyler_core::options::SortKey;
 use fyler_core::report::{ApplyProgress, CommitReport, OpOutcome, OpResult};
 use fyler_core::tree::EntryKind;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
@@ -139,6 +140,8 @@ fn run() -> anyhow::Result<()> {
     let scan_options = ScanOptions {
         show_hidden: config.show_hidden,
         sort: config.sort,
+        key: config.sort_key,
+        reverse: config.sort_reverse,
     };
     let gui_options = GuiOptions {
         confirm_detail: config.confirm_detail,
@@ -488,6 +491,89 @@ fn run() -> anyhow::Result<()> {
                                 &save_controller,
                                 &mut git,
                                 &root,
+                            )
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    AppEvent::Editor(EditorEvent::ChangeSort { query }) => {
+                        let Some(query) = query else {
+                            let (key, reverse) = save_controller.sort_state();
+                            if send_gui_message(
+                                &gui_event_tx,
+                                MessageKind::Info,
+                                sort_state_message(key, reverse),
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        };
+
+                        let (key, reverse) = match parse_sort_query(&query) {
+                            Ok(sort) => sort,
+                            Err(error) => {
+                                if send_gui_message(&gui_event_tx, MessageKind::Error, error)
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                continue;
+                            }
+                        };
+                        if app_engine.snapshot().dirty {
+                            if send_gui_message(
+                                &gui_event_tx,
+                                MessageKind::Info,
+                                "編集中はソート条件を変更できません。保存または破棄してください",
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        if !save_controller.is_idle() {
+                            continue;
+                        }
+
+                        let lines = match save_controller.change_sort(key, reverse) {
+                            Ok(lines) => lines,
+                            Err(error) => {
+                                if send_gui_message(
+                                    &gui_event_tx,
+                                    MessageKind::Error,
+                                    format!("ソート条件を変更できません: {error:#}"),
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                                continue;
+                            }
+                        };
+                        if let Err(error) = app_engine.send(EditorCommand::SetLines {
+                            lines,
+                            cursor_line: None,
+                        }) {
+                            if send_gui_message(
+                                &gui_event_tx,
+                                MessageKind::Error,
+                                format!("ソート表示を更新できません: {error:#}"),
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        if send_view_state(&gui_event_tx, &save_controller).is_err()
+                            || send_gui_message(
+                                &gui_event_tx,
+                                MessageKind::Info,
+                                sort_state_message(key, reverse),
                             )
                             .is_err()
                         {
@@ -1016,6 +1102,39 @@ fn format_drive_paths(drives: &[PathBuf]) -> String {
         .join(" ")
 }
 
+fn parse_sort_query(query: &str) -> Result<(SortKey, bool), String> {
+    let query = query.trim();
+    let (query, reverse) = match query.strip_suffix('!') {
+        Some(query) => (query.trim_end(), true),
+        None => (query, false),
+    };
+    let key = match query {
+        "name" => SortKey::Name,
+        "date" => SortKey::Date,
+        "size" => SortKey::Size,
+        "ext" => SortKey::Extension,
+        _ => return Err(format!("不明なソートキー: {query} (name|date|size|ext)")),
+    };
+    Ok((key, reverse))
+}
+
+fn sort_state_message(key: SortKey, reverse: bool) -> String {
+    if reverse {
+        format!("sort: {} (reverse)", sort_key_name(key))
+    } else {
+        format!("sort: {}", sort_key_name(key))
+    }
+}
+
+fn sort_key_name(key: SortKey) -> &'static str {
+    match key {
+        SortKey::Name => "name",
+        SortKey::Date => "date",
+        SortKey::Size => "size",
+        SortKey::Extension => "ext",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BookmarkResolution {
     Resolved(PathBuf),
@@ -1351,6 +1470,29 @@ mod tests {
         assert_eq!(
             resolve_cd_target("sub/dir", &root, None),
             Some(root.join("sub").join("dir"))
+        );
+    }
+
+    #[test]
+    fn parse_sort_query_accepts_keys_and_bang_reverse() {
+        assert_eq!(parse_sort_query("name"), Ok((SortKey::Name, false)));
+        assert_eq!(parse_sort_query("date!"), Ok((SortKey::Date, true)));
+        assert_eq!(parse_sort_query(" size! "), Ok((SortKey::Size, true)));
+        assert_eq!(parse_sort_query("ext"), Ok((SortKey::Extension, false)));
+    }
+
+    #[test]
+    fn parse_sort_query_rejects_unknown_or_empty_key() {
+        assert!(parse_sort_query("mtime").unwrap_err().contains("不明"));
+        assert!(parse_sort_query("").unwrap_err().contains("不明"));
+    }
+
+    #[test]
+    fn sort_state_message_formats_reverse_suffix() {
+        assert_eq!(sort_state_message(SortKey::Date, false), "sort: date");
+        assert_eq!(
+            sort_state_message(SortKey::Size, true),
+            "sort: size (reverse)"
         );
     }
 

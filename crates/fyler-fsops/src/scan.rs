@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use fyler_core::fileinfo::EntryMeta;
 use fyler_core::id::IdAllocator;
-use fyler_core::options::SortOrder;
+use fyler_core::options::{SortKey, SortOrder};
 use fyler_core::path::TreePath;
 use fyler_core::tree::{BaselineEntry, BaselineTree, EntryKind};
 
@@ -25,6 +25,10 @@ pub struct ScanOptions {
     pub show_hidden: bool,
     /// ディレクトリ優先または種別混在のソート順。
     pub sort: SortOrder,
+    /// 種別グループ内で使うソートキー。
+    pub key: SortKey,
+    /// `true`ならソートキー部分だけを降順にする。
+    pub reverse: bool,
 }
 
 /// ルート以下をスキャンしてBaselineTreeを構築する。
@@ -363,10 +367,12 @@ struct ScanFrame {
     relative: TreePath,
 }
 
+#[derive(Debug, Clone)]
 struct ScannedEntry {
     path: PathBuf,
     file_name: OsString,
     sort_key: String,
+    extension_key: String,
     kind: EntryKind,
     meta: EntryMeta,
 }
@@ -397,12 +403,14 @@ fn read_sorted_entries(
             format!("UTF-8として表現できないファイル名です: {}", path.display())
         })?;
         let sort_key = name.to_lowercase();
+        let extension_key = extension_sort_key(&sort_key).to_owned();
         let kind = kind_from_metadata(&metadata);
         let meta = meta_from_metadata(&metadata);
         entries.push(ScannedEntry {
             path,
             file_name,
             sort_key,
+            extension_key,
             kind,
             meta,
         });
@@ -410,20 +418,68 @@ fn read_sorted_entries(
 
     // read_dirの順序は未規定なので、設定された自然順で表示とID採番を
     // セッションごとに安定させる。同値時は元のOsStringで順序を確定する。
-    entries.sort_by(|left, right| {
-        let kind_order = match options.sort {
-            SortOrder::DirsFirst => {
-                let left_is_dir = left.kind == EntryKind::Dir;
-                let right_is_dir = right.kind == EntryKind::Dir;
-                right_is_dir.cmp(&left_is_dir)
-            }
-            SortOrder::Mixed => Ordering::Equal,
-        };
-        kind_order
-            .then_with(|| natural_cmp_bytes(left.sort_key.as_bytes(), right.sort_key.as_bytes()))
-            .then_with(|| left.file_name.cmp(&right.file_name))
-    });
+    entries.sort_by(|left, right| compare_scanned(left, right, options));
     Ok(entries)
+}
+
+fn compare_scanned(left: &ScannedEntry, right: &ScannedEntry, options: &ScanOptions) -> Ordering {
+    kind_order(left, right, options)
+        .then_with(|| compare_sort_key(left, right, options))
+        .then_with(|| natural_cmp_bytes(left.sort_key.as_bytes(), right.sort_key.as_bytes()))
+        .then_with(|| left.file_name.cmp(&right.file_name))
+}
+
+fn kind_order(left: &ScannedEntry, right: &ScannedEntry, options: &ScanOptions) -> Ordering {
+    match options.sort {
+        SortOrder::DirsFirst => {
+            let left_is_dir = left.kind == EntryKind::Dir;
+            let right_is_dir = right.kind == EntryKind::Dir;
+            right_is_dir.cmp(&left_is_dir)
+        }
+        SortOrder::Mixed => Ordering::Equal,
+    }
+}
+
+fn compare_sort_key(left: &ScannedEntry, right: &ScannedEntry, options: &ScanOptions) -> Ordering {
+    let ordering = match options.key {
+        SortKey::Name => natural_cmp_bytes(left.sort_key.as_bytes(), right.sort_key.as_bytes()),
+        SortKey::Date => {
+            return compare_optional_last(left.meta.modified, right.meta.modified, options.reverse);
+        }
+        SortKey::Size => {
+            return compare_optional_last(left.meta.size, right.meta.size, options.reverse);
+        }
+        SortKey::Extension => left.extension_key.cmp(&right.extension_key),
+    };
+
+    if options.reverse {
+        ordering.reverse()
+    } else {
+        ordering
+    }
+}
+
+fn compare_optional_last<T: Ord>(left: Option<T>, right: Option<T>, reverse: bool) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            let ordering = left.cmp(&right);
+            if reverse {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn extension_sort_key(lowercase_name: &str) -> &str {
+    match lowercase_name.rfind('.') {
+        Some(index) if index > 0 => &lowercase_name[index + 1..],
+        _ => "",
+    }
 }
 
 fn is_hidden(file_name: &OsStr, metadata: &Metadata) -> bool {
@@ -560,6 +616,7 @@ pub(crate) fn kind_from_metadata(metadata: &Metadata) -> EntryKind {
 mod tests {
     use std::collections::BTreeSet;
     use std::fs;
+    use std::time::{Duration, SystemTime};
 
     use tempfile::tempdir;
 
@@ -578,6 +635,171 @@ mod tests {
             ids.allocate();
         }
         ids
+    }
+
+    fn scanned_entry(
+        name: &str,
+        kind: EntryKind,
+        size: Option<u64>,
+        modified_seconds: Option<u64>,
+    ) -> ScannedEntry {
+        let sort_key = name.to_lowercase();
+        let extension_key = extension_sort_key(&sort_key).to_owned();
+        ScannedEntry {
+            path: PathBuf::from(name),
+            file_name: OsString::from(name),
+            sort_key,
+            extension_key,
+            kind,
+            meta: EntryMeta {
+                size,
+                modified: modified_seconds
+                    .map(|seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+                is_placeholder: false,
+            },
+        }
+    }
+
+    fn sorted_names(mut entries: Vec<ScannedEntry>, options: ScanOptions) -> Vec<String> {
+        entries.sort_by(|left, right| compare_scanned(left, right, &options));
+        entries
+            .into_iter()
+            .map(|entry| entry.file_name.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn compare_scanned_keeps_dirs_first_group_before_key_and_reverse() {
+        let entries = vec![
+            scanned_entry("z.txt", EntryKind::File, Some(10), Some(10)),
+            scanned_entry("a", EntryKind::Dir, None, Some(1)),
+            scanned_entry("b.txt", EntryKind::File, Some(1), Some(1)),
+        ];
+
+        assert_eq!(
+            sorted_names(
+                entries,
+                ScanOptions {
+                    key: SortKey::Size,
+                    reverse: true,
+                    ..ScanOptions::default()
+                },
+            ),
+            ["a", "z.txt", "b.txt"]
+        );
+    }
+
+    #[test]
+    fn compare_scanned_reverses_name_key_only_and_keeps_tiebreak_stable() {
+        let entries = vec![
+            scanned_entry("file2.txt", EntryKind::File, Some(1), Some(1)),
+            scanned_entry("file10.txt", EntryKind::File, Some(1), Some(1)),
+            scanned_entry("File2.txt", EntryKind::File, Some(1), Some(1)),
+        ];
+
+        assert_eq!(
+            sorted_names(
+                entries,
+                ScanOptions {
+                    sort: SortOrder::Mixed,
+                    key: SortKey::Name,
+                    reverse: true,
+                    ..ScanOptions::default()
+                },
+            ),
+            ["file10.txt", "File2.txt", "file2.txt"]
+        );
+    }
+
+    #[test]
+    fn compare_scanned_sorts_date_and_keeps_none_last_even_when_reversed() {
+        let entries = vec![
+            scanned_entry("none.txt", EntryKind::File, Some(1), None),
+            scanned_entry("old.txt", EntryKind::File, Some(1), Some(10)),
+            scanned_entry("new.txt", EntryKind::File, Some(1), Some(20)),
+        ];
+
+        assert_eq!(
+            sorted_names(
+                entries.clone(),
+                ScanOptions {
+                    sort: SortOrder::Mixed,
+                    key: SortKey::Date,
+                    ..ScanOptions::default()
+                },
+            ),
+            ["old.txt", "new.txt", "none.txt"]
+        );
+        assert_eq!(
+            sorted_names(
+                entries,
+                ScanOptions {
+                    sort: SortOrder::Mixed,
+                    key: SortKey::Date,
+                    reverse: true,
+                    ..ScanOptions::default()
+                },
+            ),
+            ["new.txt", "old.txt", "none.txt"]
+        );
+    }
+
+    #[test]
+    fn compare_scanned_sorts_size_and_keeps_none_last_even_when_reversed() {
+        let entries = vec![
+            scanned_entry("none", EntryKind::Dir, None, Some(1)),
+            scanned_entry("small.txt", EntryKind::File, Some(1), Some(1)),
+            scanned_entry("large.txt", EntryKind::File, Some(10), Some(1)),
+        ];
+
+        assert_eq!(
+            sorted_names(
+                entries.clone(),
+                ScanOptions {
+                    sort: SortOrder::Mixed,
+                    key: SortKey::Size,
+                    ..ScanOptions::default()
+                },
+            ),
+            ["small.txt", "large.txt", "none"]
+        );
+        assert_eq!(
+            sorted_names(
+                entries,
+                ScanOptions {
+                    sort: SortOrder::Mixed,
+                    key: SortKey::Size,
+                    reverse: true,
+                    ..ScanOptions::default()
+                },
+            ),
+            ["large.txt", "small.txt", "none"]
+        );
+    }
+
+    #[test]
+    fn compare_scanned_sorts_extension_by_precomputed_lowercase_key() {
+        let entries = vec![
+            scanned_entry("beta.TXT", EntryKind::File, Some(1), Some(1)),
+            scanned_entry(".profile", EntryKind::File, Some(1), Some(1)),
+            scanned_entry("README", EntryKind::File, Some(1), Some(1)),
+            scanned_entry("alpha.rs", EntryKind::File, Some(1), Some(1)),
+            scanned_entry("zeta.RS", EntryKind::File, Some(1), Some(1)),
+        ];
+
+        assert_eq!(extension_sort_key(".profile"), "");
+        assert_eq!(extension_sort_key("archive.tar.gz"), "gz");
+        assert_eq!(
+            sorted_names(
+                entries,
+                ScanOptions {
+                    sort: SortOrder::Mixed,
+                    key: SortKey::Extension,
+                    ..ScanOptions::default()
+                },
+            ),
+            [".profile", "README", "alpha.rs", "zeta.RS", "beta.TXT"]
+        );
     }
 
     fn assert_partial_matches_full(

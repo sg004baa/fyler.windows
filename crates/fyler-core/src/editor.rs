@@ -375,6 +375,12 @@ pub enum EditorEvent {
     ChangeDirectory {
         query: Option<String>,
     },
+    /// ユーザーがソート条件の変更、または現在条件の表示を要求した。
+    /// `query`は`date` / `date!` / `name`などの生引数文字列。
+    /// `None`は現在のソート条件表示要求。
+    ChangeSort {
+        query: Option<String>,
+    },
     /// ユーザーが隠しファイル表示の切り替えを要求した。
     ToggleHidden,
     /// ユーザーが指定行を基準に折りたたみ操作を要求した。
@@ -401,6 +407,14 @@ pub enum EditorEvent {
     /// cmdline表示の更新(`:` / `/` 入力中の内容)。GUIが自前描画する。
     CmdlineShow(CmdlineState),
     CmdlineHide,
+    /// 補完候補リストの表示。GUIが自前描画する。
+    PopupmenuShow(PopupmenuState),
+    /// 補完候補リストの選択行更新。`None`は未選択。
+    PopupmenuSelect {
+        selected: Option<usize>,
+    },
+    /// 補完候補リストの非表示。
+    PopupmenuHide,
     /// エディタからのメッセージ(例: `E486: Pattern not found`)。GUIが自前描画する。
     Message(EditorMessage),
     /// エンジンプロセスのクラッシュ・異常終了(M1: GUIに通知して操作を止める)。
@@ -417,6 +431,22 @@ pub struct CmdlineState {
     pub content: String,
     /// content内のカーソル位置(バイトオフセット)。
     pub cursor: usize,
+}
+
+/// 補完候補リストの候補1件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PopupmenuItem {
+    pub word: String,
+    pub kind: String,
+    pub menu: String,
+}
+
+/// 補完候補リストの表示状態。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PopupmenuState {
+    pub items: Vec<PopupmenuItem>,
+    /// 選択中インデックス。未選択は`None`。
+    pub selected: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

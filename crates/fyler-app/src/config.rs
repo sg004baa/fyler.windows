@@ -12,7 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use fyler_core::options::SortOrder;
+use fyler_core::options::{SortKey, SortOrder};
 use fyler_gui::confirm::{ConfirmDetail, IconStyle};
 
 const CONFIG_FILE: &str = "config.toml";
@@ -27,6 +27,10 @@ pub struct Config {
     pub show_hidden: bool,
     /// ツリーのソート順。
     pub sort: SortOrder,
+    /// ツリーのソートキー。
+    pub sort_key: SortKey,
+    /// ソートキー部分を降順にするか。
+    pub sort_reverse: bool,
     /// 確認ダイアログの操作一覧詳細度。
     pub confirm_detail: ConfirmDetail,
     /// 日本語fallbackフォントとして読み込むファイルの絶対パス。
@@ -47,6 +51,8 @@ impl Default for Config {
         Self {
             show_hidden: false,
             sort: SortOrder::DirsFirst,
+            sort_key: SortKey::Name,
+            sort_reverse: false,
             confirm_detail: ConfirmDetail::Full,
             font: None,
             font_y_offset_factor: DEFAULT_FONT_Y_OFFSET_FACTOR,
@@ -100,6 +106,24 @@ pub fn load() -> (Config, Vec<String>) {
             Some("dirs_first") => config.sort = SortOrder::DirsFirst,
             Some("mixed") => config.sort = SortOrder::Mixed,
             _ => warnings.push("sortは\"dirs_first\"または\"mixed\"で指定してください".to_owned()),
+        }
+    }
+    if let Some(value) = table.get("sort_key") {
+        match value.as_str() {
+            Some("name") => config.sort_key = SortKey::Name,
+            Some("date") => config.sort_key = SortKey::Date,
+            Some("size") => config.sort_key = SortKey::Size,
+            Some("ext") => config.sort_key = SortKey::Extension,
+            _ => warnings.push(
+                "sort_keyは\"name\"、\"date\"、\"size\"、\"ext\"のいずれかで指定してください"
+                    .to_owned(),
+            ),
+        }
+    }
+    if let Some(value) = table.get("sort_reverse") {
+        match value.as_bool() {
+            Some(reverse) => config.sort_reverse = reverse,
+            None => warnings.push("sort_reverseはtrueまたはfalseで指定してください".to_owned()),
         }
     }
     if let Some(value) = table.get("confirm_detail") {
@@ -177,6 +201,8 @@ pub fn load() -> (Config, Vec<String>) {
             key.as_str(),
             "show_hidden"
                 | "sort"
+                | "sort_key"
+                | "sort_reverse"
                 | "confirm_detail"
                 | "font"
                 | "font_y_offset_factor"
@@ -375,6 +401,17 @@ mod tests {
                 .any(|warning| warning.contains("show_hidden"))
         );
 
+        fs::write(&path, "sort_key = 'mtime'\nsort_reverse = 'yes'\n").unwrap();
+        let (config, warnings) = load();
+        assert_eq!(config.sort_key, SortKey::Name);
+        assert!(!config.sort_reverse);
+        assert!(warnings.iter().any(|warning| warning.contains("sort_key")));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("sort_reverse"))
+        );
+
         fs::write(&path, "unknown = true").unwrap();
         let (config, warnings) = load();
         assert_eq!(config, Config::default());
@@ -423,6 +460,7 @@ mod tests {
             &path,
             format!(
                 "show_hidden = true\nsort = \"mixed\"\nconfirm_detail = \"summary\"\n\
+                 sort_key = \"date\"\nsort_reverse = true\n\
                  font = '{}'\nfont_y_offset_factor = 0.25\nicons = \"nerd\"\n\
                  [bookmarks]\nzeta = '{}'\nalpha = '{}'\n",
                 font.display(),
@@ -435,6 +473,8 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(config.show_hidden);
         assert_eq!(config.sort, SortOrder::Mixed);
+        assert_eq!(config.sort_key, SortKey::Date);
+        assert!(config.sort_reverse);
         assert_eq!(config.confirm_detail, ConfirmDetail::Summary);
         assert_eq!(config.font, Some(font));
         assert_eq!(config.font_y_offset_factor, 0.25);

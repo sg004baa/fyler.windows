@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use fyler_core::editor::{
     CmdlineState, Cursor, EditorCommand, EditorEngine, EditorEvent, EditorLine, EditorMessage,
-    EditorSnapshot, FoldOp, MessageKind, Mode, SearchHighlight,
+    EditorSnapshot, FoldOp, MessageKind, Mode, PopupmenuItem, PopupmenuState, SearchHighlight,
 };
 use nvim_rs::compat::tokio::Compat;
 use nvim_rs::create::tokio::new_child_cmd;
@@ -93,9 +93,9 @@ impl NvimEngine {
     ///      [`EditorSnapshot`] として原子的に更新(revisionはRust側で単調増加)。
     ///      エンジンが追加入力を同期待ちしている間は状態取得を保留し、入力完結後に再試行する
     /// 4. **UI attach**: 起動後に `nvim_ui_attach` を最小グリッドサイズで後付け実行。
-    ///    有効化するextは `ext_cmdline` と `ext_messages` の2つだけ
-    ///    (ext_messagesがないと `E486` 等がgridに描かれて見えない)。
-    ///    grid系描画イベントはすべて無視。`ext_popupmenu` は補完UI実装時に追加
+    ///    有効化するextは `ext_cmdline` / `ext_messages` / `ext_popupmenu`。
+    ///    `ext_messages`がないと `E486` 等がgridに描かれて見えない。
+    ///    grid系描画イベントはすべて無視する
     /// 5. **事故防止**: [`crate::guard`] のautocmd・remapを導入
     /// 6. **コマンド処理**: `cmd_rx` から受けた [`EditorCommand`] を処理する。
     ///    `Key` は [`crate::translate::to_nvim_keycodes`] → `nvim_input`、
@@ -105,7 +105,7 @@ impl NvimEngine {
     /// 7. **イベント**: BufWriteCmd等のrpcnotify → `EditorEvent::CommitRequested`、
     ///    行アクション → `ActivateLine` / `YankPath` / `NavigateInto` / `NavigateParent` /
     ///    `ToggleHidden` / `Fold`、ルート選択 → `ChangeDirectory` / `JumpBookmark`、
-    ///    ext_cmdline → `CmdlineShow/CmdlineHide`、
+    ///    ext_cmdline → `CmdlineShow/CmdlineHide`、補完UI → `Popupmenu*`、
     ///    ext_messages → `Message`、プロセス終了検知 →
     ///    `EngineCrashed` として `event_tx` へ流す
     ///
@@ -171,6 +171,7 @@ impl NvimEngine {
         ui_options.set_cmdline_external(true);
         // nvim-rs 0.9.2ではこのメソッド名が`messages_externa`になっている。
         ui_options.set_messages_externa(true);
+        ui_options.set_popupmenu_external(true);
         nvim.ui_attach(80, 24, &ui_options)
             .await
             .map_err(|error| anyhow::anyhow!("Neovim UI attachに失敗しました: {error}"))?;
@@ -395,6 +396,16 @@ impl NvimEngine {
                                     .filter(|query| !query.is_empty())
                                     .map(str::to_owned);
                                 let _ = event_tx.send(EditorEvent::ChangeDirectory { query });
+                            }
+                            "fyler_sort" => {
+                                let query = notification
+                                    .args
+                                    .first()
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|query| !query.is_empty())
+                                    .map(str::to_owned);
+                                let _ = event_tx.send(EditorEvent::ChangeSort { query });
                             }
                             "fyler_bookmark" => {
                                 let query = notification
@@ -932,6 +943,27 @@ fn handle_redraw(
                 let _ = event_tx.send(EditorEvent::CmdlineHide);
                 cmdline_changed = true;
             }
+            "popupmenu_show" => {
+                for update in &batch[1..] {
+                    if let Some(fields) = update.as_array()
+                        && let Some(state) = parse_popupmenu_show(fields)
+                    {
+                        let _ = event_tx.send(EditorEvent::PopupmenuShow(state));
+                    }
+                }
+            }
+            "popupmenu_select" => {
+                for update in &batch[1..] {
+                    if let Some(fields) = update.as_array()
+                        && let Some(selected) = parse_popupmenu_select(fields)
+                    {
+                        let _ = event_tx.send(EditorEvent::PopupmenuSelect { selected });
+                    }
+                }
+            }
+            "popupmenu_hide" => {
+                let _ = event_tx.send(EditorEvent::PopupmenuHide);
+            }
             "msg_show" => {
                 for update in &batch[1..] {
                     if let Some(message) = parse_message(update) {
@@ -945,6 +977,51 @@ fn handle_redraw(
         }
     }
     cmdline_changed
+}
+
+fn parse_popupmenu_show(args: &[Value]) -> Option<PopupmenuState> {
+    let item_values = args.first()?.as_array()?;
+    let mut items = Vec::with_capacity(item_values.len());
+    for item in item_values {
+        let fields = item.as_array()?;
+        items.push(PopupmenuItem {
+            word: fields
+                .first()
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            kind: fields
+                .get(1)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            menu: fields
+                .get(2)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        });
+    }
+    let selected = args
+        .get(1)
+        .and_then(parse_popupmenu_selected)
+        .unwrap_or(None);
+    Some(PopupmenuState { items, selected })
+}
+
+fn parse_popupmenu_select(args: &[Value]) -> Option<Option<usize>> {
+    args.first().and_then(parse_popupmenu_selected)
+}
+
+fn parse_popupmenu_selected(value: &Value) -> Option<Option<usize>> {
+    let selected = value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))?;
+    Some(if selected < 0 {
+        None
+    } else {
+        usize::try_from(selected).ok()
+    })
 }
 
 fn parse_cmdline(value: &Value) -> Option<CmdlineState> {
@@ -1075,5 +1152,65 @@ mod tests {
         ];
         assert!(apply_lines_notification(&args, &mut lines));
         assert_eq!(lines, ["a", "B", "B2", "c"]);
+    }
+
+    #[test]
+    fn popupmenu_show_parser_extracts_items_and_selection() {
+        let args = vec![
+            Value::Array(vec![
+                Value::Array(vec![
+                    Value::from("name"),
+                    Value::from("sort"),
+                    Value::from("default"),
+                    Value::from("ignored"),
+                ]),
+                Value::Array(vec![
+                    Value::from("date"),
+                    Value::from("sort"),
+                    Value::from("mtime"),
+                    Value::from("ignored"),
+                ]),
+            ]),
+            Value::from(1),
+            Value::from(0),
+            Value::from(0),
+            Value::from(1),
+        ];
+
+        let state = parse_popupmenu_show(&args).unwrap();
+
+        assert_eq!(state.selected, Some(1));
+        assert_eq!(state.items.len(), 2);
+        assert_eq!(state.items[1].word, "date");
+        assert_eq!(state.items[1].kind, "sort");
+        assert_eq!(state.items[1].menu, "mtime");
+    }
+
+    #[test]
+    fn popupmenu_show_parser_maps_minus_one_to_no_selection() {
+        let args = vec![
+            Value::Array(vec![Value::Array(vec![Value::from("date")])]),
+            Value::from(-1),
+        ];
+
+        let state = parse_popupmenu_show(&args).unwrap();
+
+        assert_eq!(state.selected, None);
+        assert_eq!(state.items[0].word, "date");
+        assert_eq!(state.items[0].kind, "");
+        assert_eq!(state.items[0].menu, "");
+    }
+
+    #[test]
+    fn popupmenu_show_parser_rejects_missing_items_array() {
+        assert_eq!(parse_popupmenu_show(&[]), None);
+        assert_eq!(parse_popupmenu_show(&[Value::from("not-items")]), None);
+    }
+
+    #[test]
+    fn popupmenu_select_parser_maps_selection() {
+        assert_eq!(parse_popupmenu_select(&[Value::from(2)]), Some(Some(2)));
+        assert_eq!(parse_popupmenu_select(&[Value::from(-1)]), Some(None));
+        assert_eq!(parse_popupmenu_select(&[]), None);
     }
 }

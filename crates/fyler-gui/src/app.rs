@@ -7,7 +7,9 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 
 use eframe::egui;
-use fyler_core::editor::{CmdlineState, EditorEngine, EditorEvent, EditorMessage, Mode};
+use fyler_core::editor::{
+    CmdlineState, EditorEngine, EditorEvent, EditorMessage, Mode, PopupmenuState,
+};
 use fyler_core::fileinfo::FileInfo;
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::id::EntryId;
@@ -103,6 +105,7 @@ pub struct FylerApp {
     pub engine: Arc<dyn EditorEngine>,
     event_rx: mpsc::Receiver<GuiEvent>,
     cmdline: Option<CmdlineState>,
+    popupmenu: Option<PopupmenuState>,
     message: Option<EditorMessage>,
     root: PathBuf,
     git_badges: HashMap<EntryId, GitBadge>,
@@ -144,6 +147,7 @@ impl FylerApp {
             engine,
             event_rx,
             cmdline: None,
+            popupmenu: None,
             message: None,
             root: PathBuf::new(),
             git_badges: HashMap::new(),
@@ -170,13 +174,24 @@ impl FylerApp {
                     EditorEvent::NavigateInto { .. } => {}
                     EditorEvent::NavigateParent => {}
                     EditorEvent::ChangeDirectory { .. } => {}
+                    EditorEvent::ChangeSort { .. } => {}
                     EditorEvent::ToggleHidden => {}
                     EditorEvent::Fold { .. } => {}
                     EditorEvent::JumpBookmark { .. } => {}
                     EditorEvent::ShowHelp => self.dialog = Some(DialogState::Help),
                     EditorEvent::CommitRequested { .. } => {}
                     EditorEvent::CmdlineShow(state) => self.cmdline = Some(state),
-                    EditorEvent::CmdlineHide => self.cmdline = None,
+                    EditorEvent::CmdlineHide => {
+                        self.cmdline = None;
+                        self.popupmenu = None;
+                    }
+                    EditorEvent::PopupmenuShow(state) => self.popupmenu = Some(state),
+                    EditorEvent::PopupmenuSelect { selected } => {
+                        if let Some(state) = &mut self.popupmenu {
+                            state.selected = selected;
+                        }
+                    }
+                    EditorEvent::PopupmenuHide => self.popupmenu = None,
                     EditorEvent::Message(message) => self.message = Some(message),
                     EditorEvent::EngineCrashed { reason } => {
                         self.engine_error = Some(format!("Editor engine stopped: {reason}"));
@@ -267,6 +282,9 @@ impl eframe::App for FylerApp {
 
         egui::Panel::bottom("modeline").show(ui, |ui| {
             modeline::draw(ui, &snapshot, &self.root, &self.file_infos);
+            if let Some(state) = &self.popupmenu {
+                cmdline::draw_popupmenu(ui, state);
+            }
             if let Some(state) = &self.cmdline {
                 cmdline::draw_cmdline(ui, state);
             } else if let Some(message) = &self.message {

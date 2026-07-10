@@ -108,6 +108,22 @@ vim.api.nvim_buf_create_user_command(buffer, "FylerCd", function(opts)
 end, { nargs = "?", complete = "dir" })
 vim.cmd([[cnoreabbrev <buffer> <expr> cd (getcmdtype() == ':' && getcmdline() ==# 'cd') ? 'FylerCd' : 'cd']])
 
+local sort_keys = { "name", "date", "size", "ext" }
+vim.api.nvim_buf_create_user_command(buffer, "FylerSort", function(opts)
+  local arg = opts.args
+  if opts.bang and arg ~= "" then arg = arg .. "!" end
+  vim.rpcnotify(channel, "fyler_sort", arg)
+end, {
+  nargs = "?",
+  bang = true,
+  complete = function(arg_lead)
+    return vim.tbl_filter(function(key)
+      return vim.startswith(key, arg_lead)
+    end, sort_keys)
+  end,
+})
+vim.cmd([[cnoreabbrev <buffer> <expr> sort (getcmdtype() == ':' && getcmdline() ==# 'sort') ? 'FylerSort' : 'sort']])
+
 for _, lhs in ipairs({ "gf", "gF", "<C-]>" }) do
   vim.keymap.set({ "n", "x" }, lhs, function()
     vim.rpcnotify(channel, "fyler_action_blocked", lhs)
