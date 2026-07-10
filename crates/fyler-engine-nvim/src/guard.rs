@@ -67,6 +67,66 @@ vim.bo[buffer].expandtab = false
 
 local group = vim.api.nvim_create_augroup("fyler_guards", { clear = true })
 
+local function name_start_col(line)
+  local prefix = line:match("^/%d+ ") or ""
+  local rest = line:sub(#prefix + 1)
+  local tabs = rest:match("^\t*")
+  return #prefix + #tabs
+end
+
+local function shift_lines(first, last, delta)
+  local lines = vim.api.nvim_buf_get_lines(buffer, first, last + 1, false)
+  local changed = false
+  for i, line in ipairs(lines) do
+    if line ~= "" then
+      local prefix, rest = line:match("^(/%d+ )(.*)$")
+      if not prefix then prefix, rest = "", line end
+      if delta > 0 then
+        lines[i] = prefix .. "\t" .. rest
+        changed = true
+      else
+        local tabs, name = rest:match("^(\t*)(.*)$")
+        if #tabs > 0 then
+          lines[i] = prefix .. tabs:sub(2) .. name
+          changed = true
+        end
+      end
+    end
+  end
+  if changed then
+    vim.api.nvim_buf_set_lines(buffer, first, last + 1, false, lines)
+  end
+end
+
+_G.__fyler_shift_delta = 0
+_G.__fyler_shift_op = function(_)
+  local first = vim.api.nvim_buf_get_mark(0, "[")[1] - 1
+  local last = vim.api.nvim_buf_get_mark(0, "]")[1] - 1
+  shift_lines(first, last, _G.__fyler_shift_delta)
+  vim.api.nvim_win_set_cursor(0, { first + 1, 0 })
+end
+
+for lhs, delta in pairs({ [">"] = 1, ["<"] = -1 }) do
+  vim.keymap.set("n", lhs, function()
+    _G.__fyler_shift_delta = delta
+    vim.o.operatorfunc = "v:lua.__fyler_shift_op"
+    return "g@"
+  end, { buffer = buffer, expr = true, silent = true })
+  vim.keymap.set("n", lhs .. lhs, function()
+    _G.__fyler_shift_delta = delta
+    vim.o.operatorfunc = "v:lua.__fyler_shift_op"
+    return "g@_"
+  end, { buffer = buffer, expr = true, silent = true })
+  vim.keymap.set("x", lhs, function()
+    local first = vim.fn.line("v") - 1
+    local last = vim.api.nvim_win_get_cursor(0)[1] - 1
+    if first > last then first, last = last, first end
+    shift_lines(first, last, delta)
+    vim.api.nvim_input("<Esc>")
+    vim.api.nvim_win_set_cursor(0, { first + 1, 0 })
+  end, { buffer = buffer, silent = true })
+end
+
 vim.keymap.set({ "n", "x" }, "<CR>", function()
   local line = vim.api.nvim_win_get_cursor(0)[1] - 1
   vim.rpcnotify(channel, "fyler_open", line)
@@ -150,6 +210,19 @@ for _, event in ipairs(write_events) do
     end,
   })
 end
+
+vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
+  group = group,
+  buffer = buffer,
+  callback = function()
+    local pos = vim.api.nvim_win_get_cursor(0)
+    local line = vim.api.nvim_buf_get_lines(buffer, pos[1] - 1, pos[1], false)[1] or ""
+    local min_col = name_start_col(line)
+    if pos[2] < min_col and #line > min_col then
+      vim.api.nvim_win_set_cursor(0, { pos[1], min_col })
+    end
+  end,
+})
 
 vim.api.nvim_create_autocmd("BufEnter", {
   group = group,

@@ -142,6 +142,103 @@ async fn zc_emits_fold_close_without_native_fold_error() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a compatible nvim executable"]
+async fn shift_indents_after_id_prefix() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, _events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.set_initial_lines(vec![
+        EditorLine::new("/001 dir/"),
+        EditorLine::new("/002 \tchild.txt"),
+        EditorLine::new("/003 top.txt"),
+    ])?;
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 3 && lines[2].text == "/003 top.txt"
+    })
+    .await?;
+
+    engine.send(key_command(Key::Down))?;
+    engine.send(key_command(Key::Down))?;
+    wait_for_cursor(&engine, |line, _| line == 2).await?;
+
+    engine.send(key_command(Key::Char('>')))?;
+    engine.send(key_command(Key::Char('>')))?;
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 3 && lines[2].text == "/003 \ttop.txt"
+    })
+    .await?;
+
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot.lines[2].text, "/003 \ttop.txt");
+    assert!(
+        !snapshot.lines[2].text.starts_with('\t'),
+        "the tab must be inserted after the id prefix, not before it"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn shift_dedent_at_depth_zero_is_noop() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, _events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.set_initial_lines(vec![EditorLine::new("/001 top.txt")])?;
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 1 && lines[0].text == "/001 top.txt"
+    })
+    .await?;
+
+    let revision = engine.snapshot().revision;
+    engine.send(key_command(Key::Char('<')))?;
+    engine.send(key_command(Key::Char('<')))?;
+    wait_for_revision_after(&engine, revision).await?;
+
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot.lines.len(), 1);
+    assert_eq!(snapshot.lines[0].text, "/001 top.txt");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn cursor_clamps_to_name_start() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, _events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.set_initial_lines(vec![EditorLine::new("/001 \tname.txt")])?;
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 1 && lines[0].text == "/001 \tname.txt"
+    })
+    .await?;
+
+    engine.send(key_command(Key::End))?;
+    wait_for_cursor(&engine, |_, col| col > 6).await?;
+    engine.send(key_command(Key::Char('0')))?;
+    wait_for_cursor(&engine, |line, col| line == 0 && col == 6).await?;
+
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot.cursor.line, 0);
+    assert_eq!(snapshot.cursor.col, 6);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
 async fn character_waiting_commands_do_not_block_following_input() -> anyhow::Result<()> {
     let _serial = NVIM_TEST_SERIAL.lock().await;
     let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
@@ -487,6 +584,23 @@ async fn wait_for(engine: &NvimEngine, predicate: impl Fn(&str) -> bool) -> anyh
     .map_err(|_| anyhow::anyhow!("snapshot update timed out"))
 }
 
+async fn wait_for_lines(
+    engine: &NvimEngine,
+    predicate: impl Fn(&[EditorLine]) -> bool,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = engine.snapshot();
+            if predicate(&snapshot.lines) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("snapshot lines did not match predicate"))
+}
+
 async fn wait_for_revision_after(engine: &NvimEngine, revision: u64) -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -511,6 +625,23 @@ async fn wait_for_mode(engine: &NvimEngine, expected: Mode) -> anyhow::Result<()
     })
     .await
     .map_err(|_| anyhow::anyhow!("snapshot mode did not become {expected:?}"))
+}
+
+async fn wait_for_cursor(
+    engine: &NvimEngine,
+    predicate: impl Fn(usize, usize) -> bool,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let cursor = engine.snapshot().cursor;
+            if predicate(cursor.line, cursor.col) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("snapshot cursor did not match predicate"))
 }
 
 async fn wait_for_search(
