@@ -27,7 +27,7 @@ use fyler_fsops::watch::{ExternalChange, FsWatcher};
 use fyler_gui::app::{GuiEvent, GuiOptions};
 use fyler_gui::confirm::ConfirmChoice;
 
-use crate::save_flow::{SaveController, SaveFlowResult, ToggleCollapseResult};
+use crate::save_flow::{FoldResult, SaveController, SaveFlowResult, ToggleCollapseResult};
 
 enum AppEvent {
     Editor(EditorEvent),
@@ -613,6 +613,55 @@ fn run() -> anyhow::Result<()> {
                             return;
                         }
                         git.request(root.clone());
+                    }
+                    AppEvent::Editor(EditorEvent::Fold { op, line }) => {
+                        let snapshot = app_engine.snapshot();
+                        if snapshot.dirty {
+                            if send_gui_message(
+                                &gui_event_tx,
+                                MessageKind::Info,
+                                "編集中は折りたたみを変更できません(:w で確定するか元に戻してください)",
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+
+                        match save_controller.fold(&snapshot.lines, line, op) {
+                            FoldResult::Applied { lines, cursor_line } => {
+                                if let Err(error) =
+                                    app_engine.send(EditorCommand::SetLines { lines, cursor_line })
+                                {
+                                    if send_gui_message(
+                                        &gui_event_tx,
+                                        MessageKind::Error,
+                                        format!("折りたたみ表示を更新できません: {error:#}"),
+                                    )
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                if send_view_state(&gui_event_tx, &save_controller).is_err() {
+                                    return;
+                                }
+                            }
+                            FoldResult::NotFound => {
+                                if send_gui_message(
+                                    &gui_event_tx,
+                                    MessageKind::Info,
+                                    "この行のエントリを解決できません",
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            FoldResult::NoOp | FoldResult::Busy => {}
+                        }
                     }
                     AppEvent::Editor(event) => {
                         if gui_event_tx.send(GuiEvent::Editor(event)).is_err() {

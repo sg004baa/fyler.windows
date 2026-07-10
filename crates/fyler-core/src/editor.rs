@@ -324,6 +324,25 @@ pub struct Modifiers {
     pub shift: bool,
 }
 
+/// z系折りたたみコマンドの操作種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldOp {
+    /// zc: カーソル行を含む折りたたみを閉じる。
+    Close,
+    /// zo: カーソル行のディレクトリを開く。
+    Open,
+    /// za: カーソル行の折りたたみ状態を切り替える。
+    Toggle,
+    /// zC: 対象ディレクトリと子孫ディレクトリをすべて閉じる。
+    CloseRecursive,
+    /// zO: 対象ディレクトリと子孫ディレクトリをすべて開く。
+    OpenRecursive,
+    /// zM: 全ディレクトリを閉じる。
+    CloseAll,
+    /// zR: 全ディレクトリを開く。
+    OpenAll,
+}
+
 /// エンジンからGUI/アプリ層へ届くイベント(エンジン非依存の語彙)。
 ///
 /// NvimEngineでは BufWriteCmd / ext_cmdline / ext_messages / プロセス監視から
@@ -358,6 +377,12 @@ pub enum EditorEvent {
     },
     /// ユーザーが隠しファイル表示の切り替えを要求した。
     ToggleHidden,
+    /// ユーザーが指定行を基準に折りたたみ操作を要求した。
+    /// `line`は0始まり。
+    Fold {
+        op: FoldOp,
+        line: usize,
+    },
     /// ユーザーがブックマークまたは最近使ったルートへのジャンプ、
     /// あるいは候補一覧の表示を要求した。
     JumpBookmark {

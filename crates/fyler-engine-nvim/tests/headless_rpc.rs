@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use fyler_core::editor::{
-    EditorCommand, EditorEngine, EditorEvent, EditorLine, Key, KeyInput, Mode, Modifiers,
+    EditorCommand, EditorEngine, EditorEvent, EditorLine, FoldOp, Key, KeyInput, Mode, Modifiers,
     SearchHighlight,
 };
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
@@ -96,6 +96,39 @@ async fn spawn_attach_and_edit_updates_snapshot() -> anyhow::Result<()> {
         matches!(event, EditorEvent::EngineCrashed { .. })
     })
     .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn zc_emits_fold_close_without_native_fold_error() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.set_initial_lines(vec![
+        EditorLine::new("/001 directory/"),
+        EditorLine::new("/002   child.txt"),
+    ])?;
+    wait_for(&engine, |line| line == "/001 directory/").await?;
+
+    engine.send(key_command(Key::Char('z')))?;
+    engine.send(key_command(Key::Char('c')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            EditorEvent::Fold {
+                op: FoldOp::Close,
+                line: 0
+            }
+        )
+    })
+    .await
+    .context("zc did not emit Fold::Close")?;
 
     Ok(())
 }

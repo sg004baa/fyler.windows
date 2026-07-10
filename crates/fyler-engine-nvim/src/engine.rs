@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use fyler_core::editor::{
     CmdlineState, Cursor, EditorCommand, EditorEngine, EditorEvent, EditorLine, EditorMessage,
-    EditorSnapshot, MessageKind, Mode, SearchHighlight,
+    EditorSnapshot, FoldOp, MessageKind, Mode, SearchHighlight,
 };
 use nvim_rs::compat::tokio::Compat;
 use nvim_rs::create::tokio::new_child_cmd;
@@ -104,7 +104,7 @@ impl NvimEngine {
     ///    `Undo`/`Redo` は `u`/`<C-r>` 相当
     /// 7. **イベント**: BufWriteCmd等のrpcnotify → `EditorEvent::CommitRequested`、
     ///    行アクション → `ActivateLine` / `YankPath` / `NavigateInto` / `NavigateParent` /
-    ///    `ToggleHidden`、ルート選択 → `ChangeDirectory` / `JumpBookmark`、
+    ///    `ToggleHidden` / `Fold`、ルート選択 → `ChangeDirectory` / `JumpBookmark`、
     ///    ext_cmdline → `CmdlineShow/CmdlineHide`、
     ///    ext_messages → `Message`、プロセス終了検知 →
     ///    `EngineCrashed` として `event_tx` へ流す
@@ -355,6 +355,33 @@ impl NvimEngine {
                             }
                             "fyler_toggle_hidden" => {
                                 let _ = event_tx.send(EditorEvent::ToggleHidden);
+                            }
+                            "fyler_fold" => {
+                                let op = notification
+                                    .args
+                                    .first()
+                                    .and_then(Value::as_str)
+                                    .and_then(fold_op_from_str);
+                                let line = notification
+                                    .args
+                                    .get(1)
+                                    .and_then(value_as_u64)
+                                    .and_then(|line| usize::try_from(line).ok());
+                                match (op, line) {
+                                    (Some(op), Some(line)) => {
+                                        let _ = event_tx.send(EditorEvent::Fold { op, line });
+                                    }
+                                    (None, _) => send_message(
+                                        &event_tx,
+                                        MessageKind::Error,
+                                        "折りたたみ操作を取得できません".to_owned(),
+                                    ),
+                                    (_, None) => send_message(
+                                        &event_tx,
+                                        MessageKind::Error,
+                                        "折りたたみ対象の行番号を取得できません".to_owned(),
+                                    ),
+                                }
                             }
                             "fyler_help" => {
                                 let _ = event_tx.send(EditorEvent::ShowHelp);
@@ -977,6 +1004,19 @@ fn value_as_u64(value: &Value) -> Option<u64> {
     value
         .as_u64()
         .or_else(|| value.as_i64().and_then(|number| number.try_into().ok()))
+}
+
+fn fold_op_from_str(op: &str) -> Option<FoldOp> {
+    match op {
+        "close" => Some(FoldOp::Close),
+        "open" => Some(FoldOp::Open),
+        "toggle" => Some(FoldOp::Toggle),
+        "close_rec" => Some(FoldOp::CloseRecursive),
+        "open_rec" => Some(FoldOp::OpenRecursive),
+        "close_all" => Some(FoldOp::CloseAll),
+        "open_all" => Some(FoldOp::OpenAll),
+        _ => None,
+    }
 }
 
 fn normalize_mode(mode: &str) -> Mode {

@@ -80,6 +80,12 @@ vim.keymap.set("n", "g.", function()
   vim.rpcnotify(channel, "fyler_toggle_hidden")
 end, { buffer = buffer, silent = true, nowait = true })
 
+for lhs, op in pairs({ zc = "close", zo = "open", za = "toggle", ["zC"] = "close_rec", ["zO"] = "open_rec", ["zM"] = "close_all", ["zR"] = "open_all" }) do
+  vim.keymap.set("n", lhs, function()
+    vim.rpcnotify(channel, "fyler_fold", op, vim.api.nvim_win_get_cursor(0)[1] - 1)
+  end, { buffer = buffer, silent = true, nowait = true })
+end
+
 vim.keymap.set("n", "gy", function()
   vim.rpcnotify(channel, "fyler_yank_path", vim.api.nvim_win_get_cursor(0)[1] - 1)
 end, { buffer = buffer, silent = true, nowait = true })

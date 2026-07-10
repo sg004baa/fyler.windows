@@ -171,6 +171,7 @@ impl FylerApp {
                     EditorEvent::NavigateParent => {}
                     EditorEvent::ChangeDirectory { .. } => {}
                     EditorEvent::ToggleHidden => {}
+                    EditorEvent::Fold { .. } => {}
                     EditorEvent::JumpBookmark { .. } => {}
                     EditorEvent::ShowHelp => self.dialog = Some(DialogState::Help),
                     EditorEvent::CommitRequested { .. } => {}
