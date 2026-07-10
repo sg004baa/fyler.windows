@@ -11,6 +11,9 @@ use fyler_core::id::EntryId;
 use crate::confirm::IconStyle;
 use crate::{conceal, icon};
 
+/// 1階層ぶんのインデントを空白2文字幅として描画する。
+const INDENT_UNIT_SPACES: &str = "  ";
+
 /// 前フレームのツリー可視範囲。
 #[derive(Debug, Clone, Copy)]
 pub struct TreeViewport {
@@ -53,6 +56,11 @@ pub fn draw(
     let text_color = ui.visuals().text_color();
     let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
     let row_height_with_spacing = row_height + ui.spacing().item_spacing.y;
+    let indent_unit_px = ui
+        .painter()
+        .layout_no_wrap(INDENT_UNIT_SPACES.to_owned(), font_id.clone(), text_color)
+        .size()
+        .x;
     let selection = display_selection(snapshot);
     let requested_offset = if follow_cursor {
         previous_viewport
@@ -80,6 +88,7 @@ pub fn draw(
         for (line_offset, line) in snapshot.lines[row_range].iter().enumerate() {
             let line_index = first_line + line_offset;
             let concealed = conceal::conceal_line(&line.text);
+            let indent_px = indent_offset(concealed.depth, indent_unit_px);
             let painter = ui.painter().clone();
             let icon_galley = painter.layout_no_wrap(
                 format!(
@@ -108,7 +117,7 @@ pub fn draw(
             );
             let icon_width = icon_galley.size().x;
             let badge_width = badge_galley.size().x;
-            let text_offset = icon_width + badge_width;
+            let text_offset = indent_px + icon_width + badge_width;
             let width = ui.available_width().max(text_offset + text_galley.size().x);
             let (rect, _) =
                 ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::hover());
@@ -126,9 +135,13 @@ pub fn draw(
                     text_offset,
                 );
             }
-            painter.galley(rect.min, icon_galley, text_color);
             painter.galley(
-                egui::pos2(rect.left() + icon_width, rect.top()),
+                egui::pos2(rect.left() + indent_px, rect.top()),
+                icon_galley,
+                text_color,
+            );
+            painter.galley(
+                egui::pos2(rect.left() + indent_px + icon_width, rect.top()),
                 badge_galley,
                 badge_color(ui.visuals(), badge),
             );
@@ -258,7 +271,11 @@ fn draw_selection(
     let painter = ui.painter();
 
     if matches!(mode, Mode::VisualLine) {
-        painter.rect_filled(row_rect, 0.0, fill);
+        let selection_rect = egui::Rect::from_min_max(
+            egui::pos2(row_rect.left() + text_offset, row_rect.top()),
+            row_rect.max,
+        );
+        painter.rect_filled(selection_rect, 0.0, fill);
         return;
     }
 
@@ -376,6 +393,10 @@ fn badge_color(visuals: &egui::Visuals, badge: Option<GitBadge>) -> egui::Color3
         Some(GitBadge::Deleted | GitBadge::Conflicted) => visuals.error_fg_color,
         Some(GitBadge::Untracked) | None => visuals.weak_text_color(),
     }
+}
+
+fn indent_offset(depth: usize, unit_px: f32) -> f32 {
+    depth as f32 * unit_px
 }
 
 fn draw_cursor(
@@ -516,6 +537,13 @@ mod tests {
         );
         assert_eq!(badge_for_line("new.txt", &badges), None);
         assert_eq!(badge_for_line("/0", &badges), None);
+    }
+
+    #[test]
+    fn indent_offset_scales_depth_by_measured_unit_width() {
+        assert_eq!(indent_offset(0, 8.0), 0.0);
+        assert_eq!(indent_offset(1, 8.0), 8.0);
+        assert_eq!(indent_offset(3, 8.0), 24.0);
     }
 
     #[test]
