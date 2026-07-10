@@ -92,6 +92,32 @@ vim.keymap.set("n", "?", function()
   vim.rpcnotify(channel, "fyler_help")
 end, { buffer = buffer, silent = true, nowait = true })
 
+vim.keymap.set("n", "<C-w>", function()
+  local key = vim.fn.getcharstr()
+  local actions = {
+    s = "split_horizontal",
+    S = "split_horizontal",
+    v = "split_vertical",
+    h = "focus_left",
+    j = "focus_down",
+    k = "focus_up",
+    l = "focus_right",
+    w = "focus_next",
+    p = "focus_previous",
+    q = "close",
+    c = "close",
+  }
+  local action = actions[key]
+  if key == vim.keycode("<C-w>") then
+    action = "focus_next"
+  end
+  if action then
+    vim.rpcnotify(channel, "fyler_pane", action)
+  else
+    vim.rpcnotify(channel, "fyler_action_blocked", key)
+  end
+end, { buffer = buffer, silent = true, nowait = true })
+
 vim.api.nvim_buf_create_user_command(buffer, "FylerBookmark", function(opts)
   vim.rpcnotify(channel, "fyler_bookmark", opts.args)
 end, { nargs = "?" })

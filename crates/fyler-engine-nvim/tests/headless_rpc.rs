@@ -6,6 +6,7 @@ use fyler_core::editor::{
     EditorCommand, EditorEngine, EditorEvent, EditorLine, Key, KeyInput, Mode, Modifiers,
     SearchHighlight,
 };
+use fyler_core::pane::PaneAction;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -96,6 +97,33 @@ async fn spawn_attach_and_edit_updates_snapshot() -> anyhow::Result<()> {
         matches!(event, EditorEvent::EngineCrashed { .. })
     })
     .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn pane_keymap_emits_split_action() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.send(EditorCommand::Key(KeyInput {
+        key: Key::Char('w'),
+        mods: Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        },
+    }))?;
+    engine.send(key_command(Key::Char('s')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::PaneAction(PaneAction::SplitHorizontal))
+    })
+    .await
+    .context("pane split key did not emit PaneAction")?;
 
     Ok(())
 }

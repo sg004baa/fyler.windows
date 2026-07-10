@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use crate::pane::PaneAction;
+
 /// 編集エンジンの抽象(snapshot + command channel型)。
 ///
 /// - GUIスレッドはRPC完了を**同期待ちしない**。入力は [`EditorEngine::send`] で
@@ -366,6 +368,8 @@ pub enum EditorEvent {
     },
     /// ユーザーがヘルプ表示を要求した。
     ShowHelp,
+    /// ユーザーがpaneの分割・focus移動・closeを要求した。
+    PaneAction(PaneAction),
     /// ユーザーが保存(`:w` 相当)を要求した。`lines` は保存要求時点のsnapshotに
     /// 属する行で、後続編集で更新されたsnapshotを誤ってplanしないため同梱する。
     /// [`crate::save::SaveEvent::CommitRequested`] へ接続する。

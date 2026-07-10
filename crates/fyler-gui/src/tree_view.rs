@@ -7,6 +7,7 @@ use fyler_core::editor::{Cursor, EditorSnapshot, Mode, SearchHighlight};
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::EntryId;
+use fyler_core::pane::PaneId;
 
 use crate::confirm::IconStyle;
 use crate::{conceal, icon};
@@ -40,6 +41,7 @@ pub struct TreeViewOutput {
 /// - Visual系モードの選択範囲ハイライトもここ(M1はカーソルのみでよい)
 /// - アイコン・git status・インデントガイドはバッファ文字列に含まれない
 ///   Rust側装飾として描く(M5)
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     ui: &mut egui::Ui,
     snapshot: &EditorSnapshot,
@@ -48,6 +50,7 @@ pub fn draw(
     icon_style: IconStyle,
     follow_cursor: bool,
     previous_viewport: Option<TreeViewport>,
+    pane_id: PaneId,
 ) -> TreeViewOutput {
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
     let text_color = ui.visuals().text_color();
@@ -70,7 +73,9 @@ pub fn draw(
         None
     };
 
-    let mut scroll_area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+    let mut scroll_area = egui::ScrollArea::vertical()
+        .id_salt(pane_id.get())
+        .auto_shrink([false, false]);
     if let Some(offset) = requested_offset {
         scroll_area = scroll_area.vertical_scroll_offset(offset);
     }
