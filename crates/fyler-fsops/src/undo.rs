@@ -1000,7 +1000,6 @@ mod tests {
             HashSet::new(),
         );
         fs::remove_file(root.path().join("created.txt")).unwrap();
-        fs::write(root.path().join("burner.txt"), b"burner").unwrap();
         fs::write(root.path().join("replacement.tmp"), b"replacement").unwrap();
         fs::rename(
             root.path().join("replacement.tmp"),
@@ -1010,12 +1009,47 @@ mod tests {
 
         let report = apply_undo(&transaction);
 
-        assert_failed_contains(&report.results[0].outcome, "置き換わっています");
+        // 削除→再作成はFSのinode再利用でidentityが偶然一致し得るため、
+        // どの検査(identity or fingerprint)で拒否されたかは環境依存。
+        // 契約は「置き換わった実体を絶対にrecycleしない」こと。
+        assert!(
+            matches!(&report.results[0].outcome, OpOutcome::Failed { .. }),
+            "置き換わったファイルのundoは拒否されるべき: {:?}",
+            report.results[0].outcome
+        );
         assert_eq!(
             fs::read(root.path().join("created.txt")).unwrap(),
             b"replacement"
         );
-        assert_eq!(fs::read(root.path().join("burner.txt")).unwrap(), b"burner");
+    }
+
+    #[test]
+    fn stale_remove_created_rejects_wrong_identity_deterministically() {
+        // inode再利用に依存しないidentity経路の決定的検証:
+        // fingerprintは現物と完全一致させ、identityだけを偽物にする。
+        let root = tempdir().unwrap();
+        let path = absolute_path(&root.path().join("created.txt"));
+        fs::write(&path, b"created").unwrap();
+        let real_identity = crate::identity::capture_identity(&path).unwrap();
+        let post = crate::identity::capture_fingerprint(&path).unwrap();
+        let transaction = UndoTransaction {
+            id: "tx".to_owned(),
+            root: absolute_path(root.path()),
+            steps: vec![UndoStep::RemoveCreated {
+                path: path.clone(),
+                identity: Some(FileIdentity {
+                    volume: real_identity.volume,
+                    file: real_identity.file.wrapping_add(1),
+                }),
+                post,
+            }],
+            backup_dir: None,
+        };
+
+        let report = apply_undo(&transaction);
+
+        assert_failed_contains(&report.results[0].outcome, "置き換わっています");
+        assert_eq!(fs::read(&path).unwrap(), b"created");
     }
 
     #[test]
