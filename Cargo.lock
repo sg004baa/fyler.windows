@@ -1295,7 +1295,7 @@ dependencies = [
 
 [[package]]
 name = "fyler-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "embed-manifest",
@@ -1311,7 +1311,7 @@ dependencies = [
 
 [[package]]
 name = "fyler-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "thiserror 2.0.18",
@@ -1319,7 +1319,7 @@ dependencies = [
 
 [[package]]
 name = "fyler-engine-nvim"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1332,7 +1332,7 @@ dependencies = [
 
 [[package]]
 name = "fyler-fsops"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "fyler-core",
@@ -1344,7 +1344,7 @@ dependencies = [
 
 [[package]]
 name = "fyler-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "eframe",
@@ -1353,7 +1353,7 @@ dependencies = [
 
 [[package]]
 name = "fyler-pipeline"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fyler-core",
 ]
@@ -2007,7 +2007,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "m0-spike"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
