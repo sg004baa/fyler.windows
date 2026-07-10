@@ -29,3 +29,4 @@ mod winattr;
 
 pub use apply::apply_transfer_plan_cancellable;
 pub use preflight::{TransferPreflight, preflight_transfer};
+pub use undo::{UndoRecorder, apply_undo_cancellable, preflight_undo};
