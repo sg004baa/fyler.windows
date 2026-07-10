@@ -6,6 +6,12 @@
 > ただしコメントは **M10(pane分割)以前のsingle-root前提** で書かれており、
 > pane対応とdirtyバッファ契約の2系統の補正を織り込む。
 
+> **2026-07-10 実装済み**(2セッション、codex実装。コミット: 515ba5a / cf21d1f)。
+> Linuxゲート: cargo test --workspace 300件pass、workspace clippy(-D warnings)警告ゼロ、
+> headless RPCスモーク10件pass(実nvim v0.12.3)。**Windows実機動作確認は未実施**。
+> 既知: 既存スモーク set_initial_lines_with_multiple_lines_has_no_duplication は
+> 環境負荷依存で稀にflaky(M10 tipでも再現、本フェーズ起因ではない)。
+
 ## 方針検証の結論(2026-07-10)
 
 ### 採用(コメント通り)
