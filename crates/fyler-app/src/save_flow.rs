@@ -260,6 +260,11 @@ impl SaveController {
         baseline_to_lines(&self.baseline, &self.context)
     }
 
+    /// picker候補の構築と選択時のstale再解決に使う現在のbaselineを返す。
+    pub fn baseline(&self) -> &BaselineTree {
+        &self.baseline
+    }
+
     /// 指定IDのエントリを隠している折りたたみ祖先をすべて展開する。
     ///
     /// 展開後はbaselineから全行を再生成し、その行列と1:1対応する0始まりindexを

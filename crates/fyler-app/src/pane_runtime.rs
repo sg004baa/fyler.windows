@@ -17,7 +17,7 @@ use fyler_core::tree::EntryKind;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
 use fyler_fsops::scan::ScanOptions;
 use fyler_fsops::watch::{ExternalChange, FsWatcher};
-use fyler_gui::app::{GuiEvent, GuiOptions};
+use fyler_gui::app::{GuiAction, GuiEvent, GuiOptions};
 use fyler_gui::confirm::ConfirmChoice;
 
 use super::save_flow::{SaveController, SaveFlowResult};
@@ -28,8 +28,8 @@ use super::transfer_flow::{
 use super::{
     AppEvent, BookmarkResolution, GitRefresher, after_root_change, bookmark_list_message,
     change_root_to, default_root, format_drive_paths, handle_activate_line, handle_external_change,
-    handle_yank_path, normalize_root, resolve_bookmark_query, resolve_cd_target, send_gui_message,
-    send_save_result, send_view_state,
+    handle_open_file_picker, handle_picker_select, handle_yank_path, normalize_root,
+    resolve_bookmark_query, resolve_cd_target, send_gui_message, send_save_result, send_view_state,
 };
 
 const MAX_PANES: usize = 4;
@@ -162,13 +162,25 @@ pub(super) fn run() -> anyhow::Result<()> {
         &app_event_tx,
     )?;
 
-    let (confirm_tx, confirm_rx) = mpsc::channel();
-    let confirm_event_tx = app_event_tx.clone();
-    let confirm_bridge = thread::Builder::new()
-        .name("fyler-confirm-events".to_owned())
+    let (action_tx, action_rx) = mpsc::channel();
+    let action_event_tx = app_event_tx.clone();
+    let action_bridge = thread::Builder::new()
+        .name("fyler-gui-actions".to_owned())
         .spawn(move || {
-            while let Ok(choice) = confirm_rx.recv() {
-                if confirm_event_tx.send(AppEvent::Confirm(choice)).is_err() {
+            while let Ok(action) = action_rx.recv() {
+                let event = match action {
+                    GuiAction::Confirm(choice) => AppEvent::Confirm(choice),
+                    GuiAction::PickerSelect {
+                        pane_id,
+                        entry_id,
+                        action,
+                    } => AppEvent::PickerSelect {
+                        pane_id,
+                        entry_id,
+                        action,
+                    },
+                };
+                if action_event_tx.send(event).is_err() {
                     return;
                 }
             }
@@ -335,10 +347,26 @@ pub(super) fn run() -> anyhow::Result<()> {
                         let Some(session) = panes.get_mut(&pane_id) else {
                             continue;
                         };
-                        if session.crashed {
+                        if session.crashed && !matches!(event, EditorEvent::OpenFilePicker) {
                             continue;
                         }
                         match event {
+                            EditorEvent::OpenFilePicker => {
+                                if handle_open_file_picker(
+                                    pane_id,
+                                    &session.save_controller,
+                                    session.crashed,
+                                    dialog_owner.is_some(),
+                                    apply_owner.is_some(),
+                                    transfer.is_awaiting(),
+                                    transfer.is_running(),
+                                    &gui_event_tx,
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
                             EditorEvent::CommitRequested { changedtick, lines } => {
                                 if apply_owner.is_some()
                                     || dialog_owner.is_some()
@@ -673,6 +701,30 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     return;
                                 }
                             }
+                        }
+                    }
+                    AppEvent::PickerSelect {
+                        pane_id,
+                        entry_id,
+                        action,
+                    } => {
+                        let Some(session) = panes.get_mut(&pane_id) else {
+                            continue;
+                        };
+                        let engine = Arc::clone(&session.engine);
+                        let root = session.root.clone();
+                        if handle_picker_select(
+                            pane_id,
+                            entry_id,
+                            action,
+                            &mut session.save_controller,
+                            engine.as_ref(),
+                            &root,
+                            &gui_event_tx,
+                        )
+                        .is_err()
+                        {
+                            return;
                         }
                     }
                     AppEvent::Confirm(choice) => {
@@ -1063,10 +1115,10 @@ pub(super) fn run() -> anyhow::Result<()> {
         })
         .map_err(|error| anyhow::anyhow!("GUIイベント配線を開始できません: {error}"))?;
 
-    let gui_result = fyler_gui::app::run(gui_event_rx, confirm_tx, gui_options);
+    let gui_result = fyler_gui::app::run(gui_event_rx, action_tx, gui_options);
     let _ = app_event_tx.send(AppEvent::Shutdown);
     let _ = event_bridge.join();
-    let _ = confirm_bridge.join();
+    let _ = action_bridge.join();
     gui_result
 }
 

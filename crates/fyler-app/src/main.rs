@@ -20,20 +20,25 @@ use std::thread;
 use fyler_core::editor::{EditorCommand, EditorEngine, EditorEvent, EditorMessage, MessageKind};
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
-use fyler_core::id::IdAllocator;
+use fyler_core::id::{EntryId, IdAllocator};
 use fyler_core::pane::PaneId;
 use fyler_core::report::{ApplyProgress, CommitReport};
 use fyler_core::transfer::TransferOp;
 use fyler_core::tree::EntryKind;
 use fyler_fsops::watch::{ExternalChange, FsWatcher};
-use fyler_gui::app::GuiEvent;
+use fyler_gui::app::{GuiEvent, PickerAction};
 use fyler_gui::confirm::ConfirmChoice;
 
-use crate::save_flow::{SaveController, SaveFlowResult, ToggleCollapseResult};
+use crate::save_flow::{RevealResult, SaveController, SaveFlowResult, ToggleCollapseResult};
 
 enum AppEvent {
     Editor(PaneId, EditorEvent),
     Confirm(ConfirmChoice),
+    PickerSelect {
+        pane_id: PaneId,
+        entry_id: fyler_core::id::EntryId,
+        action: PickerAction,
+    },
     ExternalChange(PaneId, ExternalChange),
     GitStatus {
         pane_id: PaneId,
@@ -566,6 +571,203 @@ fn handle_yank_path(
     gui_event_tx.send(GuiEvent::CopyPath(path.to_string_lossy().into_owned()))
 }
 
+fn open_file_picker_rejection(
+    dialog_open: bool,
+    apply_running: bool,
+    transfer_awaiting: bool,
+    transfer_running: bool,
+    crashed: bool,
+    save_idle: bool,
+) -> Option<&'static str> {
+    if dialog_open || apply_running || transfer_awaiting || transfer_running {
+        Some("別のダイアログまたはファイル操作が進行中のため、検索を開始できません")
+    } else if crashed {
+        Some("editor engineが停止しているため、検索を開始できません")
+    } else if !save_idle {
+        Some("保存処理中のため、検索を開始できません")
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_open_file_picker(
+    pane_id: PaneId,
+    save_controller: &SaveController,
+    crashed: bool,
+    dialog_open: bool,
+    apply_running: bool,
+    transfer_awaiting: bool,
+    transfer_running: bool,
+    gui_event_tx: &mpsc::Sender<GuiEvent>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    if let Some(message) = open_file_picker_rejection(
+        dialog_open,
+        apply_running,
+        transfer_awaiting,
+        transfer_running,
+        crashed,
+        save_controller.is_idle(),
+    ) {
+        return send_gui_message(gui_event_tx, pane_id, MessageKind::Info, message);
+    }
+    gui_event_tx.send(GuiEvent::ShowFilePicker {
+        pane_id,
+        candidates: fyler_core::search::build_candidates(save_controller.baseline()),
+    })
+}
+
+fn visible_line_for_entry(save_controller: &SaveController, entry_id: EntryId) -> Option<usize> {
+    save_controller.visible_lines().iter().position(|line| {
+        matches!(
+            fyler_core::grammar::split_id_prefix(&line.text),
+            PrefixParse::WithId { id, .. } if id == entry_id
+        )
+    })
+}
+
+fn snapshot_line_matches_entry(
+    snapshot: &fyler_core::editor::EditorSnapshot,
+    line: usize,
+    entry_id: EntryId,
+) -> bool {
+    snapshot.lines.get(line).is_some_and(|editor_line| {
+        matches!(
+            fyler_core::grammar::split_id_prefix(&editor_line.text),
+            PrefixParse::WithId { id, .. } if id == entry_id
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_picker_select_with(
+    pane_id: PaneId,
+    entry_id: EntryId,
+    action: PickerAction,
+    save_controller: &mut SaveController,
+    engine: &dyn EditorEngine,
+    root: &Path,
+    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    open_path: &mut dyn FnMut(&Path) -> anyhow::Result<()>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    let Some(entry) = save_controller.baseline().get(entry_id).cloned() else {
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Warn,
+            "検索候補が見つかりません。外部変更された可能性があります",
+        );
+    };
+
+    if action == PickerAction::Open {
+        let path = entry.path.to_fs_path(root);
+        if let Err(error) = open_path(&path) {
+            send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Error,
+                format!("対象を開けません: {error:#}"),
+            )?;
+        }
+        return Ok(());
+    }
+
+    let snapshot = engine.snapshot();
+    if let Some(line) = visible_line_for_entry(save_controller, entry_id) {
+        if !snapshot_line_matches_entry(&snapshot, line, entry_id) {
+            return send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Info,
+                "編集中の行位置が検索候補と一致しないため移動できません",
+            );
+        }
+        if let Err(error) = engine.send(EditorCommand::SetCursorLine(line)) {
+            send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Error,
+                format!("検索候補へ移動できません: {error:#}"),
+            )?;
+        }
+        return Ok(());
+    }
+
+    if snapshot.dirty {
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Info,
+            "編集中は折りたたまれた検索候補を展開できません。保存または破棄してください",
+        );
+    }
+
+    match save_controller.reveal_entry(entry_id) {
+        RevealResult::AlreadyVisible { line } => {
+            if let Err(error) = engine.send(EditorCommand::SetCursorLine(line)) {
+                send_gui_message(
+                    gui_event_tx,
+                    pane_id,
+                    MessageKind::Error,
+                    format!("検索候補へ移動できません: {error:#}"),
+                )?;
+            }
+        }
+        RevealResult::Revealed { lines, line } => {
+            if let Err(error) = engine.send(EditorCommand::SetLines {
+                lines,
+                cursor_line: Some(line),
+            }) {
+                send_gui_message(
+                    gui_event_tx,
+                    pane_id,
+                    MessageKind::Error,
+                    format!("検索候補を展開できません: {error:#}"),
+                )?;
+            }
+            send_view_state(gui_event_tx, pane_id, save_controller)?;
+        }
+        RevealResult::NotFound => {
+            send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Warn,
+                "検索候補が見つかりません。外部変更された可能性があります",
+            )?;
+        }
+        RevealResult::Busy => {
+            send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Info,
+                "保存処理中のため検索候補へ移動できません",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn handle_picker_select(
+    pane_id: PaneId,
+    entry_id: EntryId,
+    action: PickerAction,
+    save_controller: &mut SaveController,
+    engine: &dyn EditorEngine,
+    root: &Path,
+    gui_event_tx: &mpsc::Sender<GuiEvent>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    handle_picker_select_with(
+        pane_id,
+        entry_id,
+        action,
+        save_controller,
+        engine,
+        root,
+        gui_event_tx,
+        &mut fyler_fsops::open::open_with_default_app,
+    )
+}
+
 fn send_gui_message(
     gui_event_tx: &mpsc::Sender<GuiEvent>,
     pane_id: PaneId,
@@ -660,7 +862,94 @@ fn send_save_result(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use fyler_core::editor::{EditorLine, EditorSnapshot};
+    use fyler_core::tree::{BaselineEntry, BaselineTree};
+
     use super::*;
+
+    struct PickerEngine {
+        snapshot: Mutex<EditorSnapshot>,
+        commands: Mutex<Vec<EditorCommand>>,
+    }
+
+    impl Default for PickerEngine {
+        fn default() -> Self {
+            Self {
+                snapshot: Mutex::new(EditorSnapshot::empty()),
+                commands: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl EditorEngine for PickerEngine {
+        fn send(&self, command: EditorCommand) -> anyhow::Result<()> {
+            self.commands.lock().unwrap().push(command);
+            Ok(())
+        }
+
+        fn snapshot(&self) -> Arc<EditorSnapshot> {
+            Arc::new(self.snapshot.lock().unwrap().clone())
+        }
+    }
+
+    impl PickerEngine {
+        fn set_snapshot(&self, lines: Vec<EditorLine>, dirty: bool) {
+            let mut snapshot = EditorSnapshot::empty();
+            snapshot.lines = lines.into();
+            snapshot.dirty = dirty;
+            *self.snapshot.lock().unwrap() = snapshot;
+        }
+
+        fn commands(&self) -> Vec<EditorCommand> {
+            self.commands.lock().unwrap().clone()
+        }
+    }
+
+    fn picker_baseline() -> BaselineTree {
+        let mut baseline = BaselineTree::new("root");
+        for (id, path, kind) in [
+            (1, "dir", EntryKind::Dir),
+            (2, "dir/file.txt", EntryKind::File),
+            (3, "link", EntryKind::Symlink),
+            (4, "other", EntryKind::Dir),
+        ] {
+            baseline.insert(BaselineEntry {
+                id: EntryId(id),
+                path: fyler_core::path::TreePath::parse(path),
+                kind,
+            });
+        }
+        baseline
+    }
+
+    fn picker_controller(collapsed: bool, dirty: bool) -> (SaveController, Arc<PickerEngine>) {
+        let engine = Arc::new(PickerEngine::default());
+        let save_engine: Arc<dyn EditorEngine> = engine.clone();
+        let mut controller = SaveController::new(
+            PathBuf::from("root"),
+            IdAllocator::new(),
+            picker_baseline(),
+            save_engine,
+        );
+        if collapsed {
+            controller.collapse_all_dirs();
+        }
+        engine.set_snapshot(controller.visible_lines(), dirty);
+        (controller, engine)
+    }
+
+    fn received_message(receiver: &mpsc::Receiver<GuiEvent>) -> EditorMessage {
+        let GuiEvent::Editor {
+            event: EditorEvent::Message(message),
+            ..
+        } = receiver.recv().unwrap()
+        else {
+            panic!("expected GUI message")
+        };
+        message
+    }
 
     #[test]
     fn normalize_root_removes_joined_current_directory_component() {
@@ -792,6 +1081,216 @@ mod tests {
         assert_eq!(
             resolve_bookmark_query("missing", &bookmarks, &recent),
             BookmarkResolution::NotFound
+        );
+    }
+
+    #[test]
+    fn picker_start_gate_rejects_each_busy_or_crashed_condition() {
+        for conditions in [
+            (true, false, false, false, false, true),
+            (false, true, false, false, false, true),
+            (false, false, true, false, false, true),
+            (false, false, false, true, false, true),
+            (false, false, false, false, true, true),
+            (false, false, false, false, false, false),
+        ] {
+            assert!(
+                open_file_picker_rejection(
+                    conditions.0,
+                    conditions.1,
+                    conditions.2,
+                    conditions.3,
+                    conditions.4,
+                    conditions.5,
+                )
+                .is_some()
+            );
+        }
+        assert!(open_file_picker_rejection(false, false, false, false, false, true).is_none());
+    }
+
+    #[test]
+    fn dirty_buffer_can_open_picker() {
+        let (controller, _engine) = picker_controller(false, true);
+        let (gui_tx, gui_rx) = mpsc::channel();
+
+        handle_open_file_picker(
+            PaneId::new(1),
+            &controller,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &gui_tx,
+        )
+        .unwrap();
+
+        let GuiEvent::ShowFilePicker {
+            pane_id,
+            candidates,
+        } = gui_rx.recv().unwrap()
+        else {
+            panic!("expected picker event")
+        };
+        assert_eq!(pane_id, PaneId::new(1));
+        assert_eq!(candidates.len(), 4);
+    }
+
+    #[test]
+    fn stale_picker_selection_only_notifies() {
+        let (mut controller, engine) = picker_controller(false, false);
+        let (gui_tx, gui_rx) = mpsc::channel();
+        let mut opened = Vec::new();
+
+        handle_picker_select_with(
+            PaneId::new(1),
+            EntryId(999),
+            PickerAction::Open,
+            &mut controller,
+            engine.as_ref(),
+            Path::new("root"),
+            &gui_tx,
+            &mut |path| {
+                opened.push(path.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(opened.is_empty());
+        assert!(engine.commands().is_empty());
+        assert!(received_message(&gui_rx).text.contains("外部変更"));
+    }
+
+    #[test]
+    fn picker_jump_to_visible_entry_sends_cursor_only() {
+        let (mut controller, engine) = picker_controller(false, false);
+        let (gui_tx, _gui_rx) = mpsc::channel();
+
+        handle_picker_select_with(
+            PaneId::new(1),
+            EntryId(2),
+            PickerAction::Jump,
+            &mut controller,
+            engine.as_ref(),
+            Path::new("root"),
+            &gui_tx,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(engine.commands(), vec![EditorCommand::SetCursorLine(1)]);
+    }
+
+    #[test]
+    fn picker_jump_reveals_collapsed_ancestors_and_sends_view_state() {
+        let (mut controller, engine) = picker_controller(true, false);
+        let (gui_tx, gui_rx) = mpsc::channel();
+
+        handle_picker_select_with(
+            PaneId::new(1),
+            EntryId(2),
+            PickerAction::Jump,
+            &mut controller,
+            engine.as_ref(),
+            Path::new("root"),
+            &gui_tx,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+
+        let commands = engine.commands();
+        assert!(matches!(
+            commands.as_slice(),
+            [EditorCommand::SetLines {
+                cursor_line: Some(1),
+                ..
+            }]
+        ));
+        assert!(matches!(gui_rx.recv().unwrap(), GuiEvent::FileInfos { .. }));
+        let GuiEvent::CollapsedDirs { dirs, .. } = gui_rx.recv().unwrap() else {
+            panic!("expected collapsed directory state")
+        };
+        assert!(!dirs.contains(&EntryId(1)));
+    }
+
+    #[test]
+    fn picker_jump_rejects_dirty_collapsed_entry() {
+        let (mut controller, engine) = picker_controller(true, true);
+        let (gui_tx, gui_rx) = mpsc::channel();
+
+        handle_picker_select_with(
+            PaneId::new(1),
+            EntryId(2),
+            PickerAction::Jump,
+            &mut controller,
+            engine.as_ref(),
+            Path::new("root"),
+            &gui_tx,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+
+        assert!(engine.commands().is_empty());
+        assert!(received_message(&gui_rx).text.contains("編集中"));
+        assert!(controller.collapsed_dirs().contains(&EntryId(1)));
+    }
+
+    #[test]
+    fn picker_jump_rejects_dirty_visible_line_with_mismatched_id() {
+        let (mut controller, engine) = picker_controller(false, true);
+        let mut lines = controller.visible_lines();
+        lines[1] = EditorLine::new("edited without id");
+        engine.set_snapshot(lines, true);
+        let (gui_tx, gui_rx) = mpsc::channel();
+
+        handle_picker_select_with(
+            PaneId::new(1),
+            EntryId(2),
+            PickerAction::Jump,
+            &mut controller,
+            engine.as_ref(),
+            Path::new("root"),
+            &gui_tx,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+
+        assert!(engine.commands().is_empty());
+        assert!(received_message(&gui_rx).text.contains("一致しない"));
+    }
+
+    #[test]
+    fn picker_open_uses_default_open_path_for_every_entry_kind() {
+        let (mut controller, engine) = picker_controller(true, true);
+        let (gui_tx, _gui_rx) = mpsc::channel();
+        let mut opened = Vec::new();
+
+        for id in [EntryId(2), EntryId(3), EntryId(1)] {
+            handle_picker_select_with(
+                PaneId::new(1),
+                id,
+                PickerAction::Open,
+                &mut controller,
+                engine.as_ref(),
+                Path::new("root"),
+                &gui_tx,
+                &mut |path| {
+                    opened.push(path.to_path_buf());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            opened,
+            vec![
+                PathBuf::from("root/dir/file.txt"),
+                PathBuf::from("root/link"),
+                PathBuf::from("root/dir"),
+            ]
         );
     }
 }
