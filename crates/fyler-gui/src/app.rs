@@ -291,6 +291,7 @@ impl FylerApp {
                     EditorEvent::PaneAction(_) => {}
                     EditorEvent::TransferRequested { .. } => {}
                     EditorEvent::CommitRequested { .. } => {}
+                    EditorEvent::UndoRequested => {}
                     EditorEvent::CmdlineShow(state) if self.active == Some(pane_id) => {
                         self.cmdline = Some(state);
                     }

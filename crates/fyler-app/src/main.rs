@@ -167,7 +167,10 @@ fn handle_external_change(
     root: &Path,
 ) -> Result<bool, mpsc::SendError<GuiEvent>> {
     let result = save_controller.on_external_change(changed_paths);
-    let invalidated_dialog = matches!(&result, SaveFlowResult::PlanInvalidated(_));
+    let invalidated_dialog = matches!(
+        &result,
+        SaveFlowResult::PlanInvalidated(_) | SaveFlowResult::UndoInvalidated { .. }
+    );
     if !matches!(&result, SaveFlowResult::NoChanges) {
         send_save_result(gui_event_tx, pane_id, result)?;
     }
@@ -821,6 +824,32 @@ fn send_save_result(
             gui_event_tx.send(GuiEvent::ShowValidationErrors(errors))
         }
         SaveFlowResult::ShowReport(report) => gui_event_tx.send(GuiEvent::ShowReport(report)),
+        SaveFlowResult::ShowUndoPlan { .. } => {
+            // TODO(M12-D): undo確認ダイアログをGUIへ配線する。
+            send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Info,
+                "undo確認UIは次セッションで配線します",
+            )
+        }
+        SaveFlowResult::UndoNothingLeft { reasons } => {
+            let message = if reasons.is_empty() {
+                "undoできる操作がありません".to_owned()
+            } else {
+                format!("undoできる操作がありません: {}", reasons.join(" / "))
+            };
+            send_gui_message(gui_event_tx, pane_id, MessageKind::Info, message)
+        }
+        SaveFlowResult::ShowUndoReport(_) => {
+            // TODO(M12-D): undo結果ダイアログをGUIへ配線する。
+            send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Info,
+                "undo結果UIは次セッションで配線します",
+            )
+        }
         SaveFlowResult::ReconcileFailed { report, error } => {
             gui_event_tx.send(GuiEvent::ShowReport(report))?;
             gui_event_tx.send(GuiEvent::FatalError(format!(
@@ -838,14 +867,27 @@ fn send_save_result(
             gui_event_tx.send(GuiEvent::CloseDialog)?;
             send_gui_message(gui_event_tx, pane_id, MessageKind::Warn, text)
         }
+        SaveFlowResult::UndoInvalidated { message, .. } => {
+            gui_event_tx.send(GuiEvent::CloseDialog)?;
+            send_gui_message(gui_event_tx, pane_id, MessageKind::Warn, message)
+        }
         SaveFlowResult::NoChanges => {
             send_gui_message(gui_event_tx, pane_id, MessageKind::Info, "変更はありません")
         }
         SaveFlowResult::Cancelled => gui_event_tx.send(GuiEvent::CloseDialog),
+        SaveFlowResult::UndoCancelled { .. } => gui_event_tx.send(GuiEvent::CloseDialog),
         SaveFlowResult::StartApply { .. } => {
             debug_assert!(
                 false,
                 "StartApplyはConfirm armで処理済みである必要があります"
+            );
+            Ok(())
+        }
+        SaveFlowResult::StartUndo { .. } => {
+            // TODO(M12-D): undo worker起動をConfirm armへ配線する。
+            debug_assert!(
+                false,
+                "StartUndoはConfirm armで処理済みである必要があります"
             );
             Ok(())
         }
