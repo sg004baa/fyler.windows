@@ -155,14 +155,17 @@ mod tests {
 
         let labels = steps.iter().map(undo_step_label).collect::<Vec<_>>();
 
+        // PathBuf::join はWindowsで `\` 区切りになるため、期待値も同じ
+        // display() から組み立てる(表示契約は「pathをそのままdisplay」)。
+        let p = |name: &str| root.join(name).display().to_string();
         assert_eq!(
             labels,
             [
-                "UNDO CREATE /root/created.txt",
-                "UNDO COPY /root/copied.txt",
-                "UNDO MOVE /root/b.txt → /root/a.txt",
-                "UNDO DELETE /root/deleted.txt",
-                "UNDO OVERWRITE /root/target.txt",
+                format!("UNDO CREATE {}", p("created.txt")),
+                format!("UNDO COPY {}", p("copied.txt")),
+                format!("UNDO MOVE {} → {}", p("b.txt"), p("a.txt")),
+                format!("UNDO DELETE {}", p("deleted.txt")),
+                format!("UNDO OVERWRITE {}", p("target.txt")),
             ]
         );
     }
