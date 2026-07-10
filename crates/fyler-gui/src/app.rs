@@ -114,6 +114,10 @@ pub enum GuiEvent {
         /// 承認時に既存実体をごみ箱へ退避する移動先。plan順。
         overwrites: Vec<TreePath>,
     },
+    /// undo確認ダイアログを表示する。行はapp層で整形済み。
+    ShowUndoPlan {
+        lines: Vec<String>,
+    },
     /// apply開始時に操作総数を設定して進捗ダイアログを表示する。
     ShowApplyProgress {
         /// 承認済みplanに含まれる操作総数。
@@ -121,6 +125,8 @@ pub enum GuiEvent {
     },
     /// apply workerから届いた操作単位の進捗を表示へ反映する。
     ApplyProgress(ApplyProgress),
+    /// undo workerから届いた操作単位の進捗を表示へ反映する。
+    UndoProgress(ApplyProgress<String>),
     ShowTransferPlan {
         plan: TransferPlan,
         target: PaneId,
@@ -130,8 +136,17 @@ pub enum GuiEvent {
     /// キャンセル要求を受理済みとして進捗ダイアログの操作を無効化する。
     ApplyCancelRequested,
     ShowReport(CommitReport),
+    /// undo結果ダイアログを表示する。行はapp層で整形済み。
+    ShowUndoReport {
+        lines: Vec<String>,
+        any_failed: bool,
+    },
     ShowTransferReport(CommitReport<TransferOp>),
     ShowValidationErrors(Vec<ValidateError>),
+    /// 起動時復旧ダイアログを表示する。行はapp層で整形済み。
+    ShowUndoRecovery {
+        descriptions: Vec<String>,
+    },
     FatalError(String),
     CloseDialog,
 }
@@ -142,6 +157,9 @@ enum DialogState {
         plan: OperationPlan,
         warnings: Vec<String>,
         overwrites: Vec<TreePath>,
+    },
+    UndoPlan {
+        lines: Vec<String>,
     },
     TransferPlan {
         plan: TransferPlan,
@@ -156,8 +174,15 @@ enum DialogState {
         cancel_requested: bool,
     },
     Report(CommitReport),
+    UndoReport {
+        lines: Vec<String>,
+        any_failed: bool,
+    },
     TransferReport(CommitReport<TransferOp>),
     ValidationErrors(Vec<ValidateError>),
+    UndoRecovery {
+        descriptions: Vec<String>,
+    },
     FilePicker {
         pane_id: PaneId,
         candidates: Vec<SearchCandidate>,
@@ -362,6 +387,9 @@ impl FylerApp {
                         overwrites,
                     });
                 }
+                GuiEvent::ShowUndoPlan { lines } => {
+                    self.dialog = Some(DialogState::UndoPlan { lines });
+                }
                 GuiEvent::ShowTransferPlan {
                     plan,
                     target,
@@ -394,6 +422,19 @@ impl FylerApp {
                         *current = progress.current.as_ref().map(confirm::operation_label);
                     }
                 }
+                GuiEvent::UndoProgress(progress) => {
+                    if let Some(DialogState::Progress {
+                        completed,
+                        total,
+                        current,
+                        ..
+                    }) = &mut self.dialog
+                    {
+                        *completed = progress.completed;
+                        *total = progress.total;
+                        *current = progress.current;
+                    }
+                }
                 GuiEvent::TransferProgress(progress) => {
                     if let Some(DialogState::Progress {
                         completed,
@@ -421,11 +462,17 @@ impl FylerApp {
                 GuiEvent::ShowReport(report) => {
                     self.dialog = Some(DialogState::Report(report));
                 }
+                GuiEvent::ShowUndoReport { lines, any_failed } => {
+                    self.dialog = Some(DialogState::UndoReport { lines, any_failed });
+                }
                 GuiEvent::ShowTransferReport(report) => {
                     self.dialog = Some(DialogState::TransferReport(report));
                 }
                 GuiEvent::ShowValidationErrors(errors) => {
                     self.dialog = Some(DialogState::ValidationErrors(errors));
+                }
+                GuiEvent::ShowUndoRecovery { descriptions } => {
+                    self.dialog = Some(DialogState::UndoRecovery { descriptions });
                 }
                 GuiEvent::FatalError(error) => {
                     self.fatal_error = Some(error);
@@ -532,11 +579,20 @@ impl eframe::App for FylerApp {
             }) => {
                 confirm_choice = confirm::draw_transfer_plan(ui, plan, *target, overwrites);
             }
+            Some(DialogState::UndoPlan { lines }) => {
+                confirm_choice = confirm::draw_undo_plan(ui, lines);
+            }
             Some(DialogState::Report(report)) => {
                 dismiss_report = confirm::draw_report(ui, report);
             }
+            Some(DialogState::UndoReport { lines, any_failed }) => {
+                dismiss_report = confirm::draw_undo_report(ui, lines, *any_failed);
+            }
             Some(DialogState::TransferReport(report)) => {
                 dismiss_report = confirm::draw_transfer_report(ui, report);
+            }
+            Some(DialogState::UndoRecovery { descriptions }) => {
+                confirm_choice = confirm::draw_undo_recovery(ui, descriptions);
             }
             Some(DialogState::Progress {
                 completed,

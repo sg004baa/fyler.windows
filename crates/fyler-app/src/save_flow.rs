@@ -314,6 +314,17 @@ impl SaveController {
         )
     }
 
+    /// 実行中undo transactionのIDを返す。
+    ///
+    /// app層がundo worker完了後にjournalを消費済みへ進めるために使う。状態機械の
+    /// 所有権は移さず、`ApplyingUndo`以外では`None`を返す。
+    pub fn applying_undo_transaction_id(&self) -> Option<&str> {
+        match &self.state {
+            SaveState::ApplyingUndo { transaction } => Some(&transaction.id),
+            _ => None,
+        }
+    }
+
     /// バッファの`line`に埋め込まれたIDを現在のbaselineへ解決する。
     ///
     /// 戻り値は表示上の編集済みパスではなく、最後に実FSと同期したルート相対パスと

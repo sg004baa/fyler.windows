@@ -11,9 +11,10 @@ use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::{EntryId, IdAllocator};
 use fyler_core::pane::{FocusDirection, PaneAction, PaneId, PaneLayout, SplitDirection};
-use fyler_core::report::{CommitReport, OpOutcome, OpResult};
+use fyler_core::report::{ApplyProgress, CommitReport, OpOutcome, OpResult};
 use fyler_core::transfer::TransferKind;
 use fyler_core::tree::EntryKind;
+use fyler_core::undo::UndoTransaction;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
 use fyler_fsops::scan::ScanOptions;
 use fyler_fsops::watch::{ExternalChange, FsWatcher};
@@ -31,6 +32,7 @@ use super::{
     handle_open_file_picker, handle_picker_select, handle_yank_path, normalize_root,
     resolve_bookmark_query, resolve_cd_target, send_gui_message, send_save_result, send_view_state,
 };
+use super::{undo_format, undo_journal};
 
 const MAX_PANES: usize = 4;
 
@@ -44,6 +46,7 @@ struct PaneSession {
     watch_tx: mpsc::Sender<ExternalChange>,
     git_badges: HashMap<EntryId, GitBadge>,
     deferred_changes: BTreeSet<PathBuf>,
+    undo_slot: Option<UndoTransaction>,
     crashed: bool,
 }
 
@@ -120,6 +123,7 @@ fn create_pane(
         watch_tx,
         git_badges: HashMap::new(),
         deferred_changes: BTreeSet::new(),
+        undo_slot: None,
         crashed: false,
     })
 }
@@ -161,6 +165,25 @@ pub(super) fn run() -> anyhow::Result<()> {
         Arc::clone(&shared_ids),
         &app_event_tx,
     )?;
+    let (journal, journal_warning) = match undo_journal::UndoJournal::open() {
+        Ok(journal) => (Some(journal), None),
+        Err(error) => (
+            None,
+            Some(format!(
+                "undo journalを開けません。次のapplyはundo不可になります: {error:#}"
+            )),
+        ),
+    };
+    let (pending_recovery, recovery_warning) = match &journal {
+        Some(journal) => match journal.scan_on_startup() {
+            Ok(entries) => (entries, None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!("undo journalの起動時走査に失敗しました: {error:#}")),
+            ),
+        },
+        None => (Vec::new(), None),
+    };
 
     let (action_tx, action_rx) = mpsc::channel();
     let action_event_tx = app_event_tx.clone();
@@ -213,6 +236,7 @@ pub(super) fn run() -> anyhow::Result<()> {
             let mut dialog_owner = None;
             let mut apply_owner = None;
             let mut transfer = TransferController::new();
+            let mut pending_recovery = pending_recovery;
 
             if send_view_state(
                 &gui_event_tx,
@@ -235,6 +259,18 @@ pub(super) fn run() -> anyhow::Result<()> {
             {
                 return;
             }
+            if let Some(warning) = &journal_warning
+                && send_gui_message(&gui_event_tx, initial_id, MessageKind::Warn, warning)
+                    .is_err()
+            {
+                return;
+            }
+            if let Some(warning) = &recovery_warning
+                && send_gui_message(&gui_event_tx, initial_id, MessageKind::Warn, warning)
+                    .is_err()
+            {
+                return;
+            }
             if let Err(error) = super::config::record_recent_root(&panes[&initial_id].root)
                 && send_gui_message(
                     &gui_event_tx,
@@ -243,6 +279,15 @@ pub(super) fn run() -> anyhow::Result<()> {
                     format!("最近使ったルートを記録できません: {error:#}"),
                 )
                 .is_err()
+            {
+                return;
+            }
+            if undo_format::should_show_undo_recovery(&pending_recovery)
+                && gui_event_tx
+                    .send(GuiEvent::ShowUndoRecovery {
+                        descriptions: undo_format::recovery_descriptions(&pending_recovery),
+                    })
+                    .is_err()
             {
                 return;
             }
@@ -272,6 +317,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                             &mut last_active,
                             &mut next_pane_id,
                             &mut git,
+                            journal.as_ref(),
                             dialog_owner,
                             apply_owner.is_some()
                                 || transfer.is_awaiting()
@@ -288,7 +334,11 @@ pub(super) fn run() -> anyhow::Result<()> {
                         };
                         session.crashed = true;
                         if dialog_owner == Some(pane_id) {
-                            let _ = session.save_controller.on_choice(ConfirmChoice::Cancel);
+                            if let SaveFlowResult::UndoCancelled { transaction } =
+                                session.save_controller.on_choice(ConfirmChoice::Cancel)
+                            {
+                                session.undo_slot = Some(transaction);
+                            }
                             dialog_owner = None;
                             if gui_event_tx.send(GuiEvent::CloseDialog).is_err() {
                                 return;
@@ -388,6 +438,57 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 let result = session.save_controller.on_commit(changedtick, &lines);
                                 if matches!(result, SaveFlowResult::ShowPlan { .. }) {
                                     dialog_owner = Some(pane_id);
+                                }
+                                if send_save_result(&gui_event_tx, pane_id, result).is_err() {
+                                    return;
+                                }
+                            }
+                            EditorEvent::UndoRequested => {
+                                if let Some(reason) = undo_rejection(
+                                    session.engine.snapshot().dirty,
+                                    session.undo_slot.is_none(),
+                                    apply_owner.is_some()
+                                        || dialog_owner.is_some()
+                                        || transfer.is_awaiting()
+                                        || transfer.is_running(),
+                                ) {
+                                    if send_gui_message(
+                                        &gui_event_tx,
+                                        pane_id,
+                                        MessageKind::Info,
+                                        reason,
+                                    )
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                let Some(transaction) = session.undo_slot.take() else {
+                                    continue;
+                                };
+                                let restore_transaction = transaction.clone();
+                                let result = session.save_controller.request_undo(transaction);
+                                match &result {
+                                    SaveFlowResult::ShowUndoPlan { .. } => {
+                                        dialog_owner = Some(pane_id);
+                                    }
+                                    SaveFlowResult::UndoNothingLeft { .. } => {
+                                        if let Some(journal) = &journal
+                                            && let Err(error) =
+                                                journal.discard(&restore_transaction.id)
+                                        {
+                                            eprintln!(
+                                                "undo journalを破棄できません: {error:#}"
+                                            );
+                                        }
+                                    }
+                                    SaveFlowResult::Ignored => {
+                                        session.undo_slot = Some(restore_transaction);
+                                    }
+                                    _ => {
+                                        session.undo_slot = Some(restore_transaction);
+                                    }
                                 }
                                 if send_save_result(&gui_event_tx, pane_id, result).is_err() {
                                     return;
@@ -728,6 +829,25 @@ pub(super) fn run() -> anyhow::Result<()> {
                         }
                     }
                     AppEvent::Confirm(choice) => {
+                        if !pending_recovery.is_empty() {
+                            if choice == ConfirmChoice::Approve
+                                && let Some(journal) = &journal
+                            {
+                                for entry in &pending_recovery {
+                                    if let Err(error) = journal.discard(&entry.id) {
+                                        eprintln!(
+                                            "undo復旧候補を破棄できません: {}: {error:#}",
+                                            entry.dir.display()
+                                        );
+                                    }
+                                }
+                            }
+                            pending_recovery.clear();
+                            if gui_event_tx.send(GuiEvent::CloseDialog).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
                         if transfer.is_awaiting() || transfer.is_running() {
                             match transfer.on_choice(choice) {
                                 TransferFlowResult::StartApply {
@@ -737,6 +857,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     overwrites,
                                     cancel,
                                 } => {
+                                    discard_all_undo_slots(&mut panes, journal.as_ref());
                                     for pane_id in [source, target] {
                                         if let Some(session) = panes.get(&pane_id) {
                                             let _ = session
@@ -827,6 +948,35 @@ pub(super) fn run() -> anyhow::Result<()> {
                             } => {
                                 dialog_owner = None;
                                 apply_owner = Some(pane_id);
+                                let mut recorder = None;
+                                let mut recorder_id = None;
+                                if let Some(journal) = &journal {
+                                    let id = undo_journal::new_transaction_id();
+                                    match journal.begin(&id, &session.root) {
+                                        Ok(dir) => {
+                                            recorder = Some(fyler_fsops::UndoRecorder::new(
+                                                id.clone(),
+                                                session.root.clone(),
+                                                dir,
+                                            ));
+                                            recorder_id = Some(id);
+                                        }
+                                        Err(error) => {
+                                            if send_gui_message(
+                                                &gui_event_tx,
+                                                pane_id,
+                                                MessageKind::Warn,
+                                                format!(
+                                                    "undo journalを開始できません。このapplyはundo不可です: {error:#}"
+                                                ),
+                                            )
+                                            .is_err()
+                                            {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
                                 if gui_event_tx
                                     .send(GuiEvent::ShowApplyProgress {
                                         total: plan.ops.len(),
@@ -841,6 +991,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 let spawn_result = thread::Builder::new()
                                     .name("fyler-apply".to_owned())
                                     .spawn(move || {
+                                        let mut recorder = recorder;
                                         let report =
                                             fyler_fsops::apply::apply_plan_cancellable(
                                                 &worker_root,
@@ -852,12 +1003,24 @@ pub(super) fn run() -> anyhow::Result<()> {
                                                         AppEvent::ApplyProgress(pane_id, progress),
                                                     );
                                                 },
-                                                None,
+                                                recorder.as_mut(),
                                             );
-                                        let _ = worker_event_tx
-                                            .send(AppEvent::ApplyFinished(pane_id, report));
+                                        let transaction =
+                                            recorder.map(fyler_fsops::UndoRecorder::into_transaction);
+                                        let _ = worker_event_tx.send(AppEvent::ApplyFinished(
+                                            pane_id,
+                                            report,
+                                            transaction,
+                                        ));
                                     });
                                 if let Err(error) = spawn_result {
+                                    if let (Some(journal), Some(id)) = (&journal, recorder_id)
+                                        && let Err(error) = journal.discard(&id)
+                                    {
+                                        eprintln!(
+                                            "起動失敗したapplyのundo journalを破棄できません: {error:#}"
+                                        );
+                                    }
                                     let error = format!("apply workerを開始できません: {error}");
                                     let report = CommitReport {
                                         results: plan
@@ -873,7 +1036,68 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             .collect(),
                                     };
                                     if event_tx
-                                        .send(AppEvent::ApplyFinished(pane_id, report))
+                                        .send(AppEvent::ApplyFinished(pane_id, report, None))
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                            SaveFlowResult::StartUndo {
+                                transaction,
+                                cancel,
+                            } => {
+                                dialog_owner = None;
+                                apply_owner = Some(pane_id);
+                                if let Some(journal) = &journal
+                                    && let Err(error) = journal.mark_undoing(&transaction.id)
+                                {
+                                    eprintln!(
+                                        "undo journalをUndoingへ更新できません: {error:#}"
+                                    );
+                                }
+                                if gui_event_tx
+                                    .send(GuiEvent::ShowApplyProgress {
+                                        total: transaction.steps.len(),
+                                    })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                let worker_transaction = transaction.clone();
+                                let worker_event_tx = event_tx.clone();
+                                let spawn_result = thread::Builder::new()
+                                    .name("fyler-undo".to_owned())
+                                    .spawn(move || {
+                                        let report = fyler_fsops::apply_undo_cancellable(
+                                            &worker_transaction,
+                                            &cancel,
+                                            &mut |progress| {
+                                                let _ = worker_event_tx.send(
+                                                    AppEvent::UndoProgress(pane_id, progress),
+                                                );
+                                            },
+                                        );
+                                        let _ = worker_event_tx
+                                            .send(AppEvent::UndoFinished(pane_id, report));
+                                    });
+                                if let Err(error) = spawn_result {
+                                    let error = format!("undo workerを開始できません: {error}");
+                                    let report = CommitReport {
+                                        results: transaction
+                                            .steps
+                                            .into_iter()
+                                            .map(|op| OpResult {
+                                                op,
+                                                outcome: OpOutcome::Failed {
+                                                    error: error.clone(),
+                                                    progress: None,
+                                                },
+                                            })
+                                            .collect(),
+                                    };
+                                    if event_tx
+                                        .send(AppEvent::UndoFinished(pane_id, report))
                                         .is_err()
                                     {
                                         return;
@@ -884,6 +1108,38 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 if gui_event_tx
                                     .send(GuiEvent::ApplyCancelRequested)
                                     .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            SaveFlowResult::UndoCancelled { transaction } => {
+                                session.undo_slot = Some(transaction.clone());
+                                dialog_owner = None;
+                                if send_save_result(
+                                    &gui_event_tx,
+                                    pane_id,
+                                    SaveFlowResult::UndoCancelled { transaction },
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            SaveFlowResult::UndoInvalidated {
+                                transaction,
+                                message,
+                            } => {
+                                session.undo_slot = Some(transaction.clone());
+                                dialog_owner = None;
+                                if send_save_result(
+                                    &gui_event_tx,
+                                    pane_id,
+                                    SaveFlowResult::UndoInvalidated {
+                                        transaction,
+                                        message,
+                                    },
+                                )
+                                .is_err()
                                 {
                                     return;
                                 }
@@ -907,13 +1163,64 @@ pub(super) fn run() -> anyhow::Result<()> {
                             return;
                         }
                     }
-                    AppEvent::ApplyFinished(pane_id, report) => {
+                    AppEvent::ApplyFinished(pane_id, report, transaction) => {
                         if apply_owner != Some(pane_id) {
                             continue;
                         }
                         let Some(session) = panes.get_mut(&pane_id) else {
                             continue;
                         };
+                        let any_success = report
+                            .results
+                            .iter()
+                            .any(|result| matches!(result.outcome, OpOutcome::Success));
+                        if any_success {
+                            discard_undo_slot(session, journal.as_ref());
+                            if let Some(transaction) = transaction {
+                                if transaction.steps.is_empty() {
+                                    if let Some(journal) = &journal
+                                        && let Err(error) = journal.discard(&transaction.id)
+                                    {
+                                        eprintln!(
+                                            "空のundo transactionを破棄できません: {error:#}"
+                                        );
+                                    }
+                                    if send_gui_message(
+                                        &gui_event_tx,
+                                        pane_id,
+                                        MessageKind::Warn,
+                                        "このapplyのundo記録は空です。undoできません",
+                                    )
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                } else {
+                                    if let Some(journal) = &journal
+                                        && let Err(error) = journal.commit(&transaction)
+                                    {
+                                        eprintln!(
+                                            "undo journalをCommittedへ更新できません: {error:#}"
+                                        );
+                                    }
+                                    session.undo_slot = Some(transaction);
+                                }
+                            } else if send_gui_message(
+                                &gui_event_tx,
+                                pane_id,
+                                MessageKind::Warn,
+                                "このapplyはundo記録がないためundoできません",
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                        } else if let Some(transaction) = transaction
+                            && let Some(journal) = &journal
+                            && let Err(error) = journal.discard(&transaction.id)
+                        {
+                            eprintln!("失敗したapplyのundo journalを破棄できません: {error:#}");
+                        }
                         let result = session.save_controller.on_apply_finished(report);
                         if send_save_result(&gui_event_tx, pane_id, result).is_err()
                             || send_view_state(
@@ -926,6 +1233,77 @@ pub(super) fn run() -> anyhow::Result<()> {
                             return;
                         }
                         git.request(pane_id, session.root.clone());
+                        apply_owner = None;
+
+                        let pane_ids = panes.keys().copied().collect::<Vec<_>>();
+                        for deferred_id in pane_ids {
+                            let Some(deferred) = panes.get_mut(&deferred_id) else {
+                                continue;
+                            };
+                            if deferred.deferred_changes.is_empty() {
+                                continue;
+                            }
+                            let changed_paths = std::mem::take(&mut deferred.deferred_changes);
+                            if handle_external_change(
+                                deferred_id,
+                                &changed_paths,
+                                &mut deferred.save_controller,
+                                &gui_event_tx,
+                                &mut git,
+                                &deferred.root,
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    AppEvent::UndoProgress(pane_id, progress) => {
+                        if apply_owner == Some(pane_id) {
+                            let current = progress
+                                .current
+                                .as_ref()
+                                .map(undo_format::undo_step_label);
+                            if gui_event_tx
+                                .send(GuiEvent::UndoProgress(ApplyProgress {
+                                    completed: progress.completed,
+                                    total: progress.total,
+                                    current,
+                                }))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    AppEvent::UndoFinished(pane_id, report) => {
+                        if apply_owner != Some(pane_id) {
+                            continue;
+                        }
+                        let Some(session) = panes.get_mut(&pane_id) else {
+                            continue;
+                        };
+                        let transaction_id = session
+                            .save_controller
+                            .applying_undo_transaction_id()
+                            .map(str::to_owned);
+                        let result = session.save_controller.on_undo_finished(report);
+                        if send_save_result(&gui_event_tx, pane_id, result).is_err()
+                            || send_view_state(
+                                &gui_event_tx,
+                                pane_id,
+                                &session.save_controller,
+                            )
+                            .is_err()
+                        {
+                            return;
+                        }
+                        git.request(pane_id, session.root.clone());
+                        if let (Some(journal), Some(transaction_id)) = (&journal, transaction_id)
+                            && let Err(error) = journal.finish_undone(&transaction_id)
+                        {
+                            eprintln!("undo journalをUndoneへ更新できません: {error:#}");
+                        }
                         apply_owner = None;
 
                         let pane_ids = panes.keys().copied().collect::<Vec<_>>();
@@ -1068,7 +1446,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 {
                                     return;
                                 }
-                                let invalidated = match handle_external_change(
+                                let outcome = match handle_external_change(
                                     changed_id,
                                     &changed_paths,
                                     &mut session.save_controller,
@@ -1076,10 +1454,13 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     &mut git,
                                     &session.root,
                                 ) {
-                                    Ok(invalidated) => invalidated,
+                                    Ok(outcome) => outcome,
                                     Err(_) => return,
                                 };
-                                if invalidated && dialog_owner == Some(changed_id) {
+                                if let Some(transaction) = outcome.undo_transaction {
+                                    session.undo_slot = Some(transaction);
+                                }
+                                if outcome.invalidated_dialog && dialog_owner == Some(changed_id) {
                                     dialog_owner = None;
                                 }
                             }
@@ -1139,6 +1520,7 @@ fn handle_pane_action(
     last_active: &mut PaneId,
     next_pane_id: &mut u64,
     git: &mut GitRefresher,
+    journal: Option<&undo_journal::UndoJournal>,
     dialog_owner: Option<PaneId>,
     workspace_applying: bool,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
@@ -1239,6 +1621,9 @@ fn handle_pane_action(
             let Some(new_layout) = layout.close(source) else {
                 return Ok(());
             };
+            if let Some(session) = panes.get_mut(&source) {
+                discard_undo_slot(session, journal);
+            }
             panes.remove(&source);
             git.remove(source);
             *layout = new_layout;
@@ -1440,6 +1825,38 @@ fn close_rejection(
     }
 }
 
+fn undo_rejection(dirty: bool, slot_empty: bool, busy: bool) -> Option<&'static str> {
+    if busy {
+        Some("別の保存処理が進行中です")
+    } else if dirty {
+        Some("編集中はundoできません。保存または破棄してください")
+    } else if slot_empty {
+        Some("undoできる操作がありません")
+    } else {
+        None
+    }
+}
+
+fn discard_all_undo_slots(
+    panes: &mut BTreeMap<PaneId, PaneSession>,
+    journal: Option<&undo_journal::UndoJournal>,
+) {
+    for session in panes.values_mut() {
+        discard_undo_slot(session, journal);
+    }
+}
+
+fn discard_undo_slot(session: &mut PaneSession, journal: Option<&undo_journal::UndoJournal>) {
+    let Some(transaction) = session.undo_slot.take() else {
+        return;
+    };
+    if let Some(journal) = journal
+        && let Err(error) = journal.discard(&transaction.id)
+    {
+        eprintln!("undo journalを破棄できません: {error:#}");
+    }
+}
+
 fn change_session_root(
     pane_id: PaneId,
     new_root: PathBuf,
@@ -1501,6 +1918,23 @@ mod tests {
     #[test]
     fn crashed_pane_can_close_even_if_snapshot_is_dirty_or_save_is_busy() {
         assert_eq!(close_rejection(true, false, false, false, true), None);
+    }
+
+    #[test]
+    fn undo_rejects_busy_dirty_and_empty_slot() {
+        assert_eq!(
+            undo_rejection(false, false, true),
+            Some("別の保存処理が進行中です")
+        );
+        assert_eq!(
+            undo_rejection(true, false, false),
+            Some("編集中はundoできません。保存または破棄してください")
+        );
+        assert_eq!(
+            undo_rejection(false, true, false),
+            Some("undoできる操作がありません")
+        );
+        assert_eq!(undo_rejection(false, false, false), None);
     }
 
     #[test]
