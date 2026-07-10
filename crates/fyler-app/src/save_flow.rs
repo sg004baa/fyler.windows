@@ -653,6 +653,24 @@ impl SaveController {
     }
 
     fn reconcile_from_fs(&mut self) -> anyhow::Result<()> {
+        self.reconcile_from_fs_preserving_state()?;
+        let effects = self.apply_event(SaveEvent::ReconcileFinished);
+        debug_assert!(matches!(self.state, SaveState::Idle));
+        debug_assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, SaveEffect::SetModifiable(true)))
+        );
+        Ok(())
+    }
+
+    /// pane間transfer完了後に、保存状態機械を変更せず実FSから再同期する。
+    pub fn reconcile_after_transfer(&mut self) -> anyhow::Result<()> {
+        debug_assert!(self.is_idle());
+        self.reconcile_from_fs_preserving_state()
+    }
+
+    fn reconcile_from_fs_preserving_state(&mut self) -> anyhow::Result<()> {
         let mut ids = self
             .ids
             .lock()
@@ -676,13 +694,6 @@ impl SaveController {
 
         self.baseline = baseline;
         self.context = context;
-        let effects = self.apply_event(SaveEvent::ReconcileFinished);
-        debug_assert!(matches!(self.state, SaveState::Idle));
-        debug_assert!(
-            effects
-                .iter()
-                .any(|effect| matches!(effect, SaveEffect::SetModifiable(true)))
-        );
         Ok(())
     }
 

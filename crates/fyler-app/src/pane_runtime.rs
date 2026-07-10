@@ -12,6 +12,7 @@ use fyler_core::grammar::PrefixParse;
 use fyler_core::id::{EntryId, IdAllocator};
 use fyler_core::pane::{FocusDirection, PaneAction, PaneId, PaneLayout, SplitDirection};
 use fyler_core::report::{CommitReport, OpOutcome, OpResult};
+use fyler_core::transfer::TransferKind;
 use fyler_core::tree::EntryKind;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
 use fyler_fsops::scan::ScanOptions;
@@ -20,6 +21,10 @@ use fyler_gui::app::{GuiEvent, GuiOptions};
 use fyler_gui::confirm::ConfirmChoice;
 
 use super::save_flow::{SaveController, SaveFlowResult};
+use super::transfer_flow::{
+    TransferController, TransferFlowResult, TransferPaneState, build_plan, destination_directory,
+    resolve_selection, resolve_target, start_rejection,
+};
 use super::{
     AppEvent, BookmarkResolution, GitRefresher, after_root_change, bookmark_list_message,
     change_root_to, default_root, format_drive_paths, handle_activate_line, handle_external_change,
@@ -195,6 +200,7 @@ pub(super) fn run() -> anyhow::Result<()> {
             let mut git = GitRefresher::new(event_tx.clone());
             let mut dialog_owner = None;
             let mut apply_owner = None;
+            let mut transfer = TransferController::new();
 
             if send_view_state(
                 &gui_event_tx,
@@ -255,7 +261,9 @@ pub(super) fn run() -> anyhow::Result<()> {
                             &mut next_pane_id,
                             &mut git,
                             dialog_owner,
-                            apply_owner,
+                            apply_owner.is_some()
+                                || transfer.is_awaiting()
+                                || transfer.is_running(),
                         )
                         .is_err()
                         {
@@ -273,6 +281,11 @@ pub(super) fn run() -> anyhow::Result<()> {
                             if gui_event_tx.send(GuiEvent::CloseDialog).is_err() {
                                 return;
                             }
+                        }
+                        if transfer.invalidate_if_involves(pane_id)
+                            && gui_event_tx.send(GuiEvent::CloseDialog).is_err()
+                        {
+                            return;
                         }
                         if gui_event_tx
                             .send(GuiEvent::Editor {
@@ -293,6 +306,31 @@ pub(super) fn run() -> anyhow::Result<()> {
                             return;
                         }
                     }
+                    AppEvent::Editor(
+                        pane_id,
+                        EditorEvent::TransferRequested { kind, lines },
+                    ) => {
+                        if pane_id != active {
+                            continue;
+                        }
+                        if handle_transfer_request(
+                            pane_id,
+                            kind,
+                            &lines,
+                            last_active,
+                            &panes,
+                            apply_owner.is_some()
+                                || dialog_owner.is_some()
+                                || transfer.is_awaiting()
+                                || transfer.is_running(),
+                            &mut transfer,
+                            &gui_event_tx,
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
                     AppEvent::Editor(pane_id, event) => {
                         let Some(session) = panes.get_mut(&pane_id) else {
                             continue;
@@ -302,7 +340,11 @@ pub(super) fn run() -> anyhow::Result<()> {
                         }
                         match event {
                             EditorEvent::CommitRequested { changedtick, lines } => {
-                                if apply_owner.is_some() || dialog_owner.is_some() {
+                                if apply_owner.is_some()
+                                    || dialog_owner.is_some()
+                                    || transfer.is_awaiting()
+                                    || transfer.is_running()
+                                {
                                     if send_gui_message(
                                         &gui_event_tx,
                                         pane_id,
@@ -634,6 +676,90 @@ pub(super) fn run() -> anyhow::Result<()> {
                         }
                     }
                     AppEvent::Confirm(choice) => {
+                        if transfer.is_awaiting() || transfer.is_running() {
+                            match transfer.on_choice(choice) {
+                                TransferFlowResult::StartApply {
+                                    source,
+                                    target,
+                                    plan,
+                                    overwrites,
+                                    cancel,
+                                } => {
+                                    for pane_id in [source, target] {
+                                        if let Some(session) = panes.get(&pane_id) {
+                                            let _ = session
+                                                .engine
+                                                .send(EditorCommand::SetModifiable(false));
+                                        }
+                                    }
+                                    if gui_event_tx
+                                        .send(GuiEvent::ShowApplyProgress {
+                                            total: plan.ops.len(),
+                                        })
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    let worker_plan = plan.clone();
+                                    let worker_event_tx = event_tx.clone();
+                                    let spawn_result = thread::Builder::new()
+                                        .name("fyler-transfer".to_owned())
+                                        .spawn(move || {
+                                            let report = fyler_fsops::apply::apply_transfer_plan_cancellable(
+                                                &worker_plan,
+                                                &overwrites,
+                                                &cancel,
+                                                &mut |progress| {
+                                                    let _ = worker_event_tx.send(
+                                                        AppEvent::TransferProgress(progress),
+                                                    );
+                                                },
+                                            );
+                                            let _ = worker_event_tx
+                                                .send(AppEvent::TransferFinished(report));
+                                        });
+                                    if let Err(error) = spawn_result {
+                                        let error =
+                                            format!("transfer workerを開始できません: {error}");
+                                        let report = CommitReport {
+                                            results: plan
+                                                .ops
+                                                .into_iter()
+                                                .map(|op| OpResult {
+                                                    op,
+                                                    outcome: OpOutcome::Failed {
+                                                        error: error.clone(),
+                                                        progress: None,
+                                                    },
+                                                })
+                                                .collect(),
+                                        };
+                                        if event_tx
+                                            .send(AppEvent::TransferFinished(report))
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                                TransferFlowResult::Cancelled => {
+                                    if gui_event_tx.send(GuiEvent::CloseDialog).is_err() {
+                                        return;
+                                    }
+                                }
+                                TransferFlowResult::CancelRequested => {
+                                    if gui_event_tx
+                                        .send(GuiEvent::ApplyCancelRequested)
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                TransferFlowResult::Finished { .. }
+                                | TransferFlowResult::Ignored => {}
+                            }
+                            continue;
+                        }
                         let Some(pane_id) = dialog_owner.or(apply_owner) else {
                             continue;
                         };
@@ -772,6 +898,87 @@ pub(super) fn run() -> anyhow::Result<()> {
                             }
                         }
                     }
+                    AppEvent::TransferProgress(progress) => {
+                        if transfer.is_running()
+                            && gui_event_tx
+                                .send(GuiEvent::TransferProgress(progress))
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    AppEvent::TransferFinished(report) => {
+                        let TransferFlowResult::Finished {
+                            source,
+                            target,
+                            report,
+                        } = transfer.on_finished(report)
+                        else {
+                            continue;
+                        };
+                        let mut reconcile_errors = Vec::new();
+                        for pane_id in [source, target] {
+                            let Some(session) = panes.get_mut(&pane_id) else {
+                                continue;
+                            };
+                            if let Err(error) = session.save_controller.reconcile_after_transfer() {
+                                reconcile_errors.push(format!("pane {pane_id}: {error:#}"));
+                            }
+                            let _ = session.engine.send(EditorCommand::SetModifiable(true));
+                            if send_view_state(
+                                &gui_event_tx,
+                                pane_id,
+                                &session.save_controller,
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                            git.request(pane_id, session.root.clone());
+                        }
+                        if gui_event_tx
+                            .send(GuiEvent::ShowTransferReport(report))
+                            .is_err()
+                        {
+                            return;
+                        }
+                        if !reconcile_errors.is_empty()
+                            && send_gui_message(
+                                &gui_event_tx,
+                                source,
+                                MessageKind::Error,
+                                format!(
+                                    "transfer後の再読込に失敗しました: {}",
+                                    reconcile_errors.join(" / ")
+                                ),
+                            )
+                            .is_err()
+                        {
+                            return;
+                        }
+                        let pane_ids = panes.keys().copied().collect::<Vec<_>>();
+                        for deferred_id in pane_ids {
+                            let Some(deferred) = panes.get_mut(&deferred_id) else {
+                                continue;
+                            };
+                            if deferred.deferred_changes.is_empty() {
+                                continue;
+                            }
+                            let changed_paths = std::mem::take(&mut deferred.deferred_changes);
+                            if handle_external_change(
+                                deferred_id,
+                                &changed_paths,
+                                &mut deferred.save_controller,
+                                &gui_event_tx,
+                                &mut git,
+                                &deferred.root,
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
                     AppEvent::ExternalChange(pane_id, change) => {
                         let mut by_pane = BTreeMap::<PaneId, BTreeSet<PathBuf>>::new();
                         by_pane.entry(pane_id).or_default().extend(change.paths);
@@ -787,9 +994,27 @@ pub(super) fn run() -> anyhow::Result<()> {
                             let Some(session) = panes.get_mut(&changed_id) else {
                                 continue;
                             };
-                            if apply_owner.is_some() {
+                            if apply_owner.is_some() || transfer.is_running() {
                                 session.deferred_changes.extend(changed_paths);
                             } else {
+                                let transfer_invalidated =
+                                    transfer.invalidate_if_involves(changed_id);
+                                if transfer_invalidated
+                                    && gui_event_tx.send(GuiEvent::CloseDialog).is_err()
+                                {
+                                    return;
+                                }
+                                if transfer_invalidated
+                                    && send_gui_message(
+                                        &gui_event_tx,
+                                        changed_id,
+                                        MessageKind::Warn,
+                                        "外部でファイルが変更されたため、transferを中断しました。内容を確認して再度実行してください",
+                                    )
+                                    .is_err()
+                                {
+                                    return;
+                                }
                                 let invalidated = match handle_external_change(
                                     changed_id,
                                     &changed_paths,
@@ -862,13 +1087,21 @@ fn handle_pane_action(
     next_pane_id: &mut u64,
     git: &mut GitRefresher,
     dialog_owner: Option<PaneId>,
-    apply_owner: Option<PaneId>,
+    workspace_applying: bool,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     if source != *active {
         return Ok(());
     }
     match action {
         PaneAction::SplitHorizontal | PaneAction::SplitVertical => {
+            if workspace_applying {
+                return send_gui_message(
+                    gui_event_tx,
+                    source,
+                    MessageKind::Info,
+                    "applyまたはtransfer中はpaneを分割できません",
+                );
+            }
             if panes.len() >= MAX_PANES {
                 return send_gui_message(
                     gui_event_tx,
@@ -932,7 +1165,7 @@ fn handle_pane_action(
             let reason = close_rejection(
                 session.engine.snapshot().dirty,
                 session.save_controller.is_idle(),
-                apply_owner.is_some(),
+                workspace_applying,
                 panes.len() == 1,
                 session.crashed,
             );
@@ -985,6 +1218,139 @@ fn handle_pane_action(
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_transfer_request(
+    source: PaneId,
+    kind: TransferKind,
+    selected_lines: &[usize],
+    last_active: PaneId,
+    panes: &BTreeMap<PaneId, PaneSession>,
+    globally_busy: bool,
+    transfer: &mut TransferController,
+    gui_event_tx: &mpsc::Sender<GuiEvent>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    let Some(target) = resolve_target(source, last_active, panes.keys().copied()) else {
+        return send_gui_message(
+            gui_event_tx,
+            source,
+            MessageKind::Info,
+            "transfer先のpaneがありません。先にpaneを分割してください",
+        );
+    };
+    let Some(source_session) = panes.get(&source) else {
+        return Ok(());
+    };
+    let Some(target_session) = panes.get(&target) else {
+        return Ok(());
+    };
+    let source_snapshot = source_session.engine.snapshot();
+    let target_snapshot = target_session.engine.snapshot();
+    let source_state = TransferPaneState {
+        dirty: source_snapshot.dirty,
+        idle: source_session.save_controller.is_idle(),
+        crashed: source_session.crashed,
+    };
+    let target_state = TransferPaneState {
+        dirty: target_snapshot.dirty,
+        idle: target_session.save_controller.is_idle(),
+        crashed: target_session.crashed,
+    };
+    if let Some(reason) = start_rejection(source_state, target_state, globally_busy) {
+        return send_gui_message(gui_event_tx, source, MessageKind::Info, reason);
+    }
+
+    let selected = match resolve_selection(
+        &source_session.save_controller,
+        &source_snapshot.lines,
+        selected_lines,
+    ) {
+        Ok(selected) => selected,
+        Err(super::transfer_flow::SelectionError::UnsavedLine) => {
+            return send_gui_message(
+                gui_event_tx,
+                source,
+                MessageKind::Info,
+                "未保存の新規行を含むためtransferできません。先に保存してください",
+            );
+        }
+        Err(super::transfer_flow::SelectionError::Empty) => {
+            return send_gui_message(
+                gui_event_tx,
+                source,
+                MessageKind::Info,
+                "transfer対象が選択されていません",
+            );
+        }
+        Err(super::transfer_flow::SelectionError::MissingLine) => {
+            return send_gui_message(
+                gui_event_tx,
+                source,
+                MessageKind::Error,
+                "transfer対象の行が見つかりません",
+            );
+        }
+        Err(super::transfer_flow::SelectionError::UnknownId) => {
+            return send_gui_message(
+                gui_event_tx,
+                source,
+                MessageKind::Error,
+                "transfer対象を現在のファイル一覧へ解決できません",
+            );
+        }
+    };
+
+    let target_empty = target_session.save_controller.visible_lines().is_empty();
+    let resolved_target = target_session
+        .save_controller
+        .resolve_line(&target_snapshot.lines, target_snapshot.cursor.line);
+    let Some(destination) = destination_directory(target_empty, resolved_target) else {
+        return send_gui_message(
+            gui_event_tx,
+            source,
+            MessageKind::Error,
+            "transfer先paneのカーソル位置を解決できません",
+        );
+    };
+    let plan = build_plan(
+        kind,
+        source_session.root.clone(),
+        target_session.root.clone(),
+        &destination,
+        selected,
+    );
+    if plan.is_empty() {
+        return send_gui_message(
+            gui_event_tx,
+            source,
+            MessageKind::Info,
+            "transfer対象がありません",
+        );
+    }
+    let preflight = fyler_fsops::preflight_transfer(&plan);
+    if !preflight.blocked.is_empty() {
+        return send_gui_message(
+            gui_event_tx,
+            source,
+            MessageKind::Error,
+            format!(
+                "transferできないパスがあります: {}",
+                preflight
+                    .blocked
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
+    transfer.begin(source, target, plan.clone(), preflight.overwritable.clone());
+    gui_event_tx.send(GuiEvent::ShowTransferPlan {
+        plan,
+        target,
+        overwrites: preflight.overwritable,
+    })
 }
 
 fn cycle_focus(layout: &PaneLayout, active: PaneId, forward: bool) -> Option<PaneId> {

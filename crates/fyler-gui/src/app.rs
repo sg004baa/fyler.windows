@@ -15,6 +15,7 @@ use fyler_core::pane::{PaneId, PaneLayout, SplitDirection};
 use fyler_core::path::TreePath;
 use fyler_core::plan::OperationPlan;
 use fyler_core::report::{ApplyProgress, CommitReport};
+use fyler_core::transfer::{TransferOp, TransferPlan};
 use fyler_core::validate::ValidateError;
 
 use crate::confirm::{ConfirmChoice, ConfirmDetail, IconStyle};
@@ -93,9 +94,16 @@ pub enum GuiEvent {
     },
     /// apply workerから届いた操作単位の進捗を表示へ反映する。
     ApplyProgress(ApplyProgress),
+    ShowTransferPlan {
+        plan: TransferPlan,
+        target: PaneId,
+        overwrites: Vec<PathBuf>,
+    },
+    TransferProgress(ApplyProgress<TransferOp>),
     /// キャンセル要求を受理済みとして進捗ダイアログの操作を無効化する。
     ApplyCancelRequested,
     ShowReport(CommitReport),
+    ShowTransferReport(CommitReport<TransferOp>),
     ShowValidationErrors(Vec<ValidateError>),
     FatalError(String),
     CloseDialog,
@@ -108,6 +116,11 @@ enum DialogState {
         warnings: Vec<String>,
         overwrites: Vec<TreePath>,
     },
+    TransferPlan {
+        plan: TransferPlan,
+        target: PaneId,
+        overwrites: Vec<PathBuf>,
+    },
     Progress {
         completed: usize,
         total: usize,
@@ -116,6 +129,7 @@ enum DialogState {
         cancel_requested: bool,
     },
     Report(CommitReport),
+    TransferReport(CommitReport<TransferOp>),
     ValidationErrors(Vec<ValidateError>),
     Help,
 }
@@ -229,6 +243,7 @@ impl FylerApp {
                     EditorEvent::JumpBookmark { .. } => {}
                     EditorEvent::ShowHelp => self.dialog = Some(DialogState::Help),
                     EditorEvent::PaneAction(_) => {}
+                    EditorEvent::TransferRequested { .. } => {}
                     EditorEvent::CommitRequested { .. } => {}
                     EditorEvent::CmdlineShow(state) if self.active == Some(pane_id) => {
                         self.cmdline = Some(state);
@@ -277,6 +292,17 @@ impl FylerApp {
                         overwrites,
                     });
                 }
+                GuiEvent::ShowTransferPlan {
+                    plan,
+                    target,
+                    overwrites,
+                } => {
+                    self.dialog = Some(DialogState::TransferPlan {
+                        plan,
+                        target,
+                        overwrites,
+                    });
+                }
                 GuiEvent::ShowApplyProgress { total } => {
                     self.dialog = Some(DialogState::Progress {
                         completed: 0,
@@ -298,6 +324,22 @@ impl FylerApp {
                         *current = progress.current.as_ref().map(confirm::operation_label);
                     }
                 }
+                GuiEvent::TransferProgress(progress) => {
+                    if let Some(DialogState::Progress {
+                        completed,
+                        total,
+                        current,
+                        ..
+                    }) = &mut self.dialog
+                    {
+                        *completed = progress.completed;
+                        *total = progress.total;
+                        *current = progress
+                            .current
+                            .as_ref()
+                            .map(|operation| confirm::transfer_operation_label(operation, None));
+                    }
+                }
                 GuiEvent::ApplyCancelRequested => {
                     if let Some(DialogState::Progress {
                         cancel_requested, ..
@@ -308,6 +350,9 @@ impl FylerApp {
                 }
                 GuiEvent::ShowReport(report) => {
                     self.dialog = Some(DialogState::Report(report));
+                }
+                GuiEvent::ShowTransferReport(report) => {
+                    self.dialog = Some(DialogState::TransferReport(report));
                 }
                 GuiEvent::ShowValidationErrors(errors) => {
                     self.dialog = Some(DialogState::ValidationErrors(errors));
@@ -404,8 +449,18 @@ impl eframe::App for FylerApp {
                 confirm_choice =
                     confirm::draw_plan(ui, plan, overwrites, warnings, self.confirm_detail);
             }
+            Some(DialogState::TransferPlan {
+                plan,
+                target,
+                overwrites,
+            }) => {
+                confirm_choice = confirm::draw_transfer_plan(ui, plan, *target, overwrites);
+            }
             Some(DialogState::Report(report)) => {
                 dismiss_report = confirm::draw_report(ui, report);
+            }
+            Some(DialogState::TransferReport(report)) => {
+                dismiss_report = confirm::draw_transfer_report(ui, report);
             }
             Some(DialogState::Progress {
                 completed,
@@ -601,6 +656,7 @@ fn draw_help(ui: &mut egui::Ui) -> bool {
                 "^     Go to parent",
                 "g.    Toggle hidden files",
                 "gy    Copy path",
+                "gm/gc Move/copy to previous pane",
                 "<C-w>s/v  Split pane",
                 "<C-w>h/j/k/l/w/p  Focus pane",
                 "<C-w>q/c  Close pane",

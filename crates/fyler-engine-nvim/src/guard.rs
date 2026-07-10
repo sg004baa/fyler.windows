@@ -88,6 +88,30 @@ vim.keymap.set("n", "gd", function()
   vim.rpcnotify(channel, "fyler_navigate_into", vim.api.nvim_win_get_cursor(0)[1] - 1)
 end, { buffer = buffer, silent = true, nowait = true })
 
+local function request_transfer(kind, visual)
+  local cursor = vim.api.nvim_win_get_cursor(0)[1] - 1
+  local first, last = cursor, cursor
+  if visual then
+    local anchor = vim.fn.line("v") - 1
+    first = math.min(anchor, cursor)
+    last = math.max(anchor, cursor)
+  end
+  vim.rpcnotify(channel, "fyler_transfer", kind, first, last)
+end
+
+vim.keymap.set("n", "gm", function()
+  request_transfer("move", false)
+end, { buffer = buffer, silent = true, nowait = true })
+vim.keymap.set("x", "gm", function()
+  request_transfer("move", true)
+end, { buffer = buffer, silent = true, nowait = true })
+vim.keymap.set("n", "gc", function()
+  request_transfer("copy", false)
+end, { buffer = buffer, silent = true, nowait = true })
+vim.keymap.set("x", "gc", function()
+  request_transfer("copy", true)
+end, { buffer = buffer, silent = true, nowait = true })
+
 vim.keymap.set("n", "?", function()
   vim.rpcnotify(channel, "fyler_help")
 end, { buffer = buffer, silent = true, nowait = true })

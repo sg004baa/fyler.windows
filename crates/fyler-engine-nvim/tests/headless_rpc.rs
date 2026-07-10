@@ -7,6 +7,7 @@ use fyler_core::editor::{
     SearchHighlight,
 };
 use fyler_core::pane::PaneAction;
+use fyler_core::transfer::TransferKind;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -124,6 +125,55 @@ async fn pane_keymap_emits_split_action() -> anyhow::Result<()> {
     })
     .await
     .context("pane split key did not emit PaneAction")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn transfer_keymaps_emit_normal_and_visual_requests() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+    engine.set_initial_lines(vec![
+        EditorLine::new("/001 a.txt"),
+        EditorLine::new("/002 b.txt"),
+        EditorLine::new("/003 c.txt"),
+    ])?;
+    wait_for(&engine, |line| line == "/001 a.txt").await?;
+
+    engine.send(key_command(Key::Char('g')))?;
+    engine.send(key_command(Key::Char('m')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            EditorEvent::TransferRequested {
+                kind: TransferKind::Move,
+                lines
+            } if lines == &[0]
+        )
+    })
+    .await
+    .context("gm did not emit a move TransferRequested")?;
+
+    engine.send(key_command(Key::Char('V')))?;
+    engine.send(key_command(Key::Down))?;
+    engine.send(key_command(Key::Char('g')))?;
+    engine.send(key_command(Key::Char('c')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            EditorEvent::TransferRequested {
+                kind: TransferKind::Copy,
+                lines
+            } if lines == &[0, 1]
+        )
+    })
+    .await
+    .context("visual gc did not emit a ranged copy TransferRequested")?;
 
     Ok(())
 }

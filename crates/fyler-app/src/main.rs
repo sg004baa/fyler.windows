@@ -9,6 +9,7 @@
 mod config;
 mod pane_runtime;
 mod save_flow;
+mod transfer_flow;
 
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
@@ -22,6 +23,7 @@ use fyler_core::grammar::PrefixParse;
 use fyler_core::id::IdAllocator;
 use fyler_core::pane::PaneId;
 use fyler_core::report::{ApplyProgress, CommitReport};
+use fyler_core::transfer::TransferOp;
 use fyler_core::tree::EntryKind;
 use fyler_fsops::watch::{ExternalChange, FsWatcher};
 use fyler_gui::app::GuiEvent;
@@ -40,6 +42,8 @@ enum AppEvent {
     },
     ApplyProgress(PaneId, ApplyProgress),
     ApplyFinished(PaneId, CommitReport),
+    TransferProgress(ApplyProgress<TransferOp>),
+    TransferFinished(CommitReport<TransferOp>),
     Shutdown,
 }
 

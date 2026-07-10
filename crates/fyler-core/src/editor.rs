@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use crate::pane::PaneAction;
+use crate::transfer::TransferKind;
 
 /// 編集エンジンの抽象(snapshot + command channel型)。
 ///
@@ -370,6 +371,12 @@ pub enum EditorEvent {
     ShowHelp,
     /// ユーザーがpaneの分割・focus移動・closeを要求した。
     PaneAction(PaneAction),
+    /// ユーザーが指定行のエントリを別paneへ移動またはコピーするよう要求した。
+    /// `lines`は要求時点の0始まり行番号で、visual選択では範囲内の全行を含む。
+    TransferRequested {
+        kind: TransferKind,
+        lines: Vec<usize>,
+    },
     /// ユーザーが保存(`:w` 相当)を要求した。`lines` は保存要求時点のsnapshotに
     /// 属する行で、後続編集で更新されたsnapshotを誤ってplanしないため同梱する。
     /// [`crate::save::SaveEvent::CommitRequested`] へ接続する。
