@@ -8,11 +8,13 @@
 //!   公開シグネチャには std のパス型と fyler-core の型だけを出す
 
 pub mod apply;
+pub mod backup;
 pub mod case;
 pub mod classify;
 pub mod dialog;
 pub mod drives;
 pub mod gitstatus;
+pub mod identity;
 pub mod info;
 pub mod long_path;
 pub mod onedrive;
@@ -20,6 +22,7 @@ pub mod open;
 pub mod preflight;
 pub mod recycle;
 pub mod scan;
+pub mod undo;
 pub mod watch;
 
 mod winattr;

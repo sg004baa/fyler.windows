@@ -852,6 +852,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                                         AppEvent::ApplyProgress(pane_id, progress),
                                                     );
                                                 },
+                                                None,
                                             );
                                         let _ = worker_event_tx
                                             .send(AppEvent::ApplyFinished(pane_id, report));
