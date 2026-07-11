@@ -3075,7 +3075,7 @@ mod tests {
     fn fold_busy_when_not_idle() {
         let (mut controller, _) = hierarchy_controller("C:/test-root");
         let mut lines = controller.visible_lines();
-        lines[4].text = lines[4].text.replace("top.txt", "renamed.txt");
+        lines[4].text = lines[4].text.replace("top.txt", "renamed.txt").into();
         assert!(matches!(
             controller.on_commit(7, &lines),
             SaveFlowResult::ShowPlan { .. }
@@ -3152,7 +3152,7 @@ mod tests {
         let (mut controller, _) = hierarchy_controller("C:/test-root");
         controller.collapse_all_dirs();
         let mut edited = controller.visible_lines();
-        edited[1].text = edited[1].text.replace("top.txt", "renamed.txt");
+        edited[1].text = edited[1].text.replace("top.txt", "renamed.txt").into();
         assert!(matches!(
             controller.on_commit(7, &edited),
             SaveFlowResult::ShowPlan { .. }
@@ -3347,7 +3347,7 @@ mod tests {
     fn toggle_collapse_rejects_non_idle_save_state() {
         let (mut controller, _) = hierarchy_controller("C:/test-root");
         let mut lines = controller.visible_lines();
-        lines[4].text = lines[4].text.replace("top.txt", "renamed.txt");
+        lines[4].text = lines[4].text.replace("top.txt", "renamed.txt").into();
         assert!(matches!(
             controller.on_commit(7, &lines),
             SaveFlowResult::ShowPlan { .. }
@@ -3367,7 +3367,7 @@ mod tests {
             ToggleCollapseResult::Toggled(lines) => lines,
             result => panic!("unexpected collapse result: {result:?}"),
         };
-        collapsed[0].text = collapsed[0].text.replace("a/", "renamed/");
+        collapsed[0].text = collapsed[0].text.replace("a/", "renamed/").into();
 
         let result = controller.on_commit(7, &collapsed);
 

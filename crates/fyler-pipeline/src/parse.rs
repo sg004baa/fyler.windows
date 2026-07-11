@@ -44,10 +44,10 @@ pub fn parse(lines: &[EditorLine]) -> Vec<ParsedLine> {
                 return None;
             }
 
-            let (id, id_broken, rest) = match grammar::split_id_prefix(editor_line.text.as_str()) {
+            let (id, id_broken, rest) = match grammar::split_id_prefix(editor_line.text.as_ref()) {
                 PrefixParse::WithId { id, rest } => (Some(id), false, rest),
                 PrefixParse::NoId { rest } => (None, false, rest),
-                PrefixParse::Broken => (None, true, editor_line.text.as_str()),
+                PrefixParse::Broken => (None, true, editor_line.text.as_ref()),
             };
             let (indent_depth, name) = grammar::split_indent(rest);
             let indent_broken = name.starts_with(' ');
