@@ -1222,6 +1222,10 @@ fn draw_feedback(
                 ui.label("匿名のため個別返信はできません。");
                 ui.label("サーバー運営上、通信経路のIPアドレスが処理される場合があります。");
                 ui.hyperlink_to(
+                    "詳細はリポジトリの docs/PRIVACY.md を参照",
+                    "https://github.com/sg004baa/fyler.windows/blob/main/docs/PRIVACY.md",
+                );
+                ui.hyperlink_to(
                     "GitHub Issues",
                     "https://github.com/sg004baa/fyler.windows/issues",
                 );

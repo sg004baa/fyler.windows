@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS feedback (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  received_at TEXT NOT NULL,
+  schema_version INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  body TEXT NOT NULL,
+  app_version TEXT NOT NULL,
+  os TEXT NOT NULL,
+  arch TEXT NOT NULL
+);

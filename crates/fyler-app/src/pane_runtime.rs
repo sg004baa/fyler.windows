@@ -498,7 +498,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         &gui_event_tx,
                                         pane_id,
                                         MessageKind::Warn,
-                                        "フィードバック送信は現在利用できません。GitHub Issuesへ: https://github.com/sg004baa/fyler.windows/issues",
+                                        "フィードバック送信は現在利用できません。詳細: https://github.com/sg004baa/fyler.windows/blob/main/docs/PRIVACY.md / GitHub Issues: https://github.com/sg004baa/fyler.windows/issues",
                                     )
                                     .is_err()
                                     {
