@@ -1,4 +1,9 @@
 //! apply: 承認済みOperationPlanの実行。**実FS書き込みの入口はここだけ**(絶対ルール1)。
+//!
+//! 承認済み上書きでは、旧targetを同一親ディレクトリの `.fyler-staged-*` へ一時的に
+//! renameしてから本体操作を行う。成功時はstaging内の旧targetをごみ箱へ送り、失敗時は
+//! 元位置へ戻す。staging dirは処理中だけ親dirに現れ、ごみ箱上の表示名は元basenameを
+//! 保つ一方、「元の場所」はstaging dirとして記録される。
 
 use std::collections::HashSet;
 use std::fs;
@@ -39,6 +44,257 @@ impl From<anyhow::Error> for OpFailure {
     }
 }
 
+#[cfg(test)]
+type FaultHook = Box<dyn FnMut(&str, &Path) -> Option<anyhow::Error>>;
+
+#[cfg(test)]
+thread_local! {
+    static FAULT_INJECTION: std::cell::RefCell<Option<FaultHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn fault_point(stage: &str, path: &Path) -> anyhow::Result<()> {
+    FAULT_INJECTION.with(|hook| {
+        let mut hook = hook.borrow_mut();
+        if let Some(error) = hook.as_mut().and_then(|hook| hook(stage, path)) {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(not(test))]
+fn fault_point(_stage: &str, _path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[derive(Debug)]
+struct StagedTarget {
+    staged_path: PathBuf,
+    staging_dir: PathBuf,
+    original: PathBuf,
+}
+
+impl StagedTarget {
+    fn commit_to_trash(self) -> anyhow::Result<()> {
+        fault_point("commit_to_trash", &self.staged_path)?;
+        crate::recycle::delete_to_recycle_bin(&self.staged_path)?;
+        let _ = fs::remove_dir(crate::long_path::to_fs(&self.staging_dir));
+        Ok(())
+    }
+
+    fn restore(self) -> anyhow::Result<()> {
+        fault_point("restore", &self.staged_path)?;
+        fs::rename(
+            crate::long_path::to_fs(&self.staged_path),
+            crate::long_path::to_fs(&self.original),
+        )
+        .with_context(|| {
+            format!(
+                "退避した旧エントリを元位置へ戻せません: {} → {}",
+                self.staged_path.display(),
+                self.original.display()
+            )
+        })?;
+        let _ = fs::remove_dir(crate::long_path::to_fs(&self.staging_dir));
+        Ok(())
+    }
+}
+
+fn stage_target_aside(target: &Path) -> Result<Option<StagedTarget>, OpFailure> {
+    match fs::symlink_metadata(crate::long_path::to_fs(target)) {
+        Ok(metadata) if crate::scan::kind_from_metadata(&metadata) == EntryKind::Dir => {
+            return Err(OpFailure::from(anyhow!(
+                "移動先がディレクトリに変わっているため上書きを中止しました: {}",
+                target.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(OpFailure::from(anyhow::Error::from(error).context(
+                format!("上書き対象の存在確認に失敗しました: {}", target.display()),
+            )));
+        }
+    }
+
+    let parent = target.parent().ok_or_else(|| {
+        OpFailure::from(anyhow!(
+            "上書き対象の親ディレクトリを取得できません: {}",
+            target.display()
+        ))
+    })?;
+    let basename = target.file_name().ok_or_else(|| {
+        OpFailure::from(anyhow!(
+            "上書き対象のファイル名を取得できません: {}",
+            target.display()
+        ))
+    })?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    let mut last_error = None;
+    for suffix in 0..8_u8 {
+        let staging_dir = parent.join(format!(
+            ".fyler-staged-{}-{nanos}-{suffix}",
+            std::process::id()
+        ));
+        match fs::create_dir(crate::long_path::to_fs(&staging_dir)) {
+            Ok(()) => {
+                let staged_path = staging_dir.join(basename);
+                if let Err(error) = fs::rename(
+                    crate::long_path::to_fs(target),
+                    crate::long_path::to_fs(&staged_path),
+                ) {
+                    let _ = fs::remove_dir(crate::long_path::to_fs(&staging_dir));
+                    return Err(OpFailure::from(anyhow::Error::from(error).context(
+                        format!(
+                            "上書き対象を一時退避できません: {} → {}",
+                            target.display(),
+                            staged_path.display()
+                        ),
+                    )));
+                }
+                return Ok(Some(StagedTarget {
+                    staged_path,
+                    staging_dir,
+                    original: target.to_path_buf(),
+                }));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_error = Some(error);
+            }
+            Err(error) => {
+                return Err(OpFailure::from(anyhow::Error::from(error).context(
+                    format!(
+                        "上書き対象の一時退避ディレクトリを作成できません: {}",
+                        staging_dir.display()
+                    ),
+                )));
+            }
+        }
+    }
+
+    Err(OpFailure::from(anyhow::Error::from(
+        last_error.unwrap_or_else(|| std::io::Error::other("staging dir名の確保に失敗しました")),
+    )))
+}
+
+fn execute_with_staged_overwrite(
+    target: &Path,
+    approved: bool,
+    mut recorder: Option<&mut UndoRecorder>,
+    execute: impl FnOnce() -> Result<(), OpFailure>,
+) -> Result<(), OpFailure> {
+    if !approved {
+        return execute();
+    }
+
+    let backup = recorder
+        .as_deref()
+        .map(|recorder| recorder.backup_for_next_step(target))
+        .transpose()
+        .map_err(OpFailure::from)?;
+    let staged = match stage_target_aside(target) {
+        Ok(staged) => staged,
+        Err(error) => {
+            if let (Some(recorder), Some(backup)) = (recorder.as_deref(), backup.as_ref()) {
+                recorder.discard_backup(backup);
+            }
+            return Err(error);
+        }
+    };
+
+    let Some(staged) = staged else {
+        if let (Some(recorder), Some(backup)) = (recorder.as_deref(), backup.as_ref()) {
+            recorder.discard_backup(backup);
+        }
+        return execute();
+    };
+    let staged_path = staged.staged_path.clone();
+    let original = staged.original.clone();
+
+    match execute() {
+        Ok(()) => match staged.commit_to_trash() {
+            Ok(()) => {
+                if let (Some(recorder), Some(backup)) = (recorder.as_deref_mut(), backup) {
+                    recorder.record_overwritten(target, backup);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let (Some(recorder), Some(backup)) = (recorder.as_deref(), backup.as_ref()) {
+                    recorder.discard_backup(backup);
+                }
+                Err(OpFailure::with_progress(
+                    error,
+                    format!(
+                        "操作自体は完了しましたが、上書きした旧エントリをごみ箱へ送れませんでした。旧エントリは {} に残っています",
+                        staged_path.display()
+                    ),
+                ))
+            }
+        },
+        Err(operation_error) => {
+            let cleanup = cleanup_staged_operation_target(target);
+            let restore = if cleanup.is_ok() {
+                staged.restore()
+            } else {
+                Err(anyhow!(
+                    "不完全なtargetを除去できないためrestoreを実行できません"
+                ))
+            };
+            match (cleanup, restore) {
+                (Ok(()), Ok(())) => {
+                    if let (Some(recorder), Some(backup)) = (recorder.as_deref(), backup.as_ref()) {
+                        recorder.discard_backup(backup);
+                    }
+                    Err(operation_error)
+                }
+                (cleanup, restore) => {
+                    let backup_note = backup.as_ref().map_or(String::new(), |backup| {
+                        format!(" backup payload {} も保持しています。", backup.payload_rel)
+                    });
+                    Err(OpFailure::with_progress(
+                        anyhow!(operation_error.error),
+                        format!(
+                            "本体操作失敗後の補償にも失敗しました(cleanup: {}; restore: {})。旧エントリは {} に退避されたままです。手動で {} へ戻してください。{}",
+                            cleanup
+                                .err()
+                                .map_or_else(|| "成功".to_owned(), |error| error.to_string()),
+                            restore
+                                .err()
+                                .map_or_else(|| "成功".to_owned(), |error| error.to_string()),
+                            staged_path.display(),
+                            original.display(),
+                            backup_note
+                        ),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+fn cleanup_staged_operation_target(target: &Path) -> anyhow::Result<()> {
+    let metadata = match fs::symlink_metadata(crate::long_path::to_fs(target)) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let kind = crate::scan::kind_from_metadata(&metadata);
+    if kind == EntryKind::Dir {
+        fs::remove_dir_all(crate::long_path::to_fs(target))
+            .with_context(|| format!("不完全なディレクトリを削除できません: {}", target.display()))
+    } else {
+        remove_non_directory_entry(target, kind)
+    }
+}
+
 /// 上書き対象を伴わないplanを実行し、操作単位の結果を返す。
 ///
 /// 呼び出し契約: 保存状態機械(`fyler_core::save`)の `Applying` 状態
@@ -55,8 +311,9 @@ pub fn apply_plan(root: &Path, plan: &OperationPlan) -> CommitReport {
 /// 承認済みの上書き対象(preflightでユーザーへ提示済みの移動先)を伴ってplanを実行する。
 ///
 /// `overwrites` に含まれる移動先は、操作の直前に実体を確認し、ファイル/シンボリック
-/// リンクであれば**ごみ箱へ退避**してから実行する。ディレクトリに変わっていた場合は
-/// 上書きせず操作失敗として報告する(TOCTOU防衛)。
+/// リンクであれば同一親dir内へstaging退避する。本体操作の成功後だけごみ箱へ送り、
+/// 失敗時は元位置へ復元する。ディレクトリに変わっていた場合は上書きせず操作失敗として
+/// 報告する(TOCTOU防衛)。
 ///
 /// 呼び出し契約と実装契約:
 /// - 保存状態機械(`fyler_core::save`)の `Applying` 状態からのみ呼ぶ
@@ -258,50 +515,50 @@ fn execute_transfer_operation(
     if case_only_rename {
         return crate::case::case_only_rename(&source, &target).map_err(OpFailure::from);
     }
-    if approved_overwrite {
-        recycle_approved_target(&target, None)?;
-    }
-    ensure_target_vacant(&target)?;
-
-    match operation.kind {
-        TransferKind::Copy => match actual_kind {
-            EntryKind::Dir => copy_tree(&source, &target).map(|_| ()),
-            kind @ (EntryKind::File | EntryKind::Symlink) => {
-                copy_single_entry(&source, &target, kind).map_err(|error| {
-                    OpFailure::with_progress(
-                        error,
-                        "コピー完了: 0/1 エントリ; コピー先に不完全なファイルが残っている可能性があります",
+    execute_with_staged_overwrite(&target, approved_overwrite, None, || {
+        ensure_target_vacant(&target)?;
+        match operation.kind {
+            TransferKind::Copy => {
+                fault_point("transfer_copy", &target).map_err(OpFailure::from)?;
+                match actual_kind {
+                    EntryKind::Dir => copy_tree(&source, &target).map(|_| ()),
+                    kind @ (EntryKind::File | EntryKind::Symlink) => {
+                        copy_single_entry(&source, &target, kind).map_err(|error| {
+                            OpFailure::with_progress(
+                                error,
+                                "コピー完了: 0/1 エントリ; コピー先に不完全なファイルが残っている可能性があります",
+                            )
+                        })
+                    }
+                }
+            }
+            TransferKind::Move => {
+                fault_point("transfer_move", &target).map_err(OpFailure::from)?;
+                match crate::classify::classify_move(&source, &target, actual_kind)
+                    .map_err(OpFailure::from)?
+                {
+                    MoveClass::SameVolumeRename => fs::rename(
+                        crate::long_path::to_fs(&source),
+                        crate::long_path::to_fs(&target),
                     )
-                })
+                    .with_context(|| {
+                        format!(
+                            "pane間renameができません: {} → {}",
+                            source.display(),
+                            target.display()
+                        )
+                    })
+                    .map_err(OpFailure::from),
+                    MoveClass::CrossVolumeFileMove => {
+                        move_file_across_volumes(&source, &target, actual_kind)
+                    }
+                    MoveClass::CrossVolumeDirectoryMove => {
+                        move_directory_across_volumes(&source, &target)
+                    }
+                }
             }
-        },
-        TransferKind::Move => match crate::classify::classify_move(
-            &source,
-            &target,
-            actual_kind,
-        )
-        .map_err(OpFailure::from)?
-        {
-            MoveClass::SameVolumeRename => fs::rename(
-                crate::long_path::to_fs(&source),
-                crate::long_path::to_fs(&target),
-            )
-            .with_context(|| {
-                format!(
-                    "pane間renameができません: {} → {}",
-                    source.display(),
-                    target.display()
-                )
-            })
-            .map_err(OpFailure::from),
-            MoveClass::CrossVolumeFileMove => {
-                move_file_across_volumes(&source, &target, actual_kind)
-            }
-            MoveClass::CrossVolumeDirectoryMove => {
-                move_directory_across_volumes(&source, &target)
-            }
-        },
-    }
+        }
+    })
 }
 
 fn absolute_path(path: &Path) -> PathBuf {
@@ -355,30 +612,42 @@ fn execute_operation(
                 // create_dir / create_new(true) は既存パスで必ず失敗する
                 // (fs::File::createの黙った切り詰めを防ぐ)。
                 EntryKind::Dir => {
-                    if overwrites.contains(path) {
-                        recycle_approved_target(&target, recorder.as_deref_mut())?;
-                    }
-                    fs::create_dir(&fs_target)
-                        .with_context(|| {
-                            format!("ディレクトリを作成できません: {}", target.display())
-                        })
-                        .map_err(OpFailure::from)?;
+                    execute_with_staged_overwrite(
+                        &target,
+                        overwrites.contains(path),
+                        recorder.as_deref_mut(),
+                        || {
+                            fault_point("create_dir", &target).map_err(OpFailure::from)?;
+                            fs::create_dir(&fs_target)
+                                .with_context(|| {
+                                    format!("ディレクトリを作成できません: {}", target.display())
+                                })
+                                .map_err(OpFailure::from)
+                        },
+                    )?;
                     if let Some(recorder) = recorder {
                         recorder.record_created(&target, *kind);
                     }
                     Ok(())
                 }
                 EntryKind::File => {
-                    if overwrites.contains(path) {
-                        recycle_approved_target(&target, recorder.as_deref_mut())?;
-                    }
-                    fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&fs_target)
-                        .map(|_| ())
-                        .with_context(|| format!("ファイルを作成できません: {}", target.display()))
-                        .map_err(OpFailure::from)?;
+                    execute_with_staged_overwrite(
+                        &target,
+                        overwrites.contains(path),
+                        recorder.as_deref_mut(),
+                        || {
+                            fault_point("create_file", &target).map_err(OpFailure::from)?;
+                            fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(&fs_target)
+                                .map(|_| ())
+                                .with_context(|| {
+                                    format!("ファイルを作成できません: {}", target.display())
+                                })
+                                .map_err(OpFailure::from)
+                        },
+                    )?;
                     if let Some(recorder) = recorder {
                         recorder.record_created(&target, *kind);
                     }
@@ -409,32 +678,43 @@ fn execute_operation(
             if case_only_rename && !case_sensitive_directory {
                 crate::case::case_only_rename(&source, &target).map_err(OpFailure::from)?;
             } else {
-                if overwrites.contains(to) {
-                    recycle_approved_target(&target, recorder.as_deref_mut())?;
-                }
-                // fs::renameはWindows(MOVEFILE_REPLACE_EXISTING)でもUnixでも
-                // 既存の移動先ファイルを黙って上書きする。baseline取得後の外部変更
-                // (TOCTOU)でユーザーデータを消さないよう、直前に存在確認する。
-                ensure_target_vacant(&target)?;
-                match crate::classify::classify_move(&source, &target, kind)
-                    .map_err(OpFailure::from)?
-                {
-                    MoveClass::SameVolumeRename => fs::rename(&fs_source, &fs_target)
-                        .with_context(|| {
-                            format!(
-                                "renameできません: {} → {}",
-                                source.display(),
-                                target.display()
-                            )
-                        })
-                        .map_err(OpFailure::from),
-                    MoveClass::CrossVolumeFileMove => {
-                        move_file_across_volumes(&source, &target, kind)
-                    }
-                    MoveClass::CrossVolumeDirectoryMove => {
-                        move_directory_across_volumes(&source, &target)
-                    }
-                }?;
+                execute_with_staged_overwrite(
+                    &target,
+                    overwrites.contains(to),
+                    recorder.as_deref_mut(),
+                    || {
+                        // fs::renameはWindows(MOVEFILE_REPLACE_EXISTING)でもUnixでも
+                        // 既存の移動先ファイルを黙って上書きする。baseline取得後の外部変更
+                        // (TOCTOU)でユーザーデータを消さないよう、直前に存在確認する。
+                        ensure_target_vacant(&target)?;
+                        match crate::classify::classify_move(&source, &target, kind)
+                            .map_err(OpFailure::from)?
+                        {
+                            MoveClass::SameVolumeRename => {
+                                fault_point("rename", &target).map_err(OpFailure::from)?;
+                                fs::rename(&fs_source, &fs_target)
+                                    .with_context(|| {
+                                        format!(
+                                            "renameできません: {} → {}",
+                                            source.display(),
+                                            target.display()
+                                        )
+                                    })
+                                    .map_err(OpFailure::from)
+                            }
+                            MoveClass::CrossVolumeFileMove => {
+                                fault_point("cross_volume_file_move", &target)
+                                    .map_err(OpFailure::from)?;
+                                move_file_across_volumes(&source, &target, kind)
+                            }
+                            MoveClass::CrossVolumeDirectoryMove => {
+                                fault_point("cross_volume_dir_move", &target)
+                                    .map_err(OpFailure::from)?;
+                                move_directory_across_volumes(&source, &target)
+                            }
+                        }
+                    },
+                )?;
             }
             if let Some(recorder) = recorder {
                 recorder.record_moved(&source, &target, kind, case_only_rename);
@@ -449,23 +729,31 @@ fn execute_operation(
                     format!("コピー元のmetadataを取得できません: {}", source.display())
                 })
                 .map_err(OpFailure::from)?;
-            if overwrites.contains(to) {
-                recycle_approved_target(&target, recorder.as_deref_mut())?;
-            }
-            // fs::copyも既存の移動先を黙って上書きするため、同様に存在確認する。
-            ensure_target_vacant(&target)?;
             let kind = crate::scan::kind_from_metadata(&metadata);
-            match kind {
-                EntryKind::Dir => copy_tree(&source, &target).map(|_| ()),
-                kind @ (EntryKind::File | EntryKind::Symlink) => {
-                    copy_single_entry(&source, &target, kind).map_err(|error| {
-                        OpFailure::with_progress(
-                            error,
-                            "コピー完了: 0/1 エントリ; コピー先に不完全なファイルが残っている可能性があります",
-                        )
-                    })
-                }
-            }?;
+            execute_with_staged_overwrite(
+                &target,
+                overwrites.contains(to),
+                recorder.as_deref_mut(),
+                || {
+                    // fs::copyも既存の移動先を黙って上書きするため、同様に存在確認する。
+                    ensure_target_vacant(&target)?;
+                    match kind {
+                        EntryKind::Dir => {
+                            fault_point("copy_tree", &target).map_err(OpFailure::from)?;
+                            copy_tree(&source, &target).map(|_| ())
+                        }
+                        kind @ (EntryKind::File | EntryKind::Symlink) => {
+                            fault_point("copy_single", &target).map_err(OpFailure::from)?;
+                            copy_single_entry(&source, &target, kind).map_err(|error| {
+                                OpFailure::with_progress(
+                                    error,
+                                    "コピー完了: 0/1 エントリ; コピー先に不完全なファイルが残っている可能性があります",
+                                )
+                            })
+                        }
+                    }
+                },
+            )?;
             if let Some(recorder) = recorder {
                 recorder.record_copied(&target, kind);
             }
@@ -477,49 +765,17 @@ fn execute_operation(
     }
 }
 
-/// 承認済み移動先の現在の実体を確認し、非ディレクトリならごみ箱へ退避する。
-///
-/// preflight後にディレクトリへ変化していた場合は破壊せず失敗させる。
-pub(crate) fn recycle_approved_target(
-    target: &Path,
-    recorder: Option<&mut UndoRecorder>,
-) -> Result<(), OpFailure> {
-    let fs_target = crate::long_path::to_fs(target);
-    match fs::symlink_metadata(&fs_target) {
-        Ok(metadata) if crate::scan::kind_from_metadata(&metadata) == EntryKind::Dir => {
-            Err(OpFailure::from(anyhow!(
-                "移動先がディレクトリに変わっているため上書きを中止しました: {}",
-                target.display()
-            )))
-        }
-        Ok(_) => {
-            recycle_with_optional_backup(target, &fs_target, recorder, UndoBackupKind::Overwritten)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(OpFailure::from(anyhow::Error::from(error).context(
-            format!("上書き対象の存在確認に失敗しました: {}", target.display()),
-        ))),
-    }
-}
-
 fn recycle_deleted_target(
     target: &Path,
     recorder: Option<&mut UndoRecorder>,
 ) -> Result<(), OpFailure> {
-    recycle_with_optional_backup(target, target, recorder, UndoBackupKind::Deleted)
-}
-
-#[derive(Debug, Clone, Copy)]
-enum UndoBackupKind {
-    Deleted,
-    Overwritten,
+    recycle_with_optional_backup(target, target, recorder)
 }
 
 fn recycle_with_optional_backup(
     logical_target: &Path,
     recycle_target: &Path,
     recorder: Option<&mut UndoRecorder>,
-    backup_kind: UndoBackupKind,
 ) -> Result<(), OpFailure> {
     let Some(recorder) = recorder else {
         return crate::recycle::delete_to_recycle_bin(recycle_target).map_err(OpFailure::from);
@@ -530,10 +786,7 @@ fn recycle_with_optional_backup(
         .map_err(OpFailure::from)?;
     match crate::recycle::delete_to_recycle_bin(recycle_target) {
         Ok(()) => {
-            match backup_kind {
-                UndoBackupKind::Deleted => recorder.record_deleted(logical_target, backup),
-                UndoBackupKind::Overwritten => recorder.record_overwritten(logical_target, backup),
-            }
+            recorder.record_deleted(logical_target, backup);
             Ok(())
         }
         Err(error) => {
@@ -843,6 +1096,42 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    struct FaultGuard;
+
+    impl FaultGuard {
+        fn once(stage: &'static str) -> Self {
+            let mut fired = false;
+            FAULT_INJECTION.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |actual, _| {
+                    if actual == stage && !fired {
+                        fired = true;
+                        Some(anyhow!("test fault at {stage}"))
+                    } else {
+                        None
+                    }
+                }));
+            });
+            Self
+        }
+
+        fn stages(stages: &'static [&'static str]) -> Self {
+            FAULT_INJECTION.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |actual, _| {
+                    stages
+                        .contains(&actual)
+                        .then(|| anyhow!("test fault at {actual}"))
+                }));
+            });
+            Self
+        }
+    }
+
+    impl Drop for FaultGuard {
+        fn drop(&mut self) {
+            FAULT_INJECTION.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
 
     /// ディレクトリ直下の実際の格納名を返す(ソート済み)。
     ///
@@ -1167,6 +1456,187 @@ mod tests {
         ));
         assert_eq!(fs::read(root.path().join("src.txt")).unwrap(), b"source");
         assert!(root.path().join("target").is_dir());
+    }
+
+    #[test]
+    fn approved_create_file_failure_restores_original_target() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("target.txt"), b"original").unwrap();
+        let target = TreePath::parse("target.txt");
+        let plan = OperationPlan {
+            ops: vec![FsOperation::Create {
+                path: target.clone(),
+                kind: EntryKind::File,
+            }],
+        };
+        let _fault = FaultGuard::once("create_file");
+
+        let report = apply_plan_with_overwrites(root.path(), &plan, &HashSet::from([target]));
+
+        assert!(matches!(
+            report.results[0].outcome,
+            OpOutcome::Failed { .. }
+        ));
+        assert_eq!(
+            fs::read(root.path().join("target.txt")).unwrap(),
+            b"original"
+        );
+    }
+
+    #[test]
+    fn approved_create_dir_failure_restores_original_file_target() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("target"), b"original").unwrap();
+        let target = TreePath::parse("target");
+        let plan = OperationPlan {
+            ops: vec![FsOperation::Create {
+                path: target.clone(),
+                kind: EntryKind::Dir,
+            }],
+        };
+        let _fault = FaultGuard::once("create_dir");
+
+        let report = apply_plan_with_overwrites(root.path(), &plan, &HashSet::from([target]));
+
+        assert!(matches!(
+            report.results[0].outcome,
+            OpOutcome::Failed { .. }
+        ));
+        assert_eq!(fs::read(root.path().join("target")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn approved_move_failure_restores_source_target_and_discards_undo_backup() {
+        let root = tempdir().unwrap();
+        let backup = tempdir().unwrap();
+        fs::write(root.path().join("source.txt"), b"source").unwrap();
+        fs::write(root.path().join("target.txt"), b"original").unwrap();
+        let target = TreePath::parse("target.txt");
+        let plan = OperationPlan {
+            ops: vec![FsOperation::Move {
+                id: EntryId(1),
+                from: TreePath::parse("source.txt"),
+                to: target.clone(),
+            }],
+        };
+        let mut recorder = UndoRecorder::new(
+            "tx".to_owned(),
+            root.path().to_path_buf(),
+            backup.path().to_path_buf(),
+        );
+        let _fault = FaultGuard::once("rename");
+
+        let report = apply_plan_cancellable(
+            root.path(),
+            &plan,
+            &HashSet::from([target]),
+            &AtomicBool::new(false),
+            &mut |_| {},
+            Some(&mut recorder),
+        );
+        let transaction = recorder.into_transaction();
+
+        assert!(matches!(
+            report.results[0].outcome,
+            OpOutcome::Failed { .. }
+        ));
+        assert_eq!(fs::read(root.path().join("source.txt")).unwrap(), b"source");
+        assert_eq!(
+            fs::read(root.path().join("target.txt")).unwrap(),
+            b"original"
+        );
+        assert!(transaction.steps.is_empty());
+        assert_eq!(transaction.backup_dir, None);
+        assert!(!backup.path().join("payload/0/target.txt").exists());
+    }
+
+    #[test]
+    fn approved_copy_failure_restores_original_without_incomplete_target() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("source.txt"), b"source").unwrap();
+        fs::write(root.path().join("target.txt"), b"original").unwrap();
+        let target = TreePath::parse("target.txt");
+        let plan = OperationPlan {
+            ops: vec![FsOperation::Copy {
+                src: EntryId(1),
+                from: TreePath::parse("source.txt"),
+                to: target.clone(),
+            }],
+        };
+        let _fault = FaultGuard::once("copy_single");
+
+        let report = apply_plan_with_overwrites(root.path(), &plan, &HashSet::from([target]));
+
+        assert!(matches!(
+            report.results[0].outcome,
+            OpOutcome::Failed { .. }
+        ));
+        assert_eq!(fs::read(root.path().join("source.txt")).unwrap(), b"source");
+        assert_eq!(
+            fs::read(root.path().join("target.txt")).unwrap(),
+            b"original"
+        );
+    }
+
+    #[test]
+    fn restore_failure_reports_staged_path_for_manual_recovery() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("source.txt"), b"source").unwrap();
+        fs::write(root.path().join("target.txt"), b"original").unwrap();
+        let target = TreePath::parse("target.txt");
+        let plan = OperationPlan {
+            ops: vec![FsOperation::Move {
+                id: EntryId(1),
+                from: TreePath::parse("source.txt"),
+                to: target.clone(),
+            }],
+        };
+        let _fault = FaultGuard::stages(&["rename", "restore"]);
+
+        let report = apply_plan_with_overwrites(root.path(), &plan, &HashSet::from([target]));
+
+        assert!(matches!(
+            &report.results[0].outcome,
+            OpOutcome::Failed { progress: Some(progress), .. }
+                if progress.contains(".fyler-staged-")
+                    && progress.contains("手動で")
+                    && progress.contains("target.txt")
+        ));
+        assert_eq!(fs::read(root.path().join("source.txt")).unwrap(), b"source");
+        assert!(!root.path().join("target.txt").exists());
+        assert!(fs::read_dir(root.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".fyler-staged-")
+        }));
+    }
+
+    #[test]
+    fn trash_commit_failure_keeps_operation_result_and_reports_staged_path() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("source.txt"), b"source").unwrap();
+        fs::write(root.path().join("target.txt"), b"original").unwrap();
+        let target = TreePath::parse("target.txt");
+        let plan = OperationPlan {
+            ops: vec![FsOperation::Move {
+                id: EntryId(1),
+                from: TreePath::parse("source.txt"),
+                to: target.clone(),
+            }],
+        };
+        let _fault = FaultGuard::once("commit_to_trash");
+
+        let report = apply_plan_with_overwrites(root.path(), &plan, &HashSet::from([target]));
+
+        assert!(matches!(
+            &report.results[0].outcome,
+            OpOutcome::Failed { progress: Some(progress), .. }
+                if progress.contains("操作自体は完了") && progress.contains(".fyler-staged-")
+        ));
+        assert!(!root.path().join("source.txt").exists());
+        assert_eq!(fs::read(root.path().join("target.txt")).unwrap(), b"source");
     }
 
     #[test]
@@ -1851,6 +2321,72 @@ mod tests {
         assert!(report.all_succeeded());
         assert_eq!(fs::read(target.join("occupied.txt")).unwrap(), b"new");
         assert_eq!(fs::read(source.join("new.txt")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn transfer_move_failure_restores_source_and_original_target() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(source.join("new.txt"), b"new").unwrap();
+        fs::write(target.join("occupied.txt"), b"old").unwrap();
+        let plan = transfer_plan(
+            &source,
+            &target,
+            vec![transfer_op(
+                TransferKind::Move,
+                "new.txt",
+                "occupied.txt",
+                EntryKind::File,
+            )],
+        );
+        let approved = HashSet::from([absolute_path(&target.join("occupied.txt"))]);
+        let _fault = FaultGuard::once("transfer_move");
+
+        let report =
+            apply_transfer_plan_cancellable(&plan, &approved, &AtomicBool::new(false), &mut |_| {});
+
+        assert!(matches!(
+            report.results[0].outcome,
+            OpOutcome::Failed { .. }
+        ));
+        assert_eq!(fs::read(source.join("new.txt")).unwrap(), b"new");
+        assert_eq!(fs::read(target.join("occupied.txt")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn transfer_copy_failure_restores_original_target() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(source.join("new.txt"), b"new").unwrap();
+        fs::write(target.join("occupied.txt"), b"old").unwrap();
+        let plan = transfer_plan(
+            &source,
+            &target,
+            vec![transfer_op(
+                TransferKind::Copy,
+                "new.txt",
+                "occupied.txt",
+                EntryKind::File,
+            )],
+        );
+        let approved = HashSet::from([absolute_path(&target.join("occupied.txt"))]);
+        let _fault = FaultGuard::once("transfer_copy");
+
+        let report =
+            apply_transfer_plan_cancellable(&plan, &approved, &AtomicBool::new(false), &mut |_| {});
+
+        assert!(matches!(
+            report.results[0].outcome,
+            OpOutcome::Failed { .. }
+        ));
+        assert_eq!(fs::read(source.join("new.txt")).unwrap(), b"new");
+        assert_eq!(fs::read(target.join("occupied.txt")).unwrap(), b"old");
     }
 
     #[test]
