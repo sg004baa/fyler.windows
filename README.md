@@ -10,7 +10,7 @@ Windowsネイティブのスタンドアロン GUI ファイラーとして Rust
 
 ## ドキュメント
 
-- **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** — `config.toml`設定リファレンス
+- **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** — `config.toml` configuration reference
 - **[docs/DESIGN.md](docs/DESIGN.md)** — 実装設計書 v2(正典)
 - **[AGENTS.md](AGENTS.md)** — 実装エージェント向け運用ルール(絶対ルール・依存境界・進め方)
 - **[docs/M0_RESULTS.md](docs/M0_RESULTS.md)** — M0成立性スパイクの結果記録

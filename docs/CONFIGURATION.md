@@ -1,48 +1,48 @@
 # Configuration
 
-fylerのユーザー設定は`config.toml`に記述します。設定は起動時にだけ読み込まれるため、
-変更を反映するにはfylerを再起動してください。
+fyler reads user settings from `config.toml`. Settings are loaded only at startup, so restart
+fyler after changing the file.
 
-## 設定ファイルの場所
+## Configuration file location
 
-| 環境 | パス |
+| Environment | Path |
 |---|---|
 | Windows | `%APPDATA%\fyler\config.toml` |
-| Linuxなど | `$XDG_CONFIG_HOME/fyler/config.toml` |
-| `XDG_CONFIG_HOME`未設定時 | `~/.config/fyler/config.toml` |
+| Linux and other platforms | `$XDG_CONFIG_HOME/fyler/config.toml` |
+| When `XDG_CONFIG_HOME` is unset | `~/.config/fyler/config.toml` |
 
-ファイルが存在しない場合は、すべて既定値で起動します。fylerは`config.toml`を
-読み取るだけで、作成や書き換えは行いません。
+If the file does not exist, fyler starts with the defaults. fyler only reads `config.toml`; it
+does not create or rewrite it.
 
-開発・テスト用途では、環境変数`FYLER_CONFIG_DIR`で設定ディレクトリを変更できます。
-また、`FYLER_NVIM_EXE`で使用するNeovim実行ファイルを指定できます。
+For development and testing, `FYLER_CONFIG_DIR` overrides the configuration directory.
+`FYLER_NVIM_EXE` selects the Neovim executable used by fyler.
 
-設定値の型や値が不正な場合、fylerは可能な範囲でその項目だけを無視し、既定値へ
-フォールバックします。警告内容はアプリ内のメッセージとして表示されます。
+When a value has the wrong type or is otherwise invalid, fyler falls back where possible and
+ignores only the affected setting. Warnings are shown as in-app messages.
 
-## 設定例
+## Complete example
 
 ```toml
-# 隠しファイルを起動時から表示
+# Show hidden files at startup
 show_hidden = false
 
-# ディレクトリを先に並べ、名前の昇順でソート
+# Put directories first and sort by name in ascending order
 sort = "dirs_first"
 sort_key = "name"
 sort_reverse = false
 
-# 保存確認ダイアログに全操作を表示
+# Show every operation in confirmation dialogs
 confirm_detail = "full"
 
-# 日本語fallbackフォントと表示位置の補正
-# Windowsパスは、バックスラッシュをそのまま書けるシングルクォートが便利
+# Japanese fallback font and vertical alignment adjustment
+# TOML literal strings are convenient for Windows paths because backslashes need no escaping
 font = 'C:\Windows\Fonts\meiryo.ttc'
 font_y_offset_factor = 0.12
 
-# "ascii"またはNerd Font向けの"nerd"
+# Use "nerd" for Nerd Font icons or "ascii" for portable icons
 icons = "ascii"
 
-# Leaderは単一の無修飾キー。省略時はSpace
+# Leader must be one unmodified key. The default is Space.
 leader = "Space"
 
 [bookmarks]
@@ -56,69 +56,68 @@ projects = 'D:\projects'
 "Ctrl+W x" = "pane_focus_next"
 ```
 
-## 設定項目一覧
+## Settings reference
 
-| 項目 | 型 | 既定値 | 設定値・意味 |
+| Setting | Type | Default | Values and behavior |
 |---|---|---|---|
-| `show_hidden` | boolean | `false` | 起動時から隠しファイルを表示する |
-| `sort` | string | `"dirs_first"` | `"dirs_first"`または`"mixed"` |
-| `sort_key` | string | `"name"` | `"name"`、`"date"`、`"size"`、`"ext"` |
-| `sort_reverse` | boolean | `false` | 選択したソートキーを降順にする |
-| `confirm_detail` | string | `"full"` | `"full"`または`"summary"` |
-| `font` | string | 未指定 | 日本語fallbackフォントの絶対パス |
-| `font_y_offset_factor` | number | `0.12` | CJKフォントを下へずらすフォントサイズ比。`0`で無効 |
-| `icons` | string | `"ascii"` | `"ascii"`または`"nerd"` |
-| `leader` | string | `"Space"` | keymapの`Leader`を展開する単一の無修飾キー |
-| `[bookmarks]` | table | 空 | ブックマーク名と絶対パス |
-| `[keymap.normal]` | table | 組み込みkeymap | キーシーケンスとaction名 |
+| `show_hidden` | boolean | `false` | Show hidden files at startup |
+| `sort` | string | `"dirs_first"` | `"dirs_first"` or `"mixed"` |
+| `sort_key` | string | `"name"` | `"name"`, `"date"`, `"size"`, or `"ext"` |
+| `sort_reverse` | boolean | `false` | Reverse the selected sort key |
+| `confirm_detail` | string | `"full"` | `"full"` or `"summary"` |
+| `font` | string | unset | Absolute path to a fallback font |
+| `font_y_offset_factor` | number | `0.12` | Downward CJK font offset as a font-size ratio; `0` disables it |
+| `icons` | string | `"ascii"` | `"ascii"` or `"nerd"` |
+| `leader` | string | `"Space"` | One unmodified key used to expand `Leader` bindings |
+| `[bookmarks]` | table | empty | Bookmark names mapped to absolute paths |
+| `[keymap.normal]` | table | built-in keymap | Key sequences mapped to action names |
 
-### 表示とソート
+### Display and sorting
 
-`show_hidden = true`にすると、ドットで始まる項目とWindowsのhidden属性を持つ項目を
-起動時から表示します。起動後は`toggle_hidden` action（既定は`g .`）でも切り替えられます。
+`show_hidden = true` shows dot-prefixed entries and entries with the Windows hidden attribute at
+startup. The `toggle_hidden` action (`g .` by default) can also change this while fyler is running.
 
-`sort`はディレクトリとファイルのグループ方法を指定します。
+`sort` controls how directories and files are grouped:
 
-- `dirs_first`: ディレクトリを先にまとめ、その後へファイルを並べる
-- `mixed`: ディレクトリとファイルを混在させて並べる
+- `dirs_first`: place all directories before files
+- `mixed`: sort directories and files together
 
-`sort_key`は各グループ内の比較方法を指定します。
+`sort_key` controls comparison within those groups:
 
-- `name`: 大文字小文字を区別しない自然順。数字部分も数値として比較する
-- `date`: 更新日時順
-- `size`: ファイルサイズ順
-- `ext`: 拡張子順
+- `name`: case-insensitive natural order with numeric segments compared numerically
+- `date`: modification time
+- `size`: file size
+- `ext`: file extension
 
-`sort_reverse = true`はソートキー部分を降順にします。ディレクトリ優先の有無は
-`sort`で独立して指定します。起動後は`:sort name|date|size|ext`でも変更でき、
-`:sort!`形式では降順になります。
+`sort_reverse = true` reverses the selected key. Directory grouping remains controlled separately
+by `sort`. At runtime, use `:sort name|date|size|ext`; add `!` to the command for descending order.
 
-### 確認ダイアログ
+### Confirmation dialogs
 
-`confirm_detail`は保存やtransfer前の確認ダイアログに表示する操作一覧の詳細度です。
+`confirm_detail` controls how save and transfer operations appear before they are applied:
 
-- `full`: 操作をすべて表示する
-- `summary`: 操作数が多い場合に種類ごとの件数へ要約する
+- `full`: show every operation
+- `summary`: summarize large plans by operation type
 
-### フォントとアイコン
+### Fonts and icons
 
-`font`にはフォントファイルの絶対パスだけを指定できます。相対パスは警告して
-無視されます。WindowsパスはTOMLのliteral stringを使うと読みやすくなります。
+`font` accepts only an absolute font-file path. Relative paths are ignored with a warning. TOML
+literal strings keep Windows paths readable:
 
 ```toml
 font = 'C:\Windows\Fonts\meiryo.ttc'
 ```
 
-`font_y_offset_factor`は、CJKフォントが上寄りに描画される場合の下方向補正です。
-フォントサイズに対する比率で、`0`にすると補正しません。
+`font_y_offset_factor` moves CJK glyphs downward by a ratio of the font size when their metrics
+make them appear too high. Set it to `0` to disable the adjustment.
 
-`icons = "nerd"`はNerd Fontのグリフを使用します。表示用フォントが対応していない
-場合は`"ascii"`を使用してください。
+`icons = "nerd"` uses Nerd Font glyphs. Use `"ascii"` when the display font does not provide
+those glyphs.
 
-### ブックマーク
+### Bookmarks
 
-`[bookmarks]`へ任意の名前と絶対パスを定義します。定義順はブックマーク一覧でも
-維持されます。
+Define bookmark names and absolute paths under `[bookmarks]`. fyler preserves their definition
+order when displaying the bookmark list.
 
 ```toml
 [bookmarks]
@@ -127,36 +126,37 @@ work = 'D:\work'
 downloads = 'C:\Users\me\Downloads'
 ```
 
-`:b`で一覧を表示し、`:b home`のように名前を指定して移動できます。一意な前方一致も
-利用できます。相対パスや文字列以外の値は警告して無視されます。
+Use `:b` to list bookmarks and `:b home` to open one. A unique name prefix also works. Relative
+paths and non-string values are ignored with a warning.
 
-最近使ったルートは同じ設定ディレクトリの`recent.toml`へ最大10件保存され、`:b`の
-候補へ追加されます。`recent.toml`はfylerが管理するため、通常は手動編集しません。
+fyler stores up to ten recently used roots in `recent.toml` in the same configuration directory
+and includes them in the `:b` candidates. fyler manages this file, so it normally should not be
+edited manually.
 
 ## Keymap
 
-keymapはエンジン非依存の表記を使用します。Neovim形式の`<C-w>`や`<CR>`は
-受け付けません。現在設定できるセクションは`[keymap.normal]`だけです。
-`[keymap.visual]`などの未対応セクションは警告して無視されます。
+Keymaps use engine-independent notation. Neovim notation such as `<C-w>` and `<CR>` is not
+accepted. `[keymap.normal]` is currently the only supported section. Unsupported sections such as
+`[keymap.visual]` are ignored with a warning.
 
-設定は組み込みkeymapへ順に上書きされます。同じキーシーケンスへactionを指定すると
-既存の割り当てを置き換え、`"none"`を指定すると割り当てを解除します。
+User entries are applied on top of the built-in keymap. Assigning an action replaces the binding
+for that sequence. Assigning `"none"` removes it.
 
 ```toml
 leader = "Space"
 
 [keymap.normal]
-"Leader f" = "file_picker" # Space fへ展開
-"g d" = "help"             # 既存キーを別actionへ変更
-"g ." = "none"             # 既存キーを解除
+"Leader f" = "file_picker" # Expands to Space f
+"g d" = "help"             # Reassign an existing sequence
+"g ." = "none"             # Remove an existing binding
 ```
 
-`activate`、`transfer_move`、`transfer_copy`はNormal modeとVisual modeの両方にmapされます。
-その他のactionはNormal mode用です。
+`activate`, `transfer_move`, and `transfer_copy` are mapped in both Normal and Visual modes. All
+other actions are mapped in Normal mode.
 
-### キー表記
+### Key notation
 
-複数ストロークは空白で区切り、1ストローク内の修飾キーは`+`で結合します。
+Separate strokes with spaces and join modifiers within a stroke with `+`:
 
 ```toml
 [keymap.normal]
@@ -166,59 +166,61 @@ leader = "Space"
 "Leader f" = "file_picker"
 ```
 
-修飾キー名と名前付きキー名は大文字小文字を区別しません。印字可能文字は区別します。
+Modifier and named-key names are case-insensitive. Printable characters are case-sensitive.
 
-- 修飾キー: `Ctrl`、`Alt`、`Shift`
-- 名前付きキー: `Enter`、`Esc`、`Backspace`、`Tab`、`Delete`、`Space`
-- 移動キー: `Up`、`Down`、`Left`、`Right`、`Home`、`End`、`PageUp`、`PageDown`
-- ファンクションキー: `F1`～`F12`
-- leader参照: `Leader`
-- その他の1文字の印字可能文字: `g`、`?`、`V`など
+- Modifiers: `Ctrl`, `Alt`, `Shift`
+- Named keys: `Enter`, `Esc`, `Backspace`, `Tab`, `Delete`, `Space`
+- Navigation keys: `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `PageUp`, `PageDown`
+- Function keys: `F1` through `F12`
+- Leader reference: `Leader`
+- Any other single printable character, such as `g`, `?`, or `V`
 
-補足と制約:
+Rules and limitations:
 
-- `V`は大文字の文字として扱われ、`v`とは別のキーになる
-- 修飾付きASCII英字は小文字へ正規化されるため、`Ctrl+W`と`Ctrl+w`は同じ
-- 印字可能文字へ`Shift`は指定できない。`Shift+v`ではなく`V`と書く
-- `leader`自体は単一の無修飾キーだけ指定できる
-- `Leader`を使うbindingで`leader`が不正な場合は、既定の`Space`へフォールバックする
-- 単独の`Ctrl+W`には割り当てできない
-- `Ctrl+W`で始まるシーケンス同士を、互いに真のprefixとなる形では定義できない
-- 不正なキー、未知のaction、重複、解除対象のない`none`は警告の対象になる
-- runtime reloadには対応していないため、変更後は再起動が必要
+- `V` is an uppercase character and is distinct from `v`.
+- Modified ASCII letters are normalized to lowercase, so `Ctrl+W` and `Ctrl+w` are equivalent.
+- Do not apply `Shift` to a printable character. Write `V`, not `Shift+v`.
+- `leader` itself must be one unmodified key.
+- An invalid `leader` falls back to `Space` when expanding `Leader` bindings.
+- A standalone `Ctrl+W` cannot be bound.
+- Two `Ctrl+W` sequences cannot be configured when either is a true prefix of the other.
+- Invalid keys, unknown actions, duplicates, and `none` entries with no binding to remove produce
+  warnings.
+- Runtime reload is not supported; restart fyler after changing the keymap.
 
-### 設定可能なaction
+### Available actions
 
-| action | 説明 | 既定キー |
+| Action | Description | Default key |
 |---|---|---|
-| `activate` | ディレクトリ開閉 / ファイルを開く | `Enter` |
-| `navigate_parent` | 親ディレクトリへ移動 | `^` |
-| `navigate_into` | ディレクトリ内へ移動 | `g d` |
-| `toggle_hidden` | 隠しファイル表示を切り替え | `g .` |
-| `fold_close` | ディレクトリを折りたたむ | `z c` |
-| `fold_open` | ディレクトリを展開 | `z o` |
-| `fold_toggle` | 折りたたみ状態を切り替え | `z a` |
-| `fold_close_recursive` | 配下を再帰的に折りたたむ | `z C` |
-| `fold_open_recursive` | 配下を再帰的に展開 | `z O` |
-| `fold_close_all` | すべて折りたたむ | `z M` |
-| `fold_open_all` | すべて展開 | `z R` |
-| `file_picker` | ファイルを検索 | `g /` |
-| `yank_path` | パスをコピー | `g y` |
-| `open_with` | アプリを選んで開く | `g o` |
-| `transfer_move` | 別paneへ移動 | `g m` |
-| `transfer_copy` | 別paneへコピー | `g c` |
-| `help` | ヘルプを表示 | `?` |
-| `pane_split_horizontal` | paneを上下分割 | `Ctrl+W s`, `Ctrl+W S` |
-| `pane_split_vertical` | paneを左右分割 | `Ctrl+W v` |
-| `pane_focus_left` | 左paneへ移動 | `Ctrl+W h` |
-| `pane_focus_down` | 下paneへ移動 | `Ctrl+W j` |
-| `pane_focus_up` | 上paneへ移動 | `Ctrl+W k` |
-| `pane_focus_right` | 右paneへ移動 | `Ctrl+W l` |
-| `pane_focus_next` | 次のpaneへ移動 | `Ctrl+W w`, `Ctrl+W Ctrl+W` |
-| `pane_focus_previous` | 前のpaneへ移動 | `Ctrl+W p` |
-| `pane_close` | paneを閉じる | `Ctrl+W q`, `Ctrl+W c` |
+| `activate` | Toggle a directory or open a file | `Enter` |
+| `navigate_parent` | Go to the parent directory | `^` |
+| `navigate_into` | Enter the selected directory | `g d` |
+| `toggle_hidden` | Toggle hidden files | `g .` |
+| `fold_close` | Collapse a directory | `z c` |
+| `fold_open` | Expand a directory | `z o` |
+| `fold_toggle` | Toggle a directory fold | `z a` |
+| `fold_close_recursive` | Recursively collapse descendants | `z C` |
+| `fold_open_recursive` | Recursively expand descendants | `z O` |
+| `fold_close_all` | Collapse all directories | `z M` |
+| `fold_open_all` | Expand all directories | `z R` |
+| `file_picker` | Find a file | `g /` |
+| `yank_path` | Copy the selected path | `g y` |
+| `open_with` | Choose an application and open the entry | `g o` |
+| `transfer_move` | Move entries to another pane | `g m` |
+| `transfer_copy` | Copy entries to another pane | `g c` |
+| `help` | Show help | `?` |
+| `pane_split_horizontal` | Split the pane horizontally | `Ctrl+W s`, `Ctrl+W S` |
+| `pane_split_vertical` | Split the pane vertically | `Ctrl+W v` |
+| `pane_focus_left` | Focus the pane to the left | `Ctrl+W h` |
+| `pane_focus_down` | Focus the pane below | `Ctrl+W j` |
+| `pane_focus_up` | Focus the pane above | `Ctrl+W k` |
+| `pane_focus_right` | Focus the pane to the right | `Ctrl+W l` |
+| `pane_focus_next` | Focus the next pane | `Ctrl+W w`, `Ctrl+W Ctrl+W` |
+| `pane_focus_previous` | Focus the previous pane | `Ctrl+W p` |
+| `pane_close` | Close the current pane | `Ctrl+W q`, `Ctrl+W c` |
 
-`none`はactionではなく、指定したキーシーケンスの割り当てを解除する特別値です。
+`none` is not an action. It is a special value that removes the binding for the specified key
+sequence.
 
-`?`で開くヘルプは、組み込みkeymapとユーザー設定を解決した後の割り当てから
-動的に生成されます。解除済みactionは表示されず、追加・変更したキーも反映されます。
+The help dialog opened with `?` is generated from the resolved built-in and user bindings. It
+omits actions with no remaining bindings and reflects added or reassigned keys.
