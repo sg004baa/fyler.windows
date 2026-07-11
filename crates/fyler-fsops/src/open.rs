@@ -39,7 +39,7 @@ pub fn open_with_default_app(path: &Path) -> anyhow::Result<()> {
     let code = result.0 as isize;
     if code <= 32 {
         bail!(
-            "既定アプリケーションで開けませんでした (ShellExecuteW={code}): {}",
+            "Failed to open with the default application (ShellExecuteW={code}): {}",
             path.display()
         );
     }
@@ -57,7 +57,7 @@ pub fn open_with_default_app(path: &Path) -> anyhow::Result<()> {
         .spawn()
         .with_context(|| {
             format!(
-                "xdg-openで既定アプリケーションを起動できません: {}",
+                "Failed to launch default application with xdg-open: {}",
                 path.display()
             )
         })?;

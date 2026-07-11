@@ -51,24 +51,25 @@ pub fn open_with_handler(path: &Path, key: &str) -> anyhow::Result<()> {
     // bind contextは不要なのでnullを渡す。
     let shell_item: IShellItem =
         unsafe { SHCreateItemFromParsingName(PCWSTR(path_wide.as_ptr()), None) }
-            .map_err(|error| anyhow::anyhow!("Shell itemを作成できません: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("Failed to create Shell item: {error}"))?;
     // SAFETY: `BHID_DataObject` はShellが定義するbind handler IDであり、戻り値型は
     // `IDataObject` に固定している。
     let data_object: IDataObject = unsafe { shell_item.BindToHandler(None, &BHID_DataObject) }
-        .map_err(|error| anyhow::anyhow!("Shell data objectを作成できません: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("Failed to create Shell data object: {error}"))?;
 
     for handler in enumerate_assoc_handlers(path)? {
         let handler_key = handler_key(&handler)?;
         if handler_key == key {
             // SAFETY: `data_object` はShell itemから取得した有効なIDataObject。
-            unsafe { handler.Invoke(&data_object) }
-                .map_err(|error| anyhow::anyhow!("指定アプリで開けません: {error}"))?;
+            unsafe { handler.Invoke(&data_object) }.map_err(|error| {
+                anyhow::anyhow!("Failed to open with selected application: {error}")
+            })?;
             return Ok(());
         }
     }
 
     anyhow::bail!(
-        "指定されたopen-withハンドラが見つかりません: {key} ({})",
+        "Selected open-with handler was not found: {key} ({})",
         path.display()
     )
 }
@@ -79,7 +80,7 @@ pub fn open_with_handler(path: &Path, key: &str) -> anyhow::Result<()> {
 #[cfg(not(windows))]
 pub fn open_with_handler(path: &Path, key: &str) -> anyhow::Result<()> {
     anyhow::bail!(
-        "open-withハンドラ指定はこのOSでは未対応です: {key} ({})",
+        "Selecting an open-with handler is not supported on this OS: {key} ({})",
         path.display()
     )
 }
@@ -111,7 +112,7 @@ pub fn open_with_system_dialog(path: &Path) -> anyhow::Result<()> {
     let code = result.0 as isize;
     if code <= 32 {
         bail!(
-            "open-withダイアログを開けませんでした (ShellExecuteW={code}): {}",
+            "Failed to open the open-with dialog (ShellExecuteW={code}): {}",
             path.display()
         );
     }
@@ -139,7 +140,9 @@ fn enumerate_assoc_handlers(
     // SAFETY: `extension` は呼び出し中有効なNUL終端UTF-16文字列。
     let enum_handlers =
         unsafe { SHAssocEnumHandlers(PCWSTR(extension.as_ptr()), ASSOC_FILTER_RECOMMENDED) }
-            .map_err(|error| anyhow::anyhow!("open-with候補を列挙できません: {error}"))?;
+            .map_err(|error| {
+                anyhow::anyhow!("Failed to enumerate open-with candidates: {error}")
+            })?;
 
     let mut handlers = Vec::new();
     loop {
@@ -147,7 +150,7 @@ fn enumerate_assoc_handlers(
         let mut slot: [Option<IAssocHandler>; 1] = [None];
         // SAFETY: `slot` は1要素分の出力領域で、`fetched` は呼び出し中有効。
         unsafe { enum_handlers.Next(&mut slot, Some(&mut fetched)) }
-            .map_err(|error| anyhow::anyhow!("open-with候補の読み取りに失敗しました: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("Failed to read open-with candidate: {error}"))?;
         if fetched == 0 {
             break;
         }
@@ -171,7 +174,7 @@ fn handler_info(
 fn handler_key(handler: &windows::Win32::UI::Shell::IAssocHandler) -> anyhow::Result<String> {
     // SAFETY: Shell APIが返すCoTaskMem文字列を読み取り、直後に解放する。
     unsafe { take_cotaskmem_string(handler.GetName()) }
-        .map_err(|error| anyhow::anyhow!("open-withハンドラ名を取得できません: {error}"))
+        .map_err(|error| anyhow::anyhow!("Failed to get open-with handler name: {error}"))
 }
 
 #[cfg(windows)]
@@ -180,7 +183,7 @@ fn handler_display_name(
 ) -> anyhow::Result<String> {
     // SAFETY: Shell APIが返すCoTaskMem文字列を読み取り、直後に解放する。
     unsafe { take_cotaskmem_string(handler.GetUIName()) }
-        .map_err(|error| anyhow::anyhow!("open-with表示名を取得できません: {error}"))
+        .map_err(|error| anyhow::anyhow!("Failed to get open-with display name: {error}"))
 }
 
 #[cfg(windows)]
@@ -252,7 +255,7 @@ impl ComApartment {
         }
         result
             .ok()
-            .map_err(|error| anyhow::anyhow!("COMを初期化できません: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("Failed to initialize COM: {error}"))?;
         Ok(Self { uninitialize: true })
     }
 }

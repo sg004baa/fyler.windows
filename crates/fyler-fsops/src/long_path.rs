@@ -41,9 +41,12 @@ pub fn to_fs(path: &Path) -> PathBuf {
 /// - 短いパスには付けない選択もあるが、判定を分岐させず常に付けてよい
 ///   (挙動が一貫する方を優先)。方針変更するならこのdocを更新すること
 pub fn to_extended(path: &Path) -> anyhow::Result<PathBuf> {
-    let raw = path
-        .to_str()
-        .with_context(|| format!("WindowsパスをUTF-8として表現できません: {}", path.display()))?;
+    let raw = path.to_str().with_context(|| {
+        format!(
+            "Windows path cannot be represented as UTF-8: {}",
+            path.display()
+        )
+    })?;
 
     if raw.starts_with(EXTENDED_PREFIX) {
         return Ok(path.to_path_buf());
@@ -55,7 +58,7 @@ pub fn to_extended(path: &Path) -> anyhow::Result<PathBuf> {
     } else if is_drive_absolute(&normalized_separators) {
         normalize_drive(&normalized_separators)
     } else {
-        bail!("絶対パスではありません: {}", path.display());
+        bail!("Path is not absolute: {}", path.display());
     };
 
     Ok(PathBuf::from(normalized))
@@ -81,11 +84,11 @@ fn normalize_unc(path: &str) -> anyhow::Result<String> {
     let server = components
         .next()
         .filter(|component| *component != "." && *component != "..")
-        .context("UNCパスにサーバー名がありません")?;
+        .context("UNC path has no server name")?;
     let share = components
         .next()
         .filter(|component| *component != "." && *component != "..")
-        .context("UNCパスに共有名がありません")?;
+        .context("UNC path has no share name")?;
     let remainder = normalize_components(components);
 
     let mut normalized = format!("{EXTENDED_UNC_PREFIX}{server}\\{share}");

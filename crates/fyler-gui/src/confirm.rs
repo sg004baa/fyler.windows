@@ -181,7 +181,7 @@ pub fn draw_undo_plan(ui: &mut egui::Ui, lines: &[String]) -> Option<ConfirmChoi
             ui.heading("Confirm undo");
             ui.add_space(8.0);
             for line in lines {
-                if line.trim_start().starts_with("[対象外]") {
+                if line.trim_start().starts_with("[Skipped]") {
                     ui.colored_label(ui.visuals().warn_fg_color, line);
                 } else {
                     ui.monospace(line);

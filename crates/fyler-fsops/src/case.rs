@@ -91,9 +91,9 @@ pub fn dir_is_case_sensitive(dir: &Path) -> anyhow::Result<bool> {
 pub fn case_only_rename(from: &Path, to: &Path) -> anyhow::Result<()> {
     let parent = from
         .parent()
-        .context("case-only renameの移動元に親ディレクトリがありません")?;
+        .context("Source of case-only rename has no parent directory")?;
     if to.parent() != Some(parent) {
-        bail!("case-only renameの移動元と移動先の親ディレクトリが異なります");
+        bail!("Source and destination of case-only rename have different parent directories");
     }
 
     let temporary = unique_temporary_path(parent);
@@ -103,7 +103,7 @@ pub fn case_only_rename(from: &Path, to: &Path) -> anyhow::Result<()> {
     )
     .with_context(|| {
         format!(
-            "case-only renameの一段目に失敗しました: {} → {}",
+            "First stage of case-only rename failed: {} → {}",
             from.display(),
             temporary.display()
         )
@@ -118,7 +118,7 @@ pub fn case_only_rename(from: &Path, to: &Path) -> anyhow::Result<()> {
             crate::long_path::to_fs(from),
         ) {
             Ok(()) => Err(anyhow::anyhow!(
-                "case-only renameの二段目に失敗し、元へ戻しました: {} → {}: {rename_error}",
+                "Second stage of case-only rename failed and the original name was restored: {} → {}: {rename_error}",
                 temporary.display(),
                 to.display()
             )),

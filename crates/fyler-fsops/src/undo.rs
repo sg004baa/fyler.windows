@@ -170,7 +170,7 @@ pub fn apply_undo_cancellable(
             results.extend(execution_steps[index..].iter().cloned().map(|op| OpResult {
                 op,
                 outcome: OpOutcome::Skipped {
-                    reason: "ユーザーがキャンセルしました".to_owned(),
+                    reason: "Cancelled by user".to_owned(),
                 },
             }));
             break;
@@ -209,8 +209,9 @@ fn execute_undo_step(transaction: &UndoTransaction, step: &UndoStep) -> Result<(
     validate_undo_step(transaction, step)?;
     match step {
         UndoStep::RemoveCreated { path, .. } | UndoStep::RemoveCopied { path, .. } => {
-            crate::recycle::delete_to_recycle_bin(&crate::long_path::to_fs(path))
-                .map_err(|error| format!("undo対象をごみ箱へ移動できません: {error:#}"))
+            crate::recycle::delete_to_recycle_bin(&crate::long_path::to_fs(path)).map_err(|error| {
+                format!("Failed to move undo target to the recycle bin: {error:#}")
+            })
         }
         UndoStep::MoveBack {
             from,
@@ -224,9 +225,9 @@ fn execute_undo_step(transaction: &UndoTransaction, step: &UndoStep) -> Result<(
             let backup_dir = transaction
                 .backup_dir
                 .as_deref()
-                .ok_or_else(|| "backupディレクトリが記録されていません".to_owned())?;
+                .ok_or_else(|| "Backup directory was not recorded".to_owned())?;
             crate::backup::restore_entry(backup_dir, backup, path).map_err(|error| {
-                format!("backup payloadから復元できません: {error:#}; backup payloadは残っています")
+                format!("Failed to restore from backup payload: {error:#}; the backup payload remains available")
             })
         }
     }
@@ -244,17 +245,17 @@ fn execute_move_back(
             .is_some_and(|parent| crate::case::dir_is_case_sensitive(parent).unwrap_or(false));
     if case_only && !case_sensitive_directory {
         return crate::case::case_only_rename(to, from)
-            .map_err(|error| format!("case-only renameを戻せません: {error:#}"));
+            .map_err(|error| format!("Failed to reverse case-only rename: {error:#}"));
     }
 
     match crate::classify::classify_move(to, from, kind)
-        .map_err(|error| format!("undo moveのボリューム分類に失敗しました: {error:#}"))?
+        .map_err(|error| format!("Failed to classify volume for undo move: {error:#}"))?
     {
         MoveClass::SameVolumeRename => {
             fs::rename(crate::long_path::to_fs(to), crate::long_path::to_fs(from)).map_err(
                 |error| {
                     format!(
-                        "renameを戻せません: {} → {}: {error}",
+                        "Failed to reverse rename: {} → {}: {error}",
                         to.display(),
                         from.display()
                     )
@@ -316,43 +317,43 @@ fn validate_remove_created(
 ) -> Result<(), String> {
     match post.kind {
         EntryKind::File => {
-            let current = capture_current(path, identity, "作成したファイルが見つかりません")?;
+            let current = capture_current(path, identity, "Created file was not found")?;
             ensure_identity_matches(
                 identity,
                 current.identity.as_ref(),
-                "作成後に別の実体へ置き換わっています",
+                "Replaced by a different object after creation",
             )?;
             ensure_file_fingerprint_matches(
                 post,
                 &current.fingerprint,
-                "作成後に内容が変更されています",
+                "Content changed after creation",
             )
         }
         EntryKind::Dir => {
-            let current = capture_current(path, identity, "作成したディレクトリが見つかりません")?;
+            let current = capture_current(path, identity, "Created directory was not found")?;
             ensure_identity_matches(
                 identity,
                 current.identity.as_ref(),
-                "作成後に別の実体へ置き換わっています",
+                "Replaced by a different object after creation",
             )?;
             ensure_kind_matches(
                 post.kind,
                 current.fingerprint.kind,
-                "作成後に種別が変更されています",
+                "Type changed after creation",
             )?;
             ensure_directory_empty(path)
         }
         EntryKind::Symlink => {
-            let current = capture_current(path, identity, "作成したsymlinkが見つかりません")?;
+            let current = capture_current(path, identity, "Created symlink was not found")?;
             ensure_identity_matches(
                 identity,
                 current.identity.as_ref(),
-                "作成後に別の実体へ置き換わっています",
+                "Replaced by a different object after creation",
             )?;
             ensure_symlink_fingerprint_matches(
                 post,
                 &current.fingerprint,
-                "作成後にリンク先が変更されています",
+                "Link target changed after creation",
             )
         }
     }
@@ -366,53 +367,52 @@ fn validate_remove_copied(
 ) -> Result<(), String> {
     match post.kind {
         EntryKind::File => {
-            let current = capture_current(path, identity, "コピーしたファイルが見つかりません")?;
+            let current = capture_current(path, identity, "Copied file was not found")?;
             ensure_identity_matches(
                 identity,
                 current.identity.as_ref(),
-                "コピー後に別の実体へ置き換わっています",
+                "Replaced by a different object after copy",
             )?;
             ensure_file_fingerprint_matches(
                 post,
                 &current.fingerprint,
-                "コピー後に内容が変更されています",
+                "Content changed after copy",
             )
         }
         EntryKind::Dir => {
             let expected_manifest = manifest
-                .ok_or_else(|| "コピーしたディレクトリのmanifestが記録されていません".to_owned())?;
-            let current =
-                capture_current(path, identity, "コピーしたディレクトリが見つかりません")?;
+                .ok_or_else(|| "Manifest for copied directory was not recorded".to_owned())?;
+            let current = capture_current(path, identity, "Copied directory was not found")?;
             ensure_identity_matches(
                 identity,
                 current.identity.as_ref(),
-                "コピー後に別の実体へ置き換わっています",
+                "Replaced by a different object after copy",
             )?;
             ensure_kind_matches(
                 post.kind,
                 current.fingerprint.kind,
-                "コピー後に種別が変更されています",
+                "Type changed after copy",
             )?;
             let current_manifest = crate::identity::capture_manifest(path).map_err(|error| {
-                format!("コピーしたディレクトリのmanifestを採取できません: {error:#}")
+                format!("Failed to capture manifest for copied directory: {error:#}")
             })?;
             if current_manifest == expected_manifest {
                 Ok(())
             } else {
-                Err("コピー後にディレクトリ内容が変更されています".to_owned())
+                Err("Directory contents changed after copy".to_owned())
             }
         }
         EntryKind::Symlink => {
-            let current = capture_current(path, identity, "コピーしたsymlinkが見つかりません")?;
+            let current = capture_current(path, identity, "Copied symlink was not found")?;
             ensure_identity_matches(
                 identity,
                 current.identity.as_ref(),
-                "コピー後に別の実体へ置き換わっています",
+                "Replaced by a different object after copy",
             )?;
             ensure_symlink_fingerprint_matches(
                 post,
                 &current.fingerprint,
-                "コピー後にリンク先が変更されています",
+                "Link target changed after copy",
             )
         }
     }
@@ -432,29 +432,29 @@ fn validate_move_back(
         from.parent()
             .is_some_and(|parent| crate::case::dir_is_case_sensitive(parent).unwrap_or(false))
     }) {
-        ensure_path_vacant(from, "元の場所に別のエントリが存在します")?;
+        ensure_path_vacant(from, "Another entry exists at the original location")?;
     }
-    let current = capture_current(to, identity, "戻す対象が見つかりません")?;
+    let current = capture_current(to, identity, "Target to restore was not found")?;
     ensure_identity_matches(
         identity,
         current.identity.as_ref(),
-        "移動後に別の実体へ置き換わっています",
+        "Replaced by a different object after move",
     )?;
     match post.kind {
         EntryKind::File => ensure_file_fingerprint_matches(
             post,
             &current.fingerprint,
-            "移動後に内容が変更されています",
+            "Content changed after move",
         ),
         EntryKind::Dir => ensure_kind_matches(
             post.kind,
             current.fingerprint.kind,
-            "移動後に種別が変更されています",
+            "Type changed after move",
         ),
         EntryKind::Symlink => ensure_symlink_fingerprint_matches(
             post,
             &current.fingerprint,
-            "移動後にリンク先が変更されています",
+            "Link target changed after move",
         ),
     }
 }
@@ -464,23 +464,23 @@ fn validate_restore(
     path: &Path,
     backup: &BackupRef,
 ) -> Result<(), String> {
-    ensure_path_vacant(path, "復元先に別のエントリが存在します")?;
+    ensure_path_vacant(path, "Another entry exists at the restore destination")?;
     let backup_dir = transaction
         .backup_dir
         .as_deref()
-        .ok_or_else(|| "backupディレクトリが記録されていません".to_owned())?;
+        .ok_or_else(|| "Backup directory was not recorded".to_owned())?;
     let payload = backup_payload_path(backup_dir, backup)?;
     let metadata = fs::symlink_metadata(crate::long_path::to_fs(&payload)).map_err(|error| {
         match error.kind() {
-            std::io::ErrorKind::NotFound => "backup payloadが見つかりません".to_owned(),
-            _ => format!("backup payloadを確認できません: {error}"),
+            std::io::ErrorKind::NotFound => "Backup payload was not found".to_owned(),
+            _ => format!("Failed to inspect backup payload: {error}"),
         }
     })?;
     let actual_kind = crate::scan::kind_from_metadata(&metadata);
     if actual_kind == backup.kind {
         Ok(())
     } else {
-        Err("backup payloadの種別が記録と一致しません".to_owned())
+        Err("Backup payload type does not match the record".to_owned())
     }
 }
 
@@ -499,13 +499,13 @@ fn capture_current(
         if metadata_missing(path) {
             not_found_reason.to_owned()
         } else {
-            format!("現在のfingerprintを採取できません: {error:#}")
+            format!("Failed to capture current fingerprint: {error:#}")
         }
     })?;
     let identity = if expected_identity.is_some() {
         Some(
             crate::identity::capture_identity(path)
-                .map_err(|error| format!("現在の実体識別子を採取できません: {error:#}"))?,
+                .map_err(|error| format!("Failed to capture current object identity: {error:#}"))?,
         )
     } else {
         None
@@ -533,7 +533,7 @@ fn ensure_file_fingerprint_matches(
     current: &Fingerprint,
     reason: &str,
 ) -> Result<(), String> {
-    ensure_kind_matches(expected.kind, current.kind, "種別が変更されています")?;
+    ensure_kind_matches(expected.kind, current.kind, "Type has changed")?;
     if current.size == expected.size && current.mtime == expected.mtime {
         Ok(())
     } else {
@@ -546,7 +546,7 @@ fn ensure_symlink_fingerprint_matches(
     current: &Fingerprint,
     reason: &str,
 ) -> Result<(), String> {
-    ensure_kind_matches(expected.kind, current.kind, "種別が変更されています")?;
+    ensure_kind_matches(expected.kind, current.kind, "Type has changed")?;
     if current.link_target == expected.link_target {
         Ok(())
     } else {
@@ -568,12 +568,12 @@ fn ensure_kind_matches(
 
 fn ensure_directory_empty(path: &Path) -> Result<(), String> {
     let mut entries = fs::read_dir(crate::long_path::to_fs(path))
-        .map_err(|error| format!("作成したディレクトリを列挙できません: {error}"))?;
+        .map_err(|error| format!("Failed to enumerate created directory: {error}"))?;
     match entries.next() {
         None => Ok(()),
-        Some(Ok(_)) => Err("作成後にディレクトリ内が変更されています".to_owned()),
+        Some(Ok(_)) => Err("Directory contents changed after creation".to_owned()),
         Some(Err(error)) => Err(format!(
-            "作成したディレクトリのエントリを確認できません: {error}"
+            "Failed to inspect entry in created directory: {error}"
         )),
     }
 }
@@ -582,7 +582,7 @@ fn ensure_path_vacant(path: &Path, occupied_reason: &str) -> Result<(), String> 
     match fs::symlink_metadata(crate::long_path::to_fs(path)) {
         Ok(_) => Err(occupied_reason.to_owned()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("パスの存在確認に失敗しました: {error}")),
+        Err(error) => Err(format!("Failed to check whether path exists: {error}")),
     }
 }
 
@@ -598,7 +598,7 @@ fn backup_payload_path(backup_dir: &Path, backup: &BackupRef) -> Result<PathBuf,
     for component in backup.payload_rel.split('/') {
         if component.is_empty() || component == "." || component == ".." {
             return Err(format!(
-                "不正なbackup payload相対パスです: {}",
+                "Invalid backup payload relative path: {}",
                 backup.payload_rel
             ));
         }
@@ -1014,7 +1014,7 @@ mod tests {
         // 契約は「置き換わった実体を絶対にrecycleしない」こと。
         assert!(
             matches!(&report.results[0].outcome, OpOutcome::Failed { .. }),
-            "置き換わったファイルのundoは拒否されるべき: {:?}",
+            "Undo should reject a replaced file: {:?}",
             report.results[0].outcome
         );
         assert_eq!(
@@ -1048,7 +1048,7 @@ mod tests {
 
         let report = apply_undo(&transaction);
 
-        assert_failed_contains(&report.results[0].outcome, "置き換わっています");
+        assert_failed_contains(&report.results[0].outcome, "different object");
         assert_eq!(fs::read(&path).unwrap(), b"created");
     }
 
@@ -1069,7 +1069,7 @@ mod tests {
 
         let report = apply_undo(&transaction);
 
-        assert_failed_contains(&report.results[0].outcome, "内容が変更されています");
+        assert_failed_contains(&report.results[0].outcome, "Content changed");
         assert_eq!(
             fs::read(root.path().join("created.txt")).unwrap(),
             b"changed"
@@ -1096,7 +1096,7 @@ mod tests {
 
         let report = apply_undo(&transaction);
 
-        assert_failed_contains(&report.results[0].outcome, "ディレクトリ内容が変更");
+        assert_failed_contains(&report.results[0].outcome, "Directory contents changed");
         assert_eq!(
             fs::read(root.path().join("dir-copy/new.txt")).unwrap(),
             b"new"
@@ -1122,7 +1122,7 @@ mod tests {
 
         let report = apply_undo(&transaction);
 
-        assert_failed_contains(&report.results[0].outcome, "元の場所に別のエントリ");
+        assert_failed_contains(&report.results[0].outcome, "original location");
         assert_eq!(fs::read(root.path().join("from.txt")).unwrap(), b"occupied");
         assert_eq!(fs::read(root.path().join("to.txt")).unwrap(), b"source");
     }
@@ -1146,7 +1146,10 @@ mod tests {
 
         let report = apply_undo(&transaction);
 
-        assert_failed_contains(&report.results[0].outcome, "戻す対象が見つかりません");
+        assert_failed_contains(
+            &report.results[0].outcome,
+            "Target to restore was not found",
+        );
         assert!(!root.path().join("from.txt").exists());
         assert!(!root.path().join("to.txt").exists());
     }
@@ -1169,7 +1172,7 @@ mod tests {
 
         let report = apply_undo(&transaction);
 
-        assert_failed_contains(&report.results[0].outcome, "復元先に別のエントリ");
+        assert_failed_contains(&report.results[0].outcome, "restore destination");
         assert_eq!(
             fs::read(root.path().join("deleted.txt")).unwrap(),
             b"occupied"
@@ -1194,7 +1197,7 @@ mod tests {
 
         let report = apply_undo(&transaction);
 
-        assert_failed_contains(&report.results[0].outcome, "backup payloadが見つかりません");
+        assert_failed_contains(&report.results[0].outcome, "Backup payload was not found");
         assert!(!root.path().join("deleted.txt").exists());
     }
 
@@ -1268,7 +1271,7 @@ mod tests {
 
         let report = apply_undo(&transaction);
 
-        assert_failed_contains(&report.results[0].outcome, "内容が変更されています");
+        assert_failed_contains(&report.results[0].outcome, "Content changed");
         assert!(matches!(report.results[1].outcome, OpOutcome::Success));
         assert!(!root.path().join("a.txt").exists());
         assert_eq!(fs::read(root.path().join("b.txt")).unwrap(), b"changed");
@@ -1341,8 +1344,8 @@ mod tests {
         let report = apply_undo(&transaction);
 
         assert_eq!(report.results.len(), 2);
-        assert_failed_contains(&report.results[0].outcome, "元の場所に別のエントリ");
-        assert_failed_contains(&report.results[1].outcome, "復元先に別のエントリ");
+        assert_failed_contains(&report.results[0].outcome, "original location");
+        assert_failed_contains(&report.results[1].outcome, "restore destination");
         assert_eq!(fs::read(root.path().join("src.txt")).unwrap(), b"occupied");
         assert_eq!(fs::read(root.path().join("target.txt")).unwrap(), b"source");
     }

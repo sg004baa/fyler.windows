@@ -79,18 +79,18 @@ pub fn watch(root: &Path, tx: Sender<ExternalChange>) -> anyhow::Result<FsWatche
 
         let _ = notify_tx.send(event.paths);
     })
-    .context("ファイルシステム監視を作成できません")?;
+    .context("Failed to create file system watcher")?;
 
     watcher
         .watch(root, RecursiveMode::Recursive)
-        .with_context(|| format!("ファイルシステム監視を開始できません: {}", root.display()))?;
+        .with_context(|| format!("Failed to start file system watcher: {}", root.display()))?;
 
     let debounce_thread = thread::Builder::new()
         .name("fyler-fs-watch-debounce".to_owned())
         // channel待機とパス集合化だけの非再帰ループなので小さいstackで十分。
         .stack_size(256 * 1024)
         .spawn(move || run_debounce(notify_rx, tx))
-        .context("ファイルシステム監視のdebounceスレッドを開始できません")?;
+        .context("Failed to start file system watcher debounce thread")?;
 
     Ok(FsWatcher {
         watcher: Some(watcher),
@@ -162,7 +162,7 @@ mod tests {
 
         let change = rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("ファイル作成の通知が届きませんでした");
+            .expect("File creation notification was not received");
         assert!(change.paths.contains(&created));
     }
 
@@ -178,7 +178,7 @@ mod tests {
 
         let change = rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("ファイル内容上書きの通知が届きませんでした");
+            .expect("File content overwrite notification was not received");
         assert!(change.paths.contains(&changed));
     }
 
@@ -191,7 +191,7 @@ mod tests {
             EventKind::Any,
             EventKind::Other,
         ] {
-            assert!(is_tree_change(&kind), "受理されませんでした: {kind:?}");
+            assert!(is_tree_change(&kind), "Event was not accepted: {kind:?}");
         }
         assert!(!is_tree_change(&EventKind::Access(AccessKind::Read)));
     }
@@ -213,7 +213,7 @@ mod tests {
 
         let first_change = rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("ファイル作成の通知が届きませんでした");
+            .expect("File creation notification was not received");
         let mut changes = vec![first_change];
         while let Ok(change) = rx.recv_timeout(Duration::from_millis(500)) {
             changes.push(change);
@@ -227,11 +227,11 @@ mod tests {
             created_paths
                 .iter()
                 .all(|path| received_paths.contains(path)),
-            "作成した全パスが通知に含まれていません: {received_paths:?}"
+            "Notification does not include all created paths: {received_paths:?}"
         );
         assert!(
             changes.iter().any(|change| change.paths.len() > 1) || changes.len() < CREATED_FILES,
-            "作成イベントがdebounceされていません: {}件",
+            "Creation events were not debounced: {} events",
             changes.len()
         );
     }

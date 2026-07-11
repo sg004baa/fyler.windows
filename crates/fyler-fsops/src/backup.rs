@@ -18,22 +18,26 @@ pub fn backup_entry(
 ) -> anyhow::Result<BackupRef> {
     let basename = source
         .file_name()
-        .context("backup対象にbasenameがありません")?;
+        .context("Backup source has no basename")?;
     let basename_text = basename
         .to_str()
-        .context("backup対象のbasenameがUTF-8ではありません")?;
+        .context("Backup source basename is not UTF-8")?;
     let step_dir = backup_dir.join("payload").join(step_index.to_string());
     let payload = step_dir.join(basename);
     let payload_rel = format!("payload/{step_index}/{basename_text}");
 
-    let metadata = fs::symlink_metadata(crate::long_path::to_fs(source))
-        .with_context(|| format!("backup対象のmetadataを取得できません: {}", source.display()))?;
+    let metadata = fs::symlink_metadata(crate::long_path::to_fs(source)).with_context(|| {
+        format!(
+            "Failed to get metadata for backup source: {}",
+            source.display()
+        )
+    })?;
     let kind = crate::scan::kind_from_metadata(&metadata);
 
     let copy_result = (|| {
         fs::create_dir_all(crate::long_path::to_fs(&step_dir)).with_context(|| {
             format!(
-                "backup payloadディレクトリを作成できません: {}",
+                "Failed to create backup payload directory: {}",
                 step_dir.display()
             )
         })?;
@@ -89,7 +93,10 @@ fn payload_path(backup_dir: &Path, backup: &BackupRef) -> anyhow::Result<PathBuf
     let mut path = backup_dir.to_path_buf();
     for component in backup.payload_rel.split('/') {
         if component.is_empty() || component == "." || component == ".." {
-            bail!("不正なbackup payload相対パスです: {}", backup.payload_rel);
+            bail!(
+                "Invalid backup payload relative path: {}",
+                backup.payload_rel
+            );
         }
         path.push(component);
     }
@@ -98,10 +105,10 @@ fn payload_path(backup_dir: &Path, backup: &BackupRef) -> anyhow::Result<PathBuf
 
 fn ensure_restore_target_vacant(target: &Path) -> anyhow::Result<()> {
     match fs::symlink_metadata(crate::long_path::to_fs(target)) {
-        Ok(_) => bail!("復元先が既に存在します: {}", target.display()),
+        Ok(_) => bail!("Restore destination already exists: {}", target.display()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error)
-            .with_context(|| format!("復元先の存在確認に失敗しました: {}", target.display())),
+            .with_context(|| format!("Failed to check restore destination: {}", target.display())),
     }
 }
 
@@ -200,7 +207,11 @@ mod tests {
 
         let error = restore_entry(backup.path(), &reference, &occupied).unwrap_err();
 
-        assert!(error.to_string().contains("復元先が既に存在"));
+        assert!(
+            error
+                .to_string()
+                .contains("Restore destination already exists")
+        );
         assert_eq!(fs::read(&occupied).unwrap(), b"occupied");
     }
 }

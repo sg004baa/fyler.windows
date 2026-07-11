@@ -93,7 +93,7 @@ impl StagedTarget {
         )
         .with_context(|| {
             format!(
-                "退避した旧エントリを元位置へ戻せません: {} → {}",
+                "Failed to restore staged old entry to its original location: {} → {}",
                 self.staged_path.display(),
                 self.original.display()
             )
@@ -107,7 +107,7 @@ fn stage_target_aside(target: &Path) -> Result<Option<StagedTarget>, OpFailure> 
     match fs::symlink_metadata(crate::long_path::to_fs(target)) {
         Ok(metadata) if crate::scan::kind_from_metadata(&metadata) == EntryKind::Dir => {
             return Err(OpFailure::from(anyhow!(
-                "移動先がディレクトリに変わっているため上書きを中止しました: {}",
+                "Overwrite cancelled because the destination became a directory: {}",
                 target.display()
             )));
         }
@@ -115,20 +115,20 @@ fn stage_target_aside(target: &Path) -> Result<Option<StagedTarget>, OpFailure> 
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(OpFailure::from(anyhow::Error::from(error).context(
-                format!("上書き対象の存在確認に失敗しました: {}", target.display()),
+                format!("Failed to check overwrite target: {}", target.display()),
             )));
         }
     }
 
     let parent = target.parent().ok_or_else(|| {
         OpFailure::from(anyhow!(
-            "上書き対象の親ディレクトリを取得できません: {}",
+            "Failed to get parent directory of overwrite target: {}",
             target.display()
         ))
     })?;
     let basename = target.file_name().ok_or_else(|| {
         OpFailure::from(anyhow!(
-            "上書き対象のファイル名を取得できません: {}",
+            "Failed to get file name of overwrite target: {}",
             target.display()
         ))
     })?;
@@ -153,7 +153,7 @@ fn stage_target_aside(target: &Path) -> Result<Option<StagedTarget>, OpFailure> 
                     let _ = fs::remove_dir(crate::long_path::to_fs(&staging_dir));
                     return Err(OpFailure::from(anyhow::Error::from(error).context(
                         format!(
-                            "上書き対象を一時退避できません: {} → {}",
+                            "Failed to stage overwrite target: {} → {}",
                             target.display(),
                             staged_path.display()
                         ),
@@ -171,7 +171,7 @@ fn stage_target_aside(target: &Path) -> Result<Option<StagedTarget>, OpFailure> 
             Err(error) => {
                 return Err(OpFailure::from(anyhow::Error::from(error).context(
                     format!(
-                        "上書き対象の一時退避ディレクトリを作成できません: {}",
+                        "Failed to create staging directory for overwrite target: {}",
                         staging_dir.display()
                     ),
                 )));
@@ -180,7 +180,8 @@ fn stage_target_aside(target: &Path) -> Result<Option<StagedTarget>, OpFailure> 
     }
 
     Err(OpFailure::from(anyhow::Error::from(
-        last_error.unwrap_or_else(|| std::io::Error::other("staging dir名の確保に失敗しました")),
+        last_error
+            .unwrap_or_else(|| std::io::Error::other("Failed to allocate staging directory name")),
     )))
 }
 
@@ -233,7 +234,7 @@ fn execute_with_staged_overwrite(
                 Err(OpFailure::with_progress(
                     error,
                     format!(
-                        "操作自体は完了しましたが、上書きした旧エントリをごみ箱へ送れませんでした。旧エントリは {} に残っています",
+                        "The operation completed, but the overwritten old entry could not be moved to the recycle bin. It remains at {}",
                         staged_path.display()
                     ),
                 ))
@@ -245,7 +246,7 @@ fn execute_with_staged_overwrite(
                 staged.restore()
             } else {
                 Err(anyhow!(
-                    "不完全なtargetを除去できないためrestoreを実行できません"
+                    "Cannot restore because the incomplete target could not be removed"
                 ))
             };
             match (cleanup, restore) {
@@ -257,18 +258,18 @@ fn execute_with_staged_overwrite(
                 }
                 (cleanup, restore) => {
                     let backup_note = backup.as_ref().map_or(String::new(), |backup| {
-                        format!(" backup payload {} も保持しています。", backup.payload_rel)
+                        format!(" Backup payload {} is also retained.", backup.payload_rel)
                     });
                     Err(OpFailure::with_progress(
                         anyhow!(operation_error.error),
                         format!(
-                            "本体操作失敗後の補償にも失敗しました(cleanup: {}; restore: {})。旧エントリは {} に退避されたままです。手動で {} へ戻してください。{}",
+                            "Compensation after the operation failed also failed (cleanup: {}; restore: {}). The old entry remains staged at {}. Restore it manually to {}.{}",
                             cleanup
                                 .err()
-                                .map_or_else(|| "成功".to_owned(), |error| error.to_string()),
+                                .map_or_else(|| "success".to_owned(), |error| error.to_string()),
                             restore
                                 .err()
-                                .map_or_else(|| "成功".to_owned(), |error| error.to_string()),
+                                .map_or_else(|| "success".to_owned(), |error| error.to_string()),
                             staged_path.display(),
                             original.display(),
                             backup_note
@@ -288,8 +289,12 @@ fn cleanup_staged_operation_target(target: &Path) -> anyhow::Result<()> {
     };
     let kind = crate::scan::kind_from_metadata(&metadata);
     if kind == EntryKind::Dir {
-        fs::remove_dir_all(crate::long_path::to_fs(target))
-            .with_context(|| format!("不完全なディレクトリを削除できません: {}", target.display()))
+        fs::remove_dir_all(crate::long_path::to_fs(target)).with_context(|| {
+            format!(
+                "Failed to remove incomplete directory: {}",
+                target.display()
+            )
+        })
     } else {
         remove_non_directory_entry(target, kind)
     }
@@ -364,7 +369,7 @@ pub fn apply_plan_cancellable(
             results.extend(plan.ops[index..].iter().cloned().map(|op| OpResult {
                 op,
                 outcome: OpOutcome::Skipped {
-                    reason: "ユーザーがキャンセルしました".to_owned(),
+                    reason: "Cancelled by user".to_owned(),
                 },
             }));
             break;
@@ -380,7 +385,9 @@ pub fn apply_plan_cancellable(
             results.push(OpResult {
                 op: operation.clone(),
                 outcome: OpOutcome::Skipped {
-                    reason: format!("先行する親ディレクトリの作成に失敗しました: {failed_parent}"),
+                    reason: format!(
+                        "A preceding parent directory creation failed: {failed_parent}"
+                    ),
                 },
             });
             continue;
@@ -448,7 +455,7 @@ pub fn apply_transfer_plan_cancellable(
             results.extend(plan.ops[index..].iter().cloned().map(|op| OpResult {
                 op,
                 outcome: OpOutcome::Skipped {
-                    reason: "ユーザーがキャンセルしました".to_owned(),
+                    reason: "Cancelled by user".to_owned(),
                 },
             }));
             break;
@@ -493,12 +500,17 @@ fn execute_transfer_operation(
     let source = operation.from.to_fs_path(from_root);
     let target = operation.to.to_fs_path(to_root);
     let metadata = fs::symlink_metadata(crate::long_path::to_fs(&source))
-        .with_context(|| format!("transfer元のmetadataを取得できません: {}", source.display()))
+        .with_context(|| {
+            format!(
+                "Failed to get transfer source metadata: {}",
+                source.display()
+            )
+        })
         .map_err(OpFailure::from)?;
     let actual_kind = crate::scan::kind_from_metadata(&metadata);
     if actual_kind != operation.entry_kind {
         return Err(OpFailure::from(anyhow!(
-            "transfer元の種別がplan確定後に変化しました: {}",
+            "Transfer source type changed after the plan was finalized: {}",
             source.display()
         )));
     }
@@ -526,7 +538,7 @@ fn execute_transfer_operation(
                         copy_single_entry(&source, &target, kind).map_err(|error| {
                             OpFailure::with_progress(
                                 error,
-                                "コピー完了: 0/1 エントリ; コピー先に不完全なファイルが残っている可能性があります",
+                                "Copy complete: 0/1 entries; an incomplete file may remain at the destination",
                             )
                         })
                     }
@@ -543,7 +555,7 @@ fn execute_transfer_operation(
                     )
                     .with_context(|| {
                         format!(
-                            "pane間renameができません: {} → {}",
+                            "Failed to rename between panes: {} → {}",
                             source.display(),
                             target.display()
                         )
@@ -620,7 +632,7 @@ fn execute_operation(
                             fault_point("create_dir", &target).map_err(OpFailure::from)?;
                             fs::create_dir(&fs_target)
                                 .with_context(|| {
-                                    format!("ディレクトリを作成できません: {}", target.display())
+                                    format!("Failed to create directory: {}", target.display())
                                 })
                                 .map_err(OpFailure::from)
                         },
@@ -643,7 +655,7 @@ fn execute_operation(
                                 .open(&fs_target)
                                 .map(|_| ())
                                 .with_context(|| {
-                                    format!("ファイルを作成できません: {}", target.display())
+                                    format!("Failed to create file: {}", target.display())
                                 })
                                 .map_err(OpFailure::from)
                         },
@@ -653,7 +665,9 @@ fn execute_operation(
                     }
                     Ok(())
                 }
-                EntryKind::Symlink => Err(OpFailure::from(anyhow!("SYMLINKのCREATEは未実装"))),
+                EntryKind::Symlink => Err(OpFailure::from(anyhow!(
+                    "CREATE for SYMLINK is not implemented"
+                ))),
             }
         }
         FsOperation::Move { from, to, .. } => {
@@ -662,7 +676,7 @@ fn execute_operation(
             let fs_source = crate::long_path::to_fs(&source);
             let fs_target = crate::long_path::to_fs(&target);
             let metadata = fs::symlink_metadata(&fs_source)
-                .with_context(|| format!("移動元のmetadataを取得できません: {}", source.display()))
+                .with_context(|| format!("Failed to get source metadata: {}", source.display()))
                 .map_err(OpFailure::from)?;
             let kind = crate::scan::kind_from_metadata(&metadata);
 
@@ -695,7 +709,7 @@ fn execute_operation(
                                 fs::rename(&fs_source, &fs_target)
                                     .with_context(|| {
                                         format!(
-                                            "renameできません: {} → {}",
+                                            "Failed to rename: {} → {}",
                                             source.display(),
                                             target.display()
                                         )
@@ -726,7 +740,7 @@ fn execute_operation(
             let target = to.to_fs_path(root);
             let metadata = fs::symlink_metadata(crate::long_path::to_fs(&source))
                 .with_context(|| {
-                    format!("コピー元のmetadataを取得できません: {}", source.display())
+                    format!("Failed to get copy source metadata: {}", source.display())
                 })
                 .map_err(OpFailure::from)?;
             let kind = crate::scan::kind_from_metadata(&metadata);
@@ -747,7 +761,7 @@ fn execute_operation(
                             copy_single_entry(&source, &target, kind).map_err(|error| {
                                 OpFailure::with_progress(
                                     error,
-                                    "コピー完了: 0/1 エントリ; コピー先に不完全なファイルが残っている可能性があります",
+                                    "Copy complete: 0/1 entries; an incomplete file may remain at the destination",
                                 )
                             })
                         }
@@ -802,13 +816,14 @@ fn recycle_with_optional_backup(
 pub(crate) fn ensure_target_vacant(target: &Path) -> Result<(), OpFailure> {
     match fs::symlink_metadata(crate::long_path::to_fs(target)) {
         Ok(_) => Err(OpFailure::from(anyhow!(
-            "移動先に別のエントリが既に存在します(外部で変更された可能性): {}",
+            "Another entry already exists at the destination, possibly due to an external change: {}",
             target.display()
         ))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(OpFailure::from(anyhow::Error::from(error).context(
-            format!("移動先の存在確認に失敗しました: {}", target.display()),
-        ))),
+        Err(error) => Err(OpFailure::from(
+            anyhow::Error::from(error)
+                .context(format!("Failed to check destination: {}", target.display())),
+        )),
     }
 }
 
@@ -819,23 +834,25 @@ pub(crate) fn move_file_across_volumes(
 ) -> Result<(), OpFailure> {
     if let Err(error) = copy_single_entry(source, target, kind) {
         let cleanup = match cleanup_incomplete_target(target) {
-            Ok(true) => "不完全なコピー先を削除済み".to_owned(),
-            Ok(false) => "コピー先は作成されていません".to_owned(),
-            Err(cleanup_error) => format!("不完全なコピー先の削除にも失敗: {cleanup_error:#}"),
+            Ok(true) => "Incomplete copy destination removed".to_owned(),
+            Ok(false) => "Copy destination was not created".to_owned(),
+            Err(cleanup_error) => {
+                format!("Failed to remove incomplete copy destination: {cleanup_error:#}")
+            }
         };
         return Err(OpFailure::with_progress(
             error,
-            format!("コピー完了: 0/1 エントリ; {cleanup}"),
+            format!("Copy complete: 0/1 entries; {cleanup}"),
         ));
     }
 
     remove_non_directory_entry(source, kind).map_err(|error| {
         OpFailure::with_progress(
             error.context(format!(
-                "コピー後に移動元を削除できません: {}",
+                "Failed to remove source after copy: {}",
                 source.display()
             )),
-            "コピー完了: 1/1 エントリ; 移動元の削除に失敗",
+            "Copy complete: 1/1 entries; failed to remove source",
         )
     })
 }
@@ -845,7 +862,7 @@ pub(crate) fn move_directory_across_volumes(source: &Path, target: &Path) -> Res
     fs::remove_dir_all(crate::long_path::to_fs(source))
         .with_context(|| {
             format!(
-                "コピー後に移動元ディレクトリを削除できません: {}",
+                "Failed to remove source directory after copy: {}",
                 source.display()
             )
         })
@@ -853,7 +870,7 @@ pub(crate) fn move_directory_across_volumes(source: &Path, target: &Path) -> Res
             OpFailure::with_progress(
                 error,
                 format!(
-                    "コピー完了: {0}/{0} エントリ; 移動元ディレクトリの削除に失敗",
+                    "Copy complete: {0}/{0} entries; failed to remove source directory",
                     progress.total
                 ),
             )
@@ -873,14 +890,14 @@ pub(crate) fn copy_single_entry(
         .map(|_| ())
         .with_context(|| {
             format!(
-                "ファイルをコピーできません: {} → {}",
+                "Failed to copy file: {} → {}",
                 source.display(),
                 target.display()
             )
         }),
         EntryKind::Symlink => copy_symlink(source, target),
         EntryKind::Dir => bail!(
-            "ディレクトリは単一エントリとしてコピーできません: {}",
+            "A directory cannot be copied as a single entry: {}",
             source.display()
         ),
     }
@@ -902,13 +919,18 @@ pub(crate) fn copy_tree(source: &Path, target: &Path) -> Result<CopyProgress, Op
     let tasks = collect_copy_tasks(source, target).map_err(|error| {
         OpFailure::with_progress(
             error,
-            "コピー完了: 0 エントリ; コピー対象の総数を確定できませんでした",
+            "Copy complete: 0 entries; could not determine total number of entries",
         )
     })?;
     let total = tasks.len();
 
     fs::create_dir(crate::long_path::to_fs(target))
-        .with_context(|| format!("コピー先ディレクトリを作成できません: {}", target.display()))
+        .with_context(|| {
+            format!(
+                "Failed to create destination directory: {}",
+                target.display()
+            )
+        })
         .map_err(|error| OpFailure::with_progress(error, copy_progress(0, total)))?;
 
     for (copied, task) in tasks.into_iter().enumerate() {
@@ -916,7 +938,7 @@ pub(crate) fn copy_tree(source: &Path, target: &Path) -> Result<CopyProgress, Op
             EntryKind::Dir => fs::create_dir(crate::long_path::to_fs(&task.target))
                 .with_context(|| {
                     format!(
-                        "コピー先ディレクトリを作成できません: {}",
+                        "Failed to create destination directory: {}",
                         task.target.display()
                     )
                 })
@@ -942,15 +964,12 @@ pub(crate) fn collect_copy_tasks(source: &Path, target: &Path) -> anyhow::Result
 
     while let Some((source_dir, target_dir)) = directories.pop() {
         let entries = fs::read_dir(crate::long_path::to_fs(&source_dir)).with_context(|| {
-            format!(
-                "コピー元ディレクトリを読み取れません: {}",
-                source_dir.display()
-            )
+            format!("Failed to read source directory: {}", source_dir.display())
         })?;
         for entry in entries {
             let entry = entry.with_context(|| {
                 format!(
-                    "コピー元ディレクトリのエントリを読み取れません: {}",
+                    "Failed to read entry in source directory: {}",
                     source_dir.display()
                 )
             })?;
@@ -959,7 +978,7 @@ pub(crate) fn collect_copy_tasks(source: &Path, target: &Path) -> anyhow::Result
             let metadata = fs::symlink_metadata(crate::long_path::to_fs(&child_source))
                 .with_context(|| {
                     format!(
-                        "コピー元のmetadataを取得できません: {}",
+                        "Failed to get copy source metadata: {}",
                         child_source.display()
                     )
                 })?;
@@ -980,15 +999,15 @@ pub(crate) fn collect_copy_tasks(source: &Path, target: &Path) -> anyhow::Result
 }
 
 fn copy_progress(copied: usize, total: usize) -> String {
-    format!("コピー完了: {copied}/{total} エントリ")
+    format!("Copy complete: {copied}/{total} entries")
 }
 
 fn copy_symlink(source: &Path, target: &Path) -> anyhow::Result<()> {
     let link_target = fs::read_link(crate::long_path::to_fs(source))
-        .with_context(|| format!("symlinkを読み取れません: {}", source.display()))?;
+        .with_context(|| format!("Failed to read symlink: {}", source.display()))?;
     create_symlink_like(source, &link_target, target).with_context(|| {
         format!(
-            "symlinkをコピーできません: {} → {}",
+            "Failed to copy symlink: {} → {}",
             source.display(),
             target.display()
         )
@@ -1018,30 +1037,39 @@ fn cleanup_incomplete_target(target: &Path) -> anyhow::Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => {
             return Err(error).with_context(|| {
-                format!("不完全なコピー先を確認できません: {}", target.display())
+                format!(
+                    "Failed to inspect incomplete copy destination: {}",
+                    target.display()
+                )
             });
         }
     };
     if metadata.is_dir() && !metadata.file_type().is_symlink() {
         bail!(
-            "既存ディレクトリはクリーンアップ対象にしません: {}",
+            "Existing directory will not be cleaned up: {}",
             target.display()
         );
     }
 
-    remove_non_directory_entry(target, crate::scan::kind_from_metadata(&metadata))
-        .with_context(|| format!("不完全なコピー先を削除できません: {}", target.display()))?;
+    remove_non_directory_entry(target, crate::scan::kind_from_metadata(&metadata)).with_context(
+        || {
+            format!(
+                "Failed to remove incomplete copy destination: {}",
+                target.display()
+            )
+        },
+    )?;
     Ok(true)
 }
 
 pub(crate) fn remove_non_directory_entry(path: &Path, kind: EntryKind) -> anyhow::Result<()> {
     match kind {
         EntryKind::File => fs::remove_file(crate::long_path::to_fs(path))
-            .with_context(|| format!("ファイルを削除できません: {}", path.display())),
+            .with_context(|| format!("Failed to remove file: {}", path.display())),
         EntryKind::Symlink => remove_symlink(path)
-            .with_context(|| format!("symlinkを削除できません: {}", path.display())),
+            .with_context(|| format!("Failed to remove symlink: {}", path.display())),
         EntryKind::Dir => bail!(
-            "ディレクトリを単一エントリ削除できません: {}",
+            "A directory cannot be removed as a single entry: {}",
             path.display()
         ),
     }
@@ -1184,7 +1212,7 @@ mod tests {
 
         assert!(report.results.iter().all(|result| matches!(
             &result.outcome,
-            OpOutcome::Skipped { reason } if reason.contains("ユーザーがキャンセルしました")
+            OpOutcome::Skipped { reason } if reason.contains("Cancelled by user")
         )));
         assert!(!root.path().join("a.txt").exists());
         assert!(!root.path().join("b.txt").exists());
@@ -1452,7 +1480,7 @@ mod tests {
         assert!(matches!(
             &report.results[0].outcome,
             OpOutcome::Failed { error, .. }
-                if error.contains("ディレクトリに変わっているため上書きを中止")
+                if error.contains("destination became a directory")
         ));
         assert_eq!(fs::read(root.path().join("src.txt")).unwrap(), b"source");
         assert!(root.path().join("target").is_dir());
@@ -1599,7 +1627,7 @@ mod tests {
             &report.results[0].outcome,
             OpOutcome::Failed { progress: Some(progress), .. }
                 if progress.contains(".fyler-staged-")
-                    && progress.contains("手動で")
+                    && progress.contains("manually")
                     && progress.contains("target.txt")
         ));
         assert_eq!(fs::read(root.path().join("source.txt")).unwrap(), b"source");
@@ -1633,7 +1661,7 @@ mod tests {
         assert!(matches!(
             &report.results[0].outcome,
             OpOutcome::Failed { progress: Some(progress), .. }
-                if progress.contains("操作自体は完了") && progress.contains(".fyler-staged-")
+                if progress.contains("operation completed") && progress.contains(".fyler-staged-")
         ));
         assert!(!root.path().join("source.txt").exists());
         assert_eq!(fs::read(root.path().join("target.txt")).unwrap(), b"source");

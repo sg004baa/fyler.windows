@@ -311,7 +311,7 @@ impl FylerApp {
                     repaint_context.request_repaint();
                 }
             })
-            .map_err(|error| anyhow::anyhow!("エディタイベント監視を開始できません: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("Failed to start editor event monitor: {error}"))?;
 
         Ok(Self {
             panes: BTreeMap::new(),
@@ -1130,11 +1130,11 @@ fn draw_feedback(
     let mut result = None;
     egui::Modal::new(egui::Id::new("fyler-feedback")).show(ui.ctx(), |ui| {
         ui.set_min_width(560.0);
-        ui.heading("匿名フィードバック");
+        ui.heading("Anonymous feedback");
         ui.add_space(8.0);
         match *stage {
             FeedbackStage::Input => {
-                ui.label("種別");
+                ui.label("Type");
                 ui.horizontal(|ui| {
                     for (number, value) in [
                         ("1", FeedbackKind::Impression),
@@ -1155,7 +1155,7 @@ fn draw_feedback(
                 ui.add_space(8.0);
                 let response = ui.add(
                     egui::TextEdit::multiline(body)
-                        .hint_text("感想、要望、不具合の内容を入力してください")
+                        .hint_text("Enter your comment, request, or bug report")
                         .desired_rows(10)
                         .desired_width(f32::INFINITY),
                 );
@@ -1188,26 +1188,26 @@ fn draw_feedback(
                 if count > MAX_BODY_CHARS {
                     ui.colored_label(
                         ui.visuals().error_fg_color,
-                        format!("{count} / {MAX_BODY_CHARS} 文字"),
+                        format!("{count} / {MAX_BODY_CHARS} characters"),
                     );
                 } else {
-                    ui.weak(format!("{count} / {MAX_BODY_CHARS} 文字"));
+                    ui.weak(format!("{count} / {MAX_BODY_CHARS} characters"));
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("閉じる (Esc)").clicked() {
+                    if ui.button("Close (Esc)").clicked() {
                         result = Some(FeedbackUiResult::Close);
                     }
                     let valid = validate_body(body).is_ok();
-                    if ui.add_enabled(valid, egui::Button::new("確認へ")).clicked() {
+                    if ui.add_enabled(valid, egui::Button::new("Review")).clicked() {
                         *stage = FeedbackStage::Confirm;
                     }
                 });
             }
             FeedbackStage::Confirm => {
-                ui.label("送信される内容");
+                ui.label("Content to send");
                 ui.separator();
-                ui.label(format!("種別: {}", kind.display_name()));
+                ui.label(format!("Type: {}", kind.display_name()));
                 ui.label(format!("fyler version: {}", env!("CARGO_PKG_VERSION")));
                 ui.label(format!("OS: {}", std::env::consts::OS));
                 ui.label(format!("arch: {}", std::env::consts::ARCH));
@@ -1219,10 +1219,10 @@ fn draw_feedback(
                         ui.label(body.as_str());
                     });
                 ui.add_space(8.0);
-                ui.label("匿名のため個別返信はできません。");
-                ui.label("サーバー運営上、通信経路のIPアドレスが処理される場合があります。");
+                ui.label("Anonymous feedback cannot receive an individual reply.");
+                ui.label("Your IP address may be processed in transit to operate the service.");
                 ui.hyperlink_to(
-                    "詳細はリポジトリの docs/PRIVACY.md を参照",
+                    "See docs/PRIVACY.md in the repository for details",
                     "https://github.com/sg004baa/fyler.windows/blob/main/docs/PRIVACY.md",
                 );
                 ui.hyperlink_to(
@@ -1231,11 +1231,11 @@ fn draw_feedback(
                 );
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("戻る").clicked() {
+                    if ui.button("Back").clicked() {
                         *stage = FeedbackStage::Input;
                         *needs_focus = true;
                     }
-                    if ui.button("送信").clicked() {
+                    if ui.button("Send").clicked() {
                         *stage = FeedbackStage::Sending;
                         result = Some(FeedbackUiResult::Submit {
                             kind: *kind,
@@ -1247,17 +1247,17 @@ fn draw_feedback(
             FeedbackStage::Sending => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("送信中です…");
+                    ui.label("Sending…");
                 });
                 ui.add_space(8.0);
-                if ui.button("キャンセル").clicked() {
+                if ui.button("Cancel").clicked() {
                     result = Some(FeedbackUiResult::Close);
                 }
             }
             FeedbackStage::Done(message) => {
                 ui.label(message);
                 ui.add_space(8.0);
-                if ui.button("閉じる").clicked() {
+                if ui.button("Close").clicked() {
                     result = Some(FeedbackUiResult::Close);
                 }
             }
@@ -1265,11 +1265,11 @@ fn draw_feedback(
                 ui.colored_label(ui.visuals().error_fg_color, message);
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("入力へ戻る").clicked() {
+                    if ui.button("Back to input").clicked() {
                         *stage = FeedbackStage::Input;
                         *needs_focus = true;
                     }
-                    if ui.button("閉じる").clicked() {
+                    if ui.button("Close").clicked() {
                         result = Some(FeedbackUiResult::Close);
                     }
                 });
@@ -1339,7 +1339,7 @@ pub fn run(
             Ok(Box::new(app))
         }),
     )
-    .map_err(|error| anyhow::anyhow!("GUIを起動できません: {error}"))
+    .map_err(|error| anyhow::anyhow!("Failed to start GUI: {error}"))
 }
 
 /// 指定パスを優先し、存在しなければ候補列の先頭から利用可能なパスを返す。

@@ -235,10 +235,7 @@ fn change_root_to(
                 gui_event_tx,
                 pane_id,
                 MessageKind::Error,
-                format!(
-                    "表示ルートを正規化できません ({}): {error}",
-                    new_root.display()
-                ),
+                format!("Failed to normalize root ({}): {error}", new_root.display()),
             )?;
             return Ok(false);
         }
@@ -249,7 +246,7 @@ fn change_root_to(
             gui_event_tx,
             pane_id,
             MessageKind::Info,
-            "編集中です。保存または破棄してからディレクトリを移動してください",
+            "You are editing. Save or discard changes before changing directories.",
         )?;
         return Ok(false);
     }
@@ -260,7 +257,7 @@ fn change_root_to(
     let scan_options = save_controller.scan_options();
     let new_baseline = match shared_ids.lock() {
         Ok(mut ids) => fyler_fsops::scan::scan_baseline_with(&new_root, &mut ids, &scan_options),
-        Err(_) => Err(anyhow::anyhow!("ID採番器のロックが破損しています")),
+        Err(_) => Err(anyhow::anyhow!("ID allocator lock is poisoned")),
     };
     let new_baseline = match new_baseline {
         Ok(baseline) => baseline,
@@ -269,10 +266,7 @@ fn change_root_to(
                 gui_event_tx,
                 pane_id,
                 MessageKind::Error,
-                format!(
-                    "表示ルートを読み込めません ({}): {error:#}",
-                    new_root.display()
-                ),
+                format!("Failed to load root ({}): {error:#}", new_root.display()),
             )?;
             return Ok(false);
         }
@@ -287,10 +281,7 @@ fn change_root_to(
                 gui_event_tx,
                 pane_id,
                 MessageKind::Error,
-                format!(
-                    "表示ルートを監視できません ({}): {error:#}",
-                    new_root.display()
-                ),
+                format!("Failed to watch root ({}): {error:#}", new_root.display()),
             )?;
             return Ok(false);
         }
@@ -303,7 +294,7 @@ fn change_root_to(
             gui_event_tx,
             pane_id,
             MessageKind::Error,
-            format!("表示ルートを変更できません: {error:#}"),
+            format!("Failed to change root: {error:#}"),
         )?;
         return Ok(false);
     }
@@ -321,7 +312,7 @@ fn change_root_to(
             gui_event_tx,
             pane_id,
             MessageKind::Error,
-            format!("新しいディレクトリを表示できません: {error:#}"),
+            format!("Failed to display new directory: {error:#}"),
         )?;
     }
     // GUIへのpane tag付けは呼び出し元の`after_root_change`で行う。
@@ -330,7 +321,7 @@ fn change_root_to(
             gui_event_tx,
             pane_id,
             MessageKind::Warn,
-            format!("最近使ったルートを記録できません: {error:#}"),
+            format!("Failed to record recent root: {error:#}"),
         )?;
     }
     Ok(true)
@@ -407,7 +398,7 @@ fn parse_sort_query(query: &str) -> Result<(SortKey, bool), String> {
         "date" => SortKey::Date,
         "size" => SortKey::Size,
         "ext" => SortKey::Extension,
-        _ => return Err(format!("不明なソートキー: {query} (name|date|size|ext)")),
+        _ => return Err(format!("Unknown sort key: {query} (name|date|size|ext)")),
     };
     Ok((key, reverse))
 }
@@ -482,7 +473,7 @@ fn bookmark_list_message(bookmarks: &[(String, PathBuf)], recent: &[PathBuf]) ->
             .map(|(index, path)| format!("{}:{}", index + 1, path.display())),
     );
     if entries.is_empty() {
-        "ブックマークと最近使ったルートはありません".to_owned()
+        "No bookmarks or recent roots".to_owned()
     } else {
         entries.join(" | ")
     }
@@ -502,7 +493,7 @@ fn handle_activate_line(
             gui_event_tx,
             pane_id,
             MessageKind::Error,
-            "開く対象の行が見つかりません",
+            "Line to open was not found",
         );
     };
 
@@ -512,7 +503,7 @@ fn handle_activate_line(
                 gui_event_tx,
                 pane_id,
                 MessageKind::Info,
-                "保存されていない行です",
+                "This line has not been saved",
             );
         }
         PrefixParse::Broken => {
@@ -520,7 +511,7 @@ fn handle_activate_line(
                 gui_event_tx,
                 pane_id,
                 MessageKind::Error,
-                "壊れたIDプレフィックスの行は開けません",
+                "Cannot open a line with a broken ID prefix",
             );
         }
         PrefixParse::WithId { .. } => {}
@@ -531,7 +522,7 @@ fn handle_activate_line(
             gui_event_tx,
             pane_id,
             MessageKind::Error,
-            "行に対応するファイルが現在のツリーに見つかりません",
+            "File for this line was not found in the current tree",
         );
     };
 
@@ -543,7 +534,7 @@ fn handle_activate_line(
                     gui_event_tx,
                     pane_id,
                     MessageKind::Error,
-                    format!("ファイルを開けません: {error:#}"),
+                    format!("Failed to open file: {error:#}"),
                 )?;
             }
         }
@@ -553,7 +544,7 @@ fn handle_activate_line(
                     gui_event_tx,
                     pane_id,
                     MessageKind::Info,
-                    "編集中は折りたたみできません。保存または破棄してください",
+                    "Cannot change folds while editing. Save or discard changes.",
                 );
             }
 
@@ -569,7 +560,7 @@ fn handle_activate_line(
                             gui_event_tx,
                             pane_id,
                             MessageKind::Error,
-                            format!("折りたたみ表示を更新できません: {error:#}"),
+                            format!("Failed to update folded view: {error:#}"),
                         )?;
                     }
                     send_view_state(gui_event_tx, pane_id, save_controller)?;
@@ -579,7 +570,7 @@ fn handle_activate_line(
                         gui_event_tx,
                         pane_id,
                         MessageKind::Error,
-                        "対象行はディレクトリではありません",
+                        "Target line is not a directory",
                     )?;
                 }
                 ToggleCollapseResult::NotFound => {
@@ -587,7 +578,7 @@ fn handle_activate_line(
                         gui_event_tx,
                         pane_id,
                         MessageKind::Error,
-                        "行に対応するディレクトリが現在のツリーに見つかりません",
+                        "Directory for this line was not found in the current tree",
                     )?;
                 }
                 ToggleCollapseResult::Busy => {}
@@ -611,7 +602,7 @@ fn handle_open_with(
             gui_event_tx,
             pane_id,
             MessageKind::Error,
-            "open-with対象の行が見つかりません",
+            "Line for open-with was not found",
         )?;
         return Ok(None);
     };
@@ -622,7 +613,7 @@ fn handle_open_with(
                 gui_event_tx,
                 pane_id,
                 MessageKind::Info,
-                "保存されていない行です",
+                "This line has not been saved",
             )?;
             return Ok(None);
         }
@@ -631,7 +622,7 @@ fn handle_open_with(
                 gui_event_tx,
                 pane_id,
                 MessageKind::Error,
-                "壊れたIDプレフィックスの行はopen-withできません",
+                "Cannot use open-with on a line with a broken ID prefix",
             )?;
             return Ok(None);
         }
@@ -643,7 +634,7 @@ fn handle_open_with(
             gui_event_tx,
             pane_id,
             MessageKind::Error,
-            "行に対応するファイルが現在のツリーに見つかりません",
+            "File for this line was not found in the current tree",
         )?;
         return Ok(None);
     };
@@ -666,7 +657,7 @@ fn handle_open_with(
                 gui_event_tx,
                 pane_id,
                 MessageKind::Error,
-                format!("open-with候補を列挙できません: {error:#}"),
+                format!("Failed to enumerate open-with candidates: {error:#}"),
             )?;
             return Ok(None);
         }
@@ -705,7 +696,7 @@ fn handle_yank_path(
             gui_event_tx,
             pane_id,
             MessageKind::Error,
-            "コピー対象の行が見つかりません",
+            "Line to copy was not found",
         );
     };
 
@@ -715,7 +706,7 @@ fn handle_yank_path(
                 gui_event_tx,
                 pane_id,
                 MessageKind::Info,
-                "保存されていない行です",
+                "This line has not been saved",
             );
         }
         PrefixParse::Broken => {
@@ -723,7 +714,7 @@ fn handle_yank_path(
                 gui_event_tx,
                 pane_id,
                 MessageKind::Error,
-                "壊れたIDプレフィックスの行はコピーできません",
+                "Cannot copy a line with a broken ID prefix",
             );
         }
         PrefixParse::WithId { .. } => {}
@@ -734,7 +725,7 @@ fn handle_yank_path(
             gui_event_tx,
             pane_id,
             MessageKind::Error,
-            "行に対応するファイルが現在のツリーに見つかりません",
+            "File for this line was not found in the current tree",
         );
     };
     let path = path.to_fs_path(root);
@@ -750,11 +741,11 @@ fn open_file_picker_rejection(
     save_idle: bool,
 ) -> Option<&'static str> {
     if dialog_open || apply_running || transfer_awaiting || transfer_running {
-        Some("別のダイアログまたはファイル操作が進行中のため、検索を開始できません")
+        Some("Cannot start search while another dialog or file operation is active")
     } else if crashed {
-        Some("editor engineが停止しているため、検索を開始できません")
+        Some("Cannot start search because the editor engine has stopped")
     } else if !save_idle {
-        Some("保存処理中のため、検索を開始できません")
+        Some("Cannot start search while saving")
     } else {
         None
     }
@@ -792,11 +783,11 @@ fn open_terminal_rejection(
     save_idle: bool,
 ) -> Option<&'static str> {
     if dialog_open || apply_running || transfer_awaiting || transfer_running {
-        Some("別のダイアログまたはファイル操作が進行中のため、terminalを開けません")
+        Some("Cannot open terminal while another dialog or file operation is active")
     } else if crashed {
-        Some("editor engineが停止しているため、terminalを開けません")
+        Some("Cannot open terminal because the editor engine has stopped")
     } else if !save_idle {
-        Some("保存処理中のため、terminalを開けません")
+        Some("Cannot open terminal while saving")
     } else {
         None
     }
@@ -834,7 +825,7 @@ fn handle_open_terminal(
             gui_event_tx,
             pane_id,
             MessageKind::Error,
-            format!("terminalを起動できません: {error:#}"),
+            format!("Failed to start terminal: {error:#}"),
         );
     }
     Ok(())
@@ -905,7 +896,7 @@ fn handle_picker_select_with(
             gui_event_tx,
             pane_id,
             MessageKind::Warn,
-            "検索候補が見つかりません。外部変更された可能性があります",
+            "Search candidate was not found. It may have changed externally.",
         );
     };
 
@@ -916,7 +907,7 @@ fn handle_picker_select_with(
                 gui_event_tx,
                 pane_id,
                 MessageKind::Error,
-                format!("対象を開けません: {error:#}"),
+                format!("Failed to open target: {error:#}"),
             )?;
         }
         return Ok(());
@@ -929,7 +920,7 @@ fn handle_picker_select_with(
                 gui_event_tx,
                 pane_id,
                 MessageKind::Info,
-                "編集中の行位置が検索候補と一致しないため移動できません",
+                "Cannot navigate because the edited line position does not match the search candidate",
             );
         }
         if let Err(error) = engine.send(EditorCommand::SetCursorLine(line)) {
@@ -937,7 +928,7 @@ fn handle_picker_select_with(
                 gui_event_tx,
                 pane_id,
                 MessageKind::Error,
-                format!("検索候補へ移動できません: {error:#}"),
+                format!("Failed to navigate to search candidate: {error:#}"),
             )?;
         }
         return Ok(());
@@ -948,7 +939,7 @@ fn handle_picker_select_with(
             gui_event_tx,
             pane_id,
             MessageKind::Info,
-            "編集中は折りたたまれた検索候補を展開できません。保存または破棄してください",
+            "Cannot reveal a folded search candidate while editing. Save or discard changes.",
         );
     }
 
@@ -959,7 +950,7 @@ fn handle_picker_select_with(
                     gui_event_tx,
                     pane_id,
                     MessageKind::Error,
-                    format!("検索候補へ移動できません: {error:#}"),
+                    format!("Failed to navigate to search candidate: {error:#}"),
                 )?;
             }
         }
@@ -972,7 +963,7 @@ fn handle_picker_select_with(
                     gui_event_tx,
                     pane_id,
                     MessageKind::Error,
-                    format!("検索候補を展開できません: {error:#}"),
+                    format!("Failed to reveal search candidate: {error:#}"),
                 )?;
             }
             send_view_state(gui_event_tx, pane_id, save_controller)?;
@@ -982,7 +973,7 @@ fn handle_picker_select_with(
                 gui_event_tx,
                 pane_id,
                 MessageKind::Warn,
-                "検索候補が見つかりません。外部変更された可能性があります",
+                "Search candidate was not found. It may have changed externally.",
             )?;
         }
         RevealResult::Busy => {
@@ -990,7 +981,7 @@ fn handle_picker_select_with(
                 gui_event_tx,
                 pane_id,
                 MessageKind::Info,
-                "保存処理中のため検索候補へ移動できません",
+                "Cannot navigate to search candidate while saving",
             )?;
         }
     }
@@ -1079,9 +1070,12 @@ fn send_save_result(
         }),
         SaveFlowResult::UndoNothingLeft { reasons } => {
             let message = if reasons.is_empty() {
-                "undoできる操作がありません".to_owned()
+                "No operations are available to undo".to_owned()
             } else {
-                format!("undoできる操作がありません: {}", reasons.join(" / "))
+                format!(
+                    "No operations are available to undo: {}",
+                    reasons.join(" / ")
+                )
             };
             send_gui_message(gui_event_tx, pane_id, MessageKind::Info, message)
         }
@@ -1092,7 +1086,7 @@ fn send_save_result(
         SaveFlowResult::ReconcileFailed { report, error } => {
             gui_event_tx.send(GuiEvent::ShowReport(report))?;
             gui_event_tx.send(GuiEvent::FatalError(format!(
-                "実行後の再読込に失敗しました。安全のため編集を停止します: {error}"
+                "Failed to reload after the operation. Editing has been disabled for safety: {error}"
             )))
         }
         SaveFlowResult::ExternalChanged => Ok(()),
@@ -1111,28 +1105,28 @@ fn send_save_result(
             send_gui_message(gui_event_tx, pane_id, MessageKind::Warn, message)
         }
         SaveFlowResult::NoChanges => {
-            send_gui_message(gui_event_tx, pane_id, MessageKind::Info, "変更はありません")
+            send_gui_message(gui_event_tx, pane_id, MessageKind::Info, "No changes")
         }
         SaveFlowResult::Cancelled => gui_event_tx.send(GuiEvent::CloseDialog),
         SaveFlowResult::UndoCancelled { .. } => gui_event_tx.send(GuiEvent::CloseDialog),
         SaveFlowResult::StartApply { .. } => {
             debug_assert!(
                 false,
-                "StartApplyはConfirm armで処理済みである必要があります"
+                "StartApply must already be handled by the Confirm arm"
             );
             Ok(())
         }
         SaveFlowResult::StartUndo { .. } => {
             debug_assert!(
                 false,
-                "StartUndoはConfirm armで処理済みである必要があります"
+                "StartUndo must already be handled by the Confirm arm"
             );
             Ok(())
         }
         SaveFlowResult::ApplyCancelRequested => {
             debug_assert!(
                 false,
-                "ApplyCancelRequestedはConfirm armで処理済みである必要があります"
+                "ApplyCancelRequested must already be handled by the Confirm arm"
             );
             Ok(())
         }
@@ -1358,8 +1352,8 @@ mod tests {
 
     #[test]
     fn parse_sort_query_rejects_unknown_or_empty_key() {
-        assert!(parse_sort_query("mtime").unwrap_err().contains("不明"));
-        assert!(parse_sort_query("").unwrap_err().contains("不明"));
+        assert!(parse_sort_query("mtime").unwrap_err().contains("Unknown"));
+        assert!(parse_sort_query("").unwrap_err().contains("Unknown"));
     }
 
     #[test]
@@ -1558,7 +1552,7 @@ mod tests {
 
         assert!(opened.is_empty());
         assert!(engine.commands().is_empty());
-        assert!(received_message(&gui_rx).text.contains("外部変更"));
+        assert!(received_message(&gui_rx).text.contains("externally"));
     }
 
     #[test]
@@ -1631,7 +1625,7 @@ mod tests {
         .unwrap();
 
         assert!(engine.commands().is_empty());
-        assert!(received_message(&gui_rx).text.contains("編集中"));
+        assert!(received_message(&gui_rx).text.contains("editing"));
         assert!(controller.collapsed_dirs().contains(&EntryId(1)));
     }
 
@@ -1656,7 +1650,7 @@ mod tests {
         .unwrap();
 
         assert!(engine.commands().is_empty());
-        assert!(received_message(&gui_rx).text.contains("一致しない"));
+        assert!(received_message(&gui_rx).text.contains("does not match"));
     }
 
     #[test]

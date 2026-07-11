@@ -174,7 +174,7 @@ pub(crate) async fn install_guards(
     let buffer_number = buffer
         .get_number()
         .await
-        .map_err(|error| anyhow::anyhow!("fylerバッファ番号の取得に失敗しました: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("Failed to get fyler buffer number: {error}"))?;
     let write_events = HANDLED_WRITE_AUTOCMDS
         .iter()
         .map(|event| Value::from(*event))
@@ -449,8 +449,8 @@ vim.api.nvim_create_autocmd("BufEnter", {
         ],
     )
     .await
-    .map_err(|error| anyhow::anyhow!("事故防止設定の導入に失敗しました: {error}"))
-    .context("Neovim guard初期化エラー")?;
+    .map_err(|error| anyhow::anyhow!("Failed to install safety guards: {error}"))
+    .context("Failed to initialize Neovim guard")?;
 
     Ok(())
 }

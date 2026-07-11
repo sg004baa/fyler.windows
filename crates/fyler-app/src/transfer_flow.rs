@@ -39,13 +39,13 @@ pub(super) fn start_rejection(
     globally_busy: bool,
 ) -> Option<&'static str> {
     if globally_busy {
-        Some("別の保存またはtransfer処理が進行中です")
+        Some("Another save or transfer is in progress")
     } else if source.crashed || target.crashed {
-        Some("停止したpaneとのtransferは開始できません")
+        Some("Cannot start a transfer with a stopped pane")
     } else if source.dirty || target.dirty {
-        Some("編集中のpaneとのtransferは開始できません。先に保存または破棄してください")
+        Some("Cannot start a transfer with a pane being edited. Save or discard changes first.")
     } else if !source.idle || !target.idle {
-        Some("保存処理中のpaneとのtransferは開始できません")
+        Some("Cannot start a transfer with a pane that is saving")
     } else {
         None
     }
