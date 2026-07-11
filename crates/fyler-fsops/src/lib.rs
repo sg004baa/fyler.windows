@@ -23,6 +23,7 @@ pub mod openwith;
 pub mod preflight;
 pub mod recycle;
 pub mod scan;
+pub mod terminal;
 pub mod undo;
 pub mod watch;
 

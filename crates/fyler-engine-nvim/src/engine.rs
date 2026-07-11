@@ -371,6 +371,34 @@ impl NvimEngine {
                                     ),
                                 }
                             }
+                            "fyler_terminal" => {
+                                let line = notification
+                                    .args
+                                    .first()
+                                    .and_then(value_as_u64)
+                                    .and_then(|line| usize::try_from(line).ok());
+                                let args = notification
+                                    .args
+                                    .get(1)
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                match line {
+                                    Some(_) if !args.trim().is_empty() => send_message(
+                                        &event_tx,
+                                        MessageKind::Warn,
+                                        ":terminal の引数は未対応です(引数なしで実行してください)"
+                                            .to_owned(),
+                                    ),
+                                    Some(line) => {
+                                        let _ = event_tx.send(EditorEvent::OpenTerminal { line });
+                                    }
+                                    None => send_message(
+                                        &event_tx,
+                                        MessageKind::Error,
+                                        "terminal対象の行番号を取得できません".to_owned(),
+                                    ),
+                                }
+                            }
                             "fyler_toggle_hidden" => {
                                 let _ = event_tx.send(EditorEvent::ToggleHidden);
                             }

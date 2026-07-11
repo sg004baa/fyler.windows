@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use fyler_core::editor::{Key, KeyInput, Modifiers};
 use fyler_core::keymap;
-use fyler_core::options::{SortKey, SortOrder};
+use fyler_core::options::{SortKey, SortOrder, TerminalKind};
 use fyler_gui::confirm::{ConfirmDetail, IconStyle};
 
 const CONFIG_FILE: &str = "config.toml";
@@ -33,6 +33,8 @@ pub struct Config {
     pub sort_key: SortKey,
     /// ソートキー部分を降順にするか。
     pub sort_reverse: bool,
+    /// 外部terminal emulatorの起動方法。
+    pub terminal: TerminalKind,
     /// 確認ダイアログの操作一覧詳細度。
     pub confirm_detail: ConfirmDetail,
     /// 日本語fallbackフォントとして読み込むファイルの絶対パス。
@@ -57,6 +59,7 @@ impl Default for Config {
             sort: SortOrder::DirsFirst,
             sort_key: SortKey::Name,
             sort_reverse: false,
+            terminal: TerminalKind::Auto,
             confirm_detail: ConfirmDetail::Full,
             font: None,
             font_y_offset_factor: DEFAULT_FONT_Y_OFFSET_FACTOR,
@@ -149,6 +152,18 @@ pub fn load() -> (Config, Vec<String>) {
         match value.as_bool() {
             Some(reverse) => config.sort_reverse = reverse,
             None => warnings.push("sort_reverseはtrueまたはfalseで指定してください".to_owned()),
+        }
+    }
+    if let Some(value) = table.get("terminal") {
+        match value.as_str() {
+            Some("auto") => config.terminal = TerminalKind::Auto,
+            Some("windows_terminal") => config.terminal = TerminalKind::WindowsTerminal,
+            Some("powershell") => config.terminal = TerminalKind::PowerShell,
+            Some("cmd") => config.terminal = TerminalKind::Cmd,
+            _ => warnings.push(
+                "terminalは\"auto\"、\"windows_terminal\"、\"powershell\"、\"cmd\"のいずれかで指定してください"
+                    .to_owned(),
+            ),
         }
     }
     if let Some(value) = table.get("confirm_detail") {
@@ -267,6 +282,7 @@ pub fn load() -> (Config, Vec<String>) {
                 | "sort"
                 | "sort_key"
                 | "sort_reverse"
+                | "terminal"
                 | "confirm_detail"
                 | "font"
                 | "font_y_offset_factor"
@@ -477,6 +493,33 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("sort_reverse"))
         );
+
+        for (value, expected) in [
+            ("auto", TerminalKind::Auto),
+            ("windows_terminal", TerminalKind::WindowsTerminal),
+            ("powershell", TerminalKind::PowerShell),
+            ("cmd", TerminalKind::Cmd),
+        ] {
+            fs::write(&path, format!("terminal = '{value}'\n")).unwrap();
+            let (config, warnings) = load();
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(config.terminal, expected);
+        }
+
+        fs::write(&path, "terminal = 'wezterm'\n").unwrap();
+        let (config, warnings) = load();
+        assert_eq!(config.terminal, TerminalKind::Auto);
+        assert!(warnings.iter().any(|warning| warning.contains("terminal")));
+
+        fs::write(&path, "terminal = 1\n").unwrap();
+        let (config, warnings) = load();
+        assert_eq!(config.terminal, TerminalKind::Auto);
+        assert!(warnings.iter().any(|warning| warning.contains("terminal")));
+
+        fs::write(&path, "show_hidden = true\n").unwrap();
+        let (config, warnings) = load();
+        assert_eq!(config.terminal, TerminalKind::Auto);
+        assert!(warnings.is_empty(), "{warnings:?}");
 
         fs::write(&path, "unknown = true").unwrap();
         let (config, warnings) = load();

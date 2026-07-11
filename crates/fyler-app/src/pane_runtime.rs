@@ -30,9 +30,9 @@ use super::transfer_flow::{
 use super::{
     AppEvent, BookmarkResolution, GitRefresher, after_root_change, bookmark_list_message,
     change_root_to, default_root, format_drive_paths, handle_activate_line, handle_external_change,
-    handle_open_file_picker, handle_open_with, handle_picker_select, handle_yank_path,
-    normalize_root, parse_sort_query, resolve_bookmark_query, resolve_cd_target, send_gui_message,
-    send_save_result, send_view_state, sort_state_message,
+    handle_open_file_picker, handle_open_terminal, handle_open_with, handle_picker_select,
+    handle_yank_path, normalize_root, parse_sort_query, resolve_bookmark_query, resolve_cd_target,
+    send_gui_message, send_save_result, send_view_state, sort_state_message,
 };
 use super::{undo_format, undo_journal};
 
@@ -152,6 +152,7 @@ fn help_lines(bindings: &[KeyBinding]) -> Vec<String> {
         ":w  変更を保存".to_owned(),
         ":cd  ルートを移動".to_owned(),
         ":b  ブックマーク / 最近使ったルート".to_owned(),
+        ":terminal  ここでterminalを開く".to_owned(),
     ]);
     lines
 }
@@ -163,6 +164,7 @@ pub(super) fn run() -> anyhow::Result<()> {
     };
     let root = normalize_root(&root)?;
     let (config, config_warnings) = super::config::load();
+    let terminal_kind = config.terminal;
     let scan_options = ScanOptions {
         show_hidden: config.show_hidden,
         sort: config.sort,
@@ -601,6 +603,27 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     &shared_ids,
                                     &gui_event_tx,
                                     &mut git,
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            EditorEvent::OpenTerminal { line } => {
+                                let snapshot = session.engine.snapshot();
+                                if handle_open_terminal(
+                                    pane_id,
+                                    &session.save_controller,
+                                    &snapshot.lines,
+                                    &session.root,
+                                    line,
+                                    terminal_kind,
+                                    session.crashed,
+                                    dialog_owner.is_some(),
+                                    apply_owner.is_some(),
+                                    transfer.is_awaiting(),
+                                    transfer.is_running(),
+                                    &gui_event_tx,
                                 )
                                 .is_err()
                                 {

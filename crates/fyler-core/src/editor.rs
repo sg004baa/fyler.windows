@@ -379,6 +379,11 @@ pub enum EditorEvent {
     NavigateInto {
         line: usize,
     },
+    /// ユーザーが指定行を基準にterminalを開くよう要求した。
+    /// `line`は0始まり。行の解釈とcwd解決はapp層が行う。
+    OpenTerminal {
+        line: usize,
+    },
     /// ユーザーが現在の表示ルートの親ディレクトリへの移動を要求した。
     NavigateParent,
     /// ユーザーがパス指定での表示ルート変更を要求した。

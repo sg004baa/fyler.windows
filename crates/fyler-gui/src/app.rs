@@ -327,6 +327,7 @@ impl FylerApp {
                     EditorEvent::OpenWith { .. } => {}
                     EditorEvent::YankPath { .. } => {}
                     EditorEvent::NavigateInto { .. } => {}
+                    EditorEvent::OpenTerminal { .. } => {}
                     EditorEvent::NavigateParent => {}
                     EditorEvent::ChangeDirectory { .. } => {}
                     EditorEvent::ChangeSort { .. } => {}
