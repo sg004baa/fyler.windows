@@ -7,6 +7,8 @@ use fyler_core::editor::{
     CmdlineState, Cursor, EditorCommand, EditorEngine, EditorEvent, EditorLine, EditorMessage,
     EditorSnapshot, MessageKind, Mode, SearchHighlight,
 };
+use fyler_core::pane::PaneAction;
+use fyler_core::transfer::TransferKind;
 use nvim_rs::compat::tokio::Compat;
 use nvim_rs::create::tokio::new_child_cmd;
 use nvim_rs::{Buffer, Handler, Neovim, UiAttachOptions};
@@ -358,6 +360,45 @@ impl NvimEngine {
                             }
                             "fyler_help" => {
                                 let _ = event_tx.send(EditorEvent::ShowHelp);
+                            }
+                            "fyler_pane" => {
+                                match notification.args.first()
+                                    .and_then(Value::as_str)
+                                    .and_then(parse_pane_action)
+                                {
+                                    Some(action) => {
+                                        let _ = event_tx.send(EditorEvent::PaneAction(action));
+                                    }
+                                    None => send_message(
+                                        &event_tx,
+                                        MessageKind::Info,
+                                        "このpane操作は無効です".to_owned(),
+                                    ),
+                                }
+                            }
+                            "fyler_transfer" => {
+                                let kind = notification.args.first()
+                                    .and_then(Value::as_str)
+                                    .and_then(parse_transfer_kind);
+                                let first = notification.args.get(1)
+                                    .and_then(value_as_u64)
+                                    .and_then(|line| usize::try_from(line).ok());
+                                let last = notification.args.get(2)
+                                    .and_then(value_as_u64)
+                                    .and_then(|line| usize::try_from(line).ok());
+                                match (kind, first, last) {
+                                    (Some(kind), Some(first), Some(last)) if first <= last => {
+                                        let _ = event_tx.send(EditorEvent::TransferRequested {
+                                            kind,
+                                            lines: (first..=last).collect(),
+                                        });
+                                    }
+                                    _ => send_message(
+                                        &event_tx,
+                                        MessageKind::Error,
+                                        "transfer対象の行範囲を取得できません".to_owned(),
+                                    ),
+                                }
                             }
                             "fyler_cd" => {
                                 let query = notification
@@ -979,6 +1020,29 @@ fn value_as_u64(value: &Value) -> Option<u64> {
         .or_else(|| value.as_i64().and_then(|number| number.try_into().ok()))
 }
 
+fn parse_pane_action(action: &str) -> Option<PaneAction> {
+    match action {
+        "split_horizontal" => Some(PaneAction::SplitHorizontal),
+        "split_vertical" => Some(PaneAction::SplitVertical),
+        "focus_left" => Some(PaneAction::FocusLeft),
+        "focus_right" => Some(PaneAction::FocusRight),
+        "focus_up" => Some(PaneAction::FocusUp),
+        "focus_down" => Some(PaneAction::FocusDown),
+        "focus_next" => Some(PaneAction::FocusNext),
+        "focus_previous" => Some(PaneAction::FocusPrevious),
+        "close" => Some(PaneAction::Close),
+        _ => None,
+    }
+}
+
+fn parse_transfer_kind(kind: &str) -> Option<TransferKind> {
+    match kind {
+        "move" => Some(TransferKind::Move),
+        "copy" => Some(TransferKind::Copy),
+        _ => None,
+    }
+}
+
 fn normalize_mode(mode: &str) -> Mode {
     if mode.starts_with("no") {
         Mode::OperatorPending
@@ -1023,6 +1087,13 @@ mod tests {
     }
 
     #[test]
+    fn transfer_kinds_are_normalized_without_leaking_rpc_strings() {
+        assert_eq!(parse_transfer_kind("move"), Some(TransferKind::Move));
+        assert_eq!(parse_transfer_kind("copy"), Some(TransferKind::Copy));
+        assert_eq!(parse_transfer_kind("unknown"), None);
+    }
+
+    #[test]
     fn line_notification_applies_incremental_replacement() {
         let mut lines = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
         let args = vec![
@@ -1035,5 +1106,23 @@ mod tests {
         ];
         assert!(apply_lines_notification(&args, &mut lines));
         assert_eq!(lines, ["a", "B", "B2", "c"]);
+    }
+
+    #[test]
+    fn pane_notifications_map_to_every_core_action() {
+        for (raw, expected) in [
+            ("split_horizontal", PaneAction::SplitHorizontal),
+            ("split_vertical", PaneAction::SplitVertical),
+            ("focus_left", PaneAction::FocusLeft),
+            ("focus_right", PaneAction::FocusRight),
+            ("focus_up", PaneAction::FocusUp),
+            ("focus_down", PaneAction::FocusDown),
+            ("focus_next", PaneAction::FocusNext),
+            ("focus_previous", PaneAction::FocusPrevious),
+            ("close", PaneAction::Close),
+        ] {
+            assert_eq!(parse_pane_action(raw), Some(expected));
+        }
+        assert_eq!(parse_pane_action("unknown"), None);
     }
 }

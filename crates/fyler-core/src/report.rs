@@ -4,24 +4,32 @@ use crate::plan::FsOperation;
 
 /// apply実行中の進捗(操作単位)。workerスレッドからGUIへ通知する。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApplyProgress {
+pub struct ApplyProgress<Operation = FsOperation> {
     /// 完了済み操作数(現在実行を開始する操作は含まない)。
     pub completed: usize,
     /// plan全体の操作数。
     pub total: usize,
     /// これから実行する操作。全操作完了直後の最終通知では`None`。
-    pub current: Option<FsOperation>,
+    pub current: Option<Operation>,
 }
 
 /// planの実行結果。**全体ロールバックはしない**。部分成功を明示し、
 /// 成功した操作のみbaselineへ反映する(DESIGN.md「保存処理の状態機械」)。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct CommitReport {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitReport<Operation = FsOperation> {
     /// planの `ops` と同順・同数。
-    pub results: Vec<OpResult>,
+    pub results: Vec<OpResult<Operation>>,
 }
 
-impl CommitReport {
+impl<Operation> Default for CommitReport<Operation> {
+    fn default() -> Self {
+        Self {
+            results: Vec::new(),
+        }
+    }
+}
+
+impl<Operation> CommitReport<Operation> {
     pub fn all_succeeded(&self) -> bool {
         self.results
             .iter()
@@ -44,8 +52,8 @@ impl CommitReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpResult {
-    pub op: FsOperation,
+pub struct OpResult<Operation = FsOperation> {
+    pub op: Operation,
     pub outcome: OpOutcome,
 }
 

@@ -3,8 +3,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use fyler_core::editor::{EditorCommand, EditorEngine, EditorLine};
@@ -140,7 +140,7 @@ pub enum ToggleCollapseResult {
 pub struct SaveController {
     state: SaveState,
     root: PathBuf,
-    ids: IdAllocator,
+    ids: Arc<Mutex<IdAllocator>>,
     baseline: BaselineTree,
     context: EditContext,
     scan_options: ScanOptions,
@@ -150,9 +150,20 @@ pub struct SaveController {
 }
 
 impl SaveController {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(
         root: PathBuf,
         ids: IdAllocator,
+        baseline: BaselineTree,
+        engine: Arc<dyn EditorEngine>,
+    ) -> Self {
+        Self::new_shared(root, Arc::new(Mutex::new(ids)), baseline, engine)
+    }
+
+    /// 複数paneで共有するID採番器を使って保存フローを作成する。
+    pub fn new_shared(
+        root: PathBuf,
+        ids: Arc<Mutex<IdAllocator>>,
         baseline: BaselineTree,
         engine: Arc<dyn EditorEngine>,
     ) -> Self {
@@ -173,6 +184,7 @@ impl SaveController {
     ///
     /// 設定ファイル由来の隠しファイル表示とソート順を、再スキャン・ルート移動でも
     /// 維持する必要がある場合に使う。既定設定では [`Self::new`] と同じである。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new_with_scan_options(
         root: PathBuf,
         ids: IdAllocator,
@@ -181,6 +193,19 @@ impl SaveController {
         scan_options: ScanOptions,
     ) -> Self {
         let mut controller = Self::new(root, ids, baseline, engine);
+        controller.scan_options = scan_options;
+        controller
+    }
+
+    /// 複数paneで共有するID採番器と表示設定を使って保存フローを作成する。
+    pub fn new_shared_with_scan_options(
+        root: PathBuf,
+        ids: Arc<Mutex<IdAllocator>>,
+        baseline: BaselineTree,
+        engine: Arc<dyn EditorEngine>,
+        scan_options: ScanOptions,
+    ) -> Self {
+        let mut controller = Self::new_shared(root, ids, baseline, engine);
         controller.scan_options = scan_options;
         controller
     }
@@ -196,6 +221,7 @@ impl SaveController {
     /// apply workerの実行中かを返す。
     ///
     /// app層はこの判定を使い、外部変更イベントをapply完了後まで遅延する。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_applying(&self) -> bool {
         matches!(self.state, SaveState::Applying { .. })
     }
@@ -356,13 +382,18 @@ impl SaveController {
             show_hidden: !self.scan_options.show_hidden,
             ..self.scan_options
         };
+        let mut ids = self
+            .ids
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ID採番器のロックが破損しています"))?;
         let baseline = fyler_fsops::scan::rescan_preserving_ids_with(
             &self.root,
-            &mut self.ids,
+            &mut ids,
             &self.baseline,
             &options,
         )
         .context("隠しファイル表示切り替え後の実FS再スキャンに失敗しました")?;
+        drop(ids);
         let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
         let lines = baseline_to_lines(&baseline, &context);
 
@@ -372,15 +403,10 @@ impl SaveController {
         Ok(lines)
     }
 
-    /// 表示ルートとID採番器、baselineを新しいスキャン結果へ差し替える。
-    ///
-    /// 保存状態機械が`Idle`のときだけ成功する。成功時はルート固有の編集文脈も
-    /// リセットする。`baseline.root`が`root`と一致しない入力は拒否し、既存状態を
-    /// 変更しない。
-    pub fn change_root(
+    /// 共有ID採番器を維持したまま表示ルートとbaselineを差し替える。
+    pub fn change_root_preserving_allocator(
         &mut self,
         root: PathBuf,
-        ids: IdAllocator,
         baseline: BaselineTree,
     ) -> anyhow::Result<()> {
         if !self.is_idle() {
@@ -393,9 +419,7 @@ impl SaveController {
                 baseline.root.display()
             );
         }
-
         self.root = root;
-        self.ids = ids;
         self.baseline = baseline;
         self.context = EditContext::default();
         Ok(())
@@ -522,9 +546,17 @@ impl SaveController {
     }
 
     pub fn on_external_change(&mut self, changed_paths: &BTreeSet<PathBuf>) -> SaveFlowResult {
+        let mut ids = match self.ids.lock() {
+            Ok(ids) => ids,
+            Err(_) => {
+                return SaveFlowResult::ExternalChangeFailed(
+                    "ID採番器のロックが破損しています".to_owned(),
+                );
+            }
+        };
         let baseline = match fyler_fsops::scan::rescan_changed_preserving_ids_with(
             &self.root,
-            &mut self.ids,
+            &mut ids,
             &self.baseline,
             changed_paths,
             &self.scan_options,
@@ -534,6 +566,7 @@ impl SaveController {
             Ok(baseline) => baseline,
             Err(error) => return SaveFlowResult::ExternalChangeFailed(error.to_string()),
         };
+        drop(ids);
 
         if baseline == self.baseline {
             // 構造とIDが同一なら表示中planの前提は変わらない。メタデータだけは
@@ -620,13 +653,36 @@ impl SaveController {
     }
 
     fn reconcile_from_fs(&mut self) -> anyhow::Result<()> {
+        self.reconcile_from_fs_preserving_state()?;
+        let effects = self.apply_event(SaveEvent::ReconcileFinished);
+        debug_assert!(matches!(self.state, SaveState::Idle));
+        debug_assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, SaveEffect::SetModifiable(true)))
+        );
+        Ok(())
+    }
+
+    /// pane間transfer完了後に、保存状態機械を変更せず実FSから再同期する。
+    pub fn reconcile_after_transfer(&mut self) -> anyhow::Result<()> {
+        debug_assert!(self.is_idle());
+        self.reconcile_from_fs_preserving_state()
+    }
+
+    fn reconcile_from_fs_preserving_state(&mut self) -> anyhow::Result<()> {
+        let mut ids = self
+            .ids
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ID採番器のロックが破損しています"))?;
         let baseline = fyler_fsops::scan::rescan_preserving_ids_with(
             &self.root,
-            &mut self.ids,
+            &mut ids,
             &self.baseline,
             &self.scan_options,
         )
         .context("実FSの再スキャンに失敗しました")?;
+        drop(ids);
         let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
         let lines = baseline_to_lines(&baseline, &context);
         self.engine
@@ -638,13 +694,6 @@ impl SaveController {
 
         self.baseline = baseline;
         self.context = context;
-        let effects = self.apply_event(SaveEvent::ReconcileFinished);
-        debug_assert!(matches!(self.state, SaveState::Idle));
-        debug_assert!(
-            effects
-                .iter()
-                .any(|effect| matches!(effect, SaveEffect::SetModifiable(true)))
-        );
         Ok(())
     }
 
@@ -1709,10 +1758,10 @@ mod tests {
     fn change_root_succeeds_only_while_idle() {
         let (mut controller, _) = controller("C:/old-root");
         let new_root = PathBuf::from("C:/new-root");
-        let (new_baseline, new_ids) = baseline(&new_root);
+        let (new_baseline, _) = baseline(&new_root);
 
         controller
-            .change_root(new_root.clone(), new_ids, new_baseline)
+            .change_root_preserving_allocator(new_root.clone(), new_baseline)
             .unwrap();
 
         assert_eq!(controller.root, new_root);
@@ -1727,11 +1776,11 @@ mod tests {
             SaveFlowResult::ShowPlan { .. }
         ));
         let rejected_root = PathBuf::from("C:/rejected-root");
-        let (rejected_baseline, rejected_ids) = baseline(&rejected_root);
+        let (rejected_baseline, _) = baseline(&rejected_root);
 
         assert!(
             controller
-                .change_root(rejected_root, rejected_ids, rejected_baseline)
+                .change_root_preserving_allocator(rejected_root, rejected_baseline)
                 .is_err()
         );
         assert_eq!(controller.root, new_root);
