@@ -7,6 +7,8 @@ use fyler_core::editor::{
     CmdlineState, Cursor, EditorCommand, EditorEngine, EditorEvent, EditorLine, EditorMessage,
     EditorSnapshot, FoldOp, MessageKind, Mode, PopupmenuItem, PopupmenuState, SearchHighlight,
 };
+use fyler_core::pane::PaneAction;
+use fyler_core::transfer::TransferKind;
 use nvim_rs::compat::tokio::Compat;
 use nvim_rs::create::tokio::new_child_cmd;
 use nvim_rs::{Buffer, Handler, Neovim, UiAttachOptions};
@@ -399,8 +401,50 @@ impl NvimEngine {
                                     ),
                                 }
                             }
+                            "fyler_open_picker" => {
+                                let _ = event_tx.send(EditorEvent::OpenFilePicker);
+                            }
                             "fyler_help" => {
                                 let _ = event_tx.send(EditorEvent::ShowHelp);
+                            }
+                            "fyler_pane" => {
+                                match notification.args.first()
+                                    .and_then(Value::as_str)
+                                    .and_then(parse_pane_action)
+                                {
+                                    Some(action) => {
+                                        let _ = event_tx.send(EditorEvent::PaneAction(action));
+                                    }
+                                    None => send_message(
+                                        &event_tx,
+                                        MessageKind::Info,
+                                        "このpane操作は無効です".to_owned(),
+                                    ),
+                                }
+                            }
+                            "fyler_transfer" => {
+                                let kind = notification.args.first()
+                                    .and_then(Value::as_str)
+                                    .and_then(parse_transfer_kind);
+                                let first = notification.args.get(1)
+                                    .and_then(value_as_u64)
+                                    .and_then(|line| usize::try_from(line).ok());
+                                let last = notification.args.get(2)
+                                    .and_then(value_as_u64)
+                                    .and_then(|line| usize::try_from(line).ok());
+                                match (kind, first, last) {
+                                    (Some(kind), Some(first), Some(last)) if first <= last => {
+                                        let _ = event_tx.send(EditorEvent::TransferRequested {
+                                            kind,
+                                            lines: (first..=last).collect(),
+                                        });
+                                    }
+                                    _ => send_message(
+                                        &event_tx,
+                                        MessageKind::Error,
+                                        "transfer対象の行範囲を取得できません".to_owned(),
+                                    ),
+                                }
                             }
                             "fyler_cd" => {
                                 let query = notification
@@ -431,6 +475,9 @@ impl NvimEngine {
                                     .filter(|query| !query.is_empty())
                                     .map(str::to_owned);
                                 let _ = event_tx.send(EditorEvent::JumpBookmark { query });
+                            }
+                            "fyler_undo" => {
+                                let _ = event_tx.send(EditorEvent::UndoRequested);
                             }
                             "fyler_yank_path" => {
                                 let line = notification.args.first()
@@ -540,6 +587,9 @@ async fn handle_command(
         EngineCommand::Editor(EditorCommand::SetLines { lines, cursor_line }) => {
             replace_buffer_lines(nvim, buffer, lines, cursor_line, "reconcile").await?;
         }
+        EngineCommand::Editor(EditorCommand::SetCursorLine(line)) => {
+            set_cursor_line(nvim, buffer, line).await?;
+        }
         EngineCommand::Editor(EditorCommand::SetModifiable(value)) => {
             set_buffer_modifiable(nvim, buffer, value, "保存フロー").await?;
         }
@@ -564,6 +614,41 @@ async fn handle_command(
     }
 
     Ok(())
+}
+
+/// バッファを変更せず、指定行へカーソルだけを移動する。
+async fn set_cursor_line(
+    nvim: &Nvim,
+    buffer: &Buffer<NvimWriter>,
+    requested_line: usize,
+) -> anyhow::Result<()> {
+    let line_count = buffer
+        .line_count()
+        .await
+        .map_err(|error| anyhow::anyhow!("カーソル移動対象の行数を取得できません: {error}"))?;
+    let target_line = clamp_cursor_line(requested_line, line_count);
+    let line = buffer
+        .get_lines(target_line, target_line + 1, false)
+        .await
+        .map_err(|error| anyhow::anyhow!("カーソル移動対象の行を取得できません: {error}"))?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let target_column =
+        i64::try_from(fyler_core::grammar::id_prefix_len(&line)).unwrap_or(i64::MAX);
+    let window = nvim.get_current_win().await.map_err(|error| {
+        anyhow::anyhow!("カーソル移動対象のウィンドウを取得できません: {error}")
+    })?;
+    window
+        .set_cursor((target_line + 1, target_column))
+        .await
+        .map_err(|error| anyhow::anyhow!("カーソルを設定できません: {error}"))?;
+    Ok(())
+}
+
+fn clamp_cursor_line(requested_line: usize, line_count: i64) -> i64 {
+    let requested_line = i64::try_from(requested_line).unwrap_or(i64::MAX);
+    requested_line.min(line_count.saturating_sub(1)).max(0)
 }
 
 /// Rust側のプログラム的な全行差し替えを実行する。
@@ -1111,6 +1196,29 @@ fn fold_op_from_str(op: &str) -> Option<FoldOp> {
     }
 }
 
+fn parse_pane_action(action: &str) -> Option<PaneAction> {
+    match action {
+        "split_horizontal" => Some(PaneAction::SplitHorizontal),
+        "split_vertical" => Some(PaneAction::SplitVertical),
+        "focus_left" => Some(PaneAction::FocusLeft),
+        "focus_right" => Some(PaneAction::FocusRight),
+        "focus_up" => Some(PaneAction::FocusUp),
+        "focus_down" => Some(PaneAction::FocusDown),
+        "focus_next" => Some(PaneAction::FocusNext),
+        "focus_previous" => Some(PaneAction::FocusPrevious),
+        "close" => Some(PaneAction::Close),
+        _ => None,
+    }
+}
+
+fn parse_transfer_kind(kind: &str) -> Option<TransferKind> {
+    match kind {
+        "move" => Some(TransferKind::Move),
+        "copy" => Some(TransferKind::Copy),
+        _ => None,
+    }
+}
+
 fn normalize_mode(mode: &str) -> Mode {
     if mode.starts_with("no") {
         Mode::OperatorPending
@@ -1152,6 +1260,21 @@ mod tests {
         assert_eq!(normalize_mode("\u{16}"), Mode::VisualBlock);
         assert_eq!(normalize_mode("c"), Mode::Cmdline);
         assert_eq!(normalize_mode("mystery"), Mode::Other("mystery".to_owned()));
+    }
+
+    #[test]
+    fn cursor_line_is_clamped_to_the_last_buffer_line() {
+        assert_eq!(clamp_cursor_line(0, 3), 0);
+        assert_eq!(clamp_cursor_line(1, 3), 1);
+        assert_eq!(clamp_cursor_line(99, 3), 2);
+        assert_eq!(clamp_cursor_line(99, 0), 0);
+    }
+
+    #[test]
+    fn transfer_kinds_are_normalized_without_leaking_rpc_strings() {
+        assert_eq!(parse_transfer_kind("move"), Some(TransferKind::Move));
+        assert_eq!(parse_transfer_kind("copy"), Some(TransferKind::Copy));
+        assert_eq!(parse_transfer_kind("unknown"), None);
     }
 
     #[test]
@@ -1227,5 +1350,23 @@ mod tests {
         assert_eq!(parse_popupmenu_select(&[Value::from(2)]), Some(Some(2)));
         assert_eq!(parse_popupmenu_select(&[Value::from(-1)]), Some(None));
         assert_eq!(parse_popupmenu_select(&[]), None);
+    }
+
+    #[test]
+    fn pane_notifications_map_to_every_core_action() {
+        for (raw, expected) in [
+            ("split_horizontal", PaneAction::SplitHorizontal),
+            ("split_vertical", PaneAction::SplitVertical),
+            ("focus_left", PaneAction::FocusLeft),
+            ("focus_right", PaneAction::FocusRight),
+            ("focus_up", PaneAction::FocusUp),
+            ("focus_down", PaneAction::FocusDown),
+            ("focus_next", PaneAction::FocusNext),
+            ("focus_previous", PaneAction::FocusPrevious),
+            ("close", PaneAction::Close),
+        ] {
+            assert_eq!(parse_pane_action(raw), Some(expected));
+        }
+        assert_eq!(parse_pane_action("unknown"), None);
     }
 }

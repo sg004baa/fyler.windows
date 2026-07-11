@@ -620,6 +620,8 @@ mod tests {
 
     use tempfile::tempdir;
 
+    use fyler_core::search::build_candidates;
+
     use super::*;
 
     fn allocator_after(previous: &BaselineTree) -> IdAllocator {
@@ -1282,6 +1284,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             [TreePath::parse("visible.txt")]
         );
+        assert_eq!(
+            build_candidates(&hidden)
+                .into_iter()
+                .map(|candidate| candidate.display)
+                .collect::<Vec<_>>(),
+            ["visible.txt"]
+        );
 
         let mut shown_ids = IdAllocator::new();
         let shown = scan_baseline_with(
@@ -1304,6 +1313,17 @@ mod tests {
                 .entries()
                 .iter()
                 .any(|entry| entry.path == TreePath::parse(".hidden-dir/child.txt"))
+        );
+        let shown_candidates = build_candidates(&shown);
+        assert!(
+            shown_candidates
+                .iter()
+                .any(|candidate| candidate.display == ".hidden.txt")
+        );
+        assert!(
+            shown_candidates
+                .iter()
+                .any(|candidate| candidate.display == ".hidden-dir/child.txt")
         );
     }
 

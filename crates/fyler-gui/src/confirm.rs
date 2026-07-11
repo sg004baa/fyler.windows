@@ -2,10 +2,14 @@
 //!
 //! **絶対ルール1**: ここでの承認なしに実FSへ触れない。
 
+use std::path::PathBuf;
+
 use eframe::egui;
+use fyler_core::pane::PaneId;
 use fyler_core::path::TreePath;
 use fyler_core::plan::{FsOperation, OperationPlan};
 use fyler_core::report::{CommitReport, OpOutcome, OpResult};
+use fyler_core::transfer::{TransferKind, TransferOp, TransferPlan};
 use fyler_core::validate::ValidateError;
 
 /// ユーザーの選択。
@@ -109,6 +113,97 @@ pub fn draw_plan(
         .inner
 }
 
+/// pane間transferを保存planと同じ確認モーダルで表示する。
+pub fn draw_transfer_plan(
+    ui: &mut egui::Ui,
+    plan: &TransferPlan,
+    target: PaneId,
+    overwrites: &[PathBuf],
+) -> Option<ConfirmChoice> {
+    let key_choice = ui.ctx().input(|input| {
+        plan_choice_from_keys(
+            input.key_pressed(egui::Key::Y),
+            input.key_pressed(egui::Key::N),
+            input.key_pressed(egui::Key::Escape),
+        )
+    });
+    egui::Modal::new(egui::Id::new("save-plan-confirmation"))
+        .show(ui.ctx(), |ui| {
+            ui.heading("Confirm changes");
+            ui.add_space(8.0);
+            for operation in &plan.ops {
+                ui.monospace(transfer_operation_label(operation, Some(target)));
+            }
+            if !overwrites.is_empty() {
+                ui.add_space(8.0);
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "These existing files will be moved to the recycle bin before overwrite:",
+                );
+                for path in overwrites {
+                    ui.colored_label(ui.visuals().warn_fg_color, path.display().to_string());
+                }
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let approve_label = if overwrites.is_empty() {
+                    "Approve (y)"
+                } else {
+                    "Overwrite and apply (y)"
+                };
+                let approve_clicked = ui.button(approve_label).clicked();
+                let cancel_clicked = ui.button("Cancel (n / Esc)").clicked();
+                if approve_clicked || key_choice == Some(ConfirmChoice::Approve) {
+                    Some(ConfirmChoice::Approve)
+                } else if cancel_clicked || key_choice == Some(ConfirmChoice::Cancel) {
+                    Some(ConfirmChoice::Cancel)
+                } else {
+                    None
+                }
+            })
+            .inner
+        })
+        .inner
+}
+
+/// undo確認ダイアログを表示する。行はapp層で整形済み。
+pub fn draw_undo_plan(ui: &mut egui::Ui, lines: &[String]) -> Option<ConfirmChoice> {
+    let key_choice = ui.ctx().input(|input| {
+        plan_choice_from_keys(
+            input.key_pressed(egui::Key::Y),
+            input.key_pressed(egui::Key::N),
+            input.key_pressed(egui::Key::Escape),
+        )
+    });
+
+    egui::Modal::new(egui::Id::new("undo-plan-confirmation"))
+        .show(ui.ctx(), |ui| {
+            ui.heading("Confirm undo");
+            ui.add_space(8.0);
+            for line in lines {
+                if line.trim_start().starts_with("[対象外]") {
+                    ui.colored_label(ui.visuals().warn_fg_color, line);
+                } else {
+                    ui.monospace(line);
+                }
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let approve_clicked = ui.button("Undo (y)").clicked();
+                let cancel_clicked = ui.button("Cancel (n / Esc)").clicked();
+                if approve_clicked || key_choice == Some(ConfirmChoice::Approve) {
+                    Some(ConfirmChoice::Approve)
+                } else if cancel_clicked || key_choice == Some(ConfirmChoice::Cancel) {
+                    Some(ConfirmChoice::Cancel)
+                } else {
+                    None
+                }
+            })
+            .inner
+        })
+        .inner
+}
+
 fn plan_labels(plan: &OperationPlan, detail: ConfirmDetail) -> Vec<String> {
     if detail == ConfirmDetail::Full || plan.ops.len() <= 5 {
         return plan.ops.iter().map(operation_label).collect();
@@ -180,6 +275,101 @@ pub fn draw_report(ui: &mut egui::Ui, report: &CommitReport) -> bool {
 
             ui.add_space(12.0);
             ui.button("Close (Enter / Esc)").clicked() || dismiss_from_keyboard
+        })
+        .inner
+}
+
+/// undo結果ダイアログを表示する。行はapp層で整形済み。
+pub fn draw_undo_report(ui: &mut egui::Ui, lines: &[String], any_failed: bool) -> bool {
+    let dismiss_from_keyboard = ui
+        .ctx()
+        .input(|input| input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape));
+
+    egui::Modal::new(egui::Id::new("undo-commit-report"))
+        .show(ui.ctx(), |ui| {
+            ui.heading("Undo result");
+            ui.add_space(8.0);
+            if any_failed {
+                ui.colored_label(ui.visuals().warn_fg_color, "Some undo steps did not run.");
+                ui.add_space(4.0);
+            }
+            for line in lines {
+                if line.starts_with("NG") {
+                    ui.colored_label(ui.visuals().error_fg_color, line);
+                } else {
+                    ui.monospace(line);
+                }
+            }
+            ui.add_space(12.0);
+            ui.button("Close (Enter / Esc)").clicked() || dismiss_from_keyboard
+        })
+        .inner
+}
+
+/// pane間transferのCommitReportを既存reportモーダルで表示する。
+pub fn draw_transfer_report(ui: &mut egui::Ui, report: &CommitReport<TransferOp>) -> bool {
+    let dismiss_from_keyboard = ui
+        .ctx()
+        .input(|input| input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape));
+    egui::Modal::new(egui::Id::new("save-commit-report"))
+        .show(ui.ctx(), |ui| {
+            ui.heading("Apply result");
+            ui.add_space(8.0);
+            for result in &report.results {
+                let label =
+                    outcome_label(transfer_operation_label(&result.op, None), &result.outcome);
+                match result.outcome {
+                    OpOutcome::Failed { .. } => {
+                        ui.colored_label(ui.visuals().error_fg_color, label);
+                    }
+                    OpOutcome::Success | OpOutcome::Skipped { .. } => {
+                        ui.monospace(label);
+                    }
+                }
+            }
+            ui.add_space(12.0);
+            ui.button("Close (Enter / Esc)").clicked() || dismiss_from_keyboard
+        })
+        .inner
+}
+
+/// 起動時のundo journal復旧候補を表示する。
+///
+/// `Approve`は候補の破棄、`Cancel`は保持して閉じることを表す。
+pub fn draw_undo_recovery(ui: &mut egui::Ui, descriptions: &[String]) -> Option<ConfirmChoice> {
+    let key_choice = ui.ctx().input(|input| {
+        plan_choice_from_keys(
+            input.key_pressed(egui::Key::Y),
+            input.key_pressed(egui::Key::N),
+            input.key_pressed(egui::Key::Escape),
+        )
+    });
+
+    egui::Modal::new(egui::Id::new("undo-recovery"))
+        .show(ui.ctx(), |ui| {
+            ui.heading("Undo recovery");
+            ui.add_space(8.0);
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "Unfinished undo journal entries were found.",
+            );
+            ui.add_space(4.0);
+            for description in descriptions {
+                ui.monospace(description);
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let discard_clicked = ui.button("Discard (y)").clicked();
+                let keep_clicked = ui.button("Keep and close (n / Esc)").clicked();
+                if discard_clicked || key_choice == Some(ConfirmChoice::Approve) {
+                    Some(ConfirmChoice::Approve)
+                } else if keep_clicked || key_choice == Some(ConfirmChoice::Cancel) {
+                    Some(ConfirmChoice::Cancel)
+                } else {
+                    None
+                }
+            })
+            .inner
         })
         .inner
 }
@@ -322,7 +512,11 @@ fn plan_choice_from_keys(y: bool, n: bool, esc: bool) -> Option<ConfirmChoice> {
 
 fn report_label(result: &OpResult) -> String {
     let operation = operation_label(&result.op);
-    match &result.outcome {
+    outcome_label(operation, &result.outcome)
+}
+
+fn outcome_label(operation: String, outcome: &OpOutcome) -> String {
+    match outcome {
         OpOutcome::Success => format!("OK  {operation}"),
         OpOutcome::Failed { error, progress } => {
             let progress = progress
@@ -335,6 +529,18 @@ fn report_label(result: &OpResult) -> String {
             format!("--  SKIP {operation} (reason: {reason})")
         }
     }
+}
+
+/// transfer操作を確認・進捗・結果ダイアログで共通利用する表示ラベルへ変換する。
+pub(crate) fn transfer_operation_label(operation: &TransferOp, target: Option<PaneId>) -> String {
+    let kind = match operation.kind {
+        TransferKind::Move => "MOVE",
+        TransferKind::Copy => "COPY",
+    };
+    let pane = target
+        .map(|pane| format!("[pane {pane}] "))
+        .unwrap_or_default();
+    format!("{kind} {} → {pane}{}", operation.from, operation.to)
 }
 
 /// 操作を確認・進捗・結果ダイアログで共通利用する表示ラベルへ変換する。
@@ -389,6 +595,20 @@ mod tests {
             to: TreePath::parse("b.txt"),
         };
         assert_eq!(operation_label(&operation), "RENAME a.txt → b.txt");
+    }
+
+    #[test]
+    fn transfer_label_names_the_target_pane() {
+        let operation = TransferOp {
+            kind: TransferKind::Move,
+            from: TreePath::parse("dir/a.txt"),
+            to: TreePath::parse("inbox/a.txt"),
+            entry_kind: fyler_core::tree::EntryKind::File,
+        };
+        assert_eq!(
+            transfer_operation_label(&operation, Some(PaneId::new(2))),
+            "MOVE dir/a.txt → [pane 2] inbox/a.txt"
+        );
     }
 
     #[test]

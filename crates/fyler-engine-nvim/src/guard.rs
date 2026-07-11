@@ -145,6 +145,9 @@ for lhs, op in pairs({ zc = "close", zo = "open", za = "toggle", ["zC"] = "close
     vim.rpcnotify(channel, "fyler_fold", op, vim.api.nvim_win_get_cursor(0)[1] - 1)
   end, { buffer = buffer, silent = true, nowait = true })
 end
+vim.keymap.set("n", "g/", function()
+  vim.rpcnotify(channel, "fyler_open_picker")
+end, { buffer = buffer, silent = true, nowait = true })
 
 vim.keymap.set("n", "gy", function()
   vim.rpcnotify(channel, "fyler_yank_path", vim.api.nvim_win_get_cursor(0)[1] - 1)
@@ -158,14 +161,68 @@ vim.keymap.set("n", "gd", function()
   vim.rpcnotify(channel, "fyler_navigate_into", vim.api.nvim_win_get_cursor(0)[1] - 1)
 end, { buffer = buffer, silent = true, nowait = true })
 
+local function request_transfer(kind, visual)
+  local cursor = vim.api.nvim_win_get_cursor(0)[1] - 1
+  local first, last = cursor, cursor
+  if visual then
+    local anchor = vim.fn.line("v") - 1
+    first = math.min(anchor, cursor)
+    last = math.max(anchor, cursor)
+  end
+  vim.rpcnotify(channel, "fyler_transfer", kind, first, last)
+end
+
+vim.keymap.set("n", "gm", function()
+  request_transfer("move", false)
+end, { buffer = buffer, silent = true, nowait = true })
+vim.keymap.set("x", "gm", function()
+  request_transfer("move", true)
+end, { buffer = buffer, silent = true, nowait = true })
+vim.keymap.set("n", "gc", function()
+  request_transfer("copy", false)
+end, { buffer = buffer, silent = true, nowait = true })
+vim.keymap.set("x", "gc", function()
+  request_transfer("copy", true)
+end, { buffer = buffer, silent = true, nowait = true })
+
 vim.keymap.set("n", "?", function()
   vim.rpcnotify(channel, "fyler_help")
+end, { buffer = buffer, silent = true, nowait = true })
+
+vim.keymap.set("n", "<C-w>", function()
+  local key = vim.fn.getcharstr()
+  local actions = {
+    s = "split_horizontal",
+    S = "split_horizontal",
+    v = "split_vertical",
+    h = "focus_left",
+    j = "focus_down",
+    k = "focus_up",
+    l = "focus_right",
+    w = "focus_next",
+    p = "focus_previous",
+    q = "close",
+    c = "close",
+  }
+  local action = actions[key]
+  if key == vim.keycode("<C-w>") then
+    action = "focus_next"
+  end
+  if action then
+    vim.rpcnotify(channel, "fyler_pane", action)
+  else
+    vim.rpcnotify(channel, "fyler_action_blocked", key)
+  end
 end, { buffer = buffer, silent = true, nowait = true })
 
 vim.api.nvim_buf_create_user_command(buffer, "FylerBookmark", function(opts)
   vim.rpcnotify(channel, "fyler_bookmark", opts.args)
 end, { nargs = "?" })
 vim.cmd([[cnoreabbrev <buffer> <expr> b (getcmdtype() == ':' && getcmdline() ==# 'b') ? 'FylerBookmark' : 'b']])
+
+vim.api.nvim_buf_create_user_command(buffer, "FylerUndo", function()
+  vim.rpcnotify(channel, "fyler_undo")
+end, {})
 
 vim.api.nvim_buf_create_user_command(buffer, "FylerCd", function(opts)
   vim.rpcnotify(channel, "fyler_cd", opts.args)

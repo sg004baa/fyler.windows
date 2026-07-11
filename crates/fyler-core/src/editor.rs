@@ -6,6 +6,9 @@
 
 use std::sync::Arc;
 
+use crate::pane::PaneAction;
+use crate::transfer::TransferKind;
+
 /// 編集エンジンの抽象(snapshot + command channel型)。
 ///
 /// - GUIスレッドはRPC完了を**同期待ちしない**。入力は [`EditorEngine::send`] で
@@ -41,6 +44,9 @@ pub enum EditorCommand {
         lines: Vec<EditorLine>,
         cursor_line: Option<usize>,
     },
+    /// バッファ内容を変更せず、カーソルを0始まりの指定行へ移動する。
+    /// 行数を超える指定は最終行へクランプする。
+    SetCursorLine(usize),
     /// バッファの `modifiable` を設定する。保存フロー中のユーザー編集すり抜けを
     /// 防ぐ(状態機械 [`crate::save`] の`SetModifiable`効果の実行系)。
     SetModifiable(bool),
@@ -401,8 +407,18 @@ pub enum EditorEvent {
         /// 指定名または番号。一覧表示要求の場合は`None`。
         query: Option<String>,
     },
+    /// ファイルpickerを開くよう要求した。
+    OpenFilePicker,
     /// ユーザーがヘルプ表示を要求した。
     ShowHelp,
+    /// ユーザーがpaneの分割・focus移動・closeを要求した。
+    PaneAction(PaneAction),
+    /// ユーザーが指定行のエントリを別paneへ移動またはコピーするよう要求した。
+    /// `lines`は要求時点の0始まり行番号で、visual選択では範囲内の全行を含む。
+    TransferRequested {
+        kind: TransferKind,
+        lines: Vec<usize>,
+    },
     /// ユーザーが保存(`:w` 相当)を要求した。`lines` は保存要求時点のsnapshotに
     /// 属する行で、後続編集で更新されたsnapshotを誤ってplanしないため同梱する。
     /// [`crate::save::SaveEvent::CommitRequested`] へ接続する。
@@ -410,6 +426,8 @@ pub enum EditorEvent {
         changedtick: u64,
         lines: Arc<[EditorLine]>,
     },
+    /// `:FylerUndo` — 直近のapply transactionのundo要求。バッファundoの`u`とは無関係。
+    UndoRequested,
     /// cmdline表示の更新(`:` / `/` 入力中の内容)。GUIが自前描画する。
     CmdlineShow(CmdlineState),
     CmdlineHide,
