@@ -205,7 +205,10 @@ impl NvimEngine {
         let mut lines = buffer
             .get_lines(0, -1, false)
             .await
-            .map_err(|error| anyhow::anyhow!("初期バッファ行を取得できません: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("初期バッファ行を取得できません: {error}"))?
+            .into_iter()
+            .map(EditorLine::new)
+            .collect::<Vec<_>>();
         let mut lines_arc = lines_to_arc(&lines);
         let status = query_status(&nvim).await?;
         let mut revision = 1;
@@ -290,7 +293,10 @@ impl NvimEngine {
                                 } else {
                                     match buffer.get_lines(0, -1, false).await {
                                         Ok(current_lines) => {
-                                            lines = current_lines;
+                                            lines = current_lines
+                                                .into_iter()
+                                                .map(EditorLine::new)
+                                                .collect();
                                             lines_arc = lines_to_arc(&lines);
                                         }
                                         Err(error) => {
@@ -697,10 +703,20 @@ async fn replace_buffer_lines(
     let new_lines: Vec<String> = if editor_lines.is_empty() {
         vec![String::new()]
     } else {
-        editor_lines.into_iter().map(|line| line.text).collect()
+        editor_lines
+            .into_iter()
+            .map(|line| line.text.to_string())
+            .collect()
     };
+    let target_line = cursor_line
+        .unwrap_or(0)
+        .min(new_lines.len().saturating_sub(1));
+    let target_column = new_lines
+        .get(target_line)
+        .map(|line| fyler_core::grammar::id_prefix_len(line))
+        .unwrap_or_default();
     buffer
-        .set_lines(0, -1, false, new_lines.clone())
+        .set_lines(0, -1, false, new_lines)
         .await
         .map_err(|error| anyhow::anyhow!("{purpose}のバッファ行を設定できません: {error}"))?;
     buffer
@@ -710,13 +726,6 @@ async fn replace_buffer_lines(
 
     // 折りたたみトグル等では操作した行へカーソルを戻す。行数を超える指定は
     // 最終行へクランプする(nvimのset_cursorは範囲外でエラーになるため)。
-    let target_line = cursor_line
-        .unwrap_or(0)
-        .min(new_lines.len().saturating_sub(1));
-    let target_column = new_lines
-        .get(target_line)
-        .map(|line| fyler_core::grammar::id_prefix_len(line))
-        .unwrap_or_default();
     let window = nvim
         .get_current_win()
         .await
@@ -882,14 +891,8 @@ fn atomic_call(name: &str, args: Vec<Value>) -> Value {
     Value::Array(vec![Value::from(name), Value::Array(args)])
 }
 
-fn lines_to_arc(lines: &[String]) -> Arc<[EditorLine]> {
-    Arc::from(
-        lines
-            .iter()
-            .cloned()
-            .map(EditorLine::new)
-            .collect::<Vec<_>>(),
-    )
+fn lines_to_arc(lines: &[EditorLine]) -> Arc<[EditorLine]> {
+    Arc::from(lines.to_vec())
 }
 
 fn build_snapshot(
@@ -992,7 +995,7 @@ async fn input_is_blocking(nvim: &Nvim) -> anyhow::Result<bool> {
         .ok_or_else(|| anyhow::anyhow!("入力待ち状態の形式が不正です"))
 }
 
-fn apply_lines_notification(args: &[Value], lines: &mut Vec<String>) -> bool {
+fn apply_lines_notification(args: &[Value], lines: &mut Vec<EditorLine>) -> bool {
     let Some(first) = args
         .get(2)
         .and_then(value_as_u64)
@@ -1019,7 +1022,7 @@ fn apply_lines_notification(args: &[Value], lines: &mut Vec<String>) -> bool {
         let Some(line) = value.as_str() else {
             return false;
         };
-        replacement.push(line.to_owned());
+        replacement.push(EditorLine::new(line));
     }
     lines.splice(first..last, replacement);
     true
@@ -1307,7 +1310,11 @@ mod tests {
 
     #[test]
     fn line_notification_applies_incremental_replacement() {
-        let mut lines = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let mut lines = vec![
+            EditorLine::new("a"),
+            EditorLine::new("b"),
+            EditorLine::new("c"),
+        ];
         let args = vec![
             Value::Nil,
             Value::from(2),
@@ -1317,7 +1324,70 @@ mod tests {
             Value::from(false),
         ];
         assert!(apply_lines_notification(&args, &mut lines));
-        assert_eq!(lines, ["a", "B", "B2", "c"]);
+        assert_eq!(
+            lines,
+            [
+                EditorLine::new("a"),
+                EditorLine::new("B"),
+                EditorLine::new("B2"),
+                EditorLine::new("c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn single_line_edit_shares_unchanged_line_payloads() {
+        let mut lines = (1..=50)
+            .map(|index| EditorLine::new(format!("/{index:05} name_{index:05}.txt")))
+            .collect::<Vec<_>>();
+        let before = lines_to_arc(&lines);
+        let args = vec![
+            Value::Nil,
+            Value::from(2),
+            Value::from(24),
+            Value::from(25),
+            Value::Array(vec![Value::from("/00025 renamed_00025.txt")]),
+            Value::from(false),
+        ];
+
+        assert!(apply_lines_notification(&args, &mut lines));
+        let after = lines_to_arc(&lines);
+
+        for index in 0..50 {
+            assert_eq!(
+                Arc::ptr_eq(&before[index].text, &after[index].text),
+                index != 24,
+                "payload sharing mismatch at line {index}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "50k行の環境依存性能計測"]
+    fn bench_single_line_edit_snapshot_rebuild_on_50k_lines() {
+        let mut lines = (1..=50_000)
+            .map(|index| EditorLine::new(format!("/{index:05} name_{index:05}.txt")))
+            .collect::<Vec<_>>();
+        let args = vec![
+            Value::Nil,
+            Value::from(2),
+            Value::from(25_000),
+            Value::from(25_001),
+            Value::Array(vec![Value::from("/25001 renamed_25001.txt")]),
+            Value::from(false),
+        ];
+        let started = std::time::Instant::now();
+
+        for _ in 0..100 {
+            assert!(apply_lines_notification(&args, &mut lines));
+            std::hint::black_box(lines_to_arc(&lines));
+        }
+
+        let elapsed = started.elapsed();
+        eprintln!(
+            "50k single-line edit + snapshot rebuild x100: {elapsed:?} ({:?} per iteration)",
+            elapsed / 100
+        );
     }
 
     #[test]

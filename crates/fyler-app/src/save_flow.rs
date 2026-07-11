@@ -454,15 +454,13 @@ impl SaveController {
         &self,
         statuses: &HashMap<PathBuf, GitBadge>,
     ) -> HashMap<EntryId, GitBadge> {
-        if statuses.is_empty() {
-            return HashMap::new();
-        }
-        self.baseline
-            .entries()
+        statuses
             .iter()
-            .filter_map(|entry| {
-                let relative = entry.path.to_fs_path(Path::new(""));
-                statuses.get(&relative).map(|badge| (entry.id, *badge))
+            .filter_map(|(path, badge)| {
+                let tree_path = tree_path_from_relative(path)?;
+                self.baseline
+                    .get_by_path(&tree_path)
+                    .map(|entry| (entry.id, *badge))
             })
             .collect()
     }
@@ -1200,6 +1198,20 @@ impl SaveController {
     }
 }
 
+/// 表示ルート相対のOSパスをエンジン非依存のツリーパスへ変換する。
+///
+/// UTF-8で表現できない成分を含む場合は、Git状態とbaselineを安全に対応付けられない
+/// ため`None`を返す。
+fn tree_path_from_relative(path: &Path) -> Option<TreePath> {
+    path.components()
+        .map(|component| match component {
+            std::path::Component::Normal(name) => name.to_str().map(ToOwned::to_owned),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(TreePath::from_components)
+}
+
 /// planの読み取り元を属性だけで検査し、クラウド取得を伴い得る操作の警告を返す。
 ///
 /// `is_placeholder`はテストで差し替え可能にし、本番では
@@ -1444,6 +1456,7 @@ mod tests {
     use std::fs;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
 
     use fyler_core::editor::{EditorSnapshot, FoldOp};
     use fyler_core::fileinfo::EntryMeta;
@@ -1704,6 +1717,47 @@ mod tests {
         let statuses = HashMap::from([(PathBuf::from("missing.txt"), GitBadge::Untracked)]);
 
         assert!(controller.map_git_badges(&statuses).is_empty());
+    }
+
+    #[test]
+    #[ignore = "環境依存性能計測"]
+    fn bench_git_badge_mapping_on_50k_baseline() {
+        const ENTRY_COUNT: usize = 50_000;
+        const ITERATIONS: usize = 20;
+
+        let root = PathBuf::from("C:/test-root");
+        let mut ids = IdAllocator::new();
+        let mut baseline = BaselineTree::new(&root);
+        for index in 0..ENTRY_COUNT {
+            baseline.insert(BaselineEntry {
+                id: ids.allocate(),
+                path: TreePath::parse(&format!("file-{index:05}.txt")),
+                kind: EntryKind::File,
+            });
+        }
+        let engine = Arc::new(RecordingEngine::default());
+        let controller =
+            SaveController::new(root, ids, baseline, Arc::<RecordingEngine>::clone(&engine));
+
+        for status_count in [1_usize, 100, 10_000] {
+            let statuses = (0..status_count)
+                .map(|index| {
+                    (
+                        PathBuf::from(format!("file-{index:05}.txt")),
+                        GitBadge::Modified,
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                std::hint::black_box(controller.map_git_badges(&statuses));
+            }
+            let elapsed = started.elapsed();
+            eprintln!(
+                "50k git badge mapping ({status_count} statuses): {:.3} ms/iteration ({ITERATIONS} iterations)",
+                elapsed.as_secs_f64() * 1_000.0 / ITERATIONS as f64,
+            );
+        }
     }
 
     #[test]
@@ -3116,7 +3170,7 @@ mod tests {
     fn fold_busy_when_not_idle() {
         let (mut controller, _) = hierarchy_controller("C:/test-root");
         let mut lines = controller.visible_lines();
-        lines[4].text = lines[4].text.replace("top.txt", "renamed.txt");
+        lines[4].text = lines[4].text.replace("top.txt", "renamed.txt").into();
         assert!(matches!(
             controller.on_commit(7, &lines),
             SaveFlowResult::ShowPlan { .. }
@@ -3193,7 +3247,7 @@ mod tests {
         let (mut controller, _) = hierarchy_controller("C:/test-root");
         controller.collapse_all_dirs();
         let mut edited = controller.visible_lines();
-        edited[1].text = edited[1].text.replace("top.txt", "renamed.txt");
+        edited[1].text = edited[1].text.replace("top.txt", "renamed.txt").into();
         assert!(matches!(
             controller.on_commit(7, &edited),
             SaveFlowResult::ShowPlan { .. }
@@ -3388,7 +3442,7 @@ mod tests {
     fn toggle_collapse_rejects_non_idle_save_state() {
         let (mut controller, _) = hierarchy_controller("C:/test-root");
         let mut lines = controller.visible_lines();
-        lines[4].text = lines[4].text.replace("top.txt", "renamed.txt");
+        lines[4].text = lines[4].text.replace("top.txt", "renamed.txt").into();
         assert!(matches!(
             controller.on_commit(7, &lines),
             SaveFlowResult::ShowPlan { .. }
@@ -3408,7 +3462,7 @@ mod tests {
             ToggleCollapseResult::Toggled(lines) => lines,
             result => panic!("unexpected collapse result: {result:?}"),
         };
-        collapsed[0].text = collapsed[0].text.replace("a/", "renamed/");
+        collapsed[0].text = collapsed[0].text.replace("a/", "renamed/").into();
 
         let result = controller.on_commit(7, &collapsed);
 

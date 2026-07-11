@@ -251,14 +251,19 @@ fn chars_match(a: char, b: char, case_sensitive: bool) -> bool {
 }
 
 /// バッファの1行。生テキスト(IDプレフィックス含む)を保持する。
-/// プレフィックスの解釈・隠蔽は [`crate::grammar`] 経由で行うこと。
+///
+/// 未変更行のpayloadをsnapshot世代間で共有するため、テキストは
+/// [`Arc<str>`](std::sync::Arc)で保持する。プレフィックスの解釈・隠蔽は
+/// [`crate::grammar`] 経由で行うこと。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditorLine {
-    pub text: String,
+    /// snapshot世代間で共有される、IDプレフィックスを含む生テキスト。
+    pub text: Arc<str>,
 }
 
 impl EditorLine {
-    pub fn new(text: impl Into<String>) -> Self {
+    /// 共有可能な行payloadを保持する。
+    pub fn new(text: impl Into<Arc<str>>) -> Self {
         Self { text: text.into() }
     }
 }

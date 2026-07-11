@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::id::EntryId;
 use crate::path::TreePath;
@@ -32,9 +33,10 @@ pub enum EntryKind {
 pub struct BaselineTree {
     /// 表示ルートの実FSパス。
     pub root: PathBuf,
-    entries: Vec<BaselineEntry>,
-    index: HashMap<EntryId, usize>,
-    meta: HashMap<EntryId, crate::fileinfo::EntryMeta>,
+    entries: Arc<Vec<BaselineEntry>>,
+    index: Arc<HashMap<EntryId, usize>>,
+    path_index: Arc<HashMap<TreePath, usize>>,
+    meta: Arc<HashMap<EntryId, crate::fileinfo::EntryMeta>>,
 }
 
 impl PartialEq for BaselineTree {
@@ -50,13 +52,14 @@ impl BaselineTree {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            entries: Vec::new(),
-            index: HashMap::new(),
-            meta: HashMap::new(),
+            entries: Arc::new(Vec::new()),
+            index: Arc::new(HashMap::new()),
+            path_index: Arc::new(HashMap::new()),
+            meta: Arc::new(HashMap::new()),
         }
     }
 
-    /// エントリを末尾へ追加し、ID検索用インデックスも同時に更新する。
+    /// エントリを末尾へ追加し、ID・パス検索用インデックスも同時に更新する。
     ///
     /// 同一IDの重複はbaseline構築側の不具合であるため、デバッグビルドでは
     /// 即座に検出する。
@@ -66,16 +69,35 @@ impl BaselineTree {
             "BaselineTreeへ同一IDが重複挿入されました: {}",
             entry.id
         );
+        debug_assert!(
+            !self.path_index.contains_key(&entry.path),
+            "BaselineTreeへ同一パスが重複挿入されました: {}",
+            entry.path
+        );
         let position = self.entries.len();
-        self.index.insert(entry.id, position);
-        self.entries.push(entry);
+        Arc::make_mut(&mut self.index).insert(entry.id, position);
+        Arc::make_mut(&mut self.path_index).insert(entry.path.clone(), position);
+        Arc::make_mut(&mut self.entries).push(entry);
     }
 
     /// エントリと表示用メタデータを同時に追加する。
     pub fn insert_with_meta(&mut self, entry: BaselineEntry, meta: crate::fileinfo::EntryMeta) {
         let id = entry.id;
         self.insert(entry);
-        self.meta.insert(id, meta);
+        Arc::make_mut(&mut self.meta).insert(id, meta);
+    }
+
+    /// 現在のツリー構造を共有し、指定IDの表示用メタデータだけを更新した複製を返す。
+    ///
+    /// エントリ構造が変わらない差分再スキャンで、全パスと検索インデックスの
+    /// 再構築を避けるために使う。未知のIDは通常のメタデータ挿入として扱う。
+    pub fn clone_with_meta_updates(
+        &self,
+        updates: impl IntoIterator<Item = (EntryId, crate::fileinfo::EntryMeta)>,
+    ) -> Self {
+        let mut cloned = self.clone();
+        Arc::make_mut(&mut cloned.meta).extend(updates);
+        cloned
     }
 
     /// IDに対応する表示用メタデータを返す。スキャン以外で構築したbaselineはNone。
@@ -88,6 +110,45 @@ impl BaselineTree {
         self.index
             .get(&id)
             .and_then(|position| self.entries.get(*position))
+    }
+
+    /// パスに対応する表示順インデックスをO(1)で返す。
+    pub fn index_by_path(&self, path: &TreePath) -> Option<usize> {
+        self.path_index.get(path).copied()
+    }
+
+    /// パスに対応するエントリをO(1)で返す。
+    pub fn get_by_path(&self, path: &TreePath) -> Option<&BaselineEntry> {
+        self.index_by_path(path)
+            .and_then(|position| self.entries.get(position))
+    }
+
+    /// 指定ディレクトリ直下の子エントリのインデックスを表示順で返す。
+    ///
+    /// `parent`が`None`なら表示ルート直下を返す。baselineのDFS順契約により、
+    /// 親の直後に連続する部分木だけを深さで走査するため、計算量はO(部分木)である。
+    pub fn child_indices(&self, parent: Option<usize>) -> Vec<usize> {
+        let (start, parent_depth) = match parent {
+            Some(parent) => {
+                let Some(entry) = self.entries.get(parent) else {
+                    return Vec::new();
+                };
+                (parent + 1, entry.path.depth())
+            }
+            None => (0, 0),
+        };
+
+        let mut children = Vec::new();
+        for (index, entry) in self.entries.iter().enumerate().skip(start) {
+            let depth = entry.path.depth();
+            if parent.is_some() && depth <= parent_depth {
+                break;
+            }
+            if depth == parent_depth + 1 {
+                children.push(index);
+            }
+        }
+        children
     }
 
     /// baselineの全エントリを表示順で返す。
@@ -160,7 +221,34 @@ mod tests {
         assert_eq!(tree.get(EntryId(1)), Some(&first));
         assert_eq!(tree.get(EntryId(2)), Some(&second));
         assert_eq!(tree.get(EntryId(3)), None);
+        assert_eq!(tree.index_by_path(&TreePath::parse("first.txt")), Some(0));
+        assert_eq!(tree.get_by_path(&TreePath::parse("second")), Some(&second));
+        assert_eq!(tree.get_by_path(&TreePath::parse("missing")), None);
         assert_eq!(tree.entries(), &[first, second]);
+    }
+
+    #[test]
+    fn child_indices_follow_dfs_order_for_root_and_nested_directory() {
+        let mut tree = BaselineTree::new("C:/root");
+        for (id, path, kind) in [
+            (1, "a", EntryKind::Dir),
+            (2, "a/first.txt", EntryKind::File),
+            (3, "a/nested", EntryKind::Dir),
+            (4, "a/nested/leaf.txt", EntryKind::File),
+            (5, "a/second.txt", EntryKind::File),
+            (6, "root.txt", EntryKind::File),
+        ] {
+            tree.insert(BaselineEntry {
+                id: EntryId(id),
+                path: TreePath::parse(path),
+                kind,
+            });
+        }
+
+        assert_eq!(tree.child_indices(None), [0, 5]);
+        assert_eq!(tree.child_indices(Some(0)), [1, 2, 4]);
+        assert_eq!(tree.child_indices(Some(2)), [3]);
+        assert!(tree.child_indices(Some(99)).is_empty());
     }
 
     #[test]

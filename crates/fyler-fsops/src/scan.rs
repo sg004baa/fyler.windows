@@ -1,7 +1,7 @@
 //! baselineスキャン: 実FS → BaselineTree(ID採番)。
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
@@ -79,15 +79,10 @@ pub fn rescan_preserving_ids_with(
     previous: &BaselineTree,
     options: &ScanOptions,
 ) -> anyhow::Result<BaselineTree> {
-    let previous_ids: HashMap<TreePath, _> = previous
-        .entries()
-        .iter()
-        .map(|entry| (entry.path.clone(), entry.id))
-        .collect();
     scan_with_id_resolver(root, options, |path| {
-        previous_ids
-            .get(path)
-            .copied()
+        previous
+            .get_by_path(path)
+            .map(|entry| entry.id)
             .unwrap_or_else(|| ids.allocate())
     })
 }
@@ -143,27 +138,13 @@ fn rebuild_changed(
 ) -> anyhow::Result<BaselineTree> {
     validate_root(root)?;
 
-    let previous_by_path = previous
-        .entries()
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| (entry.path.clone(), index))
-        .collect::<HashMap<_, _>>();
-    let mut children_of: HashMap<TreePath, Vec<usize>> = HashMap::new();
-    for (index, entry) in previous.entries().iter().enumerate() {
-        children_of
-            .entry(entry.path.parent().unwrap_or_else(TreePath::root))
-            .or_default()
-            .push(index);
-    }
-
     let mut affected = HashSet::new();
     for path in changed_paths {
         let mut ancestor = path.parent().unwrap_or_else(TreePath::root);
         loop {
-            let is_existing_dir = previous_by_path
-                .get(&ancestor)
-                .is_some_and(|index| previous.entries()[*index].kind == EntryKind::Dir);
+            let is_existing_dir = previous
+                .get_by_path(&ancestor)
+                .is_some_and(|entry| entry.kind == EntryKind::Dir);
             if ancestor.is_root() || is_existing_dir {
                 affected.insert(ancestor);
                 break;
@@ -171,12 +152,17 @@ fn rebuild_changed(
             ancestor = ancestor.parent().unwrap_or_else(TreePath::root);
         }
 
-        if previous_by_path
-            .get(path)
-            .is_some_and(|index| previous.entries()[*index].kind == EntryKind::Dir)
+        if previous
+            .get_by_path(path)
+            .is_some_and(|entry| entry.kind == EntryKind::Dir)
         {
             affected.insert(path.clone());
         }
+    }
+
+    if let Some(tree) = refresh_metadata_if_structure_unchanged(root, previous, &affected, options)?
+    {
+        return Ok(tree);
     }
 
     let mut tree = BaselineTree::new(root);
@@ -185,8 +171,6 @@ fn rebuild_changed(
         &TreePath::root(),
         ids,
         previous,
-        &previous_by_path,
-        &children_of,
         &affected,
         options,
         &mut tree,
@@ -194,22 +178,59 @@ fn rebuild_changed(
     Ok(tree)
 }
 
-#[allow(clippy::too_many_arguments)]
+fn refresh_metadata_if_structure_unchanged(
+    root: &Path,
+    previous: &BaselineTree,
+    affected: &HashSet<TreePath>,
+    options: &ScanOptions,
+) -> anyhow::Result<Option<BaselineTree>> {
+    let mut updates = Vec::new();
+    for relative in affected {
+        let scanned = read_sorted_entries(&relative.to_fs_path(root), options)?;
+        let parent = if relative.is_root() {
+            None
+        } else {
+            let Some(parent) = previous.index_by_path(relative) else {
+                return Ok(None);
+            };
+            Some(parent)
+        };
+        let children = previous.child_indices(parent);
+        if scanned.len() != children.len() {
+            return Ok(None);
+        }
+
+        for (scanned, index) in scanned.into_iter().zip(children) {
+            let name = scanned.file_name.to_str().with_context(|| {
+                format!(
+                    "UTF-8として表現できないファイル名です: {}",
+                    scanned.path.display()
+                )
+            })?;
+            let previous_entry = &previous.entries()[index];
+            if previous_entry.path != relative.child(name) || previous_entry.kind != scanned.kind {
+                return Ok(None);
+            }
+            updates.push((previous_entry.id, scanned.meta));
+        }
+    }
+
+    Ok(Some(previous.clone_with_meta_updates(updates)))
+}
+
 fn rebuild_directory(
     root: &Path,
     relative: &TreePath,
     ids: &mut IdAllocator,
     previous: &BaselineTree,
-    previous_by_path: &HashMap<TreePath, usize>,
-    children_of: &HashMap<TreePath, Vec<usize>>,
     affected: &HashSet<TreePath>,
     options: &ScanOptions,
     tree: &mut BaselineTree,
 ) -> anyhow::Result<()> {
     let was_directory = relative.is_root()
-        || previous_by_path
-            .get(relative)
-            .is_some_and(|index| previous.entries()[*index].kind == EntryKind::Dir);
+        || previous
+            .get_by_path(relative)
+            .is_some_and(|entry| entry.kind == EntryKind::Dir);
     let should_scan = affected.contains(relative) || !was_directory;
 
     if should_scan {
@@ -222,9 +243,9 @@ fn rebuild_directory(
                 )
             })?;
             let path = relative.child(name);
-            let id = previous_by_path
-                .get(&path)
-                .map(|index| previous.entries()[*index].id)
+            let id = previous
+                .get_by_path(&path)
+                .map(|entry| entry.id)
                 .unwrap_or_else(|| ids.allocate());
             let kind = entry.kind;
             let child_directory = entry.path;
@@ -238,28 +259,19 @@ fn rebuild_directory(
             );
 
             if kind == EntryKind::Dir {
-                rebuild_directory(
-                    root,
-                    &path,
-                    ids,
-                    previous,
-                    previous_by_path,
-                    children_of,
-                    affected,
-                    options,
-                    tree,
-                )
-                .with_context(|| {
-                    format!(
-                        "変更ディレクトリの再構築に失敗しました: {}",
-                        child_directory.display()
-                    )
-                })?;
+                rebuild_directory(root, &path, ids, previous, affected, options, tree)
+                    .with_context(|| {
+                        format!(
+                            "変更ディレクトリの再構築に失敗しました: {}",
+                            child_directory.display()
+                        )
+                    })?;
             }
         }
-    } else if let Some(children) = children_of.get(relative) {
-        for index in children {
-            let entry = previous.entries()[*index].clone();
+    } else {
+        let parent = previous.index_by_path(relative);
+        for index in previous.child_indices(parent) {
+            let entry = previous.entries()[index].clone();
             let id = entry.id;
             let kind = entry.kind;
             let path = entry.path.clone();
@@ -270,17 +282,7 @@ fn rebuild_directory(
             }
 
             if kind == EntryKind::Dir {
-                rebuild_directory(
-                    root,
-                    &path,
-                    ids,
-                    previous,
-                    previous_by_path,
-                    children_of,
-                    affected,
-                    options,
-                    tree,
-                )?;
+                rebuild_directory(root, &path, ids, previous, affected, options, tree)?;
             }
         }
     }
@@ -616,7 +618,7 @@ pub(crate) fn kind_from_metadata(metadata: &Metadata) -> EntryKind {
 mod tests {
     use std::collections::BTreeSet;
     use std::fs;
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, Instant, SystemTime};
 
     use tempfile::tempdir;
 
@@ -827,6 +829,56 @@ mod tests {
 
         assert_eq!(partial, full);
         partial
+    }
+
+    #[test]
+    #[ignore = "環境依存性能計測"]
+    fn bench_partial_rescan_deep_leaf_on_50k_entries() {
+        const DIRECTORY_COUNT: usize = 200;
+        const FILES_PER_DIRECTORY: usize = 250;
+        const ITERATIONS: usize = 20;
+
+        let root = tempdir().unwrap();
+        for directory_index in 0..DIRECTORY_COUNT {
+            let directory = root.path().join(format!("dir-{directory_index:03}"));
+            fs::create_dir(&directory).unwrap();
+            for file_index in 0..FILES_PER_DIRECTORY {
+                fs::write(
+                    directory.join(format!("file-{file_index:03}.txt")),
+                    b"baseline",
+                )
+                .unwrap();
+            }
+        }
+
+        let mut ids = IdAllocator::new();
+        let scan_started = Instant::now();
+        let previous = scan_baseline(root.path(), &mut ids).unwrap();
+        let scan_elapsed = scan_started.elapsed();
+        let changed = root.path().join("dir-199").join("file-249.txt");
+        fs::write(&changed, b"changed content").unwrap();
+        let changed_paths = BTreeSet::from([changed]);
+
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            let mut iteration_ids = allocator_after(&previous);
+            let rescanned = rescan_changed_preserving_ids_with(
+                root.path(),
+                &mut iteration_ids,
+                &previous,
+                &changed_paths,
+                &ScanOptions::default(),
+            )
+            .unwrap();
+            std::hint::black_box(rescanned);
+        }
+        let elapsed = started.elapsed();
+
+        eprintln!(
+            "50k initial scan: {:.3} ms; partial rescan: {:.3} ms/iteration ({ITERATIONS} iterations)",
+            scan_elapsed.as_secs_f64() * 1_000.0,
+            elapsed.as_secs_f64() * 1_000.0 / ITERATIONS as f64,
+        );
     }
 
     #[test]

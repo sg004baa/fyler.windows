@@ -350,9 +350,9 @@ async fn set_initial_lines_with_multiple_lines_has_no_duplication() -> anyhow::R
             let snapshot = engine.snapshot();
             let lines = &snapshot.lines;
             if lines.len() == 3
-                && lines[0].text == "/001 a.txt"
-                && lines[1].text == "/002 hoge.csv"
-                && lines[2].text == "/003 test.txt"
+                && lines[0].text.as_ref() == "/001 a.txt"
+                && lines[1].text.as_ref() == "/002 hoge.csv"
+                && lines[2].text.as_ref() == "/003 test.txt"
             {
                 return;
             }
@@ -372,9 +372,9 @@ async fn set_initial_lines_with_multiple_lines_has_no_duplication() -> anyhow::R
         snapshot.lines
     );
     // 各行が投入順どおりの内容であること。
-    assert_eq!(snapshot.lines[0].text, "/001 a.txt");
-    assert_eq!(snapshot.lines[1].text, "/002 hoge.csv");
-    assert_eq!(snapshot.lines[2].text, "/003 test.txt");
+    assert_eq!(snapshot.lines[0].text.as_ref(), "/001 a.txt");
+    assert_eq!(snapshot.lines[1].text.as_ref(), "/002 hoge.csv");
+    assert_eq!(snapshot.lines[2].text.as_ref(), "/003 test.txt");
 
     Ok(())
 }
@@ -401,7 +401,7 @@ async fn modifiable_blocks_normal_mode_edits_until_reenabled() -> anyhow::Result
     let revision = engine.snapshot().revision;
     engine.send(key_command(Key::Char('x')))?;
     wait_for_revision_after(&engine, revision).await?;
-    assert_eq!(engine.snapshot().lines[0].text, "/001 alpha");
+    assert_eq!(engine.snapshot().lines[0].text.as_ref(), "/001 alpha");
 
     let revision = engine.snapshot().revision;
     engine.send(EditorCommand::SetModifiable(true))?;
@@ -757,7 +757,7 @@ async fn shift_indents_after_id_prefix() -> anyhow::Result<()> {
         EditorLine::new("/003 top.txt"),
     ])?;
     wait_for_lines(&engine, |lines| {
-        lines.len() == 3 && lines[2].text == "/003 top.txt"
+        lines.len() == 3 && lines[2].text.as_ref() == "/003 top.txt"
     })
     .await?;
 
@@ -768,12 +768,12 @@ async fn shift_indents_after_id_prefix() -> anyhow::Result<()> {
     engine.send(key_command(Key::Char('>')))?;
     engine.send(key_command(Key::Char('>')))?;
     wait_for_lines(&engine, |lines| {
-        lines.len() == 3 && lines[2].text == "/003 \ttop.txt"
+        lines.len() == 3 && lines[2].text.as_ref() == "/003 \ttop.txt"
     })
     .await?;
 
     let snapshot = engine.snapshot();
-    assert_eq!(snapshot.lines[2].text, "/003 \ttop.txt");
+    assert_eq!(snapshot.lines[2].text.as_ref(), "/003 \ttop.txt");
     assert!(
         !snapshot.lines[2].text.starts_with('\t'),
         "the tab must be inserted after the id prefix, not before it"
@@ -794,7 +794,7 @@ async fn shift_dedent_at_depth_zero_is_noop() -> anyhow::Result<()> {
 
     engine.set_initial_lines(vec![EditorLine::new("/001 top.txt")])?;
     wait_for_lines(&engine, |lines| {
-        lines.len() == 1 && lines[0].text == "/001 top.txt"
+        lines.len() == 1 && lines[0].text.as_ref() == "/001 top.txt"
     })
     .await?;
 
@@ -805,7 +805,7 @@ async fn shift_dedent_at_depth_zero_is_noop() -> anyhow::Result<()> {
 
     let snapshot = engine.snapshot();
     assert_eq!(snapshot.lines.len(), 1);
-    assert_eq!(snapshot.lines[0].text, "/001 top.txt");
+    assert_eq!(snapshot.lines[0].text.as_ref(), "/001 top.txt");
 
     Ok(())
 }
@@ -822,7 +822,7 @@ async fn cursor_clamps_to_name_start() -> anyhow::Result<()> {
 
     engine.set_initial_lines(vec![EditorLine::new("/001 \tname.txt")])?;
     wait_for_lines(&engine, |lines| {
-        lines.len() == 1 && lines[0].text == "/001 \tname.txt"
+        lines.len() == 1 && lines[0].text.as_ref() == "/001 \tname.txt"
     })
     .await?;
 
