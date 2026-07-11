@@ -80,6 +80,10 @@ vim.keymap.set("n", "g.", function()
   vim.rpcnotify(channel, "fyler_toggle_hidden")
 end, { buffer = buffer, silent = true, nowait = true })
 
+vim.keymap.set("n", "g/", function()
+  vim.rpcnotify(channel, "fyler_open_picker")
+end, { buffer = buffer, silent = true, nowait = true })
+
 vim.keymap.set("n", "gy", function()
   vim.rpcnotify(channel, "fyler_yank_path", vim.api.nvim_win_get_cursor(0)[1] - 1)
 end, { buffer = buffer, silent = true, nowait = true })

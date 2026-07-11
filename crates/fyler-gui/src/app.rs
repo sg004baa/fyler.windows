@@ -15,6 +15,7 @@ use fyler_core::pane::{PaneId, PaneLayout, SplitDirection};
 use fyler_core::path::TreePath;
 use fyler_core::plan::OperationPlan;
 use fyler_core::report::{ApplyProgress, CommitReport};
+use fyler_core::search::{SearchCandidate, SearchHit};
 use fyler_core::transfer::{TransferOp, TransferPlan};
 use fyler_core::validate::ValidateError;
 
@@ -22,6 +23,27 @@ use crate::confirm::{ConfirmChoice, ConfirmDetail, IconStyle};
 use crate::{cmdline, confirm, input, modeline, tree_view};
 
 const CJK_FONT_NAME: &str = "fyler-cjk";
+const PICKER_RESULT_LIMIT: usize = 100;
+
+/// ファイルpickerで候補を確定したときの動作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerAction {
+    /// 対象をツリー上へ表示し、カーソルを移動する。
+    Jump,
+    /// OSの既定アプリケーションで対象を開く。
+    Open,
+}
+
+/// GUIからapp層へ返すユーザー操作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuiAction {
+    Confirm(ConfirmChoice),
+    PickerSelect {
+        pane_id: PaneId,
+        entry_id: EntryId,
+        action: PickerAction,
+    },
+}
 
 /// app層からGUI起動時に渡す表示設定。
 #[derive(Debug, Clone, PartialEq)]
@@ -78,6 +100,11 @@ pub enum GuiEvent {
         pane_id: PaneId,
         dirs: HashSet<EntryId>,
     },
+    /// 指定paneのbaselineから構築した候補でファイルpickerを開く。
+    ShowFilePicker {
+        pane_id: PaneId,
+        candidates: Vec<SearchCandidate>,
+    },
     /// 指定された表示用パスをクリップボードへコピーする。
     CopyPath(String),
     /// 保存planと実行前に確認すべき警告を表示する。
@@ -131,6 +158,13 @@ enum DialogState {
     Report(CommitReport),
     TransferReport(CommitReport<TransferOp>),
     ValidationErrors(Vec<ValidateError>),
+    FilePicker {
+        pane_id: PaneId,
+        candidates: Vec<SearchCandidate>,
+        query: String,
+        selected: usize,
+        hits: Vec<SearchHit>,
+    },
     Help,
 }
 
@@ -150,7 +184,8 @@ pub struct FylerApp {
     pending_copy: Option<String>,
     fatal_error: Option<String>,
     dialog: Option<DialogState>,
-    confirm_tx: mpsc::Sender<ConfirmChoice>,
+    action_tx: mpsc::Sender<GuiAction>,
+    picker_needs_focus: bool,
     confirm_detail: ConfirmDetail,
     icon_style: IconStyle,
 }
@@ -169,7 +204,7 @@ struct PaneViewState {
 impl FylerApp {
     fn new(
         gui_events: mpsc::Receiver<GuiEvent>,
-        confirm_tx: mpsc::Sender<ConfirmChoice>,
+        action_tx: mpsc::Sender<GuiAction>,
         confirm_detail: ConfirmDetail,
         icon_style: IconStyle,
         repaint_context: egui::Context,
@@ -197,7 +232,8 @@ impl FylerApp {
             pending_copy: None,
             fatal_error: None,
             dialog: None,
-            confirm_tx,
+            action_tx,
+            picker_needs_focus: false,
             confirm_detail,
             icon_style,
         })
@@ -227,6 +263,15 @@ impl FylerApp {
                 }
                 GuiEvent::RemovePane(pane_id) => {
                     self.panes.remove(&pane_id);
+                    if matches!(
+                        self.dialog,
+                        Some(DialogState::FilePicker {
+                            pane_id: owner,
+                            ..
+                        }) if owner == pane_id
+                    ) {
+                        self.dialog = None;
+                    }
                 }
                 GuiEvent::LayoutChanged { layout, active } => {
                     self.layout = Some(layout);
@@ -241,6 +286,7 @@ impl FylerApp {
                     EditorEvent::ChangeDirectory { .. } => {}
                     EditorEvent::ToggleHidden => {}
                     EditorEvent::JumpBookmark { .. } => {}
+                    EditorEvent::OpenFilePicker => {}
                     EditorEvent::ShowHelp => self.dialog = Some(DialogState::Help),
                     EditorEvent::PaneAction(_) => {}
                     EditorEvent::TransferRequested { .. } => {}
@@ -255,6 +301,15 @@ impl FylerApp {
                     EditorEvent::CmdlineHide => {}
                     EditorEvent::Message(message) => self.message = Some(message),
                     EditorEvent::EngineCrashed { reason } => {
+                        if matches!(
+                            self.dialog,
+                            Some(DialogState::FilePicker {
+                                pane_id: owner,
+                                ..
+                            }) if owner == pane_id
+                        ) {
+                            self.dialog = None;
+                        }
                         if let Some(pane) = self.panes.get_mut(&pane_id) {
                             pane.engine_error = Some(format!("Editor engine stopped: {reason}"));
                         }
@@ -279,6 +334,20 @@ impl FylerApp {
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
                         pane.collapsed_dirs = dirs;
                     }
+                }
+                GuiEvent::ShowFilePicker {
+                    pane_id,
+                    candidates,
+                } => {
+                    let hits = fyler_core::search::search(&candidates, "", PICKER_RESULT_LIMIT);
+                    self.dialog = Some(DialogState::FilePicker {
+                        pane_id,
+                        candidates,
+                        query: String::new(),
+                        selected: 0,
+                        hits,
+                    });
+                    self.picker_needs_focus = true;
                 }
                 GuiEvent::CopyPath(path) => self.pending_copy = Some(path),
                 GuiEvent::ShowPlan {
@@ -385,12 +454,15 @@ impl eframe::App for FylerApp {
             .iter()
             .map(|(id, pane)| (*id, pane.engine.snapshot()))
             .collect::<BTreeMap<_, _>>();
-        if self.dialog.is_none()
-            && self.fatal_error.is_none()
-            && let Some(active) = self.active
+        if should_forward_input(
+            self.dialog.is_none(),
+            self.fatal_error.is_none(),
+            self.active
+                .and_then(|active| self.panes.get(&active))
+                .is_some_and(|pane| pane.engine_error.is_none()),
+        ) && let Some(active) = self.active
             && let (Some(pane), Some(snapshot)) =
                 (self.panes.get_mut(&active), snapshots.get(&active))
-            && pane.engine_error.is_none()
             && let Err(error) = input::forward_input(ui.ctx(), pane.engine.as_ref(), &snapshot.mode)
         {
             pane.engine_error = Some(format!("Failed to send input to editor engine: {error}"));
@@ -426,7 +498,9 @@ impl eframe::App for FylerApp {
                 }
             })
             .inner;
-        if let Some(ime) = ime {
+        if self.dialog.is_none()
+            && let Some(ime) = ime
+        {
             ui.ctx().output_mut(|platform_output| {
                 platform_output.ime = Some(egui::output::IMEOutput {
                     rect: ime.tree_rect,
@@ -440,7 +514,8 @@ impl eframe::App for FylerApp {
         let mut cancel_apply = false;
         let mut dismiss_errors = false;
         let mut dismiss_report = false;
-        match &self.dialog {
+        let mut picker_result = None;
+        match &mut self.dialog {
             Some(DialogState::Plan {
                 plan,
                 warnings,
@@ -493,6 +568,23 @@ impl eframe::App for FylerApp {
                     })
                     .inner;
             }
+            Some(DialogState::FilePicker {
+                pane_id,
+                candidates,
+                query,
+                selected,
+                hits,
+            }) => {
+                picker_result = draw_file_picker(
+                    ui,
+                    *pane_id,
+                    candidates,
+                    query,
+                    selected,
+                    hits,
+                    &mut self.picker_needs_focus,
+                );
+            }
             None => {}
         }
 
@@ -503,14 +595,31 @@ impl eframe::App for FylerApp {
             self.dialog = None;
         }
         if let Some(choice) = confirm_choice
-            && self.confirm_tx.send(choice).is_err()
+            && self.action_tx.send(GuiAction::Confirm(choice)).is_err()
         {
             self.fatal_error = Some("Failed to send confirmation result to app".to_owned());
         }
-        if cancel_apply && self.confirm_tx.send(ConfirmChoice::Cancel).is_err() {
+        if cancel_apply
+            && self
+                .action_tx
+                .send(GuiAction::Confirm(ConfirmChoice::Cancel))
+                .is_err()
+        {
             self.fatal_error = Some("Failed to send cancel request to app".to_owned());
         }
+        if let Some(result) = picker_result {
+            self.dialog = None;
+            if let Some(action) = result
+                && self.action_tx.send(action).is_err()
+            {
+                self.fatal_error = Some("Failed to send picker result to app".to_owned());
+            }
+        }
     }
+}
+
+fn should_forward_input(dialog_absent: bool, fatal_absent: bool, engine_healthy: bool) -> bool {
+    dialog_absent && fatal_absent && engine_healthy
 }
 
 struct ImeGeometry {
@@ -641,6 +750,140 @@ fn draw_layout_in_rect(
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PickerKeys {
+    escape: bool,
+    previous: bool,
+    next: bool,
+    enter: bool,
+    ctrl_enter: bool,
+}
+
+fn read_picker_keys(context: &egui::Context) -> PickerKeys {
+    context.input(|input| PickerKeys {
+        escape: input.key_pressed(egui::Key::Escape),
+        previous: input.key_pressed(egui::Key::ArrowUp)
+            || (input.modifiers.ctrl && input.key_pressed(egui::Key::P)),
+        next: input.key_pressed(egui::Key::ArrowDown)
+            || (input.modifiers.ctrl && input.key_pressed(egui::Key::N)),
+        enter: !input.modifiers.ctrl && input.key_pressed(egui::Key::Enter),
+        ctrl_enter: input.modifiers.ctrl && input.key_pressed(egui::Key::Enter),
+    })
+}
+
+/// キー操作を選択indexへ反映し、閉じる場合は確定動作を返す。
+///
+/// 外側の`Some`はpickerを閉じること、内側の`Some`は候補を確定したことを表す。
+fn apply_picker_keys(
+    keys: PickerKeys,
+    pane_id: PaneId,
+    candidates: &[SearchCandidate],
+    hits: &[SearchHit],
+    selected: &mut usize,
+) -> Option<Option<GuiAction>> {
+    if keys.escape {
+        return Some(None);
+    }
+    if hits.is_empty() {
+        *selected = 0;
+        return None;
+    }
+    if keys.previous {
+        *selected = selected.saturating_sub(1);
+    }
+    if keys.next {
+        *selected = (*selected + 1).min(hits.len() - 1);
+    }
+    *selected = (*selected).min(hits.len() - 1);
+
+    let action = if keys.ctrl_enter {
+        Some(PickerAction::Open)
+    } else if keys.enter {
+        Some(PickerAction::Jump)
+    } else {
+        None
+    }?;
+    let candidate = candidates.get(hits[*selected].index)?;
+    Some(Some(GuiAction::PickerSelect {
+        pane_id,
+        entry_id: candidate.id,
+        action,
+    }))
+}
+
+fn update_picker_hits(
+    candidates: &[SearchCandidate],
+    query: &str,
+    selected: &mut usize,
+    hits: &mut Vec<SearchHit>,
+) {
+    *hits = fyler_core::search::search(candidates, query, PICKER_RESULT_LIMIT);
+    *selected = 0;
+}
+
+fn draw_file_picker(
+    ui: &mut egui::Ui,
+    pane_id: PaneId,
+    candidates: &[SearchCandidate],
+    query: &mut String,
+    selected: &mut usize,
+    hits: &mut Vec<SearchHit>,
+    needs_focus: &mut bool,
+) -> Option<Option<GuiAction>> {
+    let keys = read_picker_keys(ui.ctx());
+    let mut clicked_selection = None;
+    egui::Modal::new(egui::Id::new("fyler-file-picker")).show(ui.ctx(), |ui| {
+        ui.set_min_width(560.0);
+        ui.heading("Find file");
+        ui.add_space(6.0);
+        let response = ui.add(
+            egui::TextEdit::singleline(query)
+                .hint_text("Type to filter…")
+                .desired_width(f32::INFINITY),
+        );
+        if *needs_focus {
+            response.request_focus();
+            *needs_focus = false;
+        }
+        if response.changed() {
+            update_picker_hits(candidates, query, selected, hits);
+        }
+
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical()
+            .id_salt("fyler-file-picker-results")
+            .max_height(360.0)
+            .show(ui, |ui| {
+                for (position, hit) in hits.iter().enumerate() {
+                    let Some(candidate) = candidates.get(hit.index) else {
+                        continue;
+                    };
+                    let suffix = if candidate.kind == fyler_core::tree::EntryKind::Dir {
+                        "/"
+                    } else {
+                        ""
+                    };
+                    let response = ui.selectable_label(
+                        position == *selected,
+                        format!("{}{suffix}", candidate.display),
+                    );
+                    if response.clicked() {
+                        clicked_selection = Some(position);
+                    }
+                    if position == *selected {
+                        response.scroll_to_me(Some(egui::Align::Center));
+                    }
+                }
+            });
+        ui.add_space(6.0);
+        ui.weak("↑/↓ or Ctrl-p/Ctrl-n: select   Enter: jump   Ctrl-Enter: open   Esc: close");
+    });
+    if let Some(position) = clicked_selection {
+        *selected = position;
+    }
+    apply_picker_keys(keys, pane_id, candidates, hits, selected)
+}
+
 fn draw_help(ui: &mut egui::Ui) -> bool {
     let dismiss_from_keyboard = ui
         .ctx()
@@ -655,6 +898,7 @@ fn draw_help(ui: &mut egui::Ui) -> bool {
                 "gd    Enter directory",
                 "^     Go to parent",
                 "g.    Toggle hidden files",
+                "g/    Find file",
                 "gy    Copy path",
                 "gm/gc Move/copy to previous pane",
                 "<C-w>s/v  Split pane",
@@ -681,7 +925,7 @@ fn draw_help(ui: &mut egui::Ui) -> bool {
 ///   ポーリングなしで再描画されるようにする
 pub fn run(
     event_rx: mpsc::Receiver<GuiEvent>,
-    confirm_tx: mpsc::Sender<ConfirmChoice>,
+    action_tx: mpsc::Sender<GuiAction>,
     gui_options: GuiOptions,
 ) -> anyhow::Result<()> {
     let native_options = eframe::NativeOptions::default();
@@ -702,7 +946,7 @@ pub fn run(
             );
             let app = FylerApp::new(
                 event_rx,
-                confirm_tx,
+                action_tx,
                 confirm_detail,
                 icon_style,
                 creation_context.egui_ctx.clone(),
@@ -795,6 +1039,44 @@ mod tests {
         )))
     }
 
+    fn candidate(id: u64, path: &str, kind: fyler_core::tree::EntryKind) -> SearchCandidate {
+        let display = path.to_owned();
+        let key = display.to_lowercase();
+        let name_offset = key.rfind('/').map_or(0, |offset| offset + 1);
+        SearchCandidate {
+            id: EntryId(id),
+            path: TreePath::parse(path),
+            kind,
+            display,
+            key,
+            name_offset,
+        }
+    }
+
+    fn empty_test_app() -> (FylerApp, mpsc::Sender<GuiEvent>, mpsc::Receiver<GuiAction>) {
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        (
+            FylerApp {
+                panes: BTreeMap::new(),
+                layout: None,
+                active: None,
+                event_rx,
+                cmdline: None,
+                message: None,
+                pending_copy: None,
+                fatal_error: None,
+                dialog: None,
+                action_tx,
+                picker_needs_focus: false,
+                confirm_detail: ConfirmDetail::Full,
+                icon_style: IconStyle::Ascii,
+            },
+            event_tx,
+            action_rx,
+        )
+    }
+
     static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
     struct TestDirectory(PathBuf);
@@ -873,7 +1155,7 @@ mod tests {
         let first = PaneId::new(1);
         let second = PaneId::new(2);
         let (_event_tx, event_rx) = mpsc::channel();
-        let (confirm_tx, _confirm_rx) = mpsc::channel();
+        let (action_tx, _action_rx) = mpsc::channel();
         let mut app = FylerApp {
             panes: BTreeMap::from([
                 (
@@ -915,7 +1197,8 @@ mod tests {
             pending_copy: None,
             fatal_error: None,
             dialog: None,
-            confirm_tx,
+            action_tx,
+            picker_needs_focus: false,
             confirm_detail: ConfirmDetail::Full,
             icon_style: IconStyle::Ascii,
         };
@@ -941,5 +1224,150 @@ mod tests {
             app.panes[&second].git_badges.get(&EntryId(9)),
             Some(&GitBadge::Modified)
         );
+    }
+
+    #[test]
+    fn picker_query_update_recalculates_hits_and_resets_selection() {
+        let candidates = vec![
+            candidate(1, "src/main.rs", fyler_core::tree::EntryKind::File),
+            candidate(2, "README.md", fyler_core::tree::EntryKind::File),
+        ];
+        let mut selected = 1;
+        let mut hits = fyler_core::search::search(&candidates, "", PICKER_RESULT_LIMIT);
+
+        update_picker_hits(&candidates, "read", &mut selected, &mut hits);
+
+        assert_eq!(selected, 0);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(candidates[hits[0].index].id, EntryId(2));
+    }
+
+    #[test]
+    fn picker_keys_close_move_jump_and_open() {
+        let pane = PaneId::new(3);
+        let candidates = vec![
+            candidate(1, "first", fyler_core::tree::EntryKind::File),
+            candidate(2, "second", fyler_core::tree::EntryKind::File),
+        ];
+        let hits = fyler_core::search::search(&candidates, "", PICKER_RESULT_LIMIT);
+        let mut selected = 0;
+
+        assert_eq!(
+            apply_picker_keys(
+                PickerKeys {
+                    next: true,
+                    ..Default::default()
+                },
+                pane,
+                &candidates,
+                &hits,
+                &mut selected,
+            ),
+            None
+        );
+        assert_eq!(selected, 1);
+        assert_eq!(
+            apply_picker_keys(
+                PickerKeys {
+                    previous: true,
+                    ..Default::default()
+                },
+                pane,
+                &candidates,
+                &hits,
+                &mut selected,
+            ),
+            None
+        );
+        assert_eq!(selected, 0);
+        assert_eq!(
+            apply_picker_keys(
+                PickerKeys {
+                    enter: true,
+                    ..Default::default()
+                },
+                pane,
+                &candidates,
+                &hits,
+                &mut selected,
+            ),
+            Some(Some(GuiAction::PickerSelect {
+                pane_id: pane,
+                entry_id: EntryId(1),
+                action: PickerAction::Jump,
+            }))
+        );
+        assert_eq!(
+            apply_picker_keys(
+                PickerKeys {
+                    ctrl_enter: true,
+                    ..Default::default()
+                },
+                pane,
+                &candidates,
+                &hits,
+                &mut selected,
+            ),
+            Some(Some(GuiAction::PickerSelect {
+                pane_id: pane,
+                entry_id: EntryId(1),
+                action: PickerAction::Open,
+            }))
+        );
+        assert_eq!(
+            apply_picker_keys(
+                PickerKeys {
+                    escape: true,
+                    ..Default::default()
+                },
+                pane,
+                &candidates,
+                &hits,
+                &mut selected,
+            ),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn picker_dialog_blocks_editor_input_forwarding() {
+        assert!(should_forward_input(true, true, true));
+        assert!(!should_forward_input(false, true, true));
+    }
+
+    #[test]
+    fn picker_closes_when_its_pane_is_removed_or_crashes() {
+        let pane = PaneId::new(7);
+        for closing_event in [
+            GuiEvent::RemovePane(pane),
+            GuiEvent::Editor {
+                pane_id: pane,
+                event: EditorEvent::EngineCrashed {
+                    reason: "test".to_owned(),
+                },
+            },
+        ] {
+            let (mut app, event_tx, _action_rx) = empty_test_app();
+            event_tx
+                .send(GuiEvent::AddPane {
+                    pane_id: pane,
+                    engine: recording_engine(),
+                    root: PathBuf::from("root"),
+                })
+                .unwrap();
+            event_tx
+                .send(GuiEvent::ShowFilePicker {
+                    pane_id: pane,
+                    candidates: vec![candidate(1, "file.txt", fyler_core::tree::EntryKind::File)],
+                })
+                .unwrap();
+            app.receive_events();
+            assert!(matches!(app.dialog, Some(DialogState::FilePicker { .. })));
+
+            event_tx.send(closing_event).unwrap();
+            app.receive_events();
+
+            assert!(app.dialog.is_none());
+        }
     }
 }
