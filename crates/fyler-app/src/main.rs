@@ -7,6 +7,7 @@
 //! 「保存状態機械の副作用(SaveEffect)の実行」のみ。
 
 mod config;
+mod feedback;
 mod pane_runtime;
 mod queue_stats;
 pub mod save_flow;
@@ -21,6 +22,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 
 use fyler_core::editor::{EditorCommand, EditorEngine, EditorEvent, EditorMessage, MessageKind};
+use fyler_core::feedback::FeedbackKind;
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::{EntryId, IdAllocator};
@@ -46,6 +48,12 @@ enum AppEvent {
         entry_id: fyler_core::id::EntryId,
         action: PickerAction,
     },
+    FeedbackSubmit {
+        kind: FeedbackKind,
+        body: String,
+    },
+    FeedbackClosed,
+    FeedbackFinished(feedback::FeedbackOutcome),
     ExternalChange(PaneId, ExternalChange),
     GitStatus {
         pane_id: PaneId,

@@ -10,6 +10,7 @@ use eframe::egui;
 use fyler_core::editor::{
     CmdlineState, EditorEngine, EditorEvent, EditorMessage, Mode, PopupmenuState,
 };
+use fyler_core::feedback::{FeedbackKind, MAX_BODY_CHARS, validate_body};
 use fyler_core::fileinfo::FileInfo;
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::id::EntryId;
@@ -37,7 +38,7 @@ pub enum PickerAction {
 }
 
 /// GUIからapp層へ返すユーザー操作。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuiAction {
     Confirm(ConfirmChoice),
     PickerSelect {
@@ -45,6 +46,22 @@ pub enum GuiAction {
         entry_id: EntryId,
         action: PickerAction,
     },
+    FeedbackSubmit {
+        kind: FeedbackKind,
+        body: String,
+    },
+    FeedbackClosed,
+}
+
+/// GUIへ通知するフィードバック送信結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedbackResultKind {
+    Accepted,
+    Invalid,
+    RateLimited,
+    ServerError,
+    Network,
+    Timeout,
 }
 
 /// app層からGUI起動時に渡す表示設定。
@@ -108,6 +125,13 @@ pub enum GuiEvent {
     ShowFilePicker {
         pane_id: PaneId,
         candidates: Vec<SearchCandidate>,
+    },
+    /// 匿名フィードバック入力モーダルを開く。
+    ShowFeedback,
+    /// フィードバックworkerの完了結果。
+    FeedbackResult {
+        outcome: FeedbackResultKind,
+        message: &'static str,
     },
     /// 指定された表示用パスをクリップボードへコピーする。
     CopyPath(String),
@@ -204,7 +228,21 @@ enum DialogState {
         selected: usize,
         hits: Vec<SearchHit>,
     },
+    Feedback {
+        kind: FeedbackKind,
+        body: String,
+        stage: FeedbackStage,
+    },
     Help,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeedbackStage {
+    Input,
+    Confirm,
+    Sending,
+    Done(&'static str),
+    Failed(FeedbackResultKind, &'static str),
 }
 
 /// fylerのGUIアプリケーション。
@@ -227,6 +265,7 @@ pub struct FylerApp {
     dialog: Option<DialogState>,
     action_tx: mpsc::Sender<GuiAction>,
     picker_needs_focus: bool,
+    feedback_needs_focus: bool,
     confirm_detail: ConfirmDetail,
     icon_style: IconStyle,
     help_lines: Vec<String>,
@@ -288,6 +327,7 @@ impl FylerApp {
             dialog: None,
             action_tx,
             picker_needs_focus: false,
+            feedback_needs_focus: false,
             confirm_detail,
             icon_style,
             help_lines,
@@ -351,6 +391,7 @@ impl FylerApp {
                     EditorEvent::Fold { .. } => {}
                     EditorEvent::JumpBookmark { .. } => {}
                     EditorEvent::OpenFilePicker => {}
+                    EditorEvent::FeedbackRequested => {}
                     EditorEvent::ShowHelp => self.dialog = Some(DialogState::Help),
                     EditorEvent::PaneAction(_) => {}
                     EditorEvent::TransferRequested { .. } => {}
@@ -428,6 +469,25 @@ impl FylerApp {
                         hits,
                     });
                     self.picker_needs_focus = true;
+                }
+                GuiEvent::ShowFeedback => {
+                    self.dialog = Some(DialogState::Feedback {
+                        kind: FeedbackKind::Impression,
+                        body: String::new(),
+                        stage: FeedbackStage::Input,
+                    });
+                    self.feedback_needs_focus = true;
+                }
+                GuiEvent::FeedbackResult { outcome, message } => {
+                    if let Some(DialogState::Feedback { stage, .. }) = &mut self.dialog
+                        && *stage == FeedbackStage::Sending
+                    {
+                        *stage = if outcome == FeedbackResultKind::Accepted {
+                            FeedbackStage::Done(message)
+                        } else {
+                            FeedbackStage::Failed(outcome, message)
+                        };
+                    }
                 }
                 GuiEvent::CopyPath(path) => self.pending_copy = Some(path),
                 GuiEvent::ShowOpenWith { file_name, choices } => {
@@ -628,6 +688,7 @@ impl eframe::App for FylerApp {
         let mut dismiss_report = false;
         let mut open_with_choice = None;
         let mut picker_result = None;
+        let mut feedback_result = None;
         match &mut self.dialog {
             Some(DialogState::Plan {
                 plan,
@@ -719,6 +780,10 @@ impl eframe::App for FylerApp {
                     &mut self.picker_needs_focus,
                 );
             }
+            Some(DialogState::Feedback { kind, body, stage }) => {
+                feedback_result =
+                    draw_feedback(ui, kind, body, stage, &mut self.feedback_needs_focus);
+            }
             None => {}
         }
 
@@ -753,6 +818,27 @@ impl eframe::App for FylerApp {
                 && self.action_tx.send(action).is_err()
             {
                 self.fatal_error = Some("Failed to send picker result to app".to_owned());
+            }
+        }
+        if let Some(result) = feedback_result {
+            match result {
+                FeedbackUiResult::Close => {
+                    self.dialog = None;
+                    if self.action_tx.send(GuiAction::FeedbackClosed).is_err() {
+                        self.fatal_error =
+                            Some("Failed to close feedback dialog in app".to_owned());
+                    }
+                }
+                FeedbackUiResult::Submit { kind, body } => {
+                    if self
+                        .action_tx
+                        .send(GuiAction::FeedbackSubmit { kind, body })
+                        .is_err()
+                    {
+                        self.fatal_error =
+                            Some("Failed to send feedback request to app".to_owned());
+                    }
+                }
             }
         }
     }
@@ -1024,6 +1110,171 @@ fn draw_file_picker(
     apply_picker_keys(keys, pane_id, candidates, hits, selected)
 }
 
+enum FeedbackUiResult {
+    Close,
+    Submit { kind: FeedbackKind, body: String },
+}
+
+fn draw_feedback(
+    ui: &mut egui::Ui,
+    kind: &mut FeedbackKind,
+    body: &mut String,
+    stage: &mut FeedbackStage,
+    needs_focus: &mut bool,
+) -> Option<FeedbackUiResult> {
+    let escape = ui.ctx().input(|input| input.key_pressed(egui::Key::Escape));
+    if escape {
+        return Some(FeedbackUiResult::Close);
+    }
+
+    let mut result = None;
+    egui::Modal::new(egui::Id::new("fyler-feedback")).show(ui.ctx(), |ui| {
+        ui.set_min_width(560.0);
+        ui.heading("匿名フィードバック");
+        ui.add_space(8.0);
+        match *stage {
+            FeedbackStage::Input => {
+                ui.label("種別");
+                ui.horizontal(|ui| {
+                    for (number, value) in [
+                        ("1", FeedbackKind::Impression),
+                        ("2", FeedbackKind::Request),
+                        ("3", FeedbackKind::Bug),
+                    ] {
+                        if ui
+                            .selectable_label(
+                                *kind == value,
+                                format!("{number}: {}", value.display_name()),
+                            )
+                            .clicked()
+                        {
+                            *kind = value;
+                        }
+                    }
+                });
+                ui.add_space(8.0);
+                let response = ui.add(
+                    egui::TextEdit::multiline(body)
+                        .hint_text("感想、要望、不具合の内容を入力してください")
+                        .desired_rows(10)
+                        .desired_width(f32::INFINITY),
+                );
+                if *needs_focus {
+                    response.request_focus();
+                    *needs_focus = false;
+                }
+                if response.has_focus() {
+                    ui.ctx().output_mut(|output| {
+                        output.ime = Some(egui::output::IMEOutput {
+                            rect: response.rect,
+                            cursor_rect: response.rect,
+                            should_interrupt_composition: false,
+                        });
+                    });
+                }
+                // 本文入力中の数字はテキストとして扱う。ショートカットは非focus時のみ。
+                if !response.has_focus() {
+                    ui.ctx().input(|input| {
+                        if input.key_pressed(egui::Key::Num1) {
+                            *kind = FeedbackKind::Impression;
+                        } else if input.key_pressed(egui::Key::Num2) {
+                            *kind = FeedbackKind::Request;
+                        } else if input.key_pressed(egui::Key::Num3) {
+                            *kind = FeedbackKind::Bug;
+                        }
+                    });
+                }
+                let count = body.chars().count();
+                if count > MAX_BODY_CHARS {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        format!("{count} / {MAX_BODY_CHARS} 文字"),
+                    );
+                } else {
+                    ui.weak(format!("{count} / {MAX_BODY_CHARS} 文字"));
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("閉じる (Esc)").clicked() {
+                        result = Some(FeedbackUiResult::Close);
+                    }
+                    let valid = validate_body(body).is_ok();
+                    if ui.add_enabled(valid, egui::Button::new("確認へ")).clicked() {
+                        *stage = FeedbackStage::Confirm;
+                    }
+                });
+            }
+            FeedbackStage::Confirm => {
+                ui.label("送信される内容");
+                ui.separator();
+                ui.label(format!("種別: {}", kind.display_name()));
+                ui.label(format!("fyler version: {}", env!("CARGO_PKG_VERSION")));
+                ui.label(format!("OS: {}", std::env::consts::OS));
+                ui.label(format!("arch: {}", std::env::consts::ARCH));
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("fyler-feedback-preview")
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        ui.label(body.as_str());
+                    });
+                ui.add_space(8.0);
+                ui.label("匿名のため個別返信はできません。");
+                ui.label("サーバー運営上、通信経路のIPアドレスが処理される場合があります。");
+                ui.hyperlink_to(
+                    "GitHub Issues",
+                    "https://github.com/sg004baa/fyler.windows/issues",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("戻る").clicked() {
+                        *stage = FeedbackStage::Input;
+                        *needs_focus = true;
+                    }
+                    if ui.button("送信").clicked() {
+                        *stage = FeedbackStage::Sending;
+                        result = Some(FeedbackUiResult::Submit {
+                            kind: *kind,
+                            body: body.clone(),
+                        });
+                    }
+                });
+            }
+            FeedbackStage::Sending => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("送信中です…");
+                });
+                ui.add_space(8.0);
+                if ui.button("キャンセル").clicked() {
+                    result = Some(FeedbackUiResult::Close);
+                }
+            }
+            FeedbackStage::Done(message) => {
+                ui.label(message);
+                ui.add_space(8.0);
+                if ui.button("閉じる").clicked() {
+                    result = Some(FeedbackUiResult::Close);
+                }
+            }
+            FeedbackStage::Failed(_outcome, message) => {
+                ui.colored_label(ui.visuals().error_fg_color, message);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("入力へ戻る").clicked() {
+                        *stage = FeedbackStage::Input;
+                        *needs_focus = true;
+                    }
+                    if ui.button("閉じる").clicked() {
+                        result = Some(FeedbackUiResult::Close);
+                    }
+                });
+            }
+        }
+    });
+    result
+}
+
 fn draw_help(ui: &mut egui::Ui, help_lines: &[String]) -> bool {
     let dismiss_from_keyboard = ui
         .ctx()
@@ -1200,6 +1451,7 @@ mod tests {
                 dialog: None,
                 action_tx,
                 picker_needs_focus: false,
+                feedback_needs_focus: false,
                 confirm_detail: ConfirmDetail::Full,
                 icon_style: IconStyle::Ascii,
                 help_lines: Vec::new(),
@@ -1333,6 +1585,7 @@ mod tests {
             dialog: None,
             action_tx,
             picker_needs_focus: false,
+            feedback_needs_focus: false,
             confirm_detail: ConfirmDetail::Full,
             icon_style: IconStyle::Ascii,
             help_lines: Vec::new(),
@@ -1504,5 +1757,53 @@ mod tests {
 
             assert!(app.dialog.is_none());
         }
+    }
+
+    #[test]
+    fn feedback_result_is_only_accepted_while_sending() {
+        let (mut app, event_tx, _action_rx) = empty_test_app();
+        event_tx.send(GuiEvent::ShowFeedback).unwrap();
+        event_tx
+            .send(GuiEvent::FeedbackResult {
+                outcome: FeedbackResultKind::Accepted,
+                message: "accepted",
+            })
+            .unwrap();
+        app.receive_events();
+        assert!(matches!(
+            app.dialog,
+            Some(DialogState::Feedback {
+                stage: FeedbackStage::Input,
+                ..
+            })
+        ));
+
+        if let Some(DialogState::Feedback { stage, .. }) = &mut app.dialog {
+            *stage = FeedbackStage::Sending;
+        }
+        event_tx
+            .send(GuiEvent::FeedbackResult {
+                outcome: FeedbackResultKind::Accepted,
+                message: "accepted",
+            })
+            .unwrap();
+        app.receive_events();
+        assert!(matches!(
+            app.dialog,
+            Some(DialogState::Feedback {
+                stage: FeedbackStage::Done("accepted"),
+                ..
+            })
+        ));
+
+        app.dialog = None;
+        event_tx
+            .send(GuiEvent::FeedbackResult {
+                outcome: FeedbackResultKind::ServerError,
+                message: "failed",
+            })
+            .unwrap();
+        app.receive_events();
+        assert!(app.dialog.is_none());
     }
 }

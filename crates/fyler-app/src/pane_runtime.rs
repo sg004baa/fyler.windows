@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use fyler_core::editor::{EditorCommand, EditorEngine, EditorEvent, MessageKind};
+use fyler_core::feedback::{FeedbackPayload, validate_body};
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::{EntryId, IdAllocator};
@@ -19,9 +20,10 @@ use fyler_core::undo::UndoTransaction;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
 use fyler_fsops::scan::ScanOptions;
 use fyler_fsops::watch::{ExternalChange, FsWatcher};
-use fyler_gui::app::{GuiAction, GuiEvent, GuiOptions};
+use fyler_gui::app::{FeedbackResultKind, GuiAction, GuiEvent, GuiOptions};
 use fyler_gui::confirm::ConfirmChoice;
 
+use super::feedback::{FeedbackOutcome, resolve_endpoint, send_feedback};
 use super::save_flow::{FoldResult, SaveController, SaveFlowResult};
 use super::transfer_flow::{
     TransferController, TransferFlowResult, TransferPaneState, build_plan, destination_directory,
@@ -158,6 +160,7 @@ fn help_lines(bindings: &[KeyBinding]) -> Vec<String> {
         ":cd  ルートを移動".to_owned(),
         ":b  ブックマーク / 最近使ったルート".to_owned(),
         ":terminal  ここでterminalを開く".to_owned(),
+        ":feedback  匿名フィードバックを送る".to_owned(),
     ]);
     lines
 }
@@ -169,6 +172,10 @@ pub(super) fn run() -> anyhow::Result<()> {
     };
     let root = normalize_root(&root)?;
     let (config, config_warnings) = super::config::load();
+    let feedback_endpoint = resolve_endpoint(
+        config.feedback_url.as_deref(),
+        option_env!("FYLER_FEEDBACK_URL"),
+    );
     let terminal_kind = config.terminal;
     let scan_options = ScanOptions {
         show_hidden: config.show_hidden,
@@ -249,6 +256,10 @@ pub(super) fn run() -> anyhow::Result<()> {
                         entry_id,
                         action,
                     },
+                    GuiAction::FeedbackSubmit { kind, body } => {
+                        AppEvent::FeedbackSubmit { kind, body }
+                    }
+                    GuiAction::FeedbackClosed => AppEvent::FeedbackClosed,
                 };
                 if action_event_tx.send(event).is_err() {
                     return;
@@ -285,6 +296,7 @@ pub(super) fn run() -> anyhow::Result<()> {
             let mut pending_events = VecDeque::new();
             let mut git = GitRefresher::new(event_tx.clone());
             let mut dialog_owner = None;
+            let mut feedback_open = false;
             let mut apply_owner = None;
             let mut transfer = TransferController::new();
             let mut pending_recovery = pending_recovery;
@@ -456,10 +468,49 @@ pub(super) fn run() -> anyhow::Result<()> {
                         let Some(session) = panes.get_mut(&pane_id) else {
                             continue;
                         };
-                        if session.crashed && !matches!(event, EditorEvent::OpenFilePicker) {
+                        if session.crashed
+                            && !matches!(
+                                event,
+                                EditorEvent::OpenFilePicker | EditorEvent::FeedbackRequested
+                            )
+                        {
                             continue;
                         }
                         match event {
+                            EditorEvent::FeedbackRequested => {
+                                if let Some(reason) = feedback_start_rejection(
+                                    dialog_owner.is_some() || feedback_open,
+                                ) {
+                                    if send_gui_message(
+                                        &gui_event_tx,
+                                        pane_id,
+                                        MessageKind::Info,
+                                        reason,
+                                    )
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                if feedback_endpoint.is_none() {
+                                    if send_gui_message(
+                                        &gui_event_tx,
+                                        pane_id,
+                                        MessageKind::Warn,
+                                        "フィードバック送信は現在利用できません。GitHub Issuesへ: https://github.com/sg004baa/fyler.windows/issues",
+                                    )
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                feedback_open = true;
+                                if gui_event_tx.send(GuiEvent::ShowFeedback).is_err() {
+                                    return;
+                                }
+                            }
                             EditorEvent::OpenFilePicker => {
                                 if handle_open_file_picker(
                                     pane_id,
@@ -1468,6 +1519,66 @@ pub(super) fn run() -> anyhow::Result<()> {
                             return;
                         }
                     }
+                    AppEvent::FeedbackSubmit { kind, body } => {
+                        let Some(endpoint) = feedback_endpoint.clone() else {
+                            continue;
+                        };
+                        if !feedback_open || validate_body(&body).is_err() {
+                            if feedback_open
+                                && gui_event_tx
+                                    .send(GuiEvent::FeedbackResult {
+                                        outcome: FeedbackResultKind::Invalid,
+                                        message: FeedbackOutcome::Invalid.message(),
+                                    })
+                                    .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        let payload = FeedbackPayload {
+                            kind,
+                            body,
+                            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+                            os: std::env::consts::OS.to_owned(),
+                            arch: std::env::consts::ARCH.to_owned(),
+                        };
+                        let json = payload.to_json();
+                        let feedback_event_tx = event_tx.clone();
+                        if thread::Builder::new()
+                            .name("fyler-feedback".to_owned())
+                            .spawn(move || {
+                                let outcome = send_feedback(
+                                    &endpoint,
+                                    &json,
+                                    std::time::Duration::from_secs(10),
+                                );
+                                let _ =
+                                    feedback_event_tx.send(AppEvent::FeedbackFinished(outcome));
+                            })
+                            .is_err()
+                            && event_tx
+                                .send(AppEvent::FeedbackFinished(FeedbackOutcome::Network))
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    AppEvent::FeedbackClosed => {
+                        feedback_open = false;
+                    }
+                    AppEvent::FeedbackFinished(outcome) => {
+                        if feedback_open
+                            && gui_event_tx
+                                .send(GuiEvent::FeedbackResult {
+                                    outcome: feedback_result_kind(outcome),
+                                    message: outcome.message(),
+                                })
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
                     AppEvent::ApplyFinished(pane_id, report, transaction) => {
                         if apply_owner != Some(pane_id) {
                             continue;
@@ -2158,6 +2269,21 @@ fn undo_rejection(dirty: bool, slot_empty: bool, busy: bool) -> Option<&'static 
     }
 }
 
+fn feedback_start_rejection(dialog_open: bool) -> Option<&'static str> {
+    dialog_open.then_some("別のダイアログを閉じてからフィードバックを開いてください")
+}
+
+fn feedback_result_kind(outcome: FeedbackOutcome) -> FeedbackResultKind {
+    match outcome {
+        FeedbackOutcome::Accepted => FeedbackResultKind::Accepted,
+        FeedbackOutcome::Invalid => FeedbackResultKind::Invalid,
+        FeedbackOutcome::RateLimited => FeedbackResultKind::RateLimited,
+        FeedbackOutcome::ServerError => FeedbackResultKind::ServerError,
+        FeedbackOutcome::Network => FeedbackResultKind::Network,
+        FeedbackOutcome::Timeout => FeedbackResultKind::Timeout,
+    }
+}
+
 fn discard_all_undo_slots(
     panes: &mut BTreeMap<PaneId, PaneSession>,
     journal: Option<&undo_journal::UndoJournal>,
@@ -2283,6 +2409,15 @@ mod tests {
             Some("undoできる操作がありません")
         );
         assert_eq!(undo_rejection(false, false, false), None);
+    }
+
+    #[test]
+    fn feedback_start_gate_only_rejects_an_existing_dialog() {
+        assert_eq!(feedback_start_rejection(false), None);
+        assert_eq!(
+            feedback_start_rejection(true),
+            Some("別のダイアログを閉じてからフィードバックを開いてください")
+        );
     }
 
     #[test]
