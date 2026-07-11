@@ -2693,6 +2693,45 @@ mod tests {
     }
 
     #[test]
+    fn external_mtime_change_resorts_date_order_and_sends_lines() {
+        let temp_root = tempdir().unwrap();
+        let first = temp_root.path().join("a.txt");
+        let second = temp_root.path().join("b.txt");
+        fs::write(&first, b"a").unwrap();
+        fs::write(&second, b"b").unwrap();
+        fs::File::open(&first)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(10))
+            .unwrap();
+        fs::File::open(&second)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(20))
+            .unwrap();
+        let options = ScanOptions {
+            key: SortKey::Date,
+            sort: SortOrder::Mixed,
+            ..ScanOptions::default()
+        };
+        let (mut controller, engine) = scanned_controller(temp_root.path(), options);
+        fs::File::open(&first)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(30))
+            .unwrap();
+
+        let result = controller.on_external_change(&BTreeSet::from([first]));
+
+        assert_eq!(result, SaveFlowResult::ExternalChanged);
+        let commands = engine.commands.lock().unwrap();
+        assert!(matches!(
+            commands.as_slice(),
+            [EditorCommand::SetLines { lines, .. }]
+                if lines.len() == 2
+                    && lines[0].text.ends_with("b.txt")
+                    && lines[1].text.ends_with("a.txt")
+        ));
+    }
+
+    #[test]
     fn external_change_during_confirmation_invalidates_plan_and_blocks_approve() {
         // 確認ダイアログ表示中に実FSが変わると、表示中のplanは古いbaseline前提。
         // 承認済みとして実行せず破棄し、Idleへ戻す(その後のApproveは無効)。
