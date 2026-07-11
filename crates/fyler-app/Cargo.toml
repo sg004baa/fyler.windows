@@ -3,6 +3,7 @@ name = "fyler-app"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [[bin]]
@@ -24,6 +25,7 @@ ureq = { version = "3.3.0", default-features = false, features = ["native-tls"] 
 
 [build-dependencies]
 embed-manifest = "1.5"
+winresource = "0.1.31"
 
 [dev-dependencies]
 tempfile = "3"

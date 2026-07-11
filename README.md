@@ -1,30 +1,70 @@
 # fyler for windows
 
-[fyler.nvim](https://github.com/A7Lavinraj/fyler.nvim) のコンセプト
-(ツリー表示のファイルシステムをバッファのように編集する)を、
-Windowsネイティブのスタンドアロン GUI ファイラーとして Rust で実装するプロジェクト。
+fyler は、ツリー表示されたファイルシステムを Neovim のバッファのように編集できる、Windows 用のスタンドアロン GUI ファイラーです。Neovim は Vim の操作状態を処理する組み込みエンジンとして使い、画面は Rust と egui で描画します。
 
-- 編集エンジン: 組み込み Neovim(`--embed --headless`)を「Vim編集状態マシン」としてのみ利用
-- 描画: egui / eframe で全部自前(neovide方式は不採用)
-- 行の同一性追跡: in-buffer ID方式(oil.nvim方式)
+## 主な機能
 
-## ドキュメント
+- バッファを編集して rename / move / copy / delete / create をまとめて実行
+- 実行前の操作内容・上書き・外部変更の確認と、直前の操作の undo
+- 独立した最大 4 pane の分割表示と pane 間の move / copy
+- 大規模ツリーにも対応した fuzzy finder と、ディレクトリ移動・折りたたみ・自然順ソート
+- Git status、ファイル情報、OneDrive プレースホルダー、隠しファイルの表示
+- ブックマークと最近使ったルート
+- キーマップと leader key のカスタマイズ
+- `:terminal` による現在位置での外部ターミナル起動
+- `:feedback` による匿名フィードバック送信
 
-- **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** — `config.toml` configuration reference
-- **[docs/DESIGN.md](docs/DESIGN.md)** — 実装設計書 v2(正典)
-- **[AGENTS.md](AGENTS.md)** — 実装エージェント向け運用ルール(絶対ルール・依存境界・進め方)
-- **[docs/M0_RESULTS.md](docs/M0_RESULTS.md)** — M0成立性スパイクの結果記録
+## インストール
 
-## ステータス
+[GitHub Releases](https://github.com/sg004baa/fyler.windows/releases) から、installer の `fyler-vX.Y.Z-windows-x64-setup.exe`、または portable zip をダウンロードしてください。
 
-骨組み(ワークスペース構成・共有型・トレイト・仕様テスト)のみ。ロジックは `todo!()` スタブ。
-現在のマイルストーン: **M0(成立性スパイク)**。M0が全項目passするまでM1以降は着手しない。
+配布物には Neovim v0.12.4 が同梱されているため、Neovim を別途インストールする必要はありません。fyler が利用する nvim-rs はこの固定バージョンの Neovim との組み合わせで検証します。
 
-## ビルド
+アンインストールは Windows の「インストールされているアプリ」から行えます。設定や undo データなどのユーザーデータはアンインストールでは削除されません。完全に削除する場合は、アンインストール後に `%APPDATA%\fyler` と `%LOCALAPPDATA%\fyler` を手動で削除してください。
 
-対象プラットフォームは Windows。純粋ロジック部分はクロスプラットフォームでテスト可能:
+## 起動
 
+- スタートメニューから `fyler` を起動
+- コマンドラインから `fyler.exe [ルートディレクトリ]` を実行
+- installer で任意の Explorer コンテキストメニュー統合を選び、ディレクトリから起動
+
+fyler は次の順序で Neovim の実行ファイルを解決します。
+
+1. `FYLER_NVIM_EXE` で指定された実行ファイル
+2. fyler と同じ配置に同梱された `nvim/bin/nvim.exe`
+3. `PATH` 上の `nvim`
+
+`FYLER_NVIM_EXE` は開発・診断用の override で、指定された場合はファイルの存在確認をせず使用します。
+
+## 設定
+
+`config.toml`、キーマップ、leader key、ブックマークなどの設定は [設定リファレンス](docs/CONFIGURATION.md) を参照してください。
+
+## フィードバック
+
+fyler 内で `:feedback` を実行すると匿名フィードバックを送信できます。送信内容と取り扱いは [プライバシー情報](docs/PRIVACY.md) を参照してください。不具合報告や機能提案は [GitHub Issues](https://github.com/sg004baa/fyler.windows/issues) でも受け付けています。
+
+## 開発
+
+Rust toolchain を用意し、リポジトリのルートで実行します。
+
+Windows ではワークスペース全体をビルド・テストできます。
+
+```powershell
+cargo build --workspace
+cargo test --workspace
 ```
-cargo test -p fyler-core -p fyler-pipeline   # どのOSでも可
-cargo check --workspace --all-targets        # フルcheck(Windows推奨)
+
+Linux では純粋ロジックのテストとワークスペースの check / clippy を実行できます。アプリの実行確認は Windows で行ってください。
+
+```sh
+cargo test -p fyler-core -p fyler-pipeline
+cargo check --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+設計とクレート境界の詳細は [設計書](docs/DESIGN.md) を参照してください。
+
+## ライセンス
+
+MIT License または Apache License 2.0 のいずれかを選択できます。詳細は [LICENSE-MIT](LICENSE-MIT) と [LICENSE-APACHE](LICENSE-APACHE) を参照してください。

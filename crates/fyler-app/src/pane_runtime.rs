@@ -24,6 +24,7 @@ use fyler_gui::app::{FeedbackResultKind, GuiAction, GuiEvent, GuiOptions};
 use fyler_gui::confirm::ConfirmChoice;
 
 use super::feedback::{FeedbackOutcome, resolve_endpoint, send_feedback};
+use super::nvim_locate;
 use super::save_flow::{FoldResult, SaveController, SaveFlowResult};
 use super::transfer_flow::{
     TransferController, TransferFlowResult, TransferPaneState, build_plan, destination_directory,
@@ -65,13 +66,24 @@ fn create_pane(
     scan_options: ScanOptions,
     shared_ids: Arc<Mutex<IdAllocator>>,
     app_event_tx: &CountingSender<AppEvent>,
+    nvim_diagnostics: Option<&[String]>,
 ) -> anyhow::Result<PaneSession> {
     // nvim起動はflaky回避のため呼び出し元イベントループで必ず直列に行う。
-    let (engine, mut engine_events) = runtime.block_on(NvimEngine::start(NvimConfig {
-        nvim_exe: nvim_exe.to_path_buf(),
-        root: root.clone(),
-        bindings: bindings.to_vec(),
-    }))?;
+    let (engine, mut engine_events) = runtime
+        .block_on(NvimEngine::start(NvimConfig {
+            nvim_exe: nvim_exe.to_path_buf(),
+            root: root.clone(),
+            bindings: bindings.to_vec(),
+        }))
+        .map_err(|error| {
+            let Some(diagnostics) = nvim_diagnostics else {
+                return error;
+            };
+            error.context(format!(
+                "Neovimを起動できませんでした。\n探索結果:\n{}\n\nfylerを再インストールするか、Neovimをインストールして PATH を通すか、FYLER_NVIM_EXE で実行ファイルを指定してください",
+                diagnostics.join("\n")
+            ))
+        })?;
     let baseline = {
         let mut ids = shared_ids
             .lock()
@@ -192,9 +204,8 @@ pub(super) fn run() -> anyhow::Result<()> {
         help_lines: help_lines(&bindings),
     };
     let bookmarks = config.bookmarks;
-    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let resolved_nvim = nvim_locate::resolve();
+    let nvim_exe = resolved_nvim.path.clone();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         // pane最大4個のnvim RPC非同期I/Oをホストする。CPU bound処理は載せない。
         .worker_threads(2)
@@ -216,6 +227,7 @@ pub(super) fn run() -> anyhow::Result<()> {
         scan_options,
         Arc::clone(&shared_ids),
         &app_event_tx,
+        Some(&resolved_nvim.diagnostics),
     )?;
     let (journal, journal_warning) = match undo_journal::UndoJournal::open() {
         Ok(journal) => (Some(journal), None),
@@ -1989,6 +2001,7 @@ fn handle_pane_action(
                 scan_options,
                 Arc::clone(shared_ids),
                 app_event_tx,
+                None,
             ) {
                 Ok(session) => session,
                 Err(error) => {
