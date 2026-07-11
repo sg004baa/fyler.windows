@@ -23,6 +23,13 @@ pub trait EditorEngine: Send + Sync {
 
     /// 現在のスナップショットを返す(ロックフリーで常に即座に返ること)。
     fn snapshot(&self) -> Arc<EditorSnapshot>;
+
+    /// SnapshotUpdated通知の消費をエンジンへ伝える。
+    ///
+    /// エンジンは未消費の通知がある間、追加のSnapshotUpdatedを送らずにcoalesceしてよい。
+    /// 表示側はSnapshotUpdatedを処理したら(次のsnapshot()読み出し前に)これを呼ぶ。
+    /// 既定実装はno-op(coalesceしないエンジン/テストダブル用)。
+    fn acknowledge_snapshot_update(&self) {}
 }
 
 /// エンジンへ送るコマンド(DESIGN.mdの `EditorCommand` そのまま)。

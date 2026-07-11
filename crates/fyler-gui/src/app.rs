@@ -218,6 +218,7 @@ pub struct FylerApp {
     layout: Option<PaneLayout>,
     active: Option<PaneId>,
     event_rx: mpsc::Receiver<GuiEvent>,
+    event_dequeued: Arc<dyn Fn() + Send + Sync>,
     cmdline: Option<CmdlineState>,
     popupmenu: Option<PopupmenuState>,
     message: Option<EditorMessage>,
@@ -250,15 +251,24 @@ impl FylerApp {
         icon_style: IconStyle,
         help_lines: Vec<String>,
         repaint_context: egui::Context,
+        event_dequeued: Arc<dyn Fn() + Send + Sync>,
     ) -> anyhow::Result<Self> {
         let (event_tx, event_rx) = mpsc::channel();
         thread::Builder::new()
             .name("fyler-editor-events".to_owned())
+            // recv/forward/repaintだけの非再帰ループなので既定2MiB stackは不要。
+            .stack_size(256 * 1024)
             .spawn(move || {
-                while let Ok(event) = gui_events.recv() {
-                    if event_tx.send(event).is_err() {
+                while let Ok(first) = gui_events.recv() {
+                    if event_tx.send(first).is_err() {
                         return;
                     }
+                    while let Ok(event) = gui_events.try_recv() {
+                        if event_tx.send(event).is_err() {
+                            return;
+                        }
+                    }
+                    // 到着済みbatchを順序どおり転送した後、再描画要求は1回にまとめる。
                     repaint_context.request_repaint();
                 }
             })
@@ -269,6 +279,7 @@ impl FylerApp {
             layout: None,
             active: None,
             event_rx,
+            event_dequeued,
             cmdline: None,
             popupmenu: None,
             message: None,
@@ -285,6 +296,7 @@ impl FylerApp {
 
     fn receive_events(&mut self) {
         while let Ok(event) = self.event_rx.try_recv() {
+            (self.event_dequeued)();
             match event {
                 GuiEvent::AddPane {
                     pane_id,
@@ -322,7 +334,11 @@ impl FylerApp {
                     self.active = Some(active);
                 }
                 GuiEvent::Editor { pane_id, event } => match event {
-                    EditorEvent::SnapshotUpdated => {}
+                    EditorEvent::SnapshotUpdated => {
+                        if let Some(pane) = self.panes.get(&pane_id) {
+                            pane.engine.acknowledge_snapshot_update();
+                        }
+                    }
                     EditorEvent::ActivateLine { .. } => {}
                     EditorEvent::OpenWith { .. } => {}
                     EditorEvent::YankPath { .. } => {}
@@ -1036,6 +1052,7 @@ pub fn run(
     event_rx: mpsc::Receiver<GuiEvent>,
     action_tx: mpsc::Sender<GuiAction>,
     gui_options: GuiOptions,
+    event_dequeued: Arc<dyn Fn() + Send + Sync>,
 ) -> anyhow::Result<()> {
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
@@ -1061,6 +1078,7 @@ pub fn run(
                 icon_style,
                 help_lines,
                 creation_context.egui_ctx.clone(),
+                event_dequeued,
             )
             .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
             Ok(Box::new(app))
@@ -1173,6 +1191,7 @@ mod tests {
                 layout: None,
                 active: None,
                 event_rx,
+                event_dequeued: Arc::new(|| {}),
                 cmdline: None,
                 popupmenu: None,
                 message: None,
@@ -1305,6 +1324,7 @@ mod tests {
             ),
             active: Some(first),
             event_rx,
+            event_dequeued: Arc::new(|| {}),
             cmdline: None,
             popupmenu: None,
             message: None,
