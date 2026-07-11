@@ -237,7 +237,7 @@ async fn custom_ctrl_w_trie_dispatches_and_blocks_unknown_keys() -> anyhow::Resu
         matches!(
             event,
             EditorEvent::Message(message)
-                if message.kind == MessageKind::Info && message.text == "このキーは無効です"
+                if message.kind == MessageKind::Info && message.text == "This key is not available"
         )
     })
     .await?;
@@ -987,7 +987,7 @@ async fn terminal_alias_with_argument_warns() -> anyhow::Result<()> {
                 EditorEvent::OpenTerminal { .. } => opened = true,
                 EditorEvent::Message(message)
                     if message.kind == MessageKind::Warn
-                        && message.text.contains("引数は未対応") =>
+                        && message.text.contains("arguments are not supported") =>
                 {
                     return Some(opened);
                 }

@@ -17,9 +17,9 @@ impl FeedbackKind {
     /// GUIに表示する日本語名。
     pub const fn display_name(self) -> &'static str {
         match self {
-            Self::Impression => "感想",
-            Self::Request => "要望",
-            Self::Bug => "不具合",
+            Self::Impression => "Comment",
+            Self::Request => "Request",
+            Self::Bug => "Bug report",
         }
     }
 
@@ -70,9 +70,9 @@ impl FeedbackPayload {
 /// フィードバック本文の検証エラー。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum FeedbackBodyError {
-    #[error("本文を入力してください")]
+    #[error("Enter a message")]
     Empty,
-    #[error("本文は{MAX_BODY_CHARS}文字以内で入力してください")]
+    #[error("Message must be {MAX_BODY_CHARS} characters or fewer")]
     TooLong,
 }
 
@@ -115,9 +115,9 @@ mod tests {
     #[test]
     fn kind_schema_round_trip_and_display_names() {
         for (kind, schema, display) in [
-            (FeedbackKind::Impression, "impression", "感想"),
-            (FeedbackKind::Request, "request", "要望"),
-            (FeedbackKind::Bug, "bug", "不具合"),
+            (FeedbackKind::Impression, "impression", "Comment"),
+            (FeedbackKind::Request, "request", "Request"),
+            (FeedbackKind::Bug, "bug", "Bug report"),
         ] {
             assert_eq!(kind.as_schema_str(), schema);
             assert_eq!(FeedbackKind::from_schema_str(schema), Some(kind));

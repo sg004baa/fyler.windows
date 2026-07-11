@@ -681,7 +681,7 @@ impl SaveController {
     /// 折りたたみIDを維持する。戻り値はバッファへ設定すべき全行である。
     pub fn toggle_hidden(&mut self) -> anyhow::Result<Vec<EditorLine>> {
         if !self.is_idle() {
-            anyhow::bail!("保存処理中は隠しファイル表示を変更できません");
+            anyhow::bail!("Cannot change hidden-file visibility while saving");
         }
 
         let options = ScanOptions {
@@ -691,14 +691,14 @@ impl SaveController {
         let mut ids = self
             .ids
             .lock()
-            .map_err(|_| anyhow::anyhow!("ID採番器のロックが破損しています"))?;
+            .map_err(|_| anyhow::anyhow!("ID allocator lock is poisoned"))?;
         let baseline = fyler_fsops::scan::rescan_preserving_ids_with(
             &self.root,
             &mut ids,
             &self.baseline,
             &options,
         )
-        .context("隠しファイル表示切り替え後の実FS再スキャンに失敗しました")?;
+        .context("Failed to rescan file system after toggling hidden files")?;
         drop(ids);
         let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
         let lines = baseline_to_lines(&baseline, &context);
@@ -715,7 +715,7 @@ impl SaveController {
     /// 戻り値はバッファへ設定すべき全行である。
     pub fn change_sort(&mut self, key: SortKey, reverse: bool) -> anyhow::Result<Vec<EditorLine>> {
         if !self.is_idle() {
-            anyhow::bail!("保存処理中はソート条件を変更できません");
+            anyhow::bail!("Cannot change sorting while saving");
         }
 
         let options = ScanOptions {
@@ -730,14 +730,14 @@ impl SaveController {
         let mut ids = self
             .ids
             .lock()
-            .map_err(|_| anyhow::anyhow!("ID採番器のロックが破損しています"))?;
+            .map_err(|_| anyhow::anyhow!("ID allocator lock is poisoned"))?;
         let baseline = fyler_fsops::scan::rescan_preserving_ids_with(
             &self.root,
             &mut ids,
             &self.baseline,
             &options,
         )
-        .context("ソート条件変更後の実FS再スキャンに失敗しました")?;
+        .context("Failed to rescan file system after changing sorting")?;
         drop(ids);
         let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
         let lines = baseline_to_lines(&baseline, &context);
@@ -759,11 +759,11 @@ impl SaveController {
         baseline: BaselineTree,
     ) -> anyhow::Result<()> {
         if !self.is_idle() {
-            anyhow::bail!("保存処理中は表示ルートを変更できません");
+            anyhow::bail!("Cannot change root while saving");
         }
         if baseline.root != root {
             anyhow::bail!(
-                "表示ルートとbaselineのルートが一致しません: root={}, baseline={}",
+                "Root does not match baseline root: root={}, baseline={}",
                 root.display(),
                 baseline.root.display()
             );
@@ -856,7 +856,7 @@ impl SaveController {
                 })
                 .collect::<Vec<_>>();
             if reasons.is_empty() {
-                reasons.push("undo対象の操作がありません".to_owned());
+                reasons.push("No operations are available to undo".to_owned());
             }
             return SaveFlowResult::UndoNothingLeft { reasons };
         }
@@ -982,7 +982,7 @@ impl SaveController {
             .any(|effect| matches!(effect, SaveEffect::ReconcileFromFs))
             && let Err(error) = self.reconcile_from_fs()
         {
-            eprintln!("undo後の再読込に失敗しました: {error:#}");
+            eprintln!("Failed to reload after undo: {error:#}");
         }
 
         self.apply_cancel = None;
@@ -994,7 +994,7 @@ impl SaveController {
             Ok(ids) => ids,
             Err(_) => {
                 return SaveFlowResult::ExternalChangeFailed(
-                    "ID採番器のロックが破損しています".to_owned(),
+                    "ID allocator lock is poisoned".to_owned(),
                 );
             }
         };
@@ -1005,7 +1005,7 @@ impl SaveController {
             changed_paths,
             &self.scan_options,
         )
-        .context("外部変更後の実FS再スキャンに失敗しました")
+        .context("Failed to rescan file system after external change")
         {
             Ok(baseline) => baseline,
             Err(error) => return SaveFlowResult::ExternalChangeFailed(error.to_string()),
@@ -1028,7 +1028,7 @@ impl SaveController {
             return SaveFlowResult::UndoInvalidated {
                 transaction,
                 message:
-                    "外部でファイルが変更されたため、undoを中断しました。内容を確認して再度 :FylerUndo してください"
+                    "Undo was cancelled because files changed externally. Review the changes and run :FylerUndo again."
                         .to_owned(),
             };
         }
@@ -1037,14 +1037,15 @@ impl SaveController {
             self.apply_event(SaveEvent::Cancelled);
             self.pending_overwrites.clear();
             return SaveFlowResult::PlanInvalidated(
-                "外部でファイルが変更されたため、保存を中断しました。内容を確認して再度 :w してください"
+                "Save was cancelled because files changed externally. Review the changes and run :w again."
                     .to_owned(),
             );
         }
 
         if self.engine.snapshot().dirty {
             return SaveFlowResult::ExternalChangeNotified(
-                "外部でファイルが変更されました。編集中のため表示は更新していません".to_owned(),
+                "Files changed externally. The view was not updated because you are editing."
+                    .to_owned(),
             );
         }
 
@@ -1056,7 +1057,7 @@ impl SaveController {
                 lines,
                 cursor_line: None,
             })
-            .context("外部変更後のバッファ行をエンジンへ送信できません")
+            .context("Failed to send buffer lines to the engine after external change")
         {
             return SaveFlowResult::ExternalChangeFailed(error.to_string());
         }
@@ -1151,14 +1152,14 @@ impl SaveController {
         let mut ids = self
             .ids
             .lock()
-            .map_err(|_| anyhow::anyhow!("ID採番器のロックが破損しています"))?;
+            .map_err(|_| anyhow::anyhow!("ID allocator lock is poisoned"))?;
         let baseline = fyler_fsops::scan::rescan_preserving_ids_with(
             &self.root,
             &mut ids,
             &self.baseline,
             &self.scan_options,
         )
-        .context("実FSの再スキャンに失敗しました")?;
+        .context("Failed to rescan file system")?;
         drop(ids);
         let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
         let lines = baseline_to_lines(&baseline, &context);
@@ -1167,7 +1168,7 @@ impl SaveController {
                 lines,
                 cursor_line: None,
             })
-            .context("reconcile後のバッファ行をエンジンへ送信できません")?;
+            .context("Failed to send buffer lines to the engine after reconcile")?;
 
         self.baseline = baseline;
         self.context = context;
@@ -1192,7 +1193,7 @@ impl SaveController {
             _ => None,
         }) {
             if let Err(error) = self.engine.send(EditorCommand::SetModifiable(value)) {
-                eprintln!("バッファのmodifiable設定をエンジンへ送信できません: {error:#}");
+                eprintln!("Failed to send buffer modifiable setting to the engine: {error:#}");
             }
         }
     }
@@ -1289,7 +1290,7 @@ fn append_delete_backup_warnings(
 
     if saw_delete {
         warnings.push(backup_warning(
-            "削除前にbackupを作成します",
+            "A backup will be created before deletion",
             total_size,
             has_unknown_size,
         ));
@@ -1327,7 +1328,7 @@ fn append_overwrite_backup_warnings(
     }
 
     warnings.push(backup_warning(
-        "上書き前にbackupを作成します",
+        "A backup will be created before overwrite",
         total_size,
         has_unknown_size,
     ));
@@ -1336,21 +1337,21 @@ fn append_overwrite_backup_warnings(
 fn hydration_warning(path: &TreePath, size: Option<u64>) -> String {
     match size {
         Some(size) => format!(
-            "クラウドから取得します: {path}({})",
+            "Will download from the cloud: {path}({})",
             human_readable_size(size)
         ),
-        None => format!("クラウドから取得します: {path}"),
+        None => format!("Will download from the cloud: {path}"),
     }
 }
 
 fn backup_warning(prefix: &str, total_size: u64, has_unknown_size: bool) -> String {
     let unknown_suffix = if has_unknown_size {
-        " (一部サイズ不明)"
+        " (some sizes unknown)"
     } else {
         ""
     };
     format!(
-        "{prefix}: 約{}{}",
+        "{prefix}: approximately {}{}",
         human_readable_size(total_size),
         unknown_suffix
     )
@@ -1546,7 +1547,7 @@ mod tests {
                 overwrites,
                 cancel,
             } => (plan, overwrites, cancel),
-            result => panic!("承認後にStartApplyが返りませんでした: {result:?}"),
+            result => panic!("StartApply was not returned after approval: {result:?}"),
         }
     }
 
@@ -1720,7 +1721,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "環境依存性能計測"]
+    #[ignore = "environment-dependent performance measurement"]
     fn bench_git_badge_mapping_on_50k_baseline() {
         const ENTRY_COUNT: usize = 50_000;
         const ITERATIONS: usize = 20;
@@ -1808,7 +1809,7 @@ mod tests {
 
         let error = controller.change_sort(SortKey::Date, false).unwrap_err();
 
-        assert!(error.to_string().contains("保存処理中"));
+        assert!(error.to_string().contains("while saving"));
         assert_eq!(controller.sort_state(), (SortKey::Name, false));
     }
 
@@ -1859,7 +1860,10 @@ mod tests {
             |path| Ok(path == root.path().join("cloud.bin")),
         );
 
-        assert_eq!(warnings, ["クラウドから取得します: cloud.bin(2.0 KB)"]);
+        assert_eq!(
+            warnings,
+            ["Will download from the cloud: cloud.bin(2.0 KB)"]
+        );
     }
 
     #[test]
@@ -1881,7 +1885,7 @@ mod tests {
             |_| Ok(true),
         );
 
-        assert_eq!(warnings, ["クラウドから取得します: missing.bin"]);
+        assert_eq!(warnings, ["Will download from the cloud: missing.bin"]);
     }
 
     #[test]
@@ -1940,7 +1944,7 @@ mod tests {
 
         assert_eq!(
             warnings,
-            ["削除前にbackupを作成します: 約1.5 MB (一部サイズ不明)"]
+            ["A backup will be created before deletion: approximately 1.5 MB (some sizes unknown)"]
         );
     }
 
@@ -1958,7 +1962,10 @@ mod tests {
             |_| Ok(false),
         );
 
-        assert_eq!(warnings, ["上書き前にbackupを作成します: 約2.0 KB"]);
+        assert_eq!(
+            warnings,
+            ["A backup will be created before overwrite: approximately 2.0 KB"]
+        );
     }
 
     #[test]
@@ -1996,10 +2003,10 @@ mod tests {
         assert_eq!(
             warnings,
             [
-                "クラウドから取得します: cloud.bin(4.0 KB)",
-                "削除前にbackupを作成します: 約4.0 KB",
-                "クラウドから取得します: overwrite.bin(1.0 KB)",
-                "上書き前にbackupを作成します: 約1.0 KB",
+                "Will download from the cloud: cloud.bin(4.0 KB)",
+                "A backup will be created before deletion: approximately 4.0 KB",
+                "Will download from the cloud: overwrite.bin(1.0 KB)",
+                "A backup will be created before overwrite: approximately 1.0 KB",
             ]
         );
     }
@@ -2076,7 +2083,7 @@ mod tests {
             cancel,
         } = start
         else {
-            panic!("承認後にStartApplyが返りませんでした");
+            panic!("StartApply was not returned after approval");
         };
 
         assert!(matches!(controller.state(), SaveState::Applying { .. }));
@@ -2165,7 +2172,7 @@ mod tests {
             cancel,
         } = start
         else {
-            panic!("承認後にStartApplyが返りませんでした");
+            panic!("StartApply was not returned after approval");
         };
 
         assert!(matches!(controller.state(), SaveState::Applying { .. }));
@@ -2318,7 +2325,7 @@ mod tests {
             cancel,
         } = start
         else {
-            panic!("承認後にStartApplyが返りませんでした");
+            panic!("StartApply was not returned after approval");
         };
 
         assert!(matches!(controller.state(), SaveState::Applying { .. }));
@@ -2352,7 +2359,7 @@ mod tests {
                 .map(|op| OpResult {
                     op,
                     outcome: OpOutcome::Skipped {
-                        reason: "ユーザーがキャンセルしました".to_owned(),
+                        reason: "Cancelled by user".to_owned(),
                     },
                 })
                 .collect(),
@@ -2479,7 +2486,7 @@ mod tests {
             cancel,
         } = result
         else {
-            panic!("undo承認後にStartUndoが返りませんでした: {result:?}");
+            panic!("StartUndo was not returned after undo approval: {result:?}");
         };
         assert_eq!(actual, transaction);
         assert!(!cancel.load(Ordering::Relaxed));
@@ -2521,7 +2528,7 @@ mod tests {
         ));
         let SaveFlowResult::StartUndo { cancel, .. } = controller.on_choice(ConfirmChoice::Approve)
         else {
-            panic!("undo承認後にStartUndoが返りませんでした");
+            panic!("StartUndo was not returned after undo approval");
         };
 
         let result = controller.on_choice(ConfirmChoice::Cancel);
@@ -2614,7 +2621,7 @@ mod tests {
             SaveFlowResult::UndoInvalidated {
                 transaction: actual,
                 message
-            } if actual == transaction && message.contains("undoを中断しました")
+            } if actual == transaction && message.contains("Undo was cancelled")
         ));
         assert!(matches!(controller.state(), SaveState::Idle));
         assert_eq!(modifiable_values(&engine), [false, true]);
@@ -2702,7 +2709,7 @@ mod tests {
         assert!(matches!(
             result,
             SaveFlowResult::ExternalChangeNotified(ref message)
-                if message.contains("外部でファイルが変更されました")
+                if message.contains("Files changed externally")
         ));
         assert!(
             controller
@@ -2805,7 +2812,7 @@ mod tests {
         assert!(matches!(
             &result,
             SaveFlowResult::PlanInvalidated(message)
-                if message.contains("外部でファイルが変更されたため、保存を中断しました")
+                if message.contains("Save was cancelled because files changed externally")
         ));
         assert!(matches!(controller.state(), SaveState::Idle));
         assert_eq!(modifiable_values(&engine), [false, true]);
@@ -2843,7 +2850,7 @@ mod tests {
             cancel,
         } = start
         else {
-            panic!("承認後にStartApplyが返りませんでした");
+            panic!("StartApply was not returned after approval");
         };
         assert!(matches!(controller.state(), SaveState::Applying { .. }));
         assert!(!cancel.load(Ordering::Relaxed));

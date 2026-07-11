@@ -32,7 +32,7 @@ pub(super) fn undo_plan_lines(
     for (step, status) in transaction.steps.iter().zip(statuses) {
         lines.push(undo_step_label(step));
         if let UndoStepStatus::Rejected { reason } = status {
-            lines.push(format!("  [対象外] {reason}"));
+            lines.push(format!("  [Skipped] {reason}"));
         }
     }
     lines
@@ -186,7 +186,7 @@ mod tests {
         let lines = undo_plan_lines(
             &transaction,
             &[UndoStepStatus::Rejected {
-                reason: "変更されています".to_owned(),
+                reason: "It has been modified".to_owned(),
             }],
         );
 
@@ -194,7 +194,7 @@ mod tests {
             lines,
             [
                 "UNDO CREATE /root/created.txt",
-                "  [対象外] 変更されています"
+                "  [Skipped] It has been modified"
             ]
         );
     }
@@ -209,7 +209,7 @@ mod tests {
             results: vec![OpResult {
                 op: step,
                 outcome: OpOutcome::Failed {
-                    error: "復元できません".to_owned(),
+                    error: "Cannot restore".to_owned(),
                     progress: Some("1/2 files".to_owned()),
                 },
             }],
@@ -220,7 +220,7 @@ mod tests {
         assert!(any_failed);
         assert_eq!(
             lines,
-            ["NG  UNDO DELETE /root/deleted.txt (reason: 復元できません / progress: 1/2 files)"]
+            ["NG  UNDO DELETE /root/deleted.txt (reason: Cannot restore / progress: 1/2 files)"]
         );
     }
 

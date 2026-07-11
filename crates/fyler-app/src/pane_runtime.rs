@@ -80,14 +80,14 @@ fn create_pane(
                 return error;
             };
             error.context(format!(
-                "Neovimを起動できませんでした。\n探索結果:\n{}\n\nfylerを再インストールするか、Neovimをインストールして PATH を通すか、FYLER_NVIM_EXE で実行ファイルを指定してください",
+                "Failed to start Neovim.\nSearch results:\n{}\n\nReinstall fyler, install Neovim and add it to PATH, or specify the executable with FYLER_NVIM_EXE.",
                 diagnostics.join("\n")
             ))
         })?;
     let baseline = {
         let mut ids = shared_ids
             .lock()
-            .map_err(|_| anyhow::anyhow!("ID採番器のロックが破損しています"))?;
+            .map_err(|_| anyhow::anyhow!("ID allocator lock is poisoned"))?;
         fyler_fsops::scan::scan_baseline_with(&root, &mut ids, &scan_options)?
     };
     let save_engine: Arc<dyn EditorEngine> = engine.clone();
@@ -118,7 +118,7 @@ fn create_pane(
                 }
             }
         })
-        .map_err(|error| anyhow::anyhow!("エディタイベント配線を開始できません: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("Failed to start editor event forwarding: {error}"))?;
 
     let watch_event_tx = app_event_tx.clone();
     thread::Builder::new()
@@ -135,7 +135,9 @@ fn create_pane(
                 }
             }
         })
-        .map_err(|error| anyhow::anyhow!("ファイル監視イベントの配線を開始できません: {error}"))?;
+        .map_err(|error| {
+            anyhow::anyhow!("Failed to start file watcher event forwarding: {error}")
+        })?;
 
     Ok(PaneSession {
         id,
@@ -168,11 +170,11 @@ fn help_lines(bindings: &[KeyBinding]) -> Vec<String> {
         .map(|(action, sequences)| format!("{}  {}", sequences.join(", "), action.description()))
         .collect::<Vec<_>>();
     lines.extend([
-        ":w  変更を保存".to_owned(),
-        ":cd  ルートを移動".to_owned(),
-        ":b  ブックマーク / 最近使ったルート".to_owned(),
-        ":terminal  ここでterminalを開く".to_owned(),
-        ":feedback  匿名フィードバックを送る".to_owned(),
+        ":w  Save changes".to_owned(),
+        ":cd  Change root".to_owned(),
+        ":b  Bookmarks / Recent roots".to_owned(),
+        ":terminal  Open terminal here".to_owned(),
+        ":feedback  Send anonymous feedback".to_owned(),
     ]);
     lines
 }
@@ -234,7 +236,7 @@ pub(super) fn run() -> anyhow::Result<()> {
         Err(error) => (
             None,
             Some(format!(
-                "undo journalを開けません。次のapplyはundo不可になります: {error:#}"
+                "Failed to open undo journal. The next apply cannot be undone: {error:#}"
             )),
         ),
     };
@@ -243,7 +245,7 @@ pub(super) fn run() -> anyhow::Result<()> {
             Ok(entries) => (entries, None),
             Err(error) => (
                 Vec::new(),
-                Some(format!("undo journalの起動時走査に失敗しました: {error:#}")),
+                Some(format!("Failed to scan undo journal at startup: {error:#}")),
             ),
         },
         None => (Vec::new(), None),
@@ -278,7 +280,9 @@ pub(super) fn run() -> anyhow::Result<()> {
                 }
             }
         })
-        .map_err(|error| anyhow::anyhow!("確認結果の配線を開始できません: {error}"))?;
+        .map_err(|error| {
+            anyhow::anyhow!("Failed to start confirmation result forwarding: {error}")
+        })?;
 
     let gui_event_gauge = Arc::new(QueueGauge::new());
     let (gui_event_inner_tx, gui_event_rx) = mpsc::channel();
@@ -332,7 +336,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                     &gui_event_tx,
                     initial_id,
                     MessageKind::Warn,
-                    format!("設定: {}", config_warnings.join(" / ")),
+                    format!("Configuration: {}", config_warnings.join(" / ")),
                 )
                 .is_err()
             {
@@ -355,7 +359,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                     &gui_event_tx,
                     initial_id,
                     MessageKind::Warn,
-                    format!("最近使ったルートを記録できません: {error:#}"),
+                    format!("Failed to record recent root: {error:#}"),
                 )
                 .is_err()
             {
@@ -444,7 +448,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                         if panes.values().all(|pane| pane.crashed)
                             && gui_event_tx
                                 .send(GuiEvent::FatalError(
-                                    "すべてのeditor engineが停止しました".to_owned(),
+                                    "All editor engines have stopped".to_owned(),
                                 ))
                                 .is_err()
                         {
@@ -510,7 +514,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         &gui_event_tx,
                                         pane_id,
                                         MessageKind::Warn,
-                                        "フィードバック送信は現在利用できません。詳細: https://github.com/sg004baa/fyler.windows/blob/main/docs/PRIVACY.md / GitHub Issues: https://github.com/sg004baa/fyler.windows/issues",
+                                        "Feedback is currently unavailable. Details: https://github.com/sg004baa/fyler.windows/blob/main/docs/PRIVACY.md / GitHub Issues: https://github.com/sg004baa/fyler.windows/issues",
                                     )
                                     .is_err()
                                     {
@@ -549,7 +553,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         &gui_event_tx,
                                         pane_id,
                                         MessageKind::Info,
-                                        "別の保存処理が進行中です",
+                                        "Another save is in progress",
                                     )
                                     .is_err()
                                     {
@@ -601,7 +605,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                                 journal.discard(&restore_transaction.id)
                                         {
                                             eprintln!(
-                                                "undo journalを破棄できません: {error:#}"
+                                                "Failed to discard undo journal: {error:#}"
                                             );
                                         }
                                     }
@@ -637,7 +641,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         &gui_event_tx,
                                         pane_id,
                                         MessageKind::Error,
-                                        "移動対象の行が見つかりません",
+                                        "Line to navigate to was not found",
                                     )
                                     .is_err()
                                     {
@@ -653,7 +657,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         &gui_event_tx,
                                         pane_id,
                                         MessageKind::Info,
-                                        "保存済みのディレクトリ行ではありません",
+                                        "This is not a saved directory line",
                                     )
                                     .is_err()
                                     {
@@ -668,7 +672,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         &gui_event_tx,
                                         pane_id,
                                         MessageKind::Info,
-                                        "ディレクトリ行ではありません",
+                                        "This is not a directory line",
                                     )
                                     .is_err()
                                     {
@@ -733,11 +737,11 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     let drives = fyler_fsops::drives::list_drives();
                                     let message = if drives.len() >= 2 {
                                         format!(
-                                            "これ以上、上のディレクトリはありません | ドライブ: {} (:cd で移動)",
+                                            "No parent directory | Drives: {} (use :cd to navigate)",
                                             format_drive_paths(&drives)
                                         )
                                     } else {
-                                        "これ以上、上のディレクトリはありません".to_owned()
+                                        "No parent directory".to_owned()
                                     };
                                     if send_gui_message(
                                         &gui_event_tx,
@@ -770,12 +774,12 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     let drives = fyler_fsops::drives::list_drives();
                                     let message = if drives.len() >= 2 {
                                         format!(
-                                            "現在: {} | ドライブ: {}",
+                                            "Current: {} | Drives: {}",
                                             session.root.display(),
                                             format_drive_paths(&drives)
                                         )
                                     } else {
-                                        format!("現在: {}", session.root.display())
+                                        format!("Current: {}", session.root.display())
                                     };
                                     if send_gui_message(
                                         &gui_event_tx,
@@ -797,7 +801,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         &gui_event_tx,
                                         pane_id,
                                         MessageKind::Error,
-                                        format!("パスを解決できません: {query}"),
+                                        format!("Failed to resolve path: {query}"),
                                     )
                                     .is_err()
                                     {
@@ -856,7 +860,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             pane_id,
                                             MessageKind::Error,
                                             format!(
-                                                "ブックマーク名が曖昧です: {query} ({})",
+                                                "Bookmark name is ambiguous: {query} ({})",
                                                 names.join(", ")
                                             ),
                                         )
@@ -871,7 +875,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             pane_id,
                                             MessageKind::Error,
                                             format!(
-                                                "ブックマークまたは最近使ったルートが見つかりません: {query}"
+                                                "Bookmark or recent root was not found: {query}"
                                             ),
                                         )
                                         .is_err()
@@ -887,7 +891,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         &gui_event_tx,
                                         pane_id,
                                         MessageKind::Info,
-                                        "編集中は隠しファイル表示を切り替えできません。保存または破棄してください",
+                                        "Cannot toggle hidden files while editing. Save or discard changes.",
                                     )
                                     .is_err()
                                     {
@@ -903,7 +907,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             pane_id,
                                             MessageKind::Error,
                                             format!(
-                                                "隠しファイル表示を切り替えできません: {error:#}"
+                                                "Failed to toggle hidden files: {error:#}"
                                             ),
                                         )
                                         .is_err()
@@ -920,7 +924,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     &gui_event_tx,
                                     pane_id,
                                     MessageKind::Error,
-                                    format!("隠しファイル表示を更新できません: {error:#}"),
+                                    format!("Failed to update hidden-file view: {error:#}"),
                                 )
                                 .is_err()
                                 {
@@ -944,7 +948,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         &gui_event_tx,
                                         pane_id,
                                         MessageKind::Info,
-                                        "編集中は折りたたみを変更できません(:w で確定するか元に戻してください)",
+                                        "Cannot change folds while editing. Save with :w or undo the changes.",
                                     )
                                     .is_err()
                                     {
@@ -966,7 +970,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                                 pane_id,
                                                 MessageKind::Error,
                                                 format!(
-                                                    "折りたたみ表示を更新できません: {error:#}"
+                                                    "Failed to update folded view: {error:#}"
                                                 ),
                                             )
                                             .is_err()
@@ -990,7 +994,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             &gui_event_tx,
                                             pane_id,
                                             MessageKind::Info,
-                                            "この行のエントリを解決できません",
+                                            "Failed to resolve the entry on this line",
                                         )
                                         .is_err()
                                         {
@@ -1038,7 +1042,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         &gui_event_tx,
                                         pane_id,
                                         MessageKind::Info,
-                                        "編集中はソート条件を変更できません。保存または破棄してください",
+                                        "Cannot change sorting while editing. Save or discard changes.",
                                     )
                                     .is_err()
                                     {
@@ -1059,7 +1063,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                                 pane_id,
                                                 MessageKind::Error,
                                                 format!(
-                                                    "ソート条件を変更できません: {error:#}"
+                                                    "Failed to change sorting: {error:#}"
                                                 ),
                                             )
                                             .is_err()
@@ -1077,7 +1081,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         &gui_event_tx,
                                         pane_id,
                                         MessageKind::Error,
-                                        format!("ソート表示を更新できません: {error:#}"),
+                                        format!("Failed to update sorted view: {error:#}"),
                                     )
                                     .is_err()
                                     {
@@ -1173,7 +1177,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 fyler_fsops::openwith::open_with_system_dialog(&path)
                             } else {
                                 Err(anyhow::anyhow!(
-                                    "open-with候補の選択位置が範囲外です: {index}"
+                                    "Open-with selection is out of range: {index}"
                                 ))
                             };
                             if let Err(error) = result
@@ -1181,7 +1185,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     &gui_event_tx,
                                     active,
                                     MessageKind::Error,
-                                    format!("指定アプリで開けません: {error:#}"),
+                                    format!("Failed to open with selected application: {error:#}"),
                                 )
                                 .is_err()
                             {
@@ -1201,7 +1205,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 for entry in &pending_recovery {
                                     if let Err(error) = journal.discard(&entry.id) {
                                         eprintln!(
-                                            "undo復旧候補を破棄できません: {}: {error:#}",
+                                            "Failed to discard undo recovery candidate: {}: {error:#}",
                                             entry.dir.display()
                                         );
                                     }
@@ -1259,7 +1263,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         });
                                     if let Err(error) = spawn_result {
                                         let error =
-                                            format!("transfer workerを開始できません: {error}");
+                                            format!("Failed to start transfer worker: {error}");
                                         let report = CommitReport {
                                             results: plan
                                                 .ops
@@ -1333,7 +1337,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                                 pane_id,
                                                 MessageKind::Warn,
                                                 format!(
-                                                    "undo journalを開始できません。このapplyはundo不可です: {error:#}"
+                                                    "Failed to start undo journal. This apply cannot be undone: {error:#}"
                                                 ),
                                             )
                                             .is_err()
@@ -1385,10 +1389,10 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         && let Err(error) = journal.discard(&id)
                                     {
                                         eprintln!(
-                                            "起動失敗したapplyのundo journalを破棄できません: {error:#}"
+                                            "Failed to discard undo journal for an apply that failed to start: {error:#}"
                                         );
                                     }
-                                    let error = format!("apply workerを開始できません: {error}");
+                                    let error = format!("Failed to start apply worker: {error}");
                                     let report = CommitReport {
                                         results: plan
                                             .ops
@@ -1420,7 +1424,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     && let Err(error) = journal.mark_undoing(&transaction.id)
                                 {
                                     eprintln!(
-                                        "undo journalをUndoingへ更新できません: {error:#}"
+                                        "Failed to update undo journal to Undoing: {error:#}"
                                     );
                                 }
                                 if gui_event_tx
@@ -1450,7 +1454,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             .send(AppEvent::UndoFinished(pane_id, report));
                                     });
                                 if let Err(error) = spawn_result {
-                                    let error = format!("undo workerを開始できません: {error}");
+                                    let error = format!("Failed to start undo worker: {error}");
                                     let report = CommitReport {
                                         results: transaction
                                             .steps
@@ -1610,14 +1614,14 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         && let Err(error) = journal.discard(&transaction.id)
                                     {
                                         eprintln!(
-                                            "空のundo transactionを破棄できません: {error:#}"
+                                            "Failed to discard empty undo transaction: {error:#}"
                                         );
                                     }
                                     if send_gui_message(
                                         &gui_event_tx,
                                         pane_id,
                                         MessageKind::Warn,
-                                        "このapplyのundo記録は空です。undoできません",
+                                        "Undo record for this apply is empty. It cannot be undone.",
                                     )
                                     .is_err()
                                     {
@@ -1628,7 +1632,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         && let Err(error) = journal.commit(&transaction)
                                     {
                                         eprintln!(
-                                            "undo journalをCommittedへ更新できません: {error:#}"
+                                            "Failed to update undo journal to Committed: {error:#}"
                                         );
                                     }
                                     session.undo_slot = Some(transaction);
@@ -1637,7 +1641,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 &gui_event_tx,
                                 pane_id,
                                 MessageKind::Warn,
-                                "このapplyはundo記録がないためundoできません",
+                                "This apply has no undo record and cannot be undone",
                             )
                             .is_err()
                             {
@@ -1647,7 +1651,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                             && let Some(journal) = &journal
                             && let Err(error) = journal.discard(&transaction.id)
                         {
-                            eprintln!("失敗したapplyのundo journalを破棄できません: {error:#}");
+                            eprintln!("Failed to discard undo journal for failed apply: {error:#}");
                         }
                         let result = session.save_controller.on_apply_finished(report);
                         if send_save_result(&gui_event_tx, pane_id, result).is_err()
@@ -1730,7 +1734,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                         if let (Some(journal), Some(transaction_id)) = (&journal, transaction_id)
                             && let Err(error) = journal.finish_undone(&transaction_id)
                         {
-                            eprintln!("undo journalをUndoneへ更新できません: {error:#}");
+                            eprintln!("Failed to update undo journal to Undone: {error:#}");
                         }
                         apply_owner = None;
 
@@ -1807,7 +1811,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 source,
                                 MessageKind::Error,
                                 format!(
-                                    "transfer後の再読込に失敗しました: {}",
+                                    "Failed to reload after transfer: {}",
                                     reconcile_errors.join(" / ")
                                 ),
                             )
@@ -1869,7 +1873,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         &gui_event_tx,
                                         changed_id,
                                         MessageKind::Warn,
-                                        "外部でファイルが変更されたため、transferを中断しました。内容を確認して再度実行してください",
+                                        "Transfer was cancelled because files changed externally. Review the changes and try again.",
                                     )
                                     .is_err()
                                 {
@@ -1924,7 +1928,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                 }
             }
         })
-        .map_err(|error| anyhow::anyhow!("GUIイベント配線を開始できません: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("Failed to start GUI event forwarding: {error}"))?;
 
     let gui_dequeue_gauge = Arc::clone(&gui_event_gauge);
     let gui_result = fyler_gui::app::run(
@@ -1977,7 +1981,7 @@ fn handle_pane_action(
                     gui_event_tx,
                     source,
                     MessageKind::Info,
-                    "applyまたはtransfer中はpaneを分割できません",
+                    "Cannot split a pane during apply or transfer",
                 );
             }
             if panes.len() >= MAX_PANES {
@@ -1985,7 +1989,7 @@ fn handle_pane_action(
                     gui_event_tx,
                     source,
                     MessageKind::Info,
-                    "paneは最大4個です",
+                    "A maximum of four panes is allowed",
                 );
             }
             let Some(root) = panes.get(&source).map(|pane| pane.root.clone()) else {
@@ -2009,7 +2013,7 @@ fn handle_pane_action(
                         gui_event_tx,
                         source,
                         MessageKind::Error,
-                        format!("paneを追加できません: {error:#}"),
+                        format!("Failed to add pane: {error:#}"),
                     );
                 }
             };
@@ -2057,7 +2061,7 @@ fn handle_pane_action(
                     gui_event_tx,
                     source,
                     MessageKind::Info,
-                    "確認ダイアログを閉じてからpaneを閉じてください",
+                    "Close the confirmation dialog before closing the pane",
                 );
             }
             let Some(target) = layout.sibling_leaf(source) else {
@@ -2119,7 +2123,7 @@ fn handle_transfer_request(
             gui_event_tx,
             source,
             MessageKind::Info,
-            "transfer先のpaneがありません。先にpaneを分割してください",
+            "There is no destination pane for transfer. Split a pane first.",
         );
     };
     let Some(source_session) = panes.get(&source) else {
@@ -2155,7 +2159,7 @@ fn handle_transfer_request(
                 gui_event_tx,
                 source,
                 MessageKind::Info,
-                "未保存の新規行を含むためtransferできません。先に保存してください",
+                "Cannot transfer because the selection contains an unsaved new line. Save first.",
             );
         }
         Err(super::transfer_flow::SelectionError::Empty) => {
@@ -2163,7 +2167,7 @@ fn handle_transfer_request(
                 gui_event_tx,
                 source,
                 MessageKind::Info,
-                "transfer対象が選択されていません",
+                "No transfer target is selected",
             );
         }
         Err(super::transfer_flow::SelectionError::MissingLine) => {
@@ -2171,7 +2175,7 @@ fn handle_transfer_request(
                 gui_event_tx,
                 source,
                 MessageKind::Error,
-                "transfer対象の行が見つかりません",
+                "Transfer target line was not found",
             );
         }
         Err(super::transfer_flow::SelectionError::UnknownId) => {
@@ -2179,7 +2183,7 @@ fn handle_transfer_request(
                 gui_event_tx,
                 source,
                 MessageKind::Error,
-                "transfer対象を現在のファイル一覧へ解決できません",
+                "Failed to resolve transfer target in the current file list",
             );
         }
     };
@@ -2193,7 +2197,7 @@ fn handle_transfer_request(
             gui_event_tx,
             source,
             MessageKind::Error,
-            "transfer先paneのカーソル位置を解決できません",
+            "Failed to resolve cursor position in destination pane",
         );
     };
     let plan = build_plan(
@@ -2208,7 +2212,7 @@ fn handle_transfer_request(
             gui_event_tx,
             source,
             MessageKind::Info,
-            "transfer対象がありません",
+            "No transfer targets",
         );
     }
     let preflight = fyler_fsops::preflight_transfer(&plan);
@@ -2218,7 +2222,7 @@ fn handle_transfer_request(
             source,
             MessageKind::Error,
             format!(
-                "transferできないパスがあります: {}",
+                "Some paths cannot be transferred: {}",
                 preflight
                     .blocked
                     .iter()
@@ -2258,13 +2262,13 @@ fn close_rejection(
     crashed: bool,
 ) -> Option<&'static str> {
     if last_pane {
-        Some("最後のpaneは閉じられません")
+        Some("The last pane cannot be closed")
     } else if applying {
-        Some("apply中はpaneを閉じられません")
+        Some("A pane cannot be closed during apply")
     } else if !crashed && dirty {
-        Some("編集中のpaneは閉じられません")
+        Some("A pane being edited cannot be closed")
     } else if !crashed && !idle {
-        Some("保存処理中のpaneは閉じられません")
+        Some("A pane that is saving cannot be closed")
     } else {
         None
     }
@@ -2272,18 +2276,18 @@ fn close_rejection(
 
 fn undo_rejection(dirty: bool, slot_empty: bool, busy: bool) -> Option<&'static str> {
     if busy {
-        Some("別の保存処理が進行中です")
+        Some("Another save is in progress")
     } else if dirty {
-        Some("編集中はundoできません。保存または破棄してください")
+        Some("Cannot undo while editing. Save or discard changes.")
     } else if slot_empty {
-        Some("undoできる操作がありません")
+        Some("No operations are available to undo")
     } else {
         None
     }
 }
 
 fn feedback_start_rejection(dialog_open: bool) -> Option<&'static str> {
-    dialog_open.then_some("別のダイアログを閉じてからフィードバックを開いてください")
+    dialog_open.then_some("Close the other dialog before opening feedback")
 }
 
 fn feedback_result_kind(outcome: FeedbackOutcome) -> FeedbackResultKind {
@@ -2313,7 +2317,7 @@ fn discard_undo_slot(session: &mut PaneSession, journal: Option<&undo_journal::U
     if let Some(journal) = journal
         && let Err(error) = journal.discard(&transaction.id)
     {
-        eprintln!("undo journalを破棄できません: {error:#}");
+        eprintln!("Failed to discard undo journal: {error:#}");
     }
 }
 
@@ -2385,19 +2389,19 @@ mod tests {
     fn close_rejects_last_dirty_busy_and_applying_panes() {
         assert_eq!(
             close_rejection(false, true, false, true, false),
-            Some("最後のpaneは閉じられません")
+            Some("The last pane cannot be closed")
         );
         assert_eq!(
             close_rejection(true, true, false, false, false),
-            Some("編集中のpaneは閉じられません")
+            Some("A pane being edited cannot be closed")
         );
         assert_eq!(
             close_rejection(false, false, false, false, false),
-            Some("保存処理中のpaneは閉じられません")
+            Some("A pane that is saving cannot be closed")
         );
         assert_eq!(
             close_rejection(false, true, true, false, false),
-            Some("apply中はpaneを閉じられません")
+            Some("A pane cannot be closed during apply")
         );
         assert_eq!(close_rejection(false, true, false, false, false), None);
     }
@@ -2411,15 +2415,15 @@ mod tests {
     fn undo_rejects_busy_dirty_and_empty_slot() {
         assert_eq!(
             undo_rejection(false, false, true),
-            Some("別の保存処理が進行中です")
+            Some("Another save is in progress")
         );
         assert_eq!(
             undo_rejection(true, false, false),
-            Some("編集中はundoできません。保存または破棄してください")
+            Some("Cannot undo while editing. Save or discard changes.")
         );
         assert_eq!(
             undo_rejection(false, true, false),
-            Some("undoできる操作がありません")
+            Some("No operations are available to undo")
         );
         assert_eq!(undo_rejection(false, false, false), None);
     }
@@ -2429,7 +2433,7 @@ mod tests {
         assert_eq!(feedback_start_rejection(false), None);
         assert_eq!(
             feedback_start_rejection(true),
-            Some("別のダイアログを閉じてからフィードバックを開いてください")
+            Some("Close the other dialog before opening feedback")
         );
     }
 

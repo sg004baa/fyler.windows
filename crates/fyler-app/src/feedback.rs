@@ -16,14 +16,12 @@ pub(crate) enum FeedbackOutcome {
 impl FeedbackOutcome {
     pub(crate) const fn message(self) -> &'static str {
         match self {
-            Self::Accepted => "フィードバックを受け付けました。ありがとうございます。",
-            Self::Invalid => "送信内容を受け付けられませんでした。内容を確認してください。",
-            Self::RateLimited => "送信間隔が短すぎます。時間をおいてからもう一度お試しください。",
-            Self::ServerError => {
-                "サーバーで問題が発生しました。時間をおいてからもう一度お試しください。"
-            }
-            Self::Network => "ネットワークに接続できませんでした。接続を確認してください。",
-            Self::Timeout => "送信がタイムアウトしました。時間をおいてもう一度お試しください。",
+            Self::Accepted => "Feedback received. Thank you.",
+            Self::Invalid => "The feedback could not be accepted. Check the content and try again.",
+            Self::RateLimited => "Feedback was sent too recently. Wait a while and try again.",
+            Self::ServerError => "The server encountered a problem. Wait a while and try again.",
+            Self::Network => "Could not connect to the network. Check your connection.",
+            Self::Timeout => "Sending timed out. Wait a while and try again.",
         }
     }
 }

@@ -77,8 +77,8 @@ pub fn open(cwd: &Path, kind: TerminalKind) -> anyhow::Result<()> {
     }
 
     match last_error {
-        Some(error) => bail!("terminalを起動できませんでした ({programs} を試行): {error}"),
-        None => bail!("terminalを起動できませんでした (起動候補がありません)"),
+        Some(error) => bail!("Failed to start terminal (tried {programs}): {error}"),
+        None => bail!("Failed to start terminal (no candidates available)"),
     }
 }
 

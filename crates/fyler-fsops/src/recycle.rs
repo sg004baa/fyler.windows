@@ -14,5 +14,6 @@ use anyhow::Context;
 /// - `trash`クレートによる拡張形式パスの受け入れは未検証。MAX_PATH超の
 ///   ごみ箱削除はWindows実機で要検証(M7残件)
 pub fn delete_to_recycle_bin(path: &Path) -> anyhow::Result<()> {
-    trash::delete(path).with_context(|| format!("ごみ箱へ移動できません: {}", path.display()))
+    trash::delete(path)
+        .with_context(|| format!("Failed to move to recycle bin: {}", path.display()))
 }

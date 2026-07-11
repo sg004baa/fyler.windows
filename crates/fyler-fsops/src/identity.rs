@@ -10,7 +10,7 @@ use fyler_core::undo::{FileIdentity, Fingerprint, ManifestEntry};
 /// 実体識別子を採取する。symlinkは辿らず、link自身のidentityを返す。
 pub fn capture_identity(path: &Path) -> anyhow::Result<FileIdentity> {
     capture_identity_impl(path)
-        .with_context(|| format!("実体識別子を採取できません: {}", path.display()))
+        .with_context(|| format!("Failed to capture object identity: {}", path.display()))
 }
 
 #[cfg(windows)]
@@ -84,7 +84,7 @@ fn capture_identity_impl(path: &Path) -> anyhow::Result<FileIdentity> {
 #[cfg(not(any(unix, windows)))]
 fn capture_identity_impl(path: &Path) -> anyhow::Result<FileIdentity> {
     let _ = path;
-    anyhow::bail!("このプラットフォームでは実体識別子の採取に未対応です")
+    anyhow::bail!("Capturing object identity is not supported on this platform")
 }
 
 /// 属性のみのfingerprintを採取する。内容は読まない(placeholder hydration防止)。
@@ -93,7 +93,7 @@ fn capture_identity_impl(path: &Path) -> anyhow::Result<FileIdentity> {
 pub fn capture_fingerprint(path: &Path) -> anyhow::Result<Fingerprint> {
     let fs_path = crate::long_path::to_fs(path);
     let metadata = fs::symlink_metadata(&fs_path)
-        .with_context(|| format!("fingerprintのmetadataを取得できません: {}", path.display()))?;
+        .with_context(|| format!("Failed to get metadata for fingerprint: {}", path.display()))?;
     let kind = crate::scan::kind_from_metadata(&metadata);
     match kind {
         EntryKind::File => Ok(Fingerprint {
@@ -108,14 +108,16 @@ pub fn capture_fingerprint(path: &Path) -> anyhow::Result<Fingerprint> {
             mtime: None,
             link_target: None,
         }),
-        EntryKind::Symlink => Ok(Fingerprint {
-            kind,
-            size: None,
-            mtime: None,
-            link_target: Some(fs::read_link(&fs_path).with_context(|| {
-                format!("symlinkのリンク先を読み取れません: {}", path.display())
-            })?),
-        }),
+        EntryKind::Symlink => {
+            Ok(Fingerprint {
+                kind,
+                size: None,
+                mtime: None,
+                link_target: Some(fs::read_link(&fs_path).with_context(|| {
+                    format!("Failed to read symlink target: {}", path.display())
+                })?),
+            })
+        }
     }
 }
 
@@ -137,27 +139,30 @@ fn collect_manifest_entries(
 ) -> anyhow::Result<()> {
     let read_dir = fs::read_dir(crate::long_path::to_fs(directory)).with_context(|| {
         format!(
-            "manifest対象ディレクトリを列挙できません: {}",
+            "Failed to enumerate directory for manifest: {}",
             directory.display()
         )
     })?;
     for entry in read_dir {
         let entry = entry.with_context(|| {
             format!(
-                "manifest対象ディレクトリのエントリを取得できません: {}",
+                "Failed to get directory entry for manifest: {}",
                 directory.display()
             )
         })?;
         let name = entry.file_name();
         let name = name.to_str().with_context(|| {
             format!(
-                "manifest対象にUTF-8として表現できない名前があります: {}",
+                "Manifest contains a name that cannot be represented as UTF-8: {}",
                 entry.path().display()
             )
         })?;
         let path = entry.path();
         let metadata = fs::symlink_metadata(crate::long_path::to_fs(&path)).with_context(|| {
-            format!("manifest対象のmetadataを取得できません: {}", path.display())
+            format!(
+                "Failed to get metadata for manifest entry: {}",
+                path.display()
+            )
         })?;
         let kind = crate::scan::kind_from_metadata(&metadata);
 

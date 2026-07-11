@@ -26,7 +26,7 @@ pub(crate) fn get(path: &Path) -> anyhow::Result<u32> {
     if attributes == u32::MAX {
         let error = unsafe { GetLastError() };
         bail!(
-            "ファイル属性を取得できません: {}: GetLastError={} ({})",
+            "Failed to get file attributes: {}: GetLastError={} ({})",
             path.display(),
             error.0,
             std::io::Error::from_raw_os_error(error.0 as i32)

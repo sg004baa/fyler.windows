@@ -66,12 +66,12 @@ impl BaselineTree {
     pub fn insert(&mut self, entry: BaselineEntry) {
         debug_assert!(
             !self.index.contains_key(&entry.id),
-            "BaselineTreeへ同一IDが重複挿入されました: {}",
+            "Duplicate ID inserted into BaselineTree: {}",
             entry.id
         );
         debug_assert!(
             !self.path_index.contains_key(&entry.path),
-            "BaselineTreeへ同一パスが重複挿入されました: {}",
+            "Duplicate path inserted into BaselineTree: {}",
             entry.path
         );
         let position = self.entries.len();

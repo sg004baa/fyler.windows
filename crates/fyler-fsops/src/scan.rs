@@ -203,7 +203,7 @@ fn refresh_metadata_if_structure_unchanged(
         for (scanned, index) in scanned.into_iter().zip(children) {
             let name = scanned.file_name.to_str().with_context(|| {
                 format!(
-                    "UTF-8として表現できないファイル名です: {}",
+                    "File name cannot be represented as UTF-8: {}",
                     scanned.path.display()
                 )
             })?;
@@ -238,7 +238,7 @@ fn rebuild_directory(
         for entry in read_sorted_entries(&directory, options)? {
             let name = entry.file_name.to_str().with_context(|| {
                 format!(
-                    "UTF-8として表現できないファイル名です: {}",
+                    "File name cannot be represented as UTF-8: {}",
                     entry.path.display()
                 )
             })?;
@@ -262,7 +262,7 @@ fn rebuild_directory(
                 rebuild_directory(root, &path, ids, previous, affected, options, tree)
                     .with_context(|| {
                         format!(
-                            "変更ディレクトリの再構築に失敗しました: {}",
+                            "Failed to rebuild changed directory: {}",
                             child_directory.display()
                         )
                     })?;
@@ -304,15 +304,15 @@ fn scan_with_id_resolver(
 
 fn validate_root(root: &Path) -> anyhow::Result<()> {
     let root_metadata = fs::symlink_metadata(crate::long_path::to_fs(root))
-        .with_context(|| format!("表示ルートのメタデータを取得できません: {}", root.display()))?;
+        .with_context(|| format!("Failed to get root metadata: {}", root.display()))?;
     if is_link_or_reparse(&root_metadata) {
         bail!(
-            "表示ルートにはsymlink/junction/reparse pointを指定できません: {}",
+            "Root cannot be a symlink, junction, or reparse point: {}",
             root.display()
         );
     }
     if !root_metadata.is_dir() {
-        bail!("表示ルートがディレクトリではありません: {}", root.display());
+        bail!("Root is not a directory: {}", root.display());
     }
     Ok(())
 }
@@ -337,7 +337,7 @@ fn scan_directory(
 
         let name = entry.file_name.to_str().with_context(|| {
             format!(
-                "UTF-8として表現できないファイル名です: {}",
+                "File name cannot be represented as UTF-8: {}",
                 entry.path.display()
             )
         })?;
@@ -384,25 +384,24 @@ fn read_sorted_entries(
     options: &ScanOptions,
 ) -> anyhow::Result<Vec<ScannedEntry>> {
     let read_dir = fs::read_dir(crate::long_path::to_fs(directory))
-        .with_context(|| format!("ディレクトリを列挙できません: {}", directory.display()))?;
+        .with_context(|| format!("Failed to enumerate directory: {}", directory.display()))?;
     let mut entries = Vec::new();
     for entry in read_dir {
-        let entry = entry.with_context(|| {
-            format!(
-                "ディレクトリエントリを取得できません: {}",
-                directory.display()
-            )
-        })?;
+        let entry = entry
+            .with_context(|| format!("Failed to get directory entry: {}", directory.display()))?;
         let path = entry.path();
         let file_name = entry.file_name();
         let metadata = entry
             .metadata()
-            .with_context(|| format!("エントリのメタデータを取得できません: {}", path.display()))?;
+            .with_context(|| format!("Failed to get entry metadata: {}", path.display()))?;
         if !options.show_hidden && is_hidden(&file_name, &metadata) {
             continue;
         }
         let name = file_name.to_str().with_context(|| {
-            format!("UTF-8として表現できないファイル名です: {}", path.display())
+            format!(
+                "File name cannot be represented as UTF-8: {}",
+                path.display()
+            )
         })?;
         let sort_key = name.to_lowercase();
         let extension_key = extension_sort_key(&sort_key).to_owned();
@@ -832,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "環境依存性能計測"]
+    #[ignore = "environment-dependent performance measurement"]
     fn bench_partial_rescan_deep_leaf_on_50k_entries() {
         const DIRECTORY_COUNT: usize = 200;
         const FILES_PER_DIRECTORY: usize = 250;

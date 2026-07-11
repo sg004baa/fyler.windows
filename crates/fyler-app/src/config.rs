@@ -82,7 +82,9 @@ pub fn load() -> (Config, Vec<String>) {
     let directory = match config_dir() {
         Ok(directory) => directory,
         Err(error) => {
-            warnings.push(format!("設定ディレクトリを特定できません: {error:#}"));
+            warnings.push(format!(
+                "Failed to locate configuration directory: {error:#}"
+            ));
             return (Config::default(), warnings);
         }
     };
@@ -93,14 +95,14 @@ pub fn load() -> (Config, Vec<String>) {
             return (Config::default(), warnings);
         }
         Err(error) => {
-            warnings.push(format!("{}を読み込めません: {error}", path.display()));
+            warnings.push(format!("Failed to read {}: {error}", path.display()));
             return (Config::default(), warnings);
         }
     };
     let table = match source.parse::<toml::Table>() {
         Ok(table) => table,
         Err(error) => {
-            warnings.push(format!("{}のTOMLが壊れています: {error}", path.display()));
+            warnings.push(format!("Invalid TOML in {}: {error}", path.display()));
             return (Config::default(), warnings);
         }
     };
@@ -115,12 +117,12 @@ pub fn load() -> (Config, Vec<String>) {
             Some(value) => match keymap::parse_leader(value) {
                 Ok(leader) => leader,
                 Err(error) => {
-                    warnings.push(format!("leaderの指定が不正なためSpaceを使います: {error}"));
+                    warnings.push(format!("Invalid leader; using Space: {error}"));
                     default_leader
                 }
             },
             None => {
-                warnings.push("leaderは文字列で指定してください。Spaceを使います".to_owned());
+                warnings.push("leader must be a string; using Space".to_owned());
                 default_leader
             }
         },
@@ -129,14 +131,14 @@ pub fn load() -> (Config, Vec<String>) {
     if let Some(value) = table.get("show_hidden") {
         match value.as_bool() {
             Some(show_hidden) => config.show_hidden = show_hidden,
-            None => warnings.push("show_hiddenはtrueまたはfalseで指定してください".to_owned()),
+            None => warnings.push("show_hidden must be true or false".to_owned()),
         }
     }
     if let Some(value) = table.get("sort") {
         match value.as_str() {
             Some("dirs_first") => config.sort = SortOrder::DirsFirst,
             Some("mixed") => config.sort = SortOrder::Mixed,
-            _ => warnings.push("sortは\"dirs_first\"または\"mixed\"で指定してください".to_owned()),
+            _ => warnings.push("sort must be \"dirs_first\" or \"mixed\"".to_owned()),
         }
     }
     if let Some(value) = table.get("sort_key") {
@@ -145,16 +147,14 @@ pub fn load() -> (Config, Vec<String>) {
             Some("date") => config.sort_key = SortKey::Date,
             Some("size") => config.sort_key = SortKey::Size,
             Some("ext") => config.sort_key = SortKey::Extension,
-            _ => warnings.push(
-                "sort_keyは\"name\"、\"date\"、\"size\"、\"ext\"のいずれかで指定してください"
-                    .to_owned(),
-            ),
+            _ => warnings
+                .push("sort_key must be \"name\", \"date\", \"size\", or \"ext\"".to_owned()),
         }
     }
     if let Some(value) = table.get("sort_reverse") {
         match value.as_bool() {
             Some(reverse) => config.sort_reverse = reverse,
-            None => warnings.push("sort_reverseはtrueまたはfalseで指定してください".to_owned()),
+            None => warnings.push("sort_reverse must be true or false".to_owned()),
         }
     }
     if let Some(value) = table.get("terminal") {
@@ -164,7 +164,7 @@ pub fn load() -> (Config, Vec<String>) {
             Some("powershell") => config.terminal = TerminalKind::PowerShell,
             Some("cmd") => config.terminal = TerminalKind::Cmd,
             _ => warnings.push(
-                "terminalは\"auto\"、\"windows_terminal\"、\"powershell\"、\"cmd\"のいずれかで指定してください"
+                "terminal must be \"auto\", \"windows_terminal\", \"powershell\", or \"cmd\""
                     .to_owned(),
             ),
         }
@@ -172,15 +172,14 @@ pub fn load() -> (Config, Vec<String>) {
     if let Some(value) = table.get("feedback_url") {
         match value.as_str() {
             Some(url) => config.feedback_url = Some(url.to_owned()),
-            None => warnings.push("feedback_urlは文字列で指定してください".to_owned()),
+            None => warnings.push("feedback_url must be a string".to_owned()),
         }
     }
     if let Some(value) = table.get("confirm_detail") {
         match value.as_str() {
             Some("full") => config.confirm_detail = ConfirmDetail::Full,
             Some("summary") => config.confirm_detail = ConfirmDetail::Summary,
-            _ => warnings
-                .push("confirm_detailは\"full\"または\"summary\"で指定してください".to_owned()),
+            _ => warnings.push("confirm_detail must be \"full\" or \"summary\"".to_owned()),
         }
     }
     if let Some(value) = table.get("font") {
@@ -191,25 +190,25 @@ pub fn load() -> (Config, Vec<String>) {
                     config.font = Some(path);
                 } else {
                     warnings.push(format!(
-                        "fontは絶対パスではないため無視します: {}",
+                        "Ignoring font because it is not an absolute path: {}",
                         path.display()
                     ));
                 }
             }
-            None => warnings.push("fontは文字列で指定してください".to_owned()),
+            None => warnings.push("font must be a string".to_owned()),
         }
     }
     if let Some(value) = table.get("font_y_offset_factor") {
         match numeric_f32(value) {
             Some(factor) => config.font_y_offset_factor = factor,
-            None => warnings.push("font_y_offset_factorは数値で指定してください".to_owned()),
+            None => warnings.push("font_y_offset_factor must be a number".to_owned()),
         }
     }
     if let Some(value) = table.get("icons") {
         match value.as_str() {
             Some("ascii") => config.icons = IconStyle::Ascii,
             Some("nerd") => config.icons = IconStyle::Nerd,
-            _ => warnings.push("iconsは\"ascii\"または\"nerd\"で指定してください".to_owned()),
+            _ => warnings.push("icons must be \"ascii\" or \"nerd\"".to_owned()),
         }
     }
     if let Some(value) = table.get("bookmarks") {
@@ -225,15 +224,13 @@ pub fn load() -> (Config, Vec<String>) {
                         continue;
                     };
                     let Some(path) = value.as_str() else {
-                        warnings.push(format!(
-                            "ブックマーク{name}のパスは文字列で指定してください"
-                        ));
+                        warnings.push(format!("Path for bookmark {name} must be a string"));
                         continue;
                     };
                     let path = PathBuf::from(path);
                     if !path.is_absolute() {
                         warnings.push(format!(
-                            "ブックマーク{name}は絶対パスではないため無視します: {}",
+                            "Ignoring bookmark {name} because it is not an absolute path: {}",
                             path.display()
                         ));
                         continue;
@@ -241,7 +238,7 @@ pub fn load() -> (Config, Vec<String>) {
                     config.bookmarks.push((name.clone(), path));
                 }
             }
-            None => warnings.push("bookmarksはテーブルで指定してください".to_owned()),
+            None => warnings.push("bookmarks must be a table".to_owned()),
         }
     }
     if let Some(value) = table.get("keymap") {
@@ -250,7 +247,7 @@ pub fn load() -> (Config, Vec<String>) {
                 let mut entries = Vec::new();
                 for section in keymap_table.keys() {
                     if section != "normal" {
-                        warnings.push(format!("未対応のkeymapセクションを無視します: {section}"));
+                        warnings.push(format!("Ignoring unsupported keymap section: {section}"));
                     }
                 }
                 if let Some(normal) = keymap_table.get("normal") {
@@ -262,14 +259,12 @@ pub fn load() -> (Config, Vec<String>) {
                                         entries.push((sequence.clone(), action.to_owned()))
                                     }
                                     None => warnings.push(format!(
-                                        "keymap.normalの{sequence:?}は文字列で指定してください"
+                                        "keymap.normal entry {sequence:?} must be a string"
                                     )),
                                 }
                             }
                         }
-                        None => {
-                            warnings.push("keymap.normalはテーブルで指定してください".to_owned())
-                        }
+                        None => warnings.push("keymap.normal must be a table".to_owned()),
                     }
                 }
                 let (bindings, keymap_warnings) = keymap::resolve_bindings(Some(leader), &entries);
@@ -280,7 +275,7 @@ pub fn load() -> (Config, Vec<String>) {
                         .map(|warning| format!("keymap: {warning}")),
                 );
             }
-            None => warnings.push("keymapはテーブルで指定してください".to_owned()),
+            None => warnings.push("keymap must be a table".to_owned()),
         }
     }
 
@@ -301,7 +296,7 @@ pub fn load() -> (Config, Vec<String>) {
                 | "leader"
                 | "keymap"
         ) {
-            warnings.push(format!("未知の設定キーを無視します: {key}"));
+            warnings.push(format!("Ignoring unknown configuration key: {key}"));
         }
     }
 
@@ -351,12 +346,16 @@ pub fn load_recent_roots() -> Vec<PathBuf> {
 /// ディレクトリの一時ファイルへ完全なTOMLを書いてからrenameする。
 pub fn record_recent_root(root: &Path) -> anyhow::Result<()> {
     if !root.is_absolute() {
-        anyhow::bail!("最近使ったルートには絶対パスが必要です: {}", root.display());
+        anyhow::bail!("Recent root must be an absolute path: {}", root.display());
     }
 
     let directory = config_dir()?;
-    fs::create_dir_all(&directory)
-        .with_context(|| format!("設定ディレクトリを作成できません: {}", directory.display()))?;
+    fs::create_dir_all(&directory).with_context(|| {
+        format!(
+            "Failed to create configuration directory: {}",
+            directory.display()
+        )
+    })?;
 
     let mut roots = load_recent_roots();
     roots.retain(|recent| recent != root);
@@ -376,11 +375,15 @@ pub fn record_recent_root(root: &Path) -> anyhow::Result<()> {
     let contents = table.to_string();
     let target = directory.join(RECENT_FILE);
     let temporary = directory.join(format!(".{RECENT_FILE}.{}.tmp", std::process::id()));
-    fs::write(&temporary, contents)
-        .with_context(|| format!("一時設定ファイルを書き込めません: {}", temporary.display()))?;
+    fs::write(&temporary, contents).with_context(|| {
+        format!(
+            "Failed to write temporary configuration file: {}",
+            temporary.display()
+        )
+    })?;
     if let Err(error) = fs::rename(&temporary, &target) {
         let _ = fs::remove_file(&temporary);
-        return Err(error).with_context(|| format!("{}を置き換えできません", target.display()));
+        return Err(error).with_context(|| format!("Failed to replace {}", target.display()));
     }
     Ok(())
 }
@@ -395,7 +398,7 @@ fn config_dir() -> anyhow::Result<PathBuf> {
         nonempty_env("APPDATA")
             .map(PathBuf::from)
             .map(|path| path.join("fyler"))
-            .context("APPDATAが設定されていません")
+            .context("APPDATA is not set")
     }
 
     #[cfg(not(windows))]
@@ -406,7 +409,7 @@ fn config_dir() -> anyhow::Result<PathBuf> {
         nonempty_env("HOME")
             .map(PathBuf::from)
             .map(|path| path.join(".config").join("fyler"))
-            .context("XDG_CONFIG_HOMEとHOMEが設定されていません")
+            .context("Neither XDG_CONFIG_HOME nor HOME is set")
     }
 }
 
@@ -565,14 +568,18 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("文字列で指定"))
+                .any(|warning| warning.contains("must be a string"))
         );
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("未知のaction"))
+                .any(|warning| warning.contains("unknown action"))
         );
-        assert!(warnings.iter().any(|warning| warning.contains("未対応")));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("unsupported"))
+        );
 
         fs::write(&path, "[bookmarks]\nrelative = 'child/path'\n").unwrap();
         let (config, warnings) = load();
@@ -580,7 +587,7 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("絶対パスではない"))
+                .any(|warning| warning.contains("not an absolute path"))
         );
 
         fs::write(
@@ -607,7 +614,7 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("絶対パスではない"))
+                .any(|warning| warning.contains("not an absolute path"))
         );
 
         let first = directory.path().join("z-first");

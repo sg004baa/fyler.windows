@@ -48,10 +48,7 @@ impl UndoJournal {
     pub fn open() -> anyhow::Result<Self> {
         let dir = undo_dir()?;
         fs::create_dir_all(&dir).with_context(|| {
-            format!(
-                "undo journalディレクトリを作成できません: {}",
-                dir.display()
-            )
+            format!("Failed to create undo journal directory: {}", dir.display())
         })?;
         Ok(Self { dir })
     }
@@ -60,14 +57,14 @@ impl UndoJournal {
     pub fn begin(&self, id: &str, root: &Path) -> anyhow::Result<PathBuf> {
         let root = path_string(root).with_context(|| {
             format!(
-                "undo journalへ記録するrootがUTF-8ではありません: {}",
+                "Root recorded in undo journal is not UTF-8: {}",
                 root.display()
             )
         })?;
         let transaction_dir = self.transaction_dir(id);
         fs::create_dir_all(&transaction_dir).with_context(|| {
             format!(
-                "undo transactionディレクトリを作成できません: {}",
+                "Failed to create undo transaction directory: {}",
                 transaction_dir.display()
             )
         })?;
@@ -90,7 +87,7 @@ impl UndoJournal {
         let transaction_dir = self.transaction_dir(&transaction.id);
         fs::create_dir_all(&transaction_dir).with_context(|| {
             format!(
-                "undo transactionディレクトリを作成できません: {}",
+                "Failed to create undo transaction directory: {}",
                 transaction_dir.display()
             )
         })?;
@@ -114,7 +111,7 @@ impl UndoJournal {
             && error.kind() != std::io::ErrorKind::NotFound
         {
             return Err(error)
-                .with_context(|| format!("undo payloadを削除できません: {}", payload.display()));
+                .with_context(|| format!("Failed to remove undo payload: {}", payload.display()));
         }
         remove_dir_all_if_exists(&transaction_dir)
     }
@@ -128,7 +125,7 @@ impl UndoJournal {
     pub fn scan_on_startup(&self) -> anyhow::Result<Vec<JournalEntry>> {
         let mut entries = Vec::new();
         for entry in fs::read_dir(&self.dir)
-            .with_context(|| format!("undo journalを走査できません: {}", self.dir.display()))?
+            .with_context(|| format!("Failed to scan undo journal: {}", self.dir.display()))?
         {
             let entry = entry?;
             let transaction_dir = entry.path();
@@ -150,7 +147,7 @@ impl UndoJournal {
                 },
                 Err(error) => {
                     eprintln!(
-                        "undo journal manifestを読めません。復旧候補として保持します: {}: {error:#}",
+                        "Failed to read undo journal manifest; retaining it as a recovery candidate: {}: {error:#}",
                         transaction_dir.display()
                     );
                     entries.push(JournalEntry {
@@ -177,13 +174,13 @@ impl UndoJournal {
         let source =
             fs::read_to_string(transaction_dir.join(MANIFEST_FILE)).with_context(|| {
                 format!(
-                    "undo manifestを読み込めません: {}",
+                    "Failed to read undo manifest: {}",
                     transaction_dir.join(MANIFEST_FILE).display()
                 )
             })?;
         let mut table = source
             .parse::<toml::Table>()
-            .context("undo manifestのTOMLが壊れています")?;
+            .context("Undo manifest contains invalid TOML")?;
         table.insert(
             "state".to_owned(),
             toml::Value::String(state.as_str().to_owned()),
@@ -218,7 +215,7 @@ impl JournalState {
             "Committed" => Ok(Self::Committed),
             "Undoing" => Ok(Self::Undoing),
             "Undone" => Ok(Self::Undone),
-            _ => anyhow::bail!("未知のundo journal状態です: {value}"),
+            _ => anyhow::bail!("Unknown undo journal state: {value}"),
         }
     }
 }
@@ -233,7 +230,7 @@ fn undo_dir() -> anyhow::Result<PathBuf> {
         nonempty_env("LOCALAPPDATA")
             .map(PathBuf::from)
             .map(|path| path.join("fyler").join("undo"))
-            .context("LOCALAPPDATAが設定されていません")
+            .context("LOCALAPPDATA is not set")
     }
 
     #[cfg(not(windows))]
@@ -244,7 +241,7 @@ fn undo_dir() -> anyhow::Result<PathBuf> {
         nonempty_env("HOME")
             .map(PathBuf::from)
             .map(|path| path.join(".local").join("state").join("fyler").join("undo"))
-            .context("XDG_STATE_HOMEとHOMEが設定されていません")
+            .context("Neither XDG_STATE_HOME nor HOME is set")
     }
 }
 
@@ -255,7 +252,7 @@ fn nonempty_env(name: &str) -> Option<OsString> {
 fn write_manifest(transaction_dir: &Path, table: toml::Table) -> anyhow::Result<()> {
     fs::create_dir_all(transaction_dir).with_context(|| {
         format!(
-            "undo transactionディレクトリを作成できません: {}",
+            "Failed to create undo transaction directory: {}",
             transaction_dir.display()
         )
     })?;
@@ -263,14 +260,14 @@ fn write_manifest(transaction_dir: &Path, table: toml::Table) -> anyhow::Result<
     let temporary = transaction_dir.join(format!(".{MANIFEST_FILE}.{}.tmp", std::process::id()));
     fs::write(&temporary, table.to_string()).with_context(|| {
         format!(
-            "undo manifest一時ファイルを書けません: {}",
+            "Failed to write temporary undo manifest: {}",
             temporary.display()
         )
     })?;
     if let Err(error) = fs::rename(&temporary, &target) {
         let _ = fs::remove_file(&temporary);
         return Err(error)
-            .with_context(|| format!("undo manifestを置き換えできません: {}", target.display()));
+            .with_context(|| format!("Failed to replace undo manifest: {}", target.display()));
     }
     Ok(())
 }
@@ -280,7 +277,7 @@ fn remove_dir_all_if_exists(path: &Path) -> anyhow::Result<()> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => {
-            Err(error).with_context(|| format!("ディレクトリを削除できません: {}", path.display()))
+            Err(error).with_context(|| format!("Failed to remove directory: {}", path.display()))
         }
     }
 }
@@ -493,7 +490,7 @@ fn insert_time(
     };
     let duration = time
         .duration_since(UNIX_EPOCH)
-        .context("UNIX_EPOCHより前のmtimeはjournalへ記録できません")?;
+        .context("mtime before UNIX_EPOCH cannot be recorded in the journal")?;
     table.insert(
         format!("{prefix}_sec"),
         toml::Value::Integer(i64::try_from(duration.as_secs())?),
@@ -541,16 +538,14 @@ fn read_transaction(transaction_dir: &Path) -> anyhow::Result<(JournalState, Und
 fn read_manifest_table(transaction_dir: &Path) -> anyhow::Result<toml::Table> {
     let path = transaction_dir.join(MANIFEST_FILE);
     fs::read_to_string(&path)
-        .with_context(|| format!("undo manifestを読み込めません: {}", path.display()))?
+        .with_context(|| format!("Failed to read undo manifest: {}", path.display()))?
         .parse::<toml::Table>()
-        .context("undo manifestのTOMLが壊れています")
+        .context("Undo manifest contains invalid TOML")
 }
 
 #[cfg(test)]
 fn parse_step(value: &toml::Value) -> anyhow::Result<UndoStep> {
-    let table = value
-        .as_table()
-        .context("undo stepはtableである必要があります")?;
+    let table = value.as_table().context("Undo step must be a table")?;
     match string_field(table, "type")? {
         "remove_created" => Ok(UndoStep::RemoveCreated {
             path: PathBuf::from(string_field(table, "path")?),
@@ -585,7 +580,7 @@ fn parse_step(value: &toml::Value) -> anyhow::Result<UndoStep> {
             path: PathBuf::from(string_field(table, "path")?),
             backup: parse_backup(table_field(table, "backup")?)?,
         }),
-        kind => anyhow::bail!("未知のundo step typeです: {kind}"),
+        kind => anyhow::bail!("Unknown undo step type: {kind}"),
     }
 }
 
@@ -594,9 +589,7 @@ fn parse_identity(table: &toml::Table) -> anyhow::Result<Option<FileIdentity>> {
     let Some(value) = table.get("identity") else {
         return Ok(None);
     };
-    let table = value
-        .as_table()
-        .context("identityはtableである必要があります")?;
+    let table = value.as_table().context("identity must be a table")?;
     Ok(Some(FileIdentity {
         volume: string_field(table, "volume")?.parse()?,
         file: string_field(table, "file")?.parse()?,
@@ -615,9 +608,7 @@ fn parse_fingerprint(table: &toml::Table) -> anyhow::Result<Fingerprint> {
 
 #[cfg(test)]
 fn parse_manifest_entry(value: &toml::Value) -> anyhow::Result<ManifestEntry> {
-    let table = value
-        .as_table()
-        .context("manifest entryはtableである必要があります")?;
+    let table = value.as_table().context("manifest entry must be a table")?;
     Ok(ManifestEntry {
         rel_path: string_field(table, "rel_path")?.to_owned(),
         kind: parse_kind(string_field(table, "kind")?)?,
@@ -640,8 +631,8 @@ fn parse_time(table: &toml::Table, prefix: &str) -> anyhow::Result<Option<System
         return Ok(None);
     };
     let nanos = optional_i64_field(table, &format!("{prefix}_nanos"))?.unwrap_or(0);
-    let secs = u64::try_from(sec).context("負のmtime秒は未対応です")?;
-    let nanos = u32::try_from(nanos).context("mtime nanosがu32範囲外です")?;
+    let secs = u64::try_from(sec).context("Negative mtime seconds are not supported")?;
+    let nanos = u32::try_from(nanos).context("mtime nanos is outside the u32 range")?;
     Ok(Some(UNIX_EPOCH + std::time::Duration::new(secs, nanos)))
 }
 
@@ -649,7 +640,7 @@ fn string_field<'a>(table: &'a toml::Table, key: &str) -> anyhow::Result<&'a str
     table
         .get(key)
         .and_then(toml::Value::as_str)
-        .with_context(|| format!("{key}は文字列である必要があります"))
+        .with_context(|| format!("{key} must be a string"))
 }
 
 #[cfg(test)]
@@ -659,7 +650,7 @@ fn optional_string_field<'a>(table: &'a toml::Table, key: &str) -> anyhow::Resul
         .map(|value| {
             value
                 .as_str()
-                .with_context(|| format!("{key}は文字列である必要があります"))
+                .with_context(|| format!("{key} must be a string"))
         })
         .transpose()
 }
@@ -669,7 +660,7 @@ fn table_field<'a>(table: &'a toml::Table, key: &str) -> anyhow::Result<&'a toml
     table
         .get(key)
         .and_then(toml::Value::as_table)
-        .with_context(|| format!("{key}はtableである必要があります"))
+        .with_context(|| format!("{key} must be a table"))
 }
 
 #[cfg(test)]
@@ -677,7 +668,7 @@ fn array_field<'a>(table: &'a toml::Table, key: &str) -> anyhow::Result<&'a Vec<
     table
         .get(key)
         .and_then(toml::Value::as_array)
-        .with_context(|| format!("{key}はarrayである必要があります"))
+        .with_context(|| format!("{key} must be an array"))
 }
 
 #[cfg(test)]
@@ -690,7 +681,7 @@ fn optional_array_field<'a>(
         .map(|value| {
             value
                 .as_array()
-                .with_context(|| format!("{key}はarrayである必要があります"))
+                .with_context(|| format!("{key} must be an array"))
         })
         .transpose()
 }
@@ -700,7 +691,7 @@ fn bool_field(table: &toml::Table, key: &str) -> anyhow::Result<bool> {
     table
         .get(key)
         .and_then(toml::Value::as_bool)
-        .with_context(|| format!("{key}はboolである必要があります"))
+        .with_context(|| format!("{key} must be a boolean"))
 }
 
 #[cfg(test)]
@@ -710,7 +701,7 @@ fn optional_i64_field(table: &toml::Table, key: &str) -> anyhow::Result<Option<i
         .map(|value| {
             value
                 .as_integer()
-                .with_context(|| format!("{key}はintegerである必要があります"))
+                .with_context(|| format!("{key} must be an integer"))
         })
         .transpose()
 }
@@ -718,7 +709,7 @@ fn optional_i64_field(table: &toml::Table, key: &str) -> anyhow::Result<Option<i
 #[cfg(test)]
 fn optional_u64_field(table: &toml::Table, key: &str) -> anyhow::Result<Option<u64>> {
     optional_i64_field(table, key)?
-        .map(|value| u64::try_from(value).with_context(|| format!("{key}が負数です")))
+        .map(|value| u64::try_from(value).with_context(|| format!("{key} is negative")))
         .transpose()
 }
 
@@ -736,14 +727,14 @@ fn parse_kind(value: &str) -> anyhow::Result<EntryKind> {
         "file" => Ok(EntryKind::File),
         "dir" => Ok(EntryKind::Dir),
         "symlink" => Ok(EntryKind::Symlink),
-        _ => anyhow::bail!("未知のentry kindです: {value}"),
+        _ => anyhow::bail!("Unknown entry kind: {value}"),
     }
 }
 
 fn path_string(path: &Path) -> anyhow::Result<String> {
     path.to_str()
         .map(str::to_owned)
-        .context("pathがUTF-8ではありません")
+        .context("Path is not UTF-8")
 }
 
 fn path_string_opt(path: &Path) -> Option<String> {

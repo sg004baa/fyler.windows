@@ -64,7 +64,7 @@ impl EditorEngine for NvimEngine {
     fn send(&self, cmd: EditorCommand) -> anyhow::Result<()> {
         self.cmd_tx
             .send(EngineCommand::Editor(cmd))
-            .map_err(|_| anyhow::anyhow!("NvimEngineタスクが終了しています"))
+            .map_err(|_| anyhow::anyhow!("NvimEngine task has stopped"))
     }
 
     fn snapshot(&self) -> Arc<EditorSnapshot> {
@@ -84,7 +84,7 @@ impl NvimEngine {
     pub fn set_initial_lines(&self, lines: Vec<EditorLine>) -> anyhow::Result<()> {
         self.cmd_tx
             .send(EngineCommand::SetInitialLines(lines))
-            .map_err(|_| anyhow::anyhow!("NvimEngineタスクが終了しています"))
+            .map_err(|_| anyhow::anyhow!("NvimEngine task has stopped"))
     }
 
     /// nvimを起動し、エンジンタスクを開始する(M1)。
@@ -138,7 +138,7 @@ impl NvimEngine {
                 .await
                 .map_err(|error| {
                     anyhow::anyhow!(
-                        "Neovimを起動できません ({}): {error}",
+                        "Failed to start Neovim ({}): {error}",
                         config.nvim_exe.display()
                     )
                 })?;
@@ -146,25 +146,25 @@ impl NvimEngine {
         let api_info = nvim
             .get_api_info()
             .await
-            .map_err(|error| anyhow::anyhow!("Neovim RPC疎通に失敗しました: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("Neovim RPC handshake failed: {error}"))?;
         let channel_id = api_info
             .first()
             .and_then(Value::as_i64)
-            .ok_or_else(|| anyhow::anyhow!("Neovim channel IDを取得できません"))?;
+            .ok_or_else(|| anyhow::anyhow!("Failed to get Neovim channel ID"))?;
 
         let buffer = nvim
             .get_current_buf()
             .await
-            .map_err(|error| anyhow::anyhow!("初期バッファを取得できません: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("Failed to get initial buffer: {error}"))?;
         // 名前設定時に架空URIのswapfileを作ろうとしないよう、先に無効化する。
         buffer
             .set_option("swapfile", Value::Boolean(false))
             .await
-            .map_err(|error| anyhow::anyhow!("swapfileを無効化できません: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("Failed to disable swapfile: {error}"))?;
         buffer
             .set_option("buftype", Value::from(guard::BUFTYPE))
             .await
-            .map_err(|error| anyhow::anyhow!("buftypeを設定できません: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("Failed to set buftype: {error}"))?;
         let buffer_uri = format!(
             "{}{}",
             guard::BUFFER_URI_SCHEME,
@@ -173,7 +173,7 @@ impl NvimEngine {
         buffer
             .set_name(&buffer_uri)
             .await
-            .map_err(|error| anyhow::anyhow!("バッファ名を設定できません: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("Failed to set buffer name: {error}"))?;
 
         let mut ui_options = UiAttachOptions::new();
         ui_options.set_cmdline_external(true);
@@ -182,7 +182,7 @@ impl NvimEngine {
         ui_options.set_popupmenu_external(true);
         nvim.ui_attach(80, 24, &ui_options)
             .await
-            .map_err(|error| anyhow::anyhow!("Neovim UI attachに失敗しました: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("Failed to attach Neovim UI: {error}"))?;
 
         // `/` 検索の大文字小文字挙動(smartcase)と、検索状態の露出を有効化する。
         // ハイライトはGUIがsnapshotの `search` から自前描画するが、`v:hlsearch` が
@@ -195,7 +195,7 @@ impl NvimEngine {
         ] {
             nvim.set_option_value(name, Value::Boolean(value), Vec::new())
                 .await
-                .map_err(|error| anyhow::anyhow!("{name}オプションを設定できません: {error}"))?;
+                .map_err(|error| anyhow::anyhow!("Failed to set {name} option: {error}"))?;
         }
 
         guard::install_guards(&nvim, &buffer, channel_id, &config.bindings).await?;
@@ -203,15 +203,15 @@ impl NvimEngine {
         let attached = buffer
             .attach(true, Vec::new())
             .await
-            .map_err(|error| anyhow::anyhow!("バッファ通知をattachできません: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("Failed to attach buffer notifications: {error}"))?;
         if !attached {
-            anyhow::bail!("Neovimがバッファ通知のattachを拒否しました");
+            anyhow::bail!("Neovim rejected the buffer notification attachment");
         }
 
         let mut lines = buffer
             .get_lines(0, -1, false)
             .await
-            .map_err(|error| anyhow::anyhow!("初期バッファ行を取得できません: {error}"))?
+            .map_err(|error| anyhow::anyhow!("Failed to get initial buffer lines: {error}"))?
             .into_iter()
             .map(EditorLine::new)
             .collect::<Vec<_>>();
@@ -235,15 +235,15 @@ impl NvimEngine {
                 tokio::select! {
                     child_status = child.wait() => {
                         break match child_status {
-                            Ok(status) => format!("Neovimプロセスが終了しました: {status}"),
-                            Err(error) => format!("Neovimプロセスの終了監視に失敗しました: {error}"),
+                            Ok(status) => format!("Neovim process exited: {status}"),
+                            Err(error) => format!("Failed to monitor Neovim process exit: {error}"),
                         };
                     }
                     io_result = &mut io_task => {
                         break match io_result {
-                            Ok(Ok(())) => "Neovim RPC接続が終了しました".to_owned(),
-                            Ok(Err(error)) => format!("Neovim RPC接続が異常終了しました: {error}"),
-                            Err(error) => format!("Neovim RPC監視タスクが異常終了しました: {error}"),
+                            Ok(Ok(())) => "Neovim RPC connection closed".to_owned(),
+                            Ok(Err(error)) => format!("Neovim RPC connection failed: {error}"),
+                            Err(error) => format!("Neovim RPC monitor task failed: {error}"),
                         };
                     }
                     command = cmd_rx.recv() => {
@@ -257,7 +257,7 @@ impl NvimEngine {
                             send_message(
                                 &event_tx,
                                 MessageKind::Error,
-                                format!("エディタ入力に失敗しました: {error}"),
+                                format!("Editor input failed: {error}"),
                             );
                         }
                         snapshot_pending = true;
@@ -284,14 +284,14 @@ impl NvimEngine {
                                 send_message(
                                     &event_tx,
                                     MessageKind::Error,
-                                    format!("エディタ状態を更新できません: {error}"),
+                                    format!("Failed to update editor state: {error}"),
                                 );
                             }
                         }
                     }
                     notification = notification_rx.recv() => {
                         let Some(notification) = notification else {
-                            break "Neovim通知チャネルが終了しました".to_owned();
+                            break "Neovim notification channel closed".to_owned();
                         };
 
                         match notification.name.as_str() {
@@ -311,7 +311,7 @@ impl NvimEngine {
                                             send_message(
                                                 &event_tx,
                                                 MessageKind::Error,
-                                                format!("バッファ行の再同期に失敗しました: {error}"),
+                                                format!("Failed to resynchronize buffer lines: {error}"),
                                             );
                                             continue;
                                         }
@@ -320,7 +320,7 @@ impl NvimEngine {
                                 snapshot_pending = true;
                             }
                             "nvim_buf_detach_event" => {
-                                break "fylerバッファがNeovimからdetachされました".to_owned();
+                                break "fyler buffer was detached from Neovim".to_owned();
                             }
                             "redraw" => {
                                 // cmdline系イベントが来たら検索パターンが変わりうるので
@@ -348,7 +348,7 @@ impl NvimEngine {
                                     None => send_message(
                                         &event_tx,
                                         MessageKind::Error,
-                                        "開く対象の行番号を取得できません".to_owned(),
+                                        "Failed to get the line number to open".to_owned(),
                                     ),
                                 }
                             }
@@ -363,7 +363,7 @@ impl NvimEngine {
                                     None => send_message(
                                         &event_tx,
                                         MessageKind::Error,
-                                        "open-with対象の行番号を取得できません".to_owned(),
+                                        "Failed to get the line number for open-with".to_owned(),
                                     ),
                                 }
                             }
@@ -381,7 +381,7 @@ impl NvimEngine {
                                     None => send_message(
                                         &event_tx,
                                         MessageKind::Error,
-                                        "移動対象の行番号を取得できません".to_owned(),
+                                        "Failed to get the line number to navigate to".to_owned(),
                                     ),
                                 }
                             }
@@ -400,7 +400,7 @@ impl NvimEngine {
                                     Some(_) if !args.trim().is_empty() => send_message(
                                         &event_tx,
                                         MessageKind::Warn,
-                                        ":terminal の引数は未対応です(引数なしで実行してください)"
+                                        ":terminal arguments are not supported; run it without arguments"
                                             .to_owned(),
                                     ),
                                     Some(line) => {
@@ -409,7 +409,7 @@ impl NvimEngine {
                                     None => send_message(
                                         &event_tx,
                                         MessageKind::Error,
-                                        "terminal対象の行番号を取得できません".to_owned(),
+                                        "Failed to get the line number for terminal".to_owned(),
                                     ),
                                 }
                             }
@@ -434,12 +434,12 @@ impl NvimEngine {
                                     (None, _) => send_message(
                                         &event_tx,
                                         MessageKind::Error,
-                                        "折りたたみ操作を取得できません".to_owned(),
+                                        "Failed to get fold operation".to_owned(),
                                     ),
                                     (_, None) => send_message(
                                         &event_tx,
                                         MessageKind::Error,
-                                        "折りたたみ対象の行番号を取得できません".to_owned(),
+                                        "Failed to get the line number for folding".to_owned(),
                                     ),
                                 }
                             }
@@ -460,7 +460,7 @@ impl NvimEngine {
                                     None => send_message(
                                         &event_tx,
                                         MessageKind::Info,
-                                        "このpane操作は無効です".to_owned(),
+                                        "This pane action is invalid".to_owned(),
                                     ),
                                 }
                             }
@@ -484,7 +484,7 @@ impl NvimEngine {
                                     _ => send_message(
                                         &event_tx,
                                         MessageKind::Error,
-                                        "transfer対象の行範囲を取得できません".to_owned(),
+                                        "Failed to get the line range for transfer".to_owned(),
                                     ),
                                 }
                             }
@@ -535,7 +535,7 @@ impl NvimEngine {
                                     None => send_message(
                                         &event_tx,
                                         MessageKind::Error,
-                                        "コピー対象の行番号を取得できません".to_owned(),
+                                        "Failed to get the line number to copy".to_owned(),
                                     ),
                                 }
                             }
@@ -543,7 +543,7 @@ impl NvimEngine {
                                 send_message(
                                     &event_tx,
                                     MessageKind::Info,
-                                    "このキーは無効です".to_owned(),
+                                    "This key is not available".to_owned(),
                                 );
                             }
                             "fyler_write_blocked" => {
@@ -553,14 +553,14 @@ impl NvimEngine {
                                 send_message(
                                     &event_tx,
                                     MessageKind::Error,
-                                    format!("未対応の保存経路を拒否しました: {event}"),
+                                    format!("Rejected unsupported save path: {event}"),
                                 );
                             }
                             "fyler_unexpected_buffer" => {
                                 send_message(
                                     &event_tx,
                                     MessageKind::Warn,
-                                    "想定外のバッファを閉じ、fylerへ戻りました".to_owned(),
+                                    "Closed an unexpected buffer and returned to fyler".to_owned(),
                                 );
                             }
                             _ => {}
@@ -589,7 +589,7 @@ impl NvimEngine {
                                 send_message(
                                     &event_tx,
                                     MessageKind::Error,
-                                    format!("エディタ状態を更新できません: {error}"),
+                                    format!("Failed to update editor state: {error}"),
                                 );
                             }
                         }
@@ -622,13 +622,13 @@ async fn handle_command(
             let keycodes = translate::to_nvim_keycodes(&key);
             nvim.input(&keycodes)
                 .await
-                .map_err(|error| anyhow::anyhow!("キー入力RPCに失敗しました: {error}"))?;
+                .map_err(|error| anyhow::anyhow!("Key input RPC failed: {error}"))?;
         }
         EngineCommand::Editor(EditorCommand::Text(text))
         | EngineCommand::Editor(EditorCommand::Paste(text)) => {
             nvim.paste(&text, false, -1)
                 .await
-                .map_err(|error| anyhow::anyhow!("テキスト入力RPCに失敗しました: {error}"))?;
+                .map_err(|error| anyhow::anyhow!("Text input RPC failed: {error}"))?;
         }
         EngineCommand::Editor(EditorCommand::SetLines { lines, cursor_line }) => {
             replace_buffer_lines(nvim, buffer, lines, cursor_line, "reconcile").await?;
@@ -637,25 +637,25 @@ async fn handle_command(
             set_cursor_line(nvim, buffer, line).await?;
         }
         EngineCommand::Editor(EditorCommand::SetModifiable(value)) => {
-            set_buffer_modifiable(nvim, buffer, value, "保存フロー").await?;
+            set_buffer_modifiable(nvim, buffer, value, "save flow").await?;
         }
         EngineCommand::Editor(EditorCommand::RequestCommit) => {
             nvim.command("write")
                 .await
-                .map_err(|error| anyhow::anyhow!("保存要求RPCに失敗しました: {error}"))?;
+                .map_err(|error| anyhow::anyhow!("Save request RPC failed: {error}"))?;
         }
         EngineCommand::Editor(EditorCommand::Undo) => {
             nvim.input("u")
                 .await
-                .map_err(|error| anyhow::anyhow!("undo RPCに失敗しました: {error}"))?;
+                .map_err(|error| anyhow::anyhow!("Undo RPC failed: {error}"))?;
         }
         EngineCommand::Editor(EditorCommand::Redo) => {
             nvim.input("<C-r>")
                 .await
-                .map_err(|error| anyhow::anyhow!("redo RPCに失敗しました: {error}"))?;
+                .map_err(|error| anyhow::anyhow!("Redo RPC failed: {error}"))?;
         }
         EngineCommand::SetInitialLines(editor_lines) => {
-            replace_buffer_lines(nvim, buffer, editor_lines, None, "初期化").await?;
+            replace_buffer_lines(nvim, buffer, editor_lines, None, "initialization").await?;
         }
     }
 
@@ -668,27 +668,27 @@ async fn set_cursor_line(
     buffer: &Buffer<NvimWriter>,
     requested_line: usize,
 ) -> anyhow::Result<()> {
-    let line_count = buffer
-        .line_count()
-        .await
-        .map_err(|error| anyhow::anyhow!("カーソル移動対象の行数を取得できません: {error}"))?;
+    let line_count = buffer.line_count().await.map_err(|error| {
+        anyhow::anyhow!("Failed to get line count for cursor movement: {error}")
+    })?;
     let target_line = clamp_cursor_line(requested_line, line_count);
     let line = buffer
         .get_lines(target_line, target_line + 1, false)
         .await
-        .map_err(|error| anyhow::anyhow!("カーソル移動対象の行を取得できません: {error}"))?
+        .map_err(|error| anyhow::anyhow!("Failed to get line for cursor movement: {error}"))?
         .into_iter()
         .next()
         .unwrap_or_default();
     let target_column =
         i64::try_from(fyler_core::grammar::id_prefix_len(&line)).unwrap_or(i64::MAX);
-    let window = nvim.get_current_win().await.map_err(|error| {
-        anyhow::anyhow!("カーソル移動対象のウィンドウを取得できません: {error}")
-    })?;
+    let window = nvim
+        .get_current_win()
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to get window for cursor movement: {error}"))?;
     window
         .set_cursor((target_line + 1, target_column))
         .await
-        .map_err(|error| anyhow::anyhow!("カーソルを設定できません: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("Failed to set cursor: {error}"))?;
     Ok(())
 }
 
@@ -730,22 +730,22 @@ async fn replace_buffer_lines(
     buffer
         .set_lines(0, -1, false, new_lines)
         .await
-        .map_err(|error| anyhow::anyhow!("{purpose}のバッファ行を設定できません: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("Failed to set buffer lines for {purpose}: {error}"))?;
     buffer
         .set_option("modified", Value::Boolean(false))
         .await
-        .map_err(|error| anyhow::anyhow!("{purpose}後にバッファをcleanにできません: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("Failed to mark buffer clean after {purpose}: {error}"))?;
 
     // 折りたたみトグル等では操作した行へカーソルを戻す。行数を超える指定は
     // 最終行へクランプする(nvimのset_cursorは範囲外でエラーになるため)。
     let window = nvim
         .get_current_win()
         .await
-        .map_err(|error| anyhow::anyhow!("{purpose}対象のウィンドウを取得できません: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("Failed to get target window for {purpose}: {error}"))?;
     window
         .set_cursor((target_line as i64 + 1, target_column as i64))
         .await
-        .map_err(|error| anyhow::anyhow!("{purpose}後のカーソルを設定できません: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("Failed to set cursor after {purpose}: {error}"))?;
 
     Ok(())
 }
@@ -763,7 +763,9 @@ async fn set_buffer_modifiable(
         vec![(Value::from("buf"), buffer.get_value().clone())],
     )
     .await
-    .map_err(|error| anyhow::anyhow!("{purpose}のバッファmodifiable設定を変更できません: {error}"))
+    .map_err(|error| {
+        anyhow::anyhow!("Failed to change buffer modifiable setting for {purpose}: {error}")
+    })
 }
 
 #[derive(Debug)]
@@ -816,53 +818,53 @@ async fn query_status(nvim: &Nvim) -> anyhow::Result<Status> {
     let response = nvim
         .call_atomic(calls)
         .await
-        .map_err(|error| anyhow::anyhow!("nvim_call_atomicに失敗しました: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("nvim_call_atomic failed: {error}"))?;
 
     let results = response
         .first()
         .and_then(Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("nvim_call_atomicのresults形式が不正です"))?;
+        .ok_or_else(|| anyhow::anyhow!("Invalid results format from nvim_call_atomic"))?;
     if let Some(error) = response.get(1).filter(|value| !value.is_nil()) {
-        anyhow::bail!("nvim_call_atomic内の呼び出しに失敗しました: {error:?}");
+        anyhow::bail!("A call inside nvim_call_atomic failed: {error:?}");
     }
     if results.len() != 6 {
         anyhow::bail!(
-            "nvim_call_atomicのresults件数が不正です: expected 6, got {}",
+            "Invalid result count from nvim_call_atomic: expected 6, got {}",
             results.len()
         );
     }
 
     let mode_name = map_string(&results[0], "mode")
-        .ok_or_else(|| anyhow::anyhow!("mode結果の形式が不正です"))?;
+        .ok_or_else(|| anyhow::anyhow!("Invalid mode result format"))?;
     let cursor_values = results[1]
         .as_array()
-        .ok_or_else(|| anyhow::anyhow!("cursor結果の形式が不正です"))?;
+        .ok_or_else(|| anyhow::anyhow!("Invalid cursor result format"))?;
     let row = cursor_values
         .first()
         .and_then(value_as_u64)
-        .ok_or_else(|| anyhow::anyhow!("cursor rowの形式が不正です"))?;
+        .ok_or_else(|| anyhow::anyhow!("Invalid cursor row format"))?;
     let col = cursor_values
         .get(1)
         .and_then(value_as_u64)
-        .ok_or_else(|| anyhow::anyhow!("cursor colの形式が不正です"))?;
+        .ok_or_else(|| anyhow::anyhow!("Invalid cursor column format"))?;
     let changedtick = value_as_u64(&results[2])
-        .ok_or_else(|| anyhow::anyhow!("changedtick結果の形式が不正です"))?;
+        .ok_or_else(|| anyhow::anyhow!("Invalid changedtick result format"))?;
     let dirty = results[3]
         .as_bool()
-        .ok_or_else(|| anyhow::anyhow!("modified結果の形式が不正です"))?;
+        .ok_or_else(|| anyhow::anyhow!("Invalid modified result format"))?;
     let mode = normalize_mode(mode_name);
     let visual_start = if matches!(&mode, Mode::Visual | Mode::VisualLine | Mode::VisualBlock) {
         let position = results[4]
             .as_array()
-            .ok_or_else(|| anyhow::anyhow!("visual start結果の形式が不正です"))?;
+            .ok_or_else(|| anyhow::anyhow!("Invalid visual start result format"))?;
         let line = position
             .get(1)
             .and_then(value_as_u64)
-            .ok_or_else(|| anyhow::anyhow!("visual start lineの形式が不正です"))?;
+            .ok_or_else(|| anyhow::anyhow!("Invalid visual start line format"))?;
         let col = position
             .get(2)
             .and_then(value_as_u64)
-            .ok_or_else(|| anyhow::anyhow!("visual start colの形式が不正です"))?;
+            .ok_or_else(|| anyhow::anyhow!("Invalid visual start column format"))?;
         Some(Cursor {
             line: line.saturating_sub(1) as usize,
             col: col.saturating_sub(1) as usize,
@@ -873,7 +875,7 @@ async fn query_status(nvim: &Nvim) -> anyhow::Result<Status> {
 
     let search_values = results[5]
         .as_array()
-        .ok_or_else(|| anyhow::anyhow!("検索状態結果の形式が不正です"))?;
+        .ok_or_else(|| anyhow::anyhow!("Invalid search state result format"))?;
     let search = SearchRaw {
         register: search_values
             .first()
@@ -1015,14 +1017,14 @@ async fn input_is_blocking(nvim: &Nvim) -> anyhow::Result<bool> {
     let mode = nvim
         .get_mode()
         .await
-        .map_err(|error| anyhow::anyhow!("入力待ち状態を取得できません: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("Failed to get pending input state: {error}"))?;
     mode.iter()
         .find_map(|(key, value)| {
             (key.as_str() == Some("blocking"))
                 .then(|| value.as_bool())
                 .flatten()
         })
-        .ok_or_else(|| anyhow::anyhow!("入力待ち状態の形式が不正です"))
+        .ok_or_else(|| anyhow::anyhow!("Invalid pending input state format"))
 }
 
 fn apply_lines_notification(args: &[Value], lines: &mut Vec<EditorLine>) -> bool {
@@ -1432,7 +1434,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "50k行の環境依存性能計測"]
+    #[ignore = "environment-dependent performance measurement with 50k lines"]
     fn bench_single_line_edit_snapshot_rebuild_on_50k_lines() {
         let mut lines = (1..=50_000)
             .map(|index| EditorLine::new(format!("/{index:05} name_{index:05}.txt")))

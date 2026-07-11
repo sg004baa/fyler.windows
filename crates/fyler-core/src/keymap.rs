@@ -134,32 +134,32 @@ impl EditorAction {
     /// ヘルプ表示向けの日本語説明を返す。
     pub fn description(&self) -> &'static str {
         match self {
-            Self::Activate => "ディレクトリ開閉 / ファイルを開く",
-            Self::NavigateParent => "親ディレクトリへ移動",
-            Self::NavigateInto => "ディレクトリ内へ移動",
-            Self::ToggleHidden => "隠しファイル表示を切り替え",
-            Self::FoldClose => "ディレクトリを折りたたむ",
-            Self::FoldOpen => "ディレクトリを展開",
-            Self::FoldToggle => "折りたたみ状態を切り替え",
-            Self::FoldCloseRecursive => "配下を再帰的に折りたたむ",
-            Self::FoldOpenRecursive => "配下を再帰的に展開",
-            Self::FoldCloseAll => "すべて折りたたむ",
-            Self::FoldOpenAll => "すべて展開",
-            Self::FilePicker => "ファイルを検索",
-            Self::YankPath => "パスをコピー",
-            Self::OpenWith => "アプリを選んで開く",
-            Self::TransferMove => "別ペインへ移動",
-            Self::TransferCopy => "別ペインへコピー",
-            Self::Help => "ヘルプを表示",
-            Self::PaneSplitHorizontal => "ペインを上下分割",
-            Self::PaneSplitVertical => "ペインを左右分割",
-            Self::PaneFocusLeft => "左ペインへ移動",
-            Self::PaneFocusDown => "下ペインへ移動",
-            Self::PaneFocusUp => "上ペインへ移動",
-            Self::PaneFocusRight => "右ペインへ移動",
-            Self::PaneFocusNext => "次のペインへ移動",
-            Self::PaneFocusPrevious => "前のペインへ移動",
-            Self::PaneClose => "ペインを閉じる",
+            Self::Activate => "Toggle directory / Open file",
+            Self::NavigateParent => "Go to parent directory",
+            Self::NavigateInto => "Enter directory",
+            Self::ToggleHidden => "Toggle hidden files",
+            Self::FoldClose => "Collapse directory",
+            Self::FoldOpen => "Expand directory",
+            Self::FoldToggle => "Toggle directory fold",
+            Self::FoldCloseRecursive => "Collapse recursively",
+            Self::FoldOpenRecursive => "Expand recursively",
+            Self::FoldCloseAll => "Collapse all",
+            Self::FoldOpenAll => "Expand all",
+            Self::FilePicker => "Find file",
+            Self::YankPath => "Copy path",
+            Self::OpenWith => "Open with application",
+            Self::TransferMove => "Move to another pane",
+            Self::TransferCopy => "Copy to another pane",
+            Self::Help => "Show help",
+            Self::PaneSplitHorizontal => "Split pane horizontally",
+            Self::PaneSplitVertical => "Split pane vertically",
+            Self::PaneFocusLeft => "Focus left pane",
+            Self::PaneFocusDown => "Focus pane below",
+            Self::PaneFocusUp => "Focus pane above",
+            Self::PaneFocusRight => "Focus right pane",
+            Self::PaneFocusNext => "Focus next pane",
+            Self::PaneFocusPrevious => "Focus previous pane",
+            Self::PaneClose => "Close pane",
         }
     }
 }
@@ -176,23 +176,25 @@ pub struct KeyBinding {
 /// key表記を解釈できない理由。設定警告へそのまま埋め込める日本語を返す。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum KeymapError {
-    #[error("キーシーケンスが空です")]
+    #[error("Key sequence is empty")]
     Empty,
-    #[error("未知の修飾キーです: {0}")]
+    #[error("Unknown modifier: {0}")]
     UnknownModifier(String),
-    #[error("未知のキー名です: {0}")]
+    #[error("Unknown key name: {0}")]
     UnknownKey(String),
-    #[error("印字可能文字にShiftは指定できません。大文字を直接記述してください: {0}")]
+    #[error(
+        "Shift cannot be used with a printable character; write the uppercase character directly: {0}"
+    )]
     ShiftCharacter(String),
-    #[error("Leaderが設定されていません")]
+    #[error("Leader is not configured")]
     LeaderUnset,
-    #[error("Leaderに修飾キーは指定できません")]
+    #[error("Leader cannot have modifiers")]
     ModifiedLeader,
-    #[error("leaderは単一キーで指定してください")]
+    #[error("leader must be a single key")]
     LeaderSequence,
-    #[error("leader自身に修飾キーは指定できません")]
+    #[error("leader cannot have modifiers")]
     LeaderModified,
-    #[error("leaderにLeaderは指定できません")]
+    #[error("leader cannot be Leader")]
     RecursiveLeader,
 }
 
@@ -375,7 +377,7 @@ pub fn default_bindings() -> Vec<KeyBinding> {
     entries
         .into_iter()
         .map(|(sequence, action)| KeyBinding {
-            sequence: parse_key_sequence(sequence, None).expect("組み込みkeymapは妥当"),
+            sequence: parse_key_sequence(sequence, None).expect("built-in keymap must be valid"),
             action,
         })
         .collect()
@@ -393,13 +395,13 @@ pub fn resolve_bindings(
         let sequence = match parse_key_sequence(source, leader) {
             Ok(sequence) => sequence,
             Err(error) => {
-                warnings.push(format!("キー{source:?}を無視します: {error}"));
+                warnings.push(format!("Ignoring key {source:?}: {error}"));
                 continue;
             }
         };
         if seen.contains(&sequence) {
             warnings.push(format!(
-                "キーシーケンス{sequence}が重複しています。後の指定を使います"
+                "Duplicate key sequence {sequence}; using the later binding"
             ));
         }
         seen.push(sequence.clone());
@@ -407,16 +409,16 @@ pub fn resolve_bindings(
             let before = bindings.len();
             bindings.retain(|binding| binding.sequence != sequence);
             if bindings.len() == before {
-                warnings.push(format!("未割り当てのシーケンス{sequence}は解除できません"));
+                warnings.push(format!("Cannot unmap unassigned sequence {sequence}"));
             }
             continue;
         }
         let Some(action) = EditorAction::from_config_name(action_name) else {
-            warnings.push(format!("未知のaction名を無視します: {action_name}"));
+            warnings.push(format!("Ignoring unknown action name: {action_name}"));
             continue;
         };
         if is_ctrl_w_only(&sequence) {
-            warnings.push("単独のCtrl+Wにはバインドできません".to_owned());
+            warnings.push("Ctrl+W cannot be bound by itself".to_owned());
             continue;
         }
         let remaining = bindings
@@ -430,7 +432,7 @@ pub fn resolve_bindings(
             })
         {
             warnings.push(format!(
-                "Ctrl+Wシーケンス{sequence}は既存シーケンスとプレフィックス衝突するため無視します"
+                "Ignoring Ctrl+W sequence {sequence} because it has a prefix conflict with an existing sequence"
             ));
             continue;
         }
@@ -578,18 +580,14 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("未知のaction"))
+                .any(|warning| warning.contains("unknown action"))
         );
-        assert!(warnings.iter().any(|warning| warning.contains("重複")));
+        assert!(warnings.iter().any(|warning| warning.contains("Duplicate")));
+        assert!(warnings.iter().any(|warning| warning.contains("by itself")));
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("単独のCtrl+W"))
-        );
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains("プレフィックス衝突"))
+                .any(|warning| warning.contains("prefix conflict"))
         );
     }
 

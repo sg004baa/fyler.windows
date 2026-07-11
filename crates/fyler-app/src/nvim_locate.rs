@@ -23,28 +23,30 @@ pub(super) fn resolve_from(override_exe: Option<PathBuf>, exe_dir: Option<&Path>
     if let Some(path) = override_exe {
         return ResolvedNvim {
             diagnostics: vec![
-                format!("FYLER_NVIM_EXE: 使用 ({})", path.display()),
+                format!("FYLER_NVIM_EXE: using ({})", path.display()),
                 bundled_status(bundled.as_deref(), false),
-                "PATH上のnvim: 探索しません".to_owned(),
+                "nvim on PATH: not searched".to_owned(),
             ],
             path,
         };
     }
 
-    let mut diagnostics = vec!["FYLER_NVIM_EXE: 未設定".to_owned()];
+    let mut diagnostics = vec!["FYLER_NVIM_EXE: not set".to_owned()];
     if let Some(path) = bundled {
         if path.is_file() {
-            diagnostics.push(format!("同梱版 {}: 使用", path.display()));
-            diagnostics.push("PATH上のnvim: 探索しません".to_owned());
+            diagnostics.push(format!("Bundled version {}: using", path.display()));
+            diagnostics.push("nvim on PATH: not searched".to_owned());
             return ResolvedNvim { path, diagnostics };
         }
-        diagnostics.push(format!("同梱版 {}: 見つかりません", path.display()));
+        diagnostics.push(format!("Bundled version {}: not found", path.display()));
     } else {
-        diagnostics
-            .push("同梱版: fyler実行ファイルの場所を取得できないため探索できません".to_owned());
+        diagnostics.push(
+            "Bundled version: not searched because the fyler executable location is unavailable"
+                .to_owned(),
+        );
     }
 
-    diagnostics.push("PATH上のnvim: 使用".to_owned());
+    diagnostics.push("nvim on PATH: using".to_owned());
     ResolvedNvim {
         path: PathBuf::from("nvim"),
         diagnostics,
@@ -53,10 +55,15 @@ pub(super) fn resolve_from(override_exe: Option<PathBuf>, exe_dir: Option<&Path>
 
 fn bundled_status(path: Option<&Path>, checked: bool) -> String {
     match (path, checked) {
-        (Some(path), true) if path.is_file() => format!("同梱版 {}: 使用", path.display()),
-        (Some(path), true) => format!("同梱版 {}: 見つかりません", path.display()),
-        (Some(path), false) => format!("同梱版 {}: 探索しません", path.display()),
-        (None, _) => "同梱版: fyler実行ファイルの場所を取得できないため探索できません".to_owned(),
+        (Some(path), true) if path.is_file() => {
+            format!("Bundled version {}: using", path.display())
+        }
+        (Some(path), true) => format!("Bundled version {}: not found", path.display()),
+        (Some(path), false) => format!("Bundled version {}: not searched", path.display()),
+        (None, _) => {
+            "Bundled version: not searched because the fyler executable location is unavailable"
+                .to_owned()
+        }
     }
 }
 
@@ -93,7 +100,7 @@ mod tests {
             resolved
                 .diagnostics
                 .iter()
-                .any(|line| line.contains("FYLER_NVIM_EXE") && line.contains("使用"))
+                .any(|line| line.contains("FYLER_NVIM_EXE") && line.contains("using"))
         );
     }
 
@@ -134,10 +141,10 @@ mod tests {
         let diagnostics = resolved.diagnostics.join("\n");
 
         assert!(diagnostics.contains("FYLER_NVIM_EXE"));
-        assert!(diagnostics.contains("同梱版"));
-        assert!(diagnostics.contains("PATH上のnvim"));
-        assert!(diagnostics.contains("未設定"));
-        assert!(diagnostics.contains("見つかりません"));
-        assert!(diagnostics.contains("使用"));
+        assert!(diagnostics.contains("Bundled version"));
+        assert!(diagnostics.contains("nvim on PATH"));
+        assert!(diagnostics.contains("not set"));
+        assert!(diagnostics.contains("not found"));
+        assert!(diagnostics.contains("using"));
     }
 }

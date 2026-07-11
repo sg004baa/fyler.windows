@@ -308,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "50k候補の環境依存性能計測"]
+    #[ignore = "environment-dependent performance measurement with 50k candidates"]
     fn search_fifty_thousand_candidates_within_a_relaxed_limit() {
         let candidates = (0..50_000)
             .map(|index| candidate(index + 1, &format!("src/item_{index:05}.txt")))

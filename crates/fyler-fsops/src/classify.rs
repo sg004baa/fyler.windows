@@ -58,7 +58,7 @@ fn same_volume(from: &Path, to: &Path) -> anyhow::Result<bool> {
     let from_device = fs::metadata(crate::long_path::to_fs(&from_parent))
         .with_context(|| {
             format!(
-                "移動元の親ディレクトリのmetadataを取得できません: {}",
+                "Failed to get metadata for source parent directory: {}",
                 from_parent.display()
             )
         })?
@@ -66,7 +66,7 @@ fn same_volume(from: &Path, to: &Path) -> anyhow::Result<bool> {
     let to_device = fs::metadata(crate::long_path::to_fs(&to_parent))
         .with_context(|| {
             format!(
-                "移動先の親ディレクトリのmetadataを取得できません: {}",
+                "Failed to get metadata for destination parent directory: {}",
                 to_parent.display()
             )
         })?
@@ -95,7 +95,7 @@ fn nearest_existing_directory(start: &Path) -> anyhow::Result<PathBuf> {
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!(
-                        "ボリューム判定用のディレクトリを確認できません: {}",
+                        "Failed to inspect directory for volume classification: {}",
                         candidate.display()
                     )
                 });
@@ -104,7 +104,7 @@ fn nearest_existing_directory(start: &Path) -> anyhow::Result<PathBuf> {
     }
 
     bail!(
-        "ボリューム判定に使える既存の祖先ディレクトリがありません: {}",
+        "No existing ancestor directory is available for volume classification: {}",
         start.display()
     )
 }
@@ -123,7 +123,7 @@ fn nearest_existing_path(start: &Path) -> anyhow::Result<PathBuf> {
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!(
-                        "ボリューム判定用のパスを確認できません: {}",
+                        "Failed to inspect path for volume classification: {}",
                         candidate.display()
                     )
                 });
@@ -132,7 +132,7 @@ fn nearest_existing_path(start: &Path) -> anyhow::Result<PathBuf> {
     }
 
     bail!(
-        "ボリューム判定に使える既存の移動元パスがありません: {}",
+        "No existing source path is available for volume classification: {}",
         start.display()
     )
 }
@@ -149,12 +149,7 @@ fn volume_mount_point(path: &Path) -> anyhow::Result<PathBuf> {
     let path_wide: Vec<u16> = fs_path.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut volume_wide = vec![0_u16; 32_768];
     unsafe { GetVolumePathNameW(PCWSTR::from_raw(path_wide.as_ptr()), &mut volume_wide) }
-        .with_context(|| {
-            format!(
-                "ボリュームのマウントポイントを取得できません: {}",
-                path.display()
-            )
-        })?;
+        .with_context(|| format!("Failed to get volume mount point: {}", path.display()))?;
 
     let length = volume_wide
         .iter()
