@@ -763,6 +763,71 @@ async fn sort_command_completion_emits_popupmenu() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn sort_alias_with_argument_reaches_fyler_sort() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.send(key_command(Key::Char(':')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::CmdlineShow(_))
+    })
+    .await
+    .context(": did not open the command line")?;
+    engine.send(EditorCommand::Text("sort date".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            EditorEvent::ChangeSort {
+                query: Some(query)
+            } if query == "date"
+        )
+    })
+    .await
+    .context(":sort date did not emit ChangeSort(\"date\")")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn sort_alias_tab_completes_and_executes() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.send(key_command(Key::Char(':')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::CmdlineShow(_))
+    })
+    .await
+    .context(": did not open the command line")?;
+    engine.send(EditorCommand::Text("sort da".to_owned()))?;
+    engine.send(key_command(Key::Tab))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            EditorEvent::ChangeSort {
+                query: Some(query)
+            } if query == "date"
+        )
+    })
+    .await
+    .context(":sort da<Tab><CR> did not emit ChangeSort(\"date\")")?;
+
+    Ok(())
+}
+
 async fn wait_for_lines(
     engine: &NvimEngine,
     predicate: impl Fn(&[EditorLine]) -> bool,

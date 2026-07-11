@@ -375,12 +375,16 @@ fn format_drive_paths(drives: &[PathBuf]) -> String {
         .join(" ")
 }
 
+/// 先頭/末尾の`!`をreverse指定として解釈し、sortキー名を正規化する。
 fn parse_sort_query(query: &str) -> Result<(SortKey, bool), String> {
     let query = query.trim();
-    let (query, reverse) = match query.strip_suffix('!') {
+    let leading_bang = query.starts_with('!');
+    let query = query.strip_prefix('!').unwrap_or(query).trim_start();
+    let (query, trailing_bang) = match query.strip_suffix('!') {
         Some(query) => (query.trim_end(), true),
         None => (query, false),
     };
+    let reverse = leading_bang || trailing_bang;
     let key = match query {
         "name" => SortKey::Name,
         "date" => SortKey::Date,
@@ -1181,6 +1185,8 @@ mod tests {
     fn parse_sort_query_accepts_keys_and_bang_reverse() {
         assert_eq!(parse_sort_query("name"), Ok((SortKey::Name, false)));
         assert_eq!(parse_sort_query("date!"), Ok((SortKey::Date, true)));
+        assert_eq!(parse_sort_query("!date"), Ok((SortKey::Date, true)));
+        assert_eq!(parse_sort_query("!date!"), Ok((SortKey::Date, true)));
         assert_eq!(parse_sort_query(" size! "), Ok((SortKey::Size, true)));
         assert_eq!(parse_sort_query("ext"), Ok((SortKey::Extension, false)));
     }

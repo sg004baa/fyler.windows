@@ -218,7 +218,6 @@ end, { buffer = buffer, silent = true, nowait = true })
 vim.api.nvim_buf_create_user_command(buffer, "FylerBookmark", function(opts)
   vim.rpcnotify(channel, "fyler_bookmark", opts.args)
 end, { nargs = "?" })
-vim.cmd([[cnoreabbrev <buffer> <expr> b (getcmdtype() == ':' && getcmdline() ==# 'b') ? 'FylerBookmark' : 'b']])
 
 vim.api.nvim_buf_create_user_command(buffer, "FylerUndo", function()
   vim.rpcnotify(channel, "fyler_undo")
@@ -227,7 +226,6 @@ end, {})
 vim.api.nvim_buf_create_user_command(buffer, "FylerCd", function(opts)
   vim.rpcnotify(channel, "fyler_cd", opts.args)
 end, { nargs = "?", complete = "dir" })
-vim.cmd([[cnoreabbrev <buffer> <expr> cd (getcmdtype() == ':' && getcmdline() ==# 'cd') ? 'FylerCd' : 'cd']])
 
 local sort_keys = { "name", "date", "size", "ext" }
 vim.api.nvim_buf_create_user_command(buffer, "FylerSort", function(opts)
@@ -243,7 +241,28 @@ end, {
     end, sort_keys)
   end,
 })
-vim.cmd([[cnoreabbrev <buffer> <expr> sort (getcmdtype() == ':' && getcmdline() ==# 'sort') ? 'FylerSort' : 'sort']])
+
+vim.o.wildcharm = 26
+local command_aliases = { b = "FylerBookmark", cd = "FylerCd", sort = "FylerSort" }
+-- nvim_paste経由ではcnoreabbrevが展開されないため、実行/補完直前に先頭語を正式コマンドへ書き換える。
+local function rewrite_command_alias()
+  if vim.fn.getcmdtype() ~= ":" then return end
+  local line = vim.fn.getcmdline()
+  local head, bang, rest = line:match("^(%a+)(!?)(.*)$")
+  local target = head and command_aliases[head]
+  if target and (rest == "" or rest:match("^%s")) then
+    local pos = vim.fn.getcmdpos()
+    vim.fn.setcmdline(target .. bang .. rest, pos + #target - #head)
+  end
+end
+vim.keymap.set("c", "<Tab>", function()
+  rewrite_command_alias()
+  return "<C-Z>"
+end, { buffer = buffer, expr = true })
+vim.keymap.set("c", "<CR>", function()
+  rewrite_command_alias()
+  return "<CR>"
+end, { buffer = buffer, expr = true })
 
 for _, lhs in ipairs({ "gf", "gF", "<C-]>" }) do
   vim.keymap.set({ "n", "x" }, lhs, function()
