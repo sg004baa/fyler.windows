@@ -389,6 +389,8 @@ pub enum EditorEvent {
         changedtick: u64,
         lines: Arc<[EditorLine]>,
     },
+    /// `:FylerUndo` — 直近のapply transactionのundo要求。バッファundoの`u`とは無関係。
+    UndoRequested,
     /// cmdline表示の更新(`:` / `/` 入力中の内容)。GUIが自前描画する。
     CmdlineShow(CmdlineState),
     CmdlineHide,

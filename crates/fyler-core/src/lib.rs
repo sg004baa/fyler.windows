@@ -18,6 +18,7 @@ pub mod id;
 pub mod options;
 pub mod pane;
 pub mod search;
+pub mod undo;
 
 pub mod path;
 pub mod plan;
@@ -37,4 +38,5 @@ pub use plan::{FsOperation, OperationPlan};
 pub use report::{CommitReport, OpOutcome, OpResult};
 pub use transfer::{TransferKind, TransferOp, TransferPlan};
 pub use tree::{BaselineEntry, BaselineTree, DesiredEntry, DesiredTree, EditContext, EntryKind};
+pub use undo::{UndoStep, UndoTransaction};
 pub use validate::ValidateError;

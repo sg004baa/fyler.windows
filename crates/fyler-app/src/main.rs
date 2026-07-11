@@ -10,6 +10,8 @@ mod config;
 mod pane_runtime;
 pub mod save_flow;
 mod transfer_flow;
+mod undo_format;
+mod undo_journal;
 
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
@@ -25,6 +27,7 @@ use fyler_core::pane::PaneId;
 use fyler_core::report::{ApplyProgress, CommitReport};
 use fyler_core::transfer::TransferOp;
 use fyler_core::tree::EntryKind;
+use fyler_core::undo::{UndoStep, UndoTransaction};
 use fyler_fsops::watch::{ExternalChange, FsWatcher};
 use fyler_gui::app::{GuiEvent, PickerAction};
 use fyler_gui::confirm::ConfirmChoice;
@@ -46,10 +49,17 @@ enum AppEvent {
         statuses: HashMap<PathBuf, GitBadge>,
     },
     ApplyProgress(PaneId, ApplyProgress),
-    ApplyFinished(PaneId, CommitReport),
+    ApplyFinished(PaneId, CommitReport, Option<UndoTransaction>),
+    UndoProgress(PaneId, ApplyProgress<UndoStep>),
+    UndoFinished(PaneId, CommitReport<UndoStep>),
     TransferProgress(ApplyProgress<TransferOp>),
     TransferFinished(CommitReport<TransferOp>),
     Shutdown,
+}
+
+struct ExternalChangeOutcome {
+    invalidated_dialog: bool,
+    undo_transaction: Option<UndoTransaction>,
 }
 
 /// git statusサブプロセスをappイベントスレッド外で実行し、結果をAppEventで返す。
@@ -165,15 +175,25 @@ fn handle_external_change(
     gui_event_tx: &mpsc::Sender<GuiEvent>,
     git: &mut GitRefresher,
     root: &Path,
-) -> Result<bool, mpsc::SendError<GuiEvent>> {
+) -> Result<ExternalChangeOutcome, mpsc::SendError<GuiEvent>> {
     let result = save_controller.on_external_change(changed_paths);
-    let invalidated_dialog = matches!(&result, SaveFlowResult::PlanInvalidated(_));
+    let invalidated_dialog = matches!(
+        &result,
+        SaveFlowResult::PlanInvalidated(_) | SaveFlowResult::UndoInvalidated { .. }
+    );
+    let undo_transaction = match &result {
+        SaveFlowResult::UndoInvalidated { transaction, .. } => Some(transaction.clone()),
+        _ => None,
+    };
     if !matches!(&result, SaveFlowResult::NoChanges) {
         send_save_result(gui_event_tx, pane_id, result)?;
     }
     send_view_state(gui_event_tx, pane_id, save_controller)?;
     git.request(pane_id, root.to_path_buf());
-    Ok(invalidated_dialog)
+    Ok(ExternalChangeOutcome {
+        invalidated_dialog,
+        undo_transaction,
+    })
 }
 
 #[allow(clippy::too_many_arguments)] // ルート差し替えの全状態とカーソル復元対象を明示する。
@@ -821,6 +841,24 @@ fn send_save_result(
             gui_event_tx.send(GuiEvent::ShowValidationErrors(errors))
         }
         SaveFlowResult::ShowReport(report) => gui_event_tx.send(GuiEvent::ShowReport(report)),
+        SaveFlowResult::ShowUndoPlan {
+            transaction,
+            statuses,
+        } => gui_event_tx.send(GuiEvent::ShowUndoPlan {
+            lines: undo_format::undo_plan_lines(&transaction, &statuses),
+        }),
+        SaveFlowResult::UndoNothingLeft { reasons } => {
+            let message = if reasons.is_empty() {
+                "undoできる操作がありません".to_owned()
+            } else {
+                format!("undoできる操作がありません: {}", reasons.join(" / "))
+            };
+            send_gui_message(gui_event_tx, pane_id, MessageKind::Info, message)
+        }
+        SaveFlowResult::ShowUndoReport(report) => {
+            let (lines, any_failed) = undo_format::undo_report_lines(&report);
+            gui_event_tx.send(GuiEvent::ShowUndoReport { lines, any_failed })
+        }
         SaveFlowResult::ReconcileFailed { report, error } => {
             gui_event_tx.send(GuiEvent::ShowReport(report))?;
             gui_event_tx.send(GuiEvent::FatalError(format!(
@@ -838,14 +876,26 @@ fn send_save_result(
             gui_event_tx.send(GuiEvent::CloseDialog)?;
             send_gui_message(gui_event_tx, pane_id, MessageKind::Warn, text)
         }
+        SaveFlowResult::UndoInvalidated { message, .. } => {
+            gui_event_tx.send(GuiEvent::CloseDialog)?;
+            send_gui_message(gui_event_tx, pane_id, MessageKind::Warn, message)
+        }
         SaveFlowResult::NoChanges => {
             send_gui_message(gui_event_tx, pane_id, MessageKind::Info, "変更はありません")
         }
         SaveFlowResult::Cancelled => gui_event_tx.send(GuiEvent::CloseDialog),
+        SaveFlowResult::UndoCancelled { .. } => gui_event_tx.send(GuiEvent::CloseDialog),
         SaveFlowResult::StartApply { .. } => {
             debug_assert!(
                 false,
                 "StartApplyはConfirm armで処理済みである必要があります"
+            );
+            Ok(())
+        }
+        SaveFlowResult::StartUndo { .. } => {
+            debug_assert!(
+                false,
+                "StartUndoはConfirm armで処理済みである必要があります"
             );
             Ok(())
         }

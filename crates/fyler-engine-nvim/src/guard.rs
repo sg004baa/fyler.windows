@@ -151,6 +151,10 @@ vim.api.nvim_buf_create_user_command(buffer, "FylerBookmark", function(opts)
 end, { nargs = "?" })
 vim.cmd([[cnoreabbrev <buffer> <expr> b (getcmdtype() == ':' && getcmdline() ==# 'b') ? 'FylerBookmark' : 'b']])
 
+vim.api.nvim_buf_create_user_command(buffer, "FylerUndo", function()
+  vim.rpcnotify(channel, "fyler_undo")
+end, {})
+
 vim.api.nvim_buf_create_user_command(buffer, "FylerCd", function(opts)
   vim.rpcnotify(channel, "fyler_cd", opts.args)
 end, { nargs = "?", complete = "dir" })

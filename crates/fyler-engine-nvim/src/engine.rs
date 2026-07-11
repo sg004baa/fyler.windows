@@ -423,6 +423,9 @@ impl NvimEngine {
                                     .map(str::to_owned);
                                 let _ = event_tx.send(EditorEvent::JumpBookmark { query });
                             }
+                            "fyler_undo" => {
+                                let _ = event_tx.send(EditorEvent::UndoRequested);
+                            }
                             "fyler_yank_path" => {
                                 let line = notification.args.first()
                                     .and_then(value_as_u64)

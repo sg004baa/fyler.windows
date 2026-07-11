@@ -165,6 +165,44 @@ pub fn draw_transfer_plan(
         .inner
 }
 
+/// undo確認ダイアログを表示する。行はapp層で整形済み。
+pub fn draw_undo_plan(ui: &mut egui::Ui, lines: &[String]) -> Option<ConfirmChoice> {
+    let key_choice = ui.ctx().input(|input| {
+        plan_choice_from_keys(
+            input.key_pressed(egui::Key::Y),
+            input.key_pressed(egui::Key::N),
+            input.key_pressed(egui::Key::Escape),
+        )
+    });
+
+    egui::Modal::new(egui::Id::new("undo-plan-confirmation"))
+        .show(ui.ctx(), |ui| {
+            ui.heading("Confirm undo");
+            ui.add_space(8.0);
+            for line in lines {
+                if line.trim_start().starts_with("[対象外]") {
+                    ui.colored_label(ui.visuals().warn_fg_color, line);
+                } else {
+                    ui.monospace(line);
+                }
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let approve_clicked = ui.button("Undo (y)").clicked();
+                let cancel_clicked = ui.button("Cancel (n / Esc)").clicked();
+                if approve_clicked || key_choice == Some(ConfirmChoice::Approve) {
+                    Some(ConfirmChoice::Approve)
+                } else if cancel_clicked || key_choice == Some(ConfirmChoice::Cancel) {
+                    Some(ConfirmChoice::Cancel)
+                } else {
+                    None
+                }
+            })
+            .inner
+        })
+        .inner
+}
+
 fn plan_labels(plan: &OperationPlan, detail: ConfirmDetail) -> Vec<String> {
     if detail == ConfirmDetail::Full || plan.ops.len() <= 5 {
         return plan.ops.iter().map(operation_label).collect();
@@ -240,6 +278,33 @@ pub fn draw_report(ui: &mut egui::Ui, report: &CommitReport) -> bool {
         .inner
 }
 
+/// undo結果ダイアログを表示する。行はapp層で整形済み。
+pub fn draw_undo_report(ui: &mut egui::Ui, lines: &[String], any_failed: bool) -> bool {
+    let dismiss_from_keyboard = ui
+        .ctx()
+        .input(|input| input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape));
+
+    egui::Modal::new(egui::Id::new("undo-commit-report"))
+        .show(ui.ctx(), |ui| {
+            ui.heading("Undo result");
+            ui.add_space(8.0);
+            if any_failed {
+                ui.colored_label(ui.visuals().warn_fg_color, "Some undo steps did not run.");
+                ui.add_space(4.0);
+            }
+            for line in lines {
+                if line.starts_with("NG") {
+                    ui.colored_label(ui.visuals().error_fg_color, line);
+                } else {
+                    ui.monospace(line);
+                }
+            }
+            ui.add_space(12.0);
+            ui.button("Close (Enter / Esc)").clicked() || dismiss_from_keyboard
+        })
+        .inner
+}
+
 /// pane間transferのCommitReportを既存reportモーダルで表示する。
 pub fn draw_transfer_report(ui: &mut egui::Ui, report: &CommitReport<TransferOp>) -> bool {
     let dismiss_from_keyboard = ui
@@ -263,6 +328,47 @@ pub fn draw_transfer_report(ui: &mut egui::Ui, report: &CommitReport<TransferOp>
             }
             ui.add_space(12.0);
             ui.button("Close (Enter / Esc)").clicked() || dismiss_from_keyboard
+        })
+        .inner
+}
+
+/// 起動時のundo journal復旧候補を表示する。
+///
+/// `Approve`は候補の破棄、`Cancel`は保持して閉じることを表す。
+pub fn draw_undo_recovery(ui: &mut egui::Ui, descriptions: &[String]) -> Option<ConfirmChoice> {
+    let key_choice = ui.ctx().input(|input| {
+        plan_choice_from_keys(
+            input.key_pressed(egui::Key::Y),
+            input.key_pressed(egui::Key::N),
+            input.key_pressed(egui::Key::Escape),
+        )
+    });
+
+    egui::Modal::new(egui::Id::new("undo-recovery"))
+        .show(ui.ctx(), |ui| {
+            ui.heading("Undo recovery");
+            ui.add_space(8.0);
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "Unfinished undo journal entries were found.",
+            );
+            ui.add_space(4.0);
+            for description in descriptions {
+                ui.monospace(description);
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let discard_clicked = ui.button("Discard (y)").clicked();
+                let keep_clicked = ui.button("Keep and close (n / Esc)").clicked();
+                if discard_clicked || key_choice == Some(ConfirmChoice::Approve) {
+                    Some(ConfirmChoice::Approve)
+                } else if keep_clicked || key_choice == Some(ConfirmChoice::Cancel) {
+                    Some(ConfirmChoice::Cancel)
+                } else {
+                    None
+                }
+            })
+            .inner
         })
         .inner
 }

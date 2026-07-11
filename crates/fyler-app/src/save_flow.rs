@@ -17,6 +17,7 @@ use fyler_core::plan::OperationPlan;
 use fyler_core::report::CommitReport;
 use fyler_core::save::{self, SaveEffect, SaveEvent, SaveState};
 use fyler_core::tree::{BaselineEntry, BaselineTree, EditContext, EntryKind};
+use fyler_core::undo::{UndoStep, UndoStepStatus, UndoTransaction};
 use fyler_core::validate::ValidateError;
 use fyler_fsops::scan::ScanOptions;
 use fyler_gui::confirm::ConfirmChoice;
@@ -43,10 +44,34 @@ pub enum SaveFlowResult {
         /// 操作間キャンセルをworkerへ通知する共有フラグ。
         cancel: Arc<AtomicBool>,
     },
+    /// undo確認対象のtransactionと、step単位のpreflight結果を表示する。
+    ShowUndoPlan {
+        transaction: UndoTransaction,
+        statuses: Vec<UndoStepStatus>,
+    },
+    /// undo preflightの結果、実行可能なstepが残っていない。
+    UndoNothingLeft {
+        reasons: Vec<String>,
+    },
+    /// 承認済みundo transactionをworkerスレッドで実行する。
+    StartUndo {
+        transaction: UndoTransaction,
+        cancel: Arc<AtomicBool>,
+    },
     /// apply実行中のキャンセル要求を受理した。残りの操作は操作間で停止する。
     ApplyCancelRequested,
+    /// undo確認ダイアログをキャンセルした。transactionは呼び出し元がslotへ戻す。
+    UndoCancelled {
+        transaction: UndoTransaction,
+    },
+    /// undo確認ダイアログ表示中に外部変更を検知し、transactionを破棄せず返す。
+    UndoInvalidated {
+        transaction: UndoTransaction,
+        message: String,
+    },
     ShowValidationErrors(Vec<ValidateError>),
     ShowReport(CommitReport),
+    ShowUndoReport(CommitReport<UndoStep>),
     ReconcileFailed {
         report: CommitReport,
         error: String,
@@ -97,6 +122,52 @@ impl PartialEq for SaveFlowResult {
                     && left_overwrites == right_overwrites
                     && Arc::ptr_eq(left_cancel, right_cancel)
             }
+            (
+                Self::ShowUndoPlan {
+                    transaction: left_transaction,
+                    statuses: left_statuses,
+                },
+                Self::ShowUndoPlan {
+                    transaction: right_transaction,
+                    statuses: right_statuses,
+                },
+            ) => left_transaction == right_transaction && left_statuses == right_statuses,
+            (
+                Self::UndoNothingLeft {
+                    reasons: left_reasons,
+                },
+                Self::UndoNothingLeft {
+                    reasons: right_reasons,
+                },
+            ) => left_reasons == right_reasons,
+            (
+                Self::StartUndo {
+                    transaction: left_transaction,
+                    cancel: left_cancel,
+                },
+                Self::StartUndo {
+                    transaction: right_transaction,
+                    cancel: right_cancel,
+                },
+            ) => left_transaction == right_transaction && Arc::ptr_eq(left_cancel, right_cancel),
+            (
+                Self::UndoCancelled {
+                    transaction: left_transaction,
+                },
+                Self::UndoCancelled {
+                    transaction: right_transaction,
+                },
+            ) => left_transaction == right_transaction,
+            (
+                Self::UndoInvalidated {
+                    transaction: left_transaction,
+                    message: left_message,
+                },
+                Self::UndoInvalidated {
+                    transaction: right_transaction,
+                    message: right_message,
+                },
+            ) => left_transaction == right_transaction && left_message == right_message,
             (Self::ApplyCancelRequested, Self::ApplyCancelRequested)
             | (Self::ExternalChanged, Self::ExternalChanged)
             | (Self::NoChanges, Self::NoChanges)
@@ -104,6 +175,7 @@ impl PartialEq for SaveFlowResult {
             | (Self::Ignored, Self::Ignored) => true,
             (Self::ShowValidationErrors(left), Self::ShowValidationErrors(right)) => left == right,
             (Self::ShowReport(left), Self::ShowReport(right)) => left == right,
+            (Self::ShowUndoReport(left), Self::ShowUndoReport(right)) => left == right,
             (
                 Self::ReconcileFailed {
                     report: left_report,
@@ -231,12 +303,26 @@ impl SaveController {
         matches!(self.state, SaveState::Idle)
     }
 
-    /// apply workerの実行中かを返す。
+    /// applyまたはundo workerの実行中かを返す。
     ///
-    /// app層はこの判定を使い、外部変更イベントをapply完了後まで遅延する。
+    /// app層はこの判定を使い、外部変更イベントをworker完了後まで遅延する。
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_applying(&self) -> bool {
-        matches!(self.state, SaveState::Applying { .. })
+        matches!(
+            self.state,
+            SaveState::Applying { .. } | SaveState::ApplyingUndo { .. }
+        )
+    }
+
+    /// 実行中undo transactionのIDを返す。
+    ///
+    /// app層がundo worker完了後にjournalを消費済みへ進めるために使う。状態機械の
+    /// 所有権は移さず、`ApplyingUndo`以外では`None`を返す。
+    pub fn applying_undo_transaction_id(&self) -> Option<&str> {
+        match &self.state {
+            SaveState::ApplyingUndo { transaction } => Some(&transaction.id),
+            _ => None,
+        }
     }
 
     /// バッファの`line`に埋め込まれたIDを現在のbaselineへ解決する。
@@ -526,7 +612,9 @@ impl SaveController {
         let display_plan = plan.clone();
         let warnings = plan_warnings(
             &self.root,
+            &self.baseline,
             &display_plan,
+            &overwrites,
             fyler_fsops::onedrive::is_cloud_placeholder,
         );
         let effects = self.apply_event(SaveEvent::PlanReady { plan });
@@ -544,8 +632,55 @@ impl SaveController {
         }
     }
 
+    /// `:FylerUndo` 起点。Idle以外やdirty状態は呼び出し元でゲートするが、
+    /// 防御としてIdle以外では状態を変更しない。
+    ///
+    /// `preflight_undo`で現在の実FSに対するundo可否を検査し、実行可能なstepが
+    /// 1つも残っていない場合は状態機械へ入らず理由だけを返す。
+    pub fn request_undo(&mut self, transaction: UndoTransaction) -> SaveFlowResult {
+        if !matches!(self.state, SaveState::Idle) {
+            return SaveFlowResult::Ignored;
+        }
+
+        let statuses = fyler_fsops::preflight_undo(&transaction);
+        if !statuses
+            .iter()
+            .any(|status| matches!(status, UndoStepStatus::Ready))
+        {
+            let mut reasons = statuses
+                .into_iter()
+                .filter_map(|status| match status {
+                    UndoStepStatus::Ready => None,
+                    UndoStepStatus::Rejected { reason } => Some(reason),
+                })
+                .collect::<Vec<_>>();
+            if reasons.is_empty() {
+                reasons.push("undo対象の操作がありません".to_owned());
+            }
+            return SaveFlowResult::UndoNothingLeft { reasons };
+        }
+
+        let effects = self.apply_event(SaveEvent::UndoRequested {
+            transaction: transaction.clone(),
+        });
+        if effects
+            .iter()
+            .any(|effect| matches!(effect, SaveEffect::ShowUndoConfirmDialog))
+        {
+            SaveFlowResult::ShowUndoPlan {
+                transaction,
+                statuses,
+            }
+        } else {
+            SaveFlowResult::Ignored
+        }
+    }
+
     pub fn on_choice(&mut self, choice: ConfirmChoice) -> SaveFlowResult {
-        if matches!(self.state, SaveState::Applying { .. }) {
+        if matches!(
+            self.state,
+            SaveState::Applying { .. } | SaveState::ApplyingUndo { .. }
+        ) {
             if matches!(choice, ConfirmChoice::Cancel)
                 && let Some(cancel) = &self.apply_cancel
             {
@@ -553,6 +688,20 @@ impl SaveController {
                 return SaveFlowResult::ApplyCancelRequested;
             }
             return SaveFlowResult::Ignored;
+        }
+
+        if matches!(self.state, SaveState::AwaitingUndoConfirmation { .. }) {
+            return match choice {
+                ConfirmChoice::Cancel => {
+                    let transaction = match &self.state {
+                        SaveState::AwaitingUndoConfirmation { transaction } => transaction.clone(),
+                        _ => return SaveFlowResult::Ignored,
+                    };
+                    self.apply_event(SaveEvent::Cancelled);
+                    SaveFlowResult::UndoCancelled { transaction }
+                }
+                ConfirmChoice::Approve => self.approve_and_undo(),
+            };
         }
 
         if !matches!(self.state, SaveState::AwaitingConfirmation { .. }) {
@@ -607,6 +756,36 @@ impl SaveController {
         result
     }
 
+    /// undo worker完了を状態機械へ反映し、成功があれば実FSから再同期する。
+    ///
+    /// `ApplyingUndo`状態以外で呼ばれた場合は状態を変更せず
+    /// [`SaveFlowResult::Ignored`]を返す。
+    pub fn on_undo_finished(&mut self, report: CommitReport<UndoStep>) -> SaveFlowResult {
+        if !matches!(self.state, SaveState::ApplyingUndo { .. }) {
+            return SaveFlowResult::Ignored;
+        }
+
+        let effects = self.apply_event(SaveEvent::UndoApplyFinished {
+            report: report.clone(),
+        });
+        debug_assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, SaveEffect::ShowUndoReport(_)))
+        );
+
+        if effects
+            .iter()
+            .any(|effect| matches!(effect, SaveEffect::ReconcileFromFs))
+            && let Err(error) = self.reconcile_from_fs()
+        {
+            eprintln!("undo後の再読込に失敗しました: {error:#}");
+        }
+
+        self.apply_cancel = None;
+        SaveFlowResult::ShowUndoReport(report)
+    }
+
     pub fn on_external_change(&mut self, changed_paths: &BTreeSet<PathBuf>) -> SaveFlowResult {
         let mut ids = match self.ids.lock() {
             Ok(ids) => ids,
@@ -640,6 +819,17 @@ impl SaveController {
         // 確認ダイアログ表示中の外部変更は、表示中のplanを陳腐化させる。
         // 承認済みとして実行すると古いbaseline前提の操作が実FSへ流れるため、
         // ここでキャンセル扱いにしてダイアログを閉じ、ユーザーへ通知する。
+        if let SaveState::AwaitingUndoConfirmation { transaction } = &self.state {
+            let transaction = transaction.clone();
+            self.apply_event(SaveEvent::Cancelled);
+            return SaveFlowResult::UndoInvalidated {
+                transaction,
+                message:
+                    "外部でファイルが変更されたため、undoを中断しました。内容を確認して再度 :FylerUndo してください"
+                        .to_owned(),
+            };
+        }
+
         if matches!(self.state, SaveState::AwaitingConfirmation { .. }) {
             self.apply_event(SaveEvent::Cancelled);
             self.pending_overwrites.clear();
@@ -710,6 +900,28 @@ impl SaveController {
         SaveFlowResult::StartApply {
             plan,
             overwrites: self.pending_overwrites.clone(),
+            cancel,
+        }
+    }
+
+    fn approve_and_undo(&mut self) -> SaveFlowResult {
+        let effects = self.apply_event(SaveEvent::Approved);
+        if !effects
+            .iter()
+            .any(|effect| matches!(effect, SaveEffect::ExecuteUndo))
+        {
+            return SaveFlowResult::Ignored;
+        }
+
+        let transaction = match &self.state {
+            SaveState::ApplyingUndo { transaction } => transaction.clone(),
+            _ => return SaveFlowResult::Ignored,
+        };
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.apply_cancel = Some(Arc::clone(&cancel));
+        SaveFlowResult::StartUndo {
+            transaction,
             cancel,
         }
     }
@@ -790,32 +1002,141 @@ impl SaveController {
 /// 失敗した場合は保存計画を妨げず、サイズを取得できない場合だけサイズ表記を省略する。
 fn plan_warnings(
     root: &Path,
+    baseline: &BaselineTree,
     plan: &OperationPlan,
+    overwrites: &[TreePath],
     is_placeholder: impl Fn(&Path) -> anyhow::Result<bool>,
 ) -> Vec<String> {
-    plan.ops
-        .iter()
-        .filter_map(|operation| {
-            let from = match operation {
-                fyler_core::plan::FsOperation::Move { from, .. }
-                | fyler_core::plan::FsOperation::Copy { from, .. } => from,
-                fyler_core::plan::FsOperation::Create { .. }
-                | fyler_core::plan::FsOperation::Delete { .. } => return None,
-            };
-            let source = from.to_fs_path(root);
-            if !is_placeholder(&source).unwrap_or(false) {
-                return None;
-            }
+    let mut warnings = Vec::new();
 
-            let size = fs::metadata(&source)
-                .ok()
-                .map(|metadata| human_readable_size(metadata.len()));
-            Some(match size {
-                Some(size) => format!("クラウドから取得します: {from}({size})"),
-                None => format!("クラウドから取得します: {from}"),
-            })
-        })
-        .collect()
+    for operation in &plan.ops {
+        let from = match operation {
+            fyler_core::plan::FsOperation::Move { from, .. }
+            | fyler_core::plan::FsOperation::Copy { from, .. } => from,
+            fyler_core::plan::FsOperation::Create { .. }
+            | fyler_core::plan::FsOperation::Delete { .. } => continue,
+        };
+        let source = from.to_fs_path(root);
+        if !is_placeholder(&source).unwrap_or(false) {
+            continue;
+        }
+
+        let size = fs::metadata(&source).ok().map(|metadata| metadata.len());
+        warnings.push(hydration_warning(from, size));
+    }
+
+    append_delete_backup_warnings(&mut warnings, baseline, plan);
+    append_overwrite_backup_warnings(&mut warnings, root, overwrites, is_placeholder);
+    warnings
+}
+
+fn append_delete_backup_warnings(
+    warnings: &mut Vec<String>,
+    baseline: &BaselineTree,
+    plan: &OperationPlan,
+) {
+    let mut saw_delete = false;
+    let mut total_size = 0_u64;
+    let mut has_unknown_size = false;
+
+    for operation in &plan.ops {
+        let fyler_core::plan::FsOperation::Delete { path, .. } = operation else {
+            continue;
+        };
+        saw_delete = true;
+
+        let mut matched = false;
+        for entry in baseline
+            .entries()
+            .iter()
+            .filter(|entry| &entry.path == path || path.is_strict_ancestor_of(&entry.path))
+        {
+            matched = true;
+            let Some(meta) = baseline.meta(entry.id) else {
+                has_unknown_size = true;
+                continue;
+            };
+            if let Some(size) = meta.size {
+                total_size = total_size.saturating_add(size);
+            } else if entry.kind != EntryKind::Dir {
+                has_unknown_size = true;
+            }
+            if meta.is_placeholder {
+                warnings.push(hydration_warning(&entry.path, meta.size));
+            }
+        }
+        if !matched {
+            has_unknown_size = true;
+        }
+    }
+
+    if saw_delete {
+        warnings.push(backup_warning(
+            "削除前にbackupを作成します",
+            total_size,
+            has_unknown_size,
+        ));
+    }
+}
+
+fn append_overwrite_backup_warnings(
+    warnings: &mut Vec<String>,
+    root: &Path,
+    overwrites: &[TreePath],
+    is_placeholder: impl Fn(&Path) -> anyhow::Result<bool>,
+) {
+    if overwrites.is_empty() {
+        return;
+    }
+
+    let mut total_size = 0_u64;
+    let mut has_unknown_size = false;
+    for path in overwrites {
+        let fs_path = path.to_fs_path(root);
+        let size = match fs::symlink_metadata(&fs_path) {
+            Ok(metadata) if metadata.is_dir() => None,
+            Ok(metadata) => Some(metadata.len()),
+            Err(_) => {
+                has_unknown_size = true;
+                None
+            }
+        };
+        if let Some(size) = size {
+            total_size = total_size.saturating_add(size);
+        }
+        if is_placeholder(&fs_path).unwrap_or(false) {
+            warnings.push(hydration_warning(path, size));
+        }
+    }
+
+    warnings.push(backup_warning(
+        "上書き前にbackupを作成します",
+        total_size,
+        has_unknown_size,
+    ));
+}
+
+fn hydration_warning(path: &TreePath, size: Option<u64>) -> String {
+    match size {
+        Some(size) => format!(
+            "クラウドから取得します: {path}({})",
+            human_readable_size(size)
+        ),
+        None => format!("クラウドから取得します: {path}"),
+    }
+}
+
+fn backup_warning(prefix: &str, total_size: u64, has_unknown_size: bool) -> String {
+    let unknown_suffix = if has_unknown_size {
+        " (一部サイズ不明)"
+    } else {
+        ""
+    };
+    format!(
+        "{prefix}: 約{}{}",
+        human_readable_size(total_size),
+        unknown_suffix
+    )
 }
 
 /// 再スキャン後も既存ディレクトリの折りたたみ状態を維持し、新規ディレクトリは
@@ -897,10 +1218,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use fyler_core::editor::EditorSnapshot;
+    use fyler_core::fileinfo::EntryMeta;
     use fyler_core::path::TreePath;
     use fyler_core::plan::FsOperation;
     use fyler_core::report::{OpOutcome, OpResult};
     use fyler_core::tree::{BaselineEntry, EntryKind};
+    use fyler_core::undo::{Fingerprint, UndoStep};
     use tempfile::tempdir;
 
     use super::*;
@@ -965,6 +1288,45 @@ mod tests {
                 cancel,
             } => (plan, overwrites, cancel),
             result => panic!("承認後にStartApplyが返りませんでした: {result:?}"),
+        }
+    }
+
+    fn undo_transaction_for_existing_file(root: &Path, name: &str) -> UndoTransaction {
+        let path = root.join(name);
+        let post = fyler_fsops::identity::capture_fingerprint(&path).unwrap();
+        UndoTransaction {
+            id: format!("tx-{name}"),
+            root: root.to_path_buf(),
+            steps: vec![UndoStep::RemoveCreated {
+                path,
+                identity: None,
+                post,
+            }],
+            backup_dir: None,
+        }
+    }
+
+    fn rejected_undo_transaction(root: &Path) -> UndoTransaction {
+        UndoTransaction {
+            id: "tx-rejected".to_owned(),
+            root: root.to_path_buf(),
+            steps: vec![UndoStep::RemoveCreated {
+                path: root.join("missing.txt"),
+                identity: None,
+                post: Fingerprint {
+                    kind: EntryKind::File,
+                    size: Some(1),
+                    mtime: None,
+                    link_target: None,
+                },
+            }],
+            backup_dir: None,
+        }
+    }
+
+    fn undo_report(step: UndoStep, outcome: OpOutcome) -> CommitReport<UndoStep> {
+        CommitReport {
+            results: vec![OpResult { op: step, outcome }],
         }
     }
 
@@ -1130,9 +1492,13 @@ mod tests {
             }],
         };
 
-        let warnings = plan_warnings(root.path(), &plan, |path| {
-            Ok(path == root.path().join("cloud.bin"))
-        });
+        let warnings = plan_warnings(
+            root.path(),
+            &BaselineTree::new(root.path()),
+            &plan,
+            &[],
+            |path| Ok(path == root.path().join("cloud.bin")),
+        );
 
         assert_eq!(warnings, ["クラウドから取得します: cloud.bin(2.0 KB)"]);
     }
@@ -1148,9 +1514,135 @@ mod tests {
             }],
         };
 
-        let warnings = plan_warnings(root.path(), &plan, |_| Ok(true));
+        let warnings = plan_warnings(
+            root.path(),
+            &BaselineTree::new(root.path()),
+            &plan,
+            &[],
+            |_| Ok(true),
+        );
 
         assert_eq!(warnings, ["クラウドから取得します: missing.bin"]);
+    }
+
+    #[test]
+    fn plan_warnings_include_delete_backup_estimate_and_unknown_size() {
+        let root = tempdir().unwrap();
+        let mut baseline = BaselineTree::new(root.path());
+        baseline.insert_with_meta(
+            BaselineEntry {
+                id: EntryId(1),
+                path: TreePath::parse("old"),
+                kind: EntryKind::Dir,
+            },
+            EntryMeta {
+                size: None,
+                modified: None,
+                is_placeholder: false,
+            },
+        );
+        baseline.insert_with_meta(
+            BaselineEntry {
+                id: EntryId(2),
+                path: TreePath::parse("old/a.bin"),
+                kind: EntryKind::File,
+            },
+            EntryMeta {
+                size: Some(1024 * 1024),
+                modified: None,
+                is_placeholder: false,
+            },
+        );
+        baseline.insert_with_meta(
+            BaselineEntry {
+                id: EntryId(3),
+                path: TreePath::parse("old/b.bin"),
+                kind: EntryKind::File,
+            },
+            EntryMeta {
+                size: Some(512 * 1024),
+                modified: None,
+                is_placeholder: false,
+            },
+        );
+        baseline.insert(BaselineEntry {
+            id: EntryId(4),
+            path: TreePath::parse("old/unknown.bin"),
+            kind: EntryKind::File,
+        });
+        let plan = OperationPlan {
+            ops: vec![FsOperation::Delete {
+                id: EntryId(1),
+                path: TreePath::parse("old"),
+            }],
+        };
+
+        let warnings = plan_warnings(root.path(), &baseline, &plan, &[], |_| Ok(false));
+
+        assert_eq!(
+            warnings,
+            ["削除前にbackupを作成します: 約1.5 MB (一部サイズ不明)"]
+        );
+    }
+
+    #[test]
+    fn plan_warnings_include_overwrite_backup_estimate() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("existing.bin"), vec![0_u8; 2048]).unwrap();
+        let plan = OperationPlan::default();
+
+        let warnings = plan_warnings(
+            root.path(),
+            &BaselineTree::new(root.path()),
+            &plan,
+            &[TreePath::parse("existing.bin")],
+            |_| Ok(false),
+        );
+
+        assert_eq!(warnings, ["上書き前にbackupを作成します: 約2.0 KB"]);
+    }
+
+    #[test]
+    fn plan_warnings_include_placeholder_backup_warnings() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("overwrite.bin"), vec![0_u8; 1024]).unwrap();
+        let mut baseline = BaselineTree::new(root.path());
+        baseline.insert_with_meta(
+            BaselineEntry {
+                id: EntryId(1),
+                path: TreePath::parse("cloud.bin"),
+                kind: EntryKind::File,
+            },
+            EntryMeta {
+                size: Some(4096),
+                modified: None,
+                is_placeholder: true,
+            },
+        );
+        let plan = OperationPlan {
+            ops: vec![FsOperation::Delete {
+                id: EntryId(1),
+                path: TreePath::parse("cloud.bin"),
+            }],
+        };
+
+        let warnings = plan_warnings(
+            root.path(),
+            &baseline,
+            &plan,
+            &[TreePath::parse("overwrite.bin")],
+            |path| Ok(path == root.path().join("overwrite.bin")),
+        );
+
+        assert_eq!(
+            warnings,
+            [
+                "クラウドから取得します: cloud.bin(4.0 KB)",
+                "削除前にbackupを作成します: 約4.0 KB",
+                "クラウドから取得します: overwrite.bin(1.0 KB)",
+                "上書き前にbackupを作成します: 約1.0 KB",
+            ]
+        );
     }
 
     #[test]
@@ -1549,6 +2041,252 @@ mod tests {
         assert_eq!(result, SaveFlowResult::Ignored);
         assert!(!cancel.load(Ordering::Relaxed));
         assert!(controller.is_applying());
+    }
+
+    #[test]
+    fn request_undo_ready_transaction_returns_plan_and_locks_buffer() {
+        let temp_root = tempdir().unwrap();
+        fs::write(temp_root.path().join("created.txt"), b"content").unwrap();
+        let (mut controller, engine) = controller(temp_root.path());
+        let transaction = undo_transaction_for_existing_file(temp_root.path(), "created.txt");
+
+        let result = controller.request_undo(transaction.clone());
+
+        assert!(matches!(
+            result,
+            SaveFlowResult::ShowUndoPlan {
+                transaction: actual,
+                statuses
+            } if actual == transaction
+                && statuses == vec![UndoStepStatus::Ready]
+        ));
+        assert!(matches!(
+            controller.state(),
+            SaveState::AwaitingUndoConfirmation { .. }
+        ));
+        assert_eq!(modifiable_values(&engine), [false]);
+    }
+
+    #[test]
+    fn request_undo_all_rejected_returns_nothing_left_without_state_change() {
+        let temp_root = tempdir().unwrap();
+        let (mut controller, engine) = controller(temp_root.path());
+
+        let result = controller.request_undo(rejected_undo_transaction(temp_root.path()));
+
+        assert!(matches!(
+            result,
+            SaveFlowResult::UndoNothingLeft { reasons } if !reasons.is_empty()
+        ));
+        assert!(matches!(controller.state(), SaveState::Idle));
+        assert!(engine.commands.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn request_undo_while_not_idle_is_ignored() {
+        let temp_root = tempdir().unwrap();
+        fs::write(temp_root.path().join("created.txt"), b"content").unwrap();
+        let (mut controller, _) = controller(temp_root.path());
+        assert!(matches!(
+            controller.on_commit(1, &lines(&["/001 b.txt"])),
+            SaveFlowResult::ShowPlan { .. }
+        ));
+        let transaction = undo_transaction_for_existing_file(temp_root.path(), "created.txt");
+
+        let result = controller.request_undo(transaction);
+
+        assert_eq!(result, SaveFlowResult::Ignored);
+        assert!(matches!(
+            controller.state(),
+            SaveState::AwaitingConfirmation { .. }
+        ));
+    }
+
+    #[test]
+    fn approving_undo_starts_worker_and_enters_applying_undo() {
+        let temp_root = tempdir().unwrap();
+        fs::write(temp_root.path().join("created.txt"), b"content").unwrap();
+        let (mut controller, _) = controller(temp_root.path());
+        let transaction = undo_transaction_for_existing_file(temp_root.path(), "created.txt");
+        assert!(matches!(
+            controller.request_undo(transaction.clone()),
+            SaveFlowResult::ShowUndoPlan { .. }
+        ));
+
+        let result = controller.on_choice(ConfirmChoice::Approve);
+
+        let SaveFlowResult::StartUndo {
+            transaction: actual,
+            cancel,
+        } = result
+        else {
+            panic!("undo承認後にStartUndoが返りませんでした: {result:?}");
+        };
+        assert_eq!(actual, transaction);
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(matches!(controller.state(), SaveState::ApplyingUndo { .. }));
+    }
+
+    #[test]
+    fn canceling_undo_returns_transaction_and_unlocks_buffer() {
+        let temp_root = tempdir().unwrap();
+        fs::write(temp_root.path().join("created.txt"), b"content").unwrap();
+        let (mut controller, engine) = controller(temp_root.path());
+        let transaction = undo_transaction_for_existing_file(temp_root.path(), "created.txt");
+        assert!(matches!(
+            controller.request_undo(transaction.clone()),
+            SaveFlowResult::ShowUndoPlan { .. }
+        ));
+
+        let result = controller.on_choice(ConfirmChoice::Cancel);
+
+        assert_eq!(
+            result,
+            SaveFlowResult::UndoCancelled {
+                transaction: transaction.clone()
+            }
+        );
+        assert!(matches!(controller.state(), SaveState::Idle));
+        assert_eq!(modifiable_values(&engine), [false, true]);
+    }
+
+    #[test]
+    fn cancel_while_applying_undo_sets_worker_flag_and_keeps_applying() {
+        let temp_root = tempdir().unwrap();
+        fs::write(temp_root.path().join("created.txt"), b"content").unwrap();
+        let (mut controller, _) = controller(temp_root.path());
+        let transaction = undo_transaction_for_existing_file(temp_root.path(), "created.txt");
+        assert!(matches!(
+            controller.request_undo(transaction),
+            SaveFlowResult::ShowUndoPlan { .. }
+        ));
+        let SaveFlowResult::StartUndo { cancel, .. } = controller.on_choice(ConfirmChoice::Approve)
+        else {
+            panic!("undo承認後にStartUndoが返りませんでした");
+        };
+
+        let result = controller.on_choice(ConfirmChoice::Cancel);
+
+        assert_eq!(result, SaveFlowResult::ApplyCancelRequested);
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(matches!(controller.state(), SaveState::ApplyingUndo { .. }));
+    }
+
+    #[test]
+    fn undo_finished_all_failed_reports_without_reconcile() {
+        let temp_root = tempdir().unwrap();
+        fs::write(temp_root.path().join("created.txt"), b"content").unwrap();
+        let (mut controller, engine) = controller(temp_root.path());
+        let transaction = undo_transaction_for_existing_file(temp_root.path(), "created.txt");
+        let step = transaction.steps[0].clone();
+        assert!(matches!(
+            controller.request_undo(transaction),
+            SaveFlowResult::ShowUndoPlan { .. }
+        ));
+        assert!(matches!(
+            controller.on_choice(ConfirmChoice::Approve),
+            SaveFlowResult::StartUndo { .. }
+        ));
+        let report = undo_report(
+            step,
+            OpOutcome::Failed {
+                error: "stale".to_owned(),
+                progress: None,
+            },
+        );
+
+        let result = controller.on_undo_finished(report.clone());
+
+        assert_eq!(result, SaveFlowResult::ShowUndoReport(report));
+        assert!(matches!(controller.state(), SaveState::Idle));
+        assert!(
+            engine
+                .commands
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|command| matches!(command, EditorCommand::SetModifiable(_)))
+        );
+    }
+
+    #[test]
+    fn undo_finished_partial_success_reconciles_from_filesystem() {
+        let temp_root = tempdir().unwrap();
+        fs::write(temp_root.path().join("created.txt"), b"content").unwrap();
+        let (mut controller, engine) = controller(temp_root.path());
+        let transaction = undo_transaction_for_existing_file(temp_root.path(), "created.txt");
+        let step = transaction.steps[0].clone();
+        assert!(matches!(
+            controller.request_undo(transaction),
+            SaveFlowResult::ShowUndoPlan { .. }
+        ));
+        assert!(matches!(
+            controller.on_choice(ConfirmChoice::Approve),
+            SaveFlowResult::StartUndo { .. }
+        ));
+        let report = undo_report(step, OpOutcome::Success);
+
+        let result = controller.on_undo_finished(report.clone());
+
+        assert_eq!(result, SaveFlowResult::ShowUndoReport(report));
+        assert!(matches!(controller.state(), SaveState::Idle));
+        assert!(engine.commands.lock().unwrap().iter().any(|command| {
+            matches!(command, EditorCommand::SetLines { lines, .. }
+                if lines.iter().any(|line| line.text.ends_with("created.txt")))
+        }));
+    }
+
+    #[test]
+    fn external_change_during_undo_confirmation_invalidates_and_returns_transaction() {
+        let temp_root = tempdir().unwrap();
+        fs::write(temp_root.path().join("created.txt"), b"content").unwrap();
+        let (mut controller, engine) = controller(temp_root.path());
+        let transaction = undo_transaction_for_existing_file(temp_root.path(), "created.txt");
+        assert!(matches!(
+            controller.request_undo(transaction.clone()),
+            SaveFlowResult::ShowUndoPlan { .. }
+        ));
+        fs::write(temp_root.path().join("external.txt"), b"external").unwrap();
+
+        let result = controller.on_external_change(&BTreeSet::new());
+
+        assert!(matches!(
+            result,
+            SaveFlowResult::UndoInvalidated {
+                transaction: actual,
+                message
+            } if actual == transaction && message.contains("undoを中断しました")
+        ));
+        assert!(matches!(controller.state(), SaveState::Idle));
+        assert_eq!(modifiable_values(&engine), [false, true]);
+    }
+
+    #[test]
+    fn undo_flow_sends_only_modifiable_and_set_lines_commands_to_engine() {
+        let temp_root = tempdir().unwrap();
+        fs::write(temp_root.path().join("created.txt"), b"content").unwrap();
+        let (mut controller, engine) = controller(temp_root.path());
+        let transaction = undo_transaction_for_existing_file(temp_root.path(), "created.txt");
+        let step = transaction.steps[0].clone();
+        assert!(matches!(
+            controller.request_undo(transaction),
+            SaveFlowResult::ShowUndoPlan { .. }
+        ));
+        assert!(matches!(
+            controller.on_choice(ConfirmChoice::Approve),
+            SaveFlowResult::StartUndo { .. }
+        ));
+        let report = undo_report(step, OpOutcome::Success);
+
+        let result = controller.on_undo_finished(report);
+
+        assert!(matches!(result, SaveFlowResult::ShowUndoReport(_)));
+        assert!(engine.commands.lock().unwrap().iter().all(|command| {
+            matches!(
+                command,
+                EditorCommand::SetModifiable(_) | EditorCommand::SetLines { .. }
+            )
+        }));
     }
 
     #[test]
