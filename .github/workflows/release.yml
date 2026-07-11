@@ -7,6 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  NVIM_VERSION: v0.12.4
+  NVIM_SHA256: 9fc3572829ffd13debb6e32555da2c8cc02555568260a9fc4cf1f65bbcca319c
 
 permissions:
   contents: write
@@ -26,7 +28,7 @@ jobs:
             exit 1
           fi
 
-  # Windowsネイティブでテスト → releaseビルド → zip + sha256 → GitHub Release
+  # Windowsネイティブでテスト → build → package → smoke → hash → GitHub Release
   build-and-publish:
     needs: verify-version
     runs-on: windows-latest
@@ -40,18 +42,138 @@ jobs:
         run: cargo build --release --locked -p fyler-app
         env:
           FYLER_FEEDBACK_URL: ${{ vars.FYLER_FEEDBACK_URL }}
-      - name: Package
+
+      # Future signing hook: sign target/release/fyler.exe here before packaging.
+      - name: Download and verify bundled Neovim
         shell: pwsh
         run: |
-          $name = "fyler-${{ github.ref_name }}-x86_64-pc-windows-msvc"
-          New-Item -ItemType Directory -Path "dist/$name" | Out-Null
-          Copy-Item target/release/fyler.exe "dist/$name/"
-          Copy-Item README.md "dist/$name/"
-          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
-          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"
+          $archive = Join-Path $env:RUNNER_TEMP "nvim-win64.zip"
+          $extractDir = Join-Path $env:RUNNER_TEMP "fyler-nvim"
+          $downloadUrl = "https://github.com/neovim/neovim/releases/download/$env:NVIM_VERSION/nvim-win64.zip"
+
+          Invoke-WebRequest -Uri $downloadUrl -OutFile $archive
+          $actualHash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:NVIM_SHA256.ToLowerInvariant()) {
+            throw "Neovim SHA-256 mismatch: expected $env:NVIM_SHA256, got $actualHash"
+          }
+
+          New-Item -ItemType Directory -Path "stage/fyler" -Force | Out-Null
+          Expand-Archive -Path $archive -DestinationPath $extractDir
+          Move-Item -Path (Join-Path $extractDir "nvim-win64") -Destination "stage/fyler/nvim"
+          Invoke-WebRequest `
+            -Uri "https://raw.githubusercontent.com/neovim/neovim/$env:NVIM_VERSION/LICENSE.txt" `
+            -OutFile "stage/fyler/nvim/LICENSE.txt"
+
+          $versionOutput = & ".\stage\fyler\nvim\bin\nvim.exe" --version 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            throw "Bundled nvim.exe --version failed with exit code $LASTEXITCODE"
+          }
+          $versionText = $versionOutput -join "`n"
+          if ($versionText -notmatch [regex]::Escape($env:NVIM_VERSION)) {
+            throw "Bundled Neovim version output does not contain $env:NVIM_VERSION"
+          }
+
+      - name: Generate third-party licenses
+        shell: pwsh
+        run: |
+          cargo install cargo-bundle-licenses --version 4.2.0 --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo-bundle-licenses installation failed" }
+          cargo bundle-licenses --format yaml --output THIRD_PARTY_LICENSES.yml
+          if ($LASTEXITCODE -ne 0) { throw "Third-party license generation failed" }
+
+      - name: Assemble distribution staging directory
+        shell: pwsh
+        run: |
+          Copy-Item "target/release/fyler.exe" "stage/fyler/fyler.exe"
+          Copy-Item "LICENSE-MIT" "stage/fyler/LICENSE-MIT"
+          Copy-Item "LICENSE-APACHE" "stage/fyler/LICENSE-APACHE"
+          Copy-Item "THIRD_PARTY_LICENSES.yml" "stage/fyler/THIRD_PARTY_LICENSES.yml"
+          Copy-Item "README.md" "stage/fyler/README.md"
+
+          $requiredPaths = @(
+            "stage/fyler/fyler.exe",
+            "stage/fyler/LICENSE-MIT",
+            "stage/fyler/LICENSE-APACHE",
+            "stage/fyler/THIRD_PARTY_LICENSES.yml",
+            "stage/fyler/README.md",
+            "stage/fyler/nvim/LICENSE.txt",
+            "stage/fyler/nvim/bin/nvim.exe",
+            "stage/fyler/nvim/lib",
+            "stage/fyler/nvim/share/nvim/runtime"
+          )
+          foreach ($path in $requiredPaths) {
+            if (-not (Test-Path $path)) { throw "Missing staged distribution path: $path" }
+          }
+
+      - name: Create portable archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path "dist" -Force | Out-Null
+          $portableName = "fyler-${{ github.ref_name }}-windows-x64-portable.zip"
+          Compress-Archive -Path "stage/fyler" -DestinationPath "dist/$portableName"
+
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          $stageDir = (Resolve-Path "stage/fyler").Path
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          & $iscc "/DAppVersion=$version" "/DStageDir=$stageDir" "installer\fyler.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed" }
+
+          $setupPath = "dist/fyler-${{ github.ref_name }}-windows-x64-setup.exe"
+          if (-not (Test-Path $setupPath)) { throw "Missing installer artifact: $setupPath" }
+
+      # Future signing hook: sign the compiled setup.exe here before smoke/hash/publish.
+      - name: Smoke test install and uninstall
+        shell: pwsh
+        run: |
+          $setupPath = (Resolve-Path "dist/fyler-${{ github.ref_name }}-windows-x64-setup.exe").Path
+          $installDir = Join-Path $env:LOCALAPPDATA "Programs\fyler"
+          $install = Start-Process -FilePath $setupPath -ArgumentList '/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Installer exited with code $($install.ExitCode)" }
+
+          $fylerExe = Join-Path $installDir "fyler.exe"
+          $nvimExe = Join-Path $installDir "nvim\bin\nvim.exe"
+          if (-not (Test-Path $fylerExe)) { throw "Installed fyler.exe was not found: $fylerExe" }
+          if (-not (Test-Path $nvimExe)) { throw "Installed nvim.exe was not found: $nvimExe" }
+
+          & $nvimExe --headless +q
+          if ($LASTEXITCODE -ne 0) { throw "Installed Neovim headless smoke test failed" }
+
+          $uninstaller = Join-Path $installDir "unins000.exe"
+          if (-not (Test-Path $uninstaller)) { throw "Uninstaller was not found: $uninstaller" }
+          $uninstall = Start-Process -FilePath $uninstaller -ArgumentList '/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES' -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "Uninstaller exited with code $($uninstall.ExitCode)" }
+          # unins000.exe は自身のコピーを%TEMP%へspawnして即座に戻るため、
+          # 実際のファイル除去完了をポーリングで待つ(最大30秒)。
+          $removed = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            if (-not (Test-Path $installDir)) { $removed = $true; break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $removed) { throw "Install directory remains after uninstall: $installDir" }
+
+      - name: Generate artifact checksums
+        shell: pwsh
+        run: |
+          $artifacts = @(
+            "fyler-${{ github.ref_name }}-windows-x64-portable.zip",
+            "fyler-${{ github.ref_name }}-windows-x64-setup.exe"
+          )
+          foreach ($name in $artifacts) {
+            $hash = (Get-FileHash "dist/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $name" | Out-File -Encoding ascii "dist/$name.sha256"
+          }
+
       - name: Create GitHub Release
         shell: pwsh
-        run: gh release create "${{ github.ref_name }}" (Get-Item dist/*.zip, dist/*.sha256) --title "${{ github.ref_name }}" --generate-notes
+        run: |
+          $assets = Get-Item `
+            "dist/fyler-${{ github.ref_name }}-windows-x64-portable.zip", `
+            "dist/fyler-${{ github.ref_name }}-windows-x64-portable.zip.sha256", `
+            "dist/fyler-${{ github.ref_name }}-windows-x64-setup.exe", `
+            "dist/fyler-${{ github.ref_name }}-windows-x64-setup.exe.sha256"
+          gh release create "${{ github.ref_name }}" $assets.FullName --title "${{ github.ref_name }}" --generate-notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
