@@ -8,6 +8,7 @@
 
 mod config;
 mod feedback;
+mod nvim_locate;
 mod pane_runtime;
 mod queue_stats;
 pub mod save_flow;
