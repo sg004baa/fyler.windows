@@ -35,6 +35,8 @@ pub struct Config {
     pub sort_reverse: bool,
     /// 外部terminal emulatorの起動方法。
     pub terminal: TerminalKind,
+    /// 匿名フィードバック送信endpoint。空文字列は明示的無効化を表す。
+    pub feedback_url: Option<String>,
     /// 確認ダイアログの操作一覧詳細度。
     pub confirm_detail: ConfirmDetail,
     /// 日本語fallbackフォントとして読み込むファイルの絶対パス。
@@ -60,6 +62,7 @@ impl Default for Config {
             sort_key: SortKey::Name,
             sort_reverse: false,
             terminal: TerminalKind::Auto,
+            feedback_url: None,
             confirm_detail: ConfirmDetail::Full,
             font: None,
             font_y_offset_factor: DEFAULT_FONT_Y_OFFSET_FACTOR,
@@ -164,6 +167,12 @@ pub fn load() -> (Config, Vec<String>) {
                 "terminalは\"auto\"、\"windows_terminal\"、\"powershell\"、\"cmd\"のいずれかで指定してください"
                     .to_owned(),
             ),
+        }
+    }
+    if let Some(value) = table.get("feedback_url") {
+        match value.as_str() {
+            Some(url) => config.feedback_url = Some(url.to_owned()),
+            None => warnings.push("feedback_urlは文字列で指定してください".to_owned()),
         }
     }
     if let Some(value) = table.get("confirm_detail") {
@@ -283,6 +292,7 @@ pub fn load() -> (Config, Vec<String>) {
                 | "sort_key"
                 | "sort_reverse"
                 | "terminal"
+                | "feedback_url"
                 | "confirm_detail"
                 | "font"
                 | "font_y_offset_factor"

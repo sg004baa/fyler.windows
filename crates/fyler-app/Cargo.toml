@@ -18,6 +18,9 @@ fyler-gui.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 toml.workspace = true
+# native-tls固定: WindowsではSChannel=システム証明書ストアを使う(企業proxy対応)。
+# rustls(既定feature)はringのCコンパイルを要求しCIのwindows-gnuクロスclippyが割れるため使わない。
+ureq = { version = "3.3.0", default-features = false, features = ["native-tls"] }
 
 [build-dependencies]
 embed-manifest = "1.5"

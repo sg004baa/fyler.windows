@@ -521,6 +521,9 @@ impl NvimEngine {
                             "fyler_undo" => {
                                 let _ = event_tx.send(EditorEvent::UndoRequested);
                             }
+                            "fyler_feedback" => {
+                                let _ = event_tx.send(EditorEvent::FeedbackRequested);
+                            }
                             "fyler_yank_path" => {
                                 let line = notification.args.first()
                                     .and_then(value_as_u64)

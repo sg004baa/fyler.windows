@@ -933,6 +933,35 @@ async fn terminal_alias_fires_open_terminal_event() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a compatible nvim executable"]
+async fn feedback_alias_fires_feedback_requested_event() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+
+    engine.set_initial_lines(vec![EditorLine::new("/001 alpha")])?;
+    wait_for(&engine, |line| line == "/001 alpha").await?;
+    engine.send(key_command(Key::Char(':')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::CmdlineShow(_))
+    })
+    .await
+    .context(": did not open the command line")?;
+    engine.send(EditorCommand::Text("feedback".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::FeedbackRequested)
+    })
+    .await
+    .context(":feedback did not emit FeedbackRequested")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
 async fn terminal_alias_with_argument_warns() -> anyhow::Result<()> {
     let _serial = NVIM_TEST_SERIAL.lock().await;
     let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")

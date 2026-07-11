@@ -426,6 +426,8 @@ pub enum EditorEvent {
     },
     /// ファイルpickerを開くよう要求した。
     OpenFilePicker,
+    /// 匿名フィードバックモーダルを開くよう要求した。
+    FeedbackRequested,
     /// ユーザーがヘルプ表示を要求した。
     ShowHelp,
     /// ユーザーがpaneの分割・focus移動・closeを要求した。

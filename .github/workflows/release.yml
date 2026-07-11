@@ -38,6 +38,8 @@ jobs:
         run: cargo test --workspace --locked
       - name: Build release binary
         run: cargo build --release --locked -p fyler-app
+        env:
+          FYLER_FEEDBACK_URL: ${{ vars.FYLER_FEEDBACK_URL }}
       - name: Package
         shell: pwsh
         run: |

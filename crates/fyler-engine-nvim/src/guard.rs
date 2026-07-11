@@ -331,6 +331,10 @@ vim.api.nvim_buf_create_user_command(buffer, "FylerUndo", function()
   vim.rpcnotify(channel, "fyler_undo")
 end, {})
 
+vim.api.nvim_buf_create_user_command(buffer, "FylerFeedback", function()
+  vim.rpcnotify(channel, "fyler_feedback")
+end, {})
+
 vim.api.nvim_buf_create_user_command(buffer, "FylerCd", function(opts)
   vim.rpcnotify(channel, "fyler_cd", opts.args)
 end, { nargs = "?", complete = "dir" })
@@ -356,7 +360,7 @@ vim.api.nvim_buf_create_user_command(buffer, "FylerTerminal", function(opts)
 end, { nargs = "*", bang = true })
 
 vim.o.wildcharm = 26
-local command_aliases = { b = "FylerBookmark", cd = "FylerCd", sort = "FylerSort", terminal = "FylerTerminal" }
+local command_aliases = { b = "FylerBookmark", cd = "FylerCd", feedback = "FylerFeedback", sort = "FylerSort", terminal = "FylerTerminal" }
 -- nvim_paste経由ではcnoreabbrevが展開されないため、実行/補完直前に先頭語を正式コマンドへ書き換える。
 local function rewrite_command_alias()
   if vim.fn.getcmdtype() ~= ":" then return end
