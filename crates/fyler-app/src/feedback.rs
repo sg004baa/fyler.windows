@@ -164,11 +164,14 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
+        // WindowsのWinsockはloopbackの接続拒否でも内部で約1秒connectを
+        // リトライするため、timeoutが短いと拒否確定前にTimeoutへ倒れる。
+        // 拒否は両OSとも数秒以内に確定するので、余裕を持たせてNetworkを検証する。
         assert_eq!(
             send_feedback(
                 &format!("http://{address}/feedback"),
                 "{}",
-                Duration::from_secs(1)
+                Duration::from_secs(10)
             ),
             FeedbackOutcome::Network
         );
