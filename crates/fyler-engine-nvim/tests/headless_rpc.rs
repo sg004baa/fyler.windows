@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use fyler_core::editor::{
-    EditorCommand, EditorEngine, EditorEvent, EditorLine, Key, KeyInput, Mode, Modifiers,
+    EditorCommand, EditorEngine, EditorEvent, EditorLine, FoldOp, Key, KeyInput, Mode, Modifiers,
     SearchHighlight,
 };
 use fyler_core::pane::PaneAction;
@@ -61,6 +61,13 @@ async fn spawn_attach_and_edit_updates_snapshot() -> anyhow::Result<()> {
     })
     .await
     .context("gy did not emit YankPath")?;
+    engine.send(key_command(Key::Char('g')))?;
+    engine.send(key_command(Key::Char('o')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::OpenWith { line: 0 })
+    })
+    .await
+    .context("go did not emit OpenWith")?;
 
     engine.send(EditorCommand::Key(KeyInput {
         key: Key::Char('i'),
@@ -593,4 +600,264 @@ async fn wait_for_event(
     })
     .await
     .map_err(|_| anyhow::anyhow!("editor event timed out"))?
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn zc_emits_fold_close_without_native_fold_error() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.set_initial_lines(vec![
+        EditorLine::new("/001 directory/"),
+        EditorLine::new("/002   child.txt"),
+    ])?;
+    wait_for(&engine, |line| line == "/001 directory/").await?;
+
+    engine.send(key_command(Key::Char('z')))?;
+    engine.send(key_command(Key::Char('c')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            EditorEvent::Fold {
+                op: FoldOp::Close,
+                line: 0
+            }
+        )
+    })
+    .await
+    .context("zc did not emit Fold::Close")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn shift_indents_after_id_prefix() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, _events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.set_initial_lines(vec![
+        EditorLine::new("/001 dir/"),
+        EditorLine::new("/002 \tchild.txt"),
+        EditorLine::new("/003 top.txt"),
+    ])?;
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 3 && lines[2].text == "/003 top.txt"
+    })
+    .await?;
+
+    engine.send(key_command(Key::Down))?;
+    engine.send(key_command(Key::Down))?;
+    wait_for_cursor(&engine, |line, _| line == 2).await?;
+
+    engine.send(key_command(Key::Char('>')))?;
+    engine.send(key_command(Key::Char('>')))?;
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 3 && lines[2].text == "/003 \ttop.txt"
+    })
+    .await?;
+
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot.lines[2].text, "/003 \ttop.txt");
+    assert!(
+        !snapshot.lines[2].text.starts_with('\t'),
+        "the tab must be inserted after the id prefix, not before it"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn shift_dedent_at_depth_zero_is_noop() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, _events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.set_initial_lines(vec![EditorLine::new("/001 top.txt")])?;
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 1 && lines[0].text == "/001 top.txt"
+    })
+    .await?;
+
+    let revision = engine.snapshot().revision;
+    engine.send(key_command(Key::Char('<')))?;
+    engine.send(key_command(Key::Char('<')))?;
+    wait_for_revision_after(&engine, revision).await?;
+
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot.lines.len(), 1);
+    assert_eq!(snapshot.lines[0].text, "/001 top.txt");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn cursor_clamps_to_name_start() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, _events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.set_initial_lines(vec![EditorLine::new("/001 \tname.txt")])?;
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 1 && lines[0].text == "/001 \tname.txt"
+    })
+    .await?;
+
+    engine.send(key_command(Key::End))?;
+    wait_for_cursor(&engine, |_, col| col > 6).await?;
+    engine.send(key_command(Key::Char('0')))?;
+    wait_for_cursor(&engine, |line, col| line == 0 && col == 6).await?;
+
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot.cursor.line, 0);
+    assert_eq!(snapshot.cursor.col, 6);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn sort_command_completion_emits_popupmenu() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.send(key_command(Key::Char(':')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::CmdlineShow(_))
+    })
+    .await
+    .context(": did not open the command line")?;
+    engine.send(EditorCommand::Text("FylerSort ".to_owned()))?;
+    engine.send(key_command(Key::Tab))?;
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            EditorEvent::PopupmenuShow(state)
+                if state.items.iter().any(|item| item.word == "date")
+        )
+    })
+    .await
+    .context(":FylerSort <Tab> did not emit popupmenu with date")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn sort_alias_with_argument_reaches_fyler_sort() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.send(key_command(Key::Char(':')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::CmdlineShow(_))
+    })
+    .await
+    .context(": did not open the command line")?;
+    engine.send(EditorCommand::Text("sort date".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            EditorEvent::ChangeSort {
+                query: Some(query)
+            } if query == "date"
+        )
+    })
+    .await
+    .context(":sort date did not emit ChangeSort(\"date\")")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn sort_alias_tab_completes_and_executes() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+
+    engine.send(key_command(Key::Char(':')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::CmdlineShow(_))
+    })
+    .await
+    .context(": did not open the command line")?;
+    engine.send(EditorCommand::Text("sort da".to_owned()))?;
+    engine.send(key_command(Key::Tab))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            EditorEvent::ChangeSort {
+                query: Some(query)
+            } if query == "date"
+        )
+    })
+    .await
+    .context(":sort da<Tab><CR> did not emit ChangeSort(\"date\")")?;
+
+    Ok(())
+}
+
+async fn wait_for_lines(
+    engine: &NvimEngine,
+    predicate: impl Fn(&[EditorLine]) -> bool,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = engine.snapshot();
+            if predicate(&snapshot.lines) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("snapshot lines did not match predicate"))
+}
+
+async fn wait_for_cursor(
+    engine: &NvimEngine,
+    predicate: impl Fn(usize, usize) -> bool,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let cursor = engine.snapshot().cursor;
+            if predicate(cursor.line, cursor.col) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("snapshot cursor did not match predicate"))
 }

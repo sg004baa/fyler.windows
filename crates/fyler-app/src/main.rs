@@ -23,11 +23,13 @@ use fyler_core::editor::{EditorCommand, EditorEngine, EditorEvent, EditorMessage
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::{EntryId, IdAllocator};
+use fyler_core::options::SortKey;
 use fyler_core::pane::PaneId;
 use fyler_core::report::{ApplyProgress, CommitReport};
 use fyler_core::transfer::TransferOp;
 use fyler_core::tree::EntryKind;
 use fyler_core::undo::{UndoStep, UndoTransaction};
+use fyler_fsops::openwith::OpenWithHandler;
 use fyler_fsops::watch::{ExternalChange, FsWatcher};
 use fyler_gui::app::{GuiEvent, PickerAction};
 use fyler_gui::confirm::ConfirmChoice;
@@ -373,6 +375,43 @@ fn format_drive_paths(drives: &[PathBuf]) -> String {
         .join(" ")
 }
 
+/// 先頭/末尾の`!`をreverse指定として解釈し、sortキー名を正規化する。
+fn parse_sort_query(query: &str) -> Result<(SortKey, bool), String> {
+    let query = query.trim();
+    let leading_bang = query.starts_with('!');
+    let query = query.strip_prefix('!').unwrap_or(query).trim_start();
+    let (query, trailing_bang) = match query.strip_suffix('!') {
+        Some(query) => (query.trim_end(), true),
+        None => (query, false),
+    };
+    let reverse = leading_bang || trailing_bang;
+    let key = match query {
+        "name" => SortKey::Name,
+        "date" => SortKey::Date,
+        "size" => SortKey::Size,
+        "ext" => SortKey::Extension,
+        _ => return Err(format!("不明なソートキー: {query} (name|date|size|ext)")),
+    };
+    Ok((key, reverse))
+}
+
+fn sort_state_message(key: SortKey, reverse: bool) -> String {
+    if reverse {
+        format!("sort: {} (reverse)", sort_key_name(key))
+    } else {
+        format!("sort: {}", sort_key_name(key))
+    }
+}
+
+fn sort_key_name(key: SortKey) -> &'static str {
+    match key {
+        SortKey::Name => "name",
+        SortKey::Date => "date",
+        SortKey::Size => "size",
+        SortKey::Extension => "ext",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BookmarkResolution {
     Resolved(PathBuf),
@@ -539,6 +578,100 @@ fn handle_activate_line(
         }
     }
     Ok(())
+}
+
+fn handle_open_with(
+    pane_id: PaneId,
+    save_controller: &SaveController,
+    engine: &dyn EditorEngine,
+    root: &Path,
+    line: usize,
+    gui_event_tx: &mpsc::Sender<GuiEvent>,
+) -> Result<Option<(PathBuf, Vec<OpenWithHandler>)>, mpsc::SendError<GuiEvent>> {
+    let snapshot = engine.snapshot();
+    let Some(editor_line) = snapshot.lines.get(line) else {
+        send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            "open-with対象の行が見つかりません",
+        )?;
+        return Ok(None);
+    };
+
+    match fyler_core::grammar::split_id_prefix(&editor_line.text) {
+        PrefixParse::NoId { .. } => {
+            send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Info,
+                "保存されていない行です",
+            )?;
+            return Ok(None);
+        }
+        PrefixParse::Broken => {
+            send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Error,
+                "壊れたIDプレフィックスの行はopen-withできません",
+            )?;
+            return Ok(None);
+        }
+        PrefixParse::WithId { .. } => {}
+    }
+
+    let Some((path, kind)) = save_controller.resolve_line(&snapshot.lines, line) else {
+        send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            "行に対応するファイルが現在のツリーに見つかりません",
+        )?;
+        return Ok(None);
+    };
+
+    if kind == EntryKind::Dir {
+        send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Info,
+            "Open-with is for files only",
+        )?;
+        return Ok(None);
+    }
+
+    let path = path.to_fs_path(root);
+    let handlers = match fyler_fsops::openwith::enumerate_handlers(&path) {
+        Ok(handlers) => handlers,
+        Err(error) => {
+            send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Error,
+                format!("open-with候補を列挙できません: {error:#}"),
+            )?;
+            return Ok(None);
+        }
+    };
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    gui_event_tx.send(GuiEvent::ShowOpenWith {
+        file_name,
+        choices: open_with_choices(&handlers),
+    })?;
+    Ok(Some((path, handlers)))
+}
+
+fn open_with_choices(handlers: &[OpenWithHandler]) -> Vec<String> {
+    let mut choices = handlers
+        .iter()
+        .map(|handler| handler.display_name.clone())
+        .collect::<Vec<_>>();
+    choices.push("Open with... (Windows dialog)".to_owned());
+    choices
 }
 
 fn handle_yank_path(
@@ -1045,6 +1178,56 @@ mod tests {
         assert_eq!(
             resolve_cd_target("sub/dir", &root, None),
             Some(root.join("sub").join("dir"))
+        );
+    }
+
+    #[test]
+    fn parse_sort_query_accepts_keys_and_bang_reverse() {
+        assert_eq!(parse_sort_query("name"), Ok((SortKey::Name, false)));
+        assert_eq!(parse_sort_query("date!"), Ok((SortKey::Date, true)));
+        assert_eq!(parse_sort_query("!date"), Ok((SortKey::Date, true)));
+        assert_eq!(parse_sort_query("!date!"), Ok((SortKey::Date, true)));
+        assert_eq!(parse_sort_query(" size! "), Ok((SortKey::Size, true)));
+        assert_eq!(parse_sort_query("ext"), Ok((SortKey::Extension, false)));
+    }
+
+    #[test]
+    fn parse_sort_query_rejects_unknown_or_empty_key() {
+        assert!(parse_sort_query("mtime").unwrap_err().contains("不明"));
+        assert!(parse_sort_query("").unwrap_err().contains("不明"));
+    }
+
+    #[test]
+    fn sort_state_message_formats_reverse_suffix() {
+        assert_eq!(sort_state_message(SortKey::Date, false), "sort: date");
+        assert_eq!(
+            sort_state_message(SortKey::Size, true),
+            "sort: size (reverse)"
+        );
+    }
+
+    #[test]
+    fn open_with_choices_always_appends_system_dialog() {
+        assert_eq!(
+            open_with_choices(&[]),
+            ["Open with... (Windows dialog)".to_owned()]
+        );
+        assert_eq!(
+            open_with_choices(&[
+                OpenWithHandler {
+                    display_name: "Editor".to_owned(),
+                    key: "editor.exe".to_owned(),
+                },
+                OpenWithHandler {
+                    display_name: "Viewer".to_owned(),
+                    key: "viewer.exe".to_owned(),
+                },
+            ]),
+            [
+                "Editor".to_owned(),
+                "Viewer".to_owned(),
+                "Open with... (Windows dialog)".to_owned(),
+            ]
         );
     }
 

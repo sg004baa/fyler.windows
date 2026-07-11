@@ -330,6 +330,25 @@ pub struct Modifiers {
     pub shift: bool,
 }
 
+/// z系折りたたみコマンドの操作種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldOp {
+    /// zc: カーソル行を含む折りたたみを閉じる。
+    Close,
+    /// zo: カーソル行のディレクトリを開く。
+    Open,
+    /// za: カーソル行の折りたたみ状態を切り替える。
+    Toggle,
+    /// zC: 対象ディレクトリと子孫ディレクトリをすべて閉じる。
+    CloseRecursive,
+    /// zO: 対象ディレクトリと子孫ディレクトリをすべて開く。
+    OpenRecursive,
+    /// zM: 全ディレクトリを閉じる。
+    CloseAll,
+    /// zR: 全ディレクトリを開く。
+    OpenAll,
+}
+
 /// エンジンからGUI/アプリ層へ届くイベント(エンジン非依存の語彙)。
 ///
 /// NvimEngineでは BufWriteCmd / ext_cmdline / ext_messages / プロセス監視から
@@ -342,6 +361,12 @@ pub enum EditorEvent {
     ///
     /// 行テキストの解釈と、ファイル・ディレクトリごとの動作選択はapp層が行う。
     ActivateLine {
+        line: usize,
+    },
+    /// ユーザーが指定行のファイルを開くアプリ選択を要求した。`line` は0始まり。
+    ///
+    /// 行テキストの解釈、候補列挙、実際の起動はapp層が行う。
+    OpenWith {
         line: usize,
     },
     /// ユーザーが指定行のエントリの絶対パスをコピーするよう要求した。
@@ -362,8 +387,20 @@ pub enum EditorEvent {
     ChangeDirectory {
         query: Option<String>,
     },
+    /// ユーザーがソート条件の変更、または現在条件の表示を要求した。
+    /// `query`は`date` / `date!` / `name`などの生引数文字列。
+    /// `None`は現在のソート条件表示要求。
+    ChangeSort {
+        query: Option<String>,
+    },
     /// ユーザーが隠しファイル表示の切り替えを要求した。
     ToggleHidden,
+    /// ユーザーが指定行を基準に折りたたみ操作を要求した。
+    /// `line`は0始まり。
+    Fold {
+        op: FoldOp,
+        line: usize,
+    },
     /// ユーザーがブックマークまたは最近使ったルートへのジャンプ、
     /// あるいは候補一覧の表示を要求した。
     JumpBookmark {
@@ -394,6 +431,14 @@ pub enum EditorEvent {
     /// cmdline表示の更新(`:` / `/` 入力中の内容)。GUIが自前描画する。
     CmdlineShow(CmdlineState),
     CmdlineHide,
+    /// 補完候補リストの表示。GUIが自前描画する。
+    PopupmenuShow(PopupmenuState),
+    /// 補完候補リストの選択行更新。`None`は未選択。
+    PopupmenuSelect {
+        selected: Option<usize>,
+    },
+    /// 補完候補リストの非表示。
+    PopupmenuHide,
     /// エディタからのメッセージ(例: `E486: Pattern not found`)。GUIが自前描画する。
     Message(EditorMessage),
     /// エンジンプロセスのクラッシュ・異常終了(M1: GUIに通知して操作を止める)。
@@ -410,6 +455,22 @@ pub struct CmdlineState {
     pub content: String,
     /// content内のカーソル位置(バイトオフセット)。
     pub cursor: usize,
+}
+
+/// 補完候補リストの候補1件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PopupmenuItem {
+    pub word: String,
+    pub kind: String,
+    pub menu: String,
+}
+
+/// 補完候補リストの表示状態。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PopupmenuState {
+    pub items: Vec<PopupmenuItem>,
+    /// 選択中インデックス。未選択は`None`。
+    pub selected: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

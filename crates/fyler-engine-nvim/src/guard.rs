@@ -67,6 +67,66 @@ vim.bo[buffer].expandtab = false
 
 local group = vim.api.nvim_create_augroup("fyler_guards", { clear = true })
 
+local function name_start_col(line)
+  local prefix = line:match("^/%d+ ") or ""
+  local rest = line:sub(#prefix + 1)
+  local tabs = rest:match("^\t*")
+  return #prefix + #tabs
+end
+
+local function shift_lines(first, last, delta)
+  local lines = vim.api.nvim_buf_get_lines(buffer, first, last + 1, false)
+  local changed = false
+  for i, line in ipairs(lines) do
+    if line ~= "" then
+      local prefix, rest = line:match("^(/%d+ )(.*)$")
+      if not prefix then prefix, rest = "", line end
+      if delta > 0 then
+        lines[i] = prefix .. "\t" .. rest
+        changed = true
+      else
+        local tabs, name = rest:match("^(\t*)(.*)$")
+        if #tabs > 0 then
+          lines[i] = prefix .. tabs:sub(2) .. name
+          changed = true
+        end
+      end
+    end
+  end
+  if changed then
+    vim.api.nvim_buf_set_lines(buffer, first, last + 1, false, lines)
+  end
+end
+
+_G.__fyler_shift_delta = 0
+_G.__fyler_shift_op = function(_)
+  local first = vim.api.nvim_buf_get_mark(0, "[")[1] - 1
+  local last = vim.api.nvim_buf_get_mark(0, "]")[1] - 1
+  shift_lines(first, last, _G.__fyler_shift_delta)
+  vim.api.nvim_win_set_cursor(0, { first + 1, 0 })
+end
+
+for lhs, delta in pairs({ [">"] = 1, ["<"] = -1 }) do
+  vim.keymap.set("n", lhs, function()
+    _G.__fyler_shift_delta = delta
+    vim.o.operatorfunc = "v:lua.__fyler_shift_op"
+    return "g@"
+  end, { buffer = buffer, expr = true, silent = true })
+  vim.keymap.set("n", lhs .. lhs, function()
+    _G.__fyler_shift_delta = delta
+    vim.o.operatorfunc = "v:lua.__fyler_shift_op"
+    return "g@_"
+  end, { buffer = buffer, expr = true, silent = true })
+  vim.keymap.set("x", lhs, function()
+    local first = vim.fn.line("v") - 1
+    local last = vim.api.nvim_win_get_cursor(0)[1] - 1
+    if first > last then first, last = last, first end
+    shift_lines(first, last, delta)
+    vim.api.nvim_input("<Esc>")
+    vim.api.nvim_win_set_cursor(0, { first + 1, 0 })
+  end, { buffer = buffer, silent = true })
+end
+
 vim.keymap.set({ "n", "x" }, "<CR>", function()
   local line = vim.api.nvim_win_get_cursor(0)[1] - 1
   vim.rpcnotify(channel, "fyler_open", line)
@@ -80,12 +140,21 @@ vim.keymap.set("n", "g.", function()
   vim.rpcnotify(channel, "fyler_toggle_hidden")
 end, { buffer = buffer, silent = true, nowait = true })
 
+for lhs, op in pairs({ zc = "close", zo = "open", za = "toggle", ["zC"] = "close_rec", ["zO"] = "open_rec", ["zM"] = "close_all", ["zR"] = "open_all" }) do
+  vim.keymap.set("n", lhs, function()
+    vim.rpcnotify(channel, "fyler_fold", op, vim.api.nvim_win_get_cursor(0)[1] - 1)
+  end, { buffer = buffer, silent = true, nowait = true })
+end
 vim.keymap.set("n", "g/", function()
   vim.rpcnotify(channel, "fyler_open_picker")
 end, { buffer = buffer, silent = true, nowait = true })
 
 vim.keymap.set("n", "gy", function()
   vim.rpcnotify(channel, "fyler_yank_path", vim.api.nvim_win_get_cursor(0)[1] - 1)
+end, { buffer = buffer, silent = true, nowait = true })
+
+vim.keymap.set("n", "go", function()
+  vim.rpcnotify(channel, "fyler_open_with", vim.api.nvim_win_get_cursor(0)[1] - 1)
 end, { buffer = buffer, silent = true, nowait = true })
 
 vim.keymap.set("n", "gd", function()
@@ -149,7 +218,6 @@ end, { buffer = buffer, silent = true, nowait = true })
 vim.api.nvim_buf_create_user_command(buffer, "FylerBookmark", function(opts)
   vim.rpcnotify(channel, "fyler_bookmark", opts.args)
 end, { nargs = "?" })
-vim.cmd([[cnoreabbrev <buffer> <expr> b (getcmdtype() == ':' && getcmdline() ==# 'b') ? 'FylerBookmark' : 'b']])
 
 vim.api.nvim_buf_create_user_command(buffer, "FylerUndo", function()
   vim.rpcnotify(channel, "fyler_undo")
@@ -158,7 +226,43 @@ end, {})
 vim.api.nvim_buf_create_user_command(buffer, "FylerCd", function(opts)
   vim.rpcnotify(channel, "fyler_cd", opts.args)
 end, { nargs = "?", complete = "dir" })
-vim.cmd([[cnoreabbrev <buffer> <expr> cd (getcmdtype() == ':' && getcmdline() ==# 'cd') ? 'FylerCd' : 'cd']])
+
+local sort_keys = { "name", "date", "size", "ext" }
+vim.api.nvim_buf_create_user_command(buffer, "FylerSort", function(opts)
+  local arg = opts.args
+  if opts.bang and arg ~= "" then arg = arg .. "!" end
+  vim.rpcnotify(channel, "fyler_sort", arg)
+end, {
+  nargs = "?",
+  bang = true,
+  complete = function(arg_lead)
+    return vim.tbl_filter(function(key)
+      return vim.startswith(key, arg_lead)
+    end, sort_keys)
+  end,
+})
+
+vim.o.wildcharm = 26
+local command_aliases = { b = "FylerBookmark", cd = "FylerCd", sort = "FylerSort" }
+-- nvim_paste経由ではcnoreabbrevが展開されないため、実行/補完直前に先頭語を正式コマンドへ書き換える。
+local function rewrite_command_alias()
+  if vim.fn.getcmdtype() ~= ":" then return end
+  local line = vim.fn.getcmdline()
+  local head, bang, rest = line:match("^(%a+)(!?)(.*)$")
+  local target = head and command_aliases[head]
+  if target and (rest == "" or rest:match("^%s")) then
+    local pos = vim.fn.getcmdpos()
+    vim.fn.setcmdline(target .. bang .. rest, pos + #target - #head)
+  end
+end
+vim.keymap.set("c", "<Tab>", function()
+  rewrite_command_alias()
+  return "<C-Z>"
+end, { buffer = buffer, expr = true })
+vim.keymap.set("c", "<CR>", function()
+  rewrite_command_alias()
+  return "<CR>"
+end, { buffer = buffer, expr = true })
 
 for _, lhs in ipairs({ "gf", "gF", "<C-]>" }) do
   vim.keymap.set({ "n", "x" }, lhs, function()
@@ -182,6 +286,19 @@ for _, event in ipairs(write_events) do
     end,
   })
 end
+
+vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
+  group = group,
+  buffer = buffer,
+  callback = function()
+    local pos = vim.api.nvim_win_get_cursor(0)
+    local line = vim.api.nvim_buf_get_lines(buffer, pos[1] - 1, pos[1], false)[1] or ""
+    local min_col = name_start_col(line)
+    if pos[2] < min_col and #line > min_col then
+      vim.api.nvim_win_set_cursor(0, { pos[1], min_col })
+    end
+  end,
+})
 
 vim.api.nvim_create_autocmd("BufEnter", {
   group = group,

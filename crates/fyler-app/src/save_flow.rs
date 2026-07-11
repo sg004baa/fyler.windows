@@ -7,11 +7,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use fyler_core::editor::{EditorCommand, EditorEngine, EditorLine};
+use fyler_core::editor::{EditorCommand, EditorEngine, EditorLine, FoldOp};
 use fyler_core::fileinfo::{FileInfo, human_readable_size};
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::{EntryId, IdAllocator};
+use fyler_core::options::SortKey;
 use fyler_core::path::TreePath;
 use fyler_core::plan::OperationPlan;
 use fyler_core::report::CommitReport;
@@ -206,6 +207,22 @@ pub enum ToggleCollapseResult {
     /// 対象行はディレクトリではない。
     NotADirectory,
     /// 保存状態機械が`Idle`ではないため、状態を変更しなかった。
+    Busy,
+}
+
+/// 折りたたみ操作の結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FoldResult {
+    /// 折りたたみ状態が変化した。linesをバッファへ設定し、cursor_lineへカーソルを移す。
+    Applied {
+        lines: Vec<EditorLine>,
+        cursor_line: Option<usize>,
+    },
+    /// 状態が変化しなかった(既に開いている等)。
+    NoOp,
+    /// 行を解決できない(ID無し行・baseline不在)。
+    NotFound,
+    /// 保存状態機械がIdleでない。
     Busy,
 }
 
@@ -422,6 +439,13 @@ impl SaveController {
         self.scan_options
     }
 
+    /// 現在のソート条件を返す。
+    ///
+    /// `:sort`引数なしの表示で使う。第1要素がソートキー、第2要素が降順フラグである。
+    pub fn sort_state(&self) -> (SortKey, bool) {
+        (self.scan_options.key, self.scan_options.reverse)
+    }
+
     /// 表示ルート相対のGit状態を、現在のbaselineのエントリIDへ対応付けて返す。
     ///
     /// Gitがディレクトリ単位で報告した状態は同じパスのエントリだけへ付け、子孫や
@@ -517,6 +541,142 @@ impl SaveController {
         ToggleCollapseResult::Toggled(self.visible_lines())
     }
 
+    /// z系コマンドによる折りたたみ状態変更を行う。
+    ///
+    /// 対象行は埋め込みIDを使って現在のbaselineへ解決する。Close系はファイル行や
+    /// 既に閉じたディレクトリ行から親の展開中ディレクトリへ遡り、Open系は現在行の
+    /// ディレクトリだけを対象にする。dirty判定は呼び出し元のapp層が先に行うこと。
+    pub fn fold(&mut self, lines: &[EditorLine], line: usize, op: FoldOp) -> FoldResult {
+        let Some(entry) = self.resolve_line_entry(lines, line) else {
+            return FoldResult::NotFound;
+        };
+        if !self.is_idle() {
+            return FoldResult::Busy;
+        }
+
+        let before = self.context.collapsed_dirs.clone();
+        let cursor_id = match op {
+            FoldOp::Close => {
+                let Some(target) = self.close_target_for_entry(&entry) else {
+                    return FoldResult::NoOp;
+                };
+                self.context.collapsed_dirs.insert(target.id);
+                target.id
+            }
+            FoldOp::Open => {
+                if entry.kind != EntryKind::Dir {
+                    return FoldResult::NoOp;
+                }
+                self.context.collapsed_dirs.remove(&entry.id);
+                entry.id
+            }
+            FoldOp::Toggle => {
+                if entry.kind == EntryKind::Dir {
+                    if !self.context.collapsed_dirs.remove(&entry.id) {
+                        self.context.collapsed_dirs.insert(entry.id);
+                    }
+                    entry.id
+                } else {
+                    let Some(target) = self.close_target_for_entry(&entry) else {
+                        return FoldResult::NoOp;
+                    };
+                    self.context.collapsed_dirs.insert(target.id);
+                    target.id
+                }
+            }
+            FoldOp::CloseRecursive => {
+                let Some(target) = self.close_target_for_entry(&entry) else {
+                    return FoldResult::NoOp;
+                };
+                self.collapse_dir_recursive(&target.path);
+                target.id
+            }
+            FoldOp::OpenRecursive => {
+                if entry.kind != EntryKind::Dir {
+                    return FoldResult::NoOp;
+                }
+                self.expand_dir_recursive(&entry.path);
+                entry.id
+            }
+            FoldOp::CloseAll => {
+                self.collapse_all_dirs();
+                top_level_ancestor_entry(&self.baseline, &entry)
+                    .map(|entry| entry.id)
+                    .unwrap_or(entry.id)
+            }
+            FoldOp::OpenAll => {
+                self.context.collapsed_dirs.clear();
+                entry.id
+            }
+        };
+
+        if self.context.collapsed_dirs == before {
+            return FoldResult::NoOp;
+        }
+
+        FoldResult::Applied {
+            lines: self.visible_lines(),
+            cursor_line: visible_position_by_id(&self.baseline, &self.context, cursor_id),
+        }
+    }
+
+    fn resolve_line_entry(&self, lines: &[EditorLine], line: usize) -> Option<BaselineEntry> {
+        let editor_line = lines.get(line)?;
+        let PrefixParse::WithId { id, .. } =
+            fyler_core::grammar::split_id_prefix(&editor_line.text)
+        else {
+            return None;
+        };
+        self.baseline.get(id).cloned()
+    }
+
+    fn close_target_for_entry(&self, entry: &BaselineEntry) -> Option<BaselineEntry> {
+        if entry.kind == EntryKind::Dir && !self.context.collapsed_dirs.contains(&entry.id) {
+            return Some(entry.clone());
+        }
+
+        let mut parent = entry.path.parent();
+        while let Some(path) = parent {
+            if let Some(candidate) = entry_by_path(&self.baseline, &path)
+                && candidate.kind == EntryKind::Dir
+                && !self.context.collapsed_dirs.contains(&candidate.id)
+            {
+                return Some(candidate.clone());
+            }
+            parent = path.parent();
+        }
+
+        None
+    }
+
+    fn collapse_dir_recursive(&mut self, path: &TreePath) {
+        let ids = self
+            .baseline
+            .entries()
+            .iter()
+            .filter(|entry| {
+                entry.kind == EntryKind::Dir
+                    && (&entry.path == path || path.is_strict_ancestor_of(&entry.path))
+            })
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        self.context.collapsed_dirs.extend(ids);
+    }
+
+    fn expand_dir_recursive(&mut self, path: &TreePath) {
+        let ids = self
+            .baseline
+            .entries()
+            .iter()
+            .filter(|entry| {
+                entry.kind == EntryKind::Dir
+                    && (&entry.path == path || path.is_strict_ancestor_of(&entry.path))
+            })
+            .map(|entry| entry.id)
+            .collect::<HashSet<_>>();
+        self.context.collapsed_dirs.retain(|id| !ids.contains(id));
+    }
+
     /// 隠しファイル表示を切り替えて現在のルートを再スキャンする。
     ///
     /// 保存状態機械が`Idle`のときだけ実行し、同じパスのIDと新baselineにも実在する
@@ -551,7 +711,50 @@ impl SaveController {
         Ok(lines)
     }
 
+    /// ソート条件を変更して現在のルートを再スキャンする。
+    ///
+    /// 保存状態機械が`Idle`のときだけ実行し、IDと折りたたみ状態を維持する。
+    /// 戻り値はバッファへ設定すべき全行である。
+    pub fn change_sort(&mut self, key: SortKey, reverse: bool) -> anyhow::Result<Vec<EditorLine>> {
+        if !self.is_idle() {
+            anyhow::bail!("保存処理中はソート条件を変更できません");
+        }
+
+        let options = ScanOptions {
+            key,
+            reverse,
+            ..self.scan_options
+        };
+        if options == self.scan_options {
+            return Ok(self.visible_lines());
+        }
+
+        let mut ids = self
+            .ids
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ID採番器のロックが破損しています"))?;
+        let baseline = fyler_fsops::scan::rescan_preserving_ids_with(
+            &self.root,
+            &mut ids,
+            &self.baseline,
+            &options,
+        )
+        .context("ソート条件変更後の実FS再スキャンに失敗しました")?;
+        drop(ids);
+        let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
+        let lines = baseline_to_lines(&baseline, &context);
+
+        self.baseline = baseline;
+        self.context = context;
+        self.scan_options = options;
+        Ok(lines)
+    }
+
     /// 共有ID採番器を維持したまま表示ルートとbaselineを差し替える。
+    ///
+    /// 保存状態機械が`Idle`のときだけ成功する。成功時はルート固有の編集文脈も
+    /// リセットする。`baseline.root`が`root`と一致しない入力は拒否し、既存状態を
+    /// 変更しない。
     pub fn change_root_preserving_allocator(
         &mut self,
         root: PathBuf,
@@ -701,6 +904,7 @@ impl SaveController {
                     SaveFlowResult::UndoCancelled { transaction }
                 }
                 ConfirmChoice::Approve => self.approve_and_undo(),
+                ConfirmChoice::OpenWithSelected(_) => SaveFlowResult::Ignored,
             };
         }
 
@@ -715,6 +919,7 @@ impl SaveController {
                 SaveFlowResult::Cancelled
             }
             ConfirmChoice::Approve => self.approve_and_apply(),
+            ConfirmChoice::OpenWithSelected(_) => SaveFlowResult::Ignored,
         }
     }
 
@@ -1162,6 +1367,29 @@ fn carry_collapsed_dirs(
     context
 }
 
+fn entry_by_path<'a>(baseline: &'a BaselineTree, path: &TreePath) -> Option<&'a BaselineEntry> {
+    baseline.entries().iter().find(|entry| &entry.path == path)
+}
+
+fn top_level_ancestor_entry<'a>(
+    baseline: &'a BaselineTree,
+    entry: &BaselineEntry,
+) -> Option<&'a BaselineEntry> {
+    let name = entry.path.components().first()?;
+    let path = TreePath::from_components([name.clone()]);
+    entry_by_path(baseline, &path)
+}
+
+fn visible_position_by_id(
+    baseline: &BaselineTree,
+    context: &EditContext,
+    id: EntryId,
+) -> Option<usize> {
+    visible_entries(baseline, context)
+        .into_iter()
+        .position(|entry| entry.id == id)
+}
+
 /// 折りたたみ状態を反映した表示対象エントリを1パスで列挙する。
 ///
 /// baselineの表示順は親の直後に全子孫が連続するDFS順であることを前提とする。
@@ -1217,8 +1445,9 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use fyler_core::editor::EditorSnapshot;
+    use fyler_core::editor::{EditorSnapshot, FoldOp};
     use fyler_core::fileinfo::EntryMeta;
+    use fyler_core::options::{SortKey, SortOrder};
     use fyler_core::path::TreePath;
     use fyler_core::plan::FsOperation;
     use fyler_core::report::{OpOutcome, OpResult};
@@ -1271,6 +1500,23 @@ mod tests {
         let engine = Arc::new(RecordingEngine::default());
         let controller =
             SaveController::new(root, ids, baseline, Arc::<RecordingEngine>::clone(&engine));
+        (controller, engine)
+    }
+
+    fn scanned_controller(
+        root: &Path,
+        options: ScanOptions,
+    ) -> (SaveController, Arc<RecordingEngine>) {
+        let mut ids = IdAllocator::new();
+        let baseline = fyler_fsops::scan::scan_baseline_with(root, &mut ids, &options).unwrap();
+        let engine = Arc::new(RecordingEngine::default());
+        let controller = SaveController::new_with_scan_options(
+            root.to_path_buf(),
+            ids,
+            baseline,
+            Arc::<RecordingEngine>::clone(&engine),
+            options,
+        );
         (controller, engine)
     }
 
@@ -1374,6 +1620,13 @@ mod tests {
         lines.iter().map(|line| EditorLine::new(*line)).collect()
     }
 
+    fn fold_applied(result: FoldResult) -> (Vec<EditorLine>, Option<usize>) {
+        match result {
+            FoldResult::Applied { lines, cursor_line } => (lines, cursor_line),
+            result => panic!("unexpected fold result: {result:?}"),
+        }
+    }
+
     fn legacy_baseline_to_lines(baseline: &BaselineTree, context: &EditContext) -> Vec<EditorLine> {
         let collapsed_paths = context
             .collapsed_dirs
@@ -1451,6 +1704,58 @@ mod tests {
         let statuses = HashMap::from([(PathBuf::from("missing.txt"), GitBadge::Untracked)]);
 
         assert!(controller.map_git_badges(&statuses).is_empty());
+    }
+
+    #[test]
+    fn change_sort_rescans_and_preserves_collapsed_dirs() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("dir")).unwrap();
+        fs::write(root.path().join("dir").join("child.txt"), b"child").unwrap();
+        fs::write(root.path().join("small.txt"), b"1").unwrap();
+        fs::write(root.path().join("large.txt"), b"12345").unwrap();
+        let options = ScanOptions {
+            sort: SortOrder::Mixed,
+            ..ScanOptions::default()
+        };
+        let (mut controller, _) = scanned_controller(root.path(), options);
+        controller.collapse_all_dirs();
+        let dir_id = controller
+            .baseline
+            .entries()
+            .iter()
+            .find(|entry| entry.path == TreePath::parse("dir"))
+            .unwrap()
+            .id;
+
+        let lines = controller.change_sort(SortKey::Size, false).unwrap();
+
+        assert_eq!(controller.sort_state(), (SortKey::Size, false));
+        assert!(controller.collapsed_dirs().contains(&dir_id));
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].text.ends_with("small.txt"));
+        assert!(lines[1].text.ends_with("large.txt"));
+        assert!(lines[2].text.ends_with("dir/"));
+    }
+
+    #[test]
+    fn change_sort_requires_idle_state() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("a.txt"), b"content").unwrap();
+        let (mut controller, _) = scanned_controller(root.path(), ScanOptions::default());
+        let entry_id = controller.baseline.entries()[0].id;
+        let renamed_line = EditorLine::new(format!(
+            "{}b.txt",
+            fyler_core::grammar::format_id_prefix(entry_id)
+        ));
+        assert!(matches!(
+            controller.on_commit(1, &[renamed_line]),
+            SaveFlowResult::ShowPlan { .. }
+        ));
+
+        let error = controller.change_sort(SortKey::Date, false).unwrap_err();
+
+        assert!(error.to_string().contains("保存処理中"));
+        assert_eq!(controller.sort_state(), (SortKey::Name, false));
     }
 
     #[test]
@@ -2611,12 +2916,181 @@ mod tests {
     }
 
     #[test]
+    fn close_on_file_collapses_parent_and_moves_cursor() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        let expanded = controller.visible_lines();
+
+        let (collapsed, cursor_line) = fold_applied(controller.fold(&expanded, 2, FoldOp::Close));
+
+        assert_eq!(cursor_line, Some(1));
+        assert!(collapsed[1].text.ends_with("nested/"));
+        assert!(
+            collapsed
+                .iter()
+                .all(|line| !line.text.ends_with("leaf.txt"))
+        );
+        assert_eq!(controller.context.collapsed_dirs, [EntryId(2)].into());
+    }
+
+    #[test]
+    fn close_on_expanded_dir_collapses_it() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        let expanded = controller.visible_lines();
+
+        let (collapsed, cursor_line) = fold_applied(controller.fold(&expanded, 0, FoldOp::Close));
+
+        assert_eq!(cursor_line, Some(0));
+        assert_eq!(collapsed.len(), 2);
+        assert!(collapsed[0].text.ends_with("a/"));
+        assert_eq!(controller.context.collapsed_dirs, [EntryId(1)].into());
+    }
+
+    #[test]
+    fn close_on_collapsed_dir_climbs_to_parent() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        let expanded = controller.visible_lines();
+        let (nested_collapsed, _) = fold_applied(controller.fold(&expanded, 1, FoldOp::Close));
+
+        let (parent_collapsed, cursor_line) =
+            fold_applied(controller.fold(&nested_collapsed, 1, FoldOp::Close));
+
+        assert_eq!(cursor_line, Some(0));
+        assert_eq!(parent_collapsed.len(), 2);
+        assert!(parent_collapsed[0].text.ends_with("a/"));
+        assert_eq!(
+            controller.context.collapsed_dirs,
+            [EntryId(1), EntryId(2)].into()
+        );
+    }
+
+    #[test]
+    fn close_on_top_level_file_is_noop() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        let expanded = controller.visible_lines();
+
+        assert_eq!(
+            controller.fold(&expanded, 4, FoldOp::Close),
+            FoldResult::NoOp
+        );
+        assert_eq!(controller.visible_lines(), expanded);
+    }
+
+    #[test]
+    fn open_on_collapsed_dir_expands() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        let expanded = controller.visible_lines();
+        let (nested_collapsed, _) = fold_applied(controller.fold(&expanded, 1, FoldOp::Close));
+
+        let (opened, cursor_line) =
+            fold_applied(controller.fold(&nested_collapsed, 1, FoldOp::Open));
+
+        assert_eq!(cursor_line, Some(1));
+        assert!(opened.iter().any(|line| line.text.ends_with("leaf.txt")));
+        assert!(controller.context.collapsed_dirs.is_empty());
+    }
+
+    #[test]
+    fn toggle_on_file_closes_parent() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        let expanded = controller.visible_lines();
+
+        let (collapsed, cursor_line) = fold_applied(controller.fold(&expanded, 3, FoldOp::Toggle));
+
+        assert_eq!(cursor_line, Some(0));
+        assert_eq!(collapsed.len(), 2);
+        assert_eq!(controller.context.collapsed_dirs, [EntryId(1)].into());
+    }
+
+    #[test]
+    fn close_recursive_collapses_descendant_dirs() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        let expanded = controller.visible_lines();
+
+        let (collapsed, cursor_line) =
+            fold_applied(controller.fold(&expanded, 0, FoldOp::CloseRecursive));
+
+        assert_eq!(cursor_line, Some(0));
+        assert_eq!(collapsed.len(), 2);
+        assert_eq!(
+            controller.context.collapsed_dirs,
+            [EntryId(1), EntryId(2)].into()
+        );
+    }
+
+    #[test]
     fn reveal_entry_returns_the_correct_line_when_already_visible() {
         let (mut controller, _) = hierarchy_controller("C:/test-root");
 
         assert_eq!(
             controller.reveal_entry(EntryId(3)),
             RevealResult::AlreadyVisible { line: 2 }
+        );
+    }
+
+    #[test]
+    fn open_recursive_expands_descendant_dirs() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        controller.collapse_all_dirs();
+        let collapsed = controller.visible_lines();
+
+        let (opened, cursor_line) =
+            fold_applied(controller.fold(&collapsed, 0, FoldOp::OpenRecursive));
+
+        assert_eq!(cursor_line, Some(0));
+        assert!(opened.iter().any(|line| line.text.ends_with("leaf.txt")));
+        assert!(controller.context.collapsed_dirs.is_empty());
+    }
+
+    #[test]
+    fn close_all_moves_cursor_to_top_level_ancestor() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        let expanded = controller.visible_lines();
+
+        let (collapsed, cursor_line) =
+            fold_applied(controller.fold(&expanded, 2, FoldOp::CloseAll));
+
+        assert_eq!(cursor_line, Some(0));
+        assert_eq!(collapsed.len(), 2);
+        assert_eq!(
+            controller.context.collapsed_dirs,
+            [EntryId(1), EntryId(2)].into()
+        );
+    }
+
+    #[test]
+    fn open_all_clears_and_keeps_cursor_entry() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        let expanded = controller.visible_lines();
+        let (nested_collapsed, _) = fold_applied(controller.fold(&expanded, 1, FoldOp::Close));
+
+        let (opened, cursor_line) =
+            fold_applied(controller.fold(&nested_collapsed, 1, FoldOp::OpenAll));
+
+        assert_eq!(cursor_line, Some(1));
+        assert_eq!(opened, expanded);
+        assert!(controller.context.collapsed_dirs.is_empty());
+    }
+
+    #[test]
+    fn fold_busy_when_not_idle() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        let mut lines = controller.visible_lines();
+        lines[4].text = lines[4].text.replace("top.txt", "renamed.txt");
+        assert!(matches!(
+            controller.on_commit(7, &lines),
+            SaveFlowResult::ShowPlan { .. }
+        ));
+
+        assert_eq!(controller.fold(&lines, 0, FoldOp::Close), FoldResult::Busy);
+    }
+
+    #[test]
+    fn fold_not_found_for_no_id_line() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+
+        assert_eq!(
+            controller.fold(&lines(&["new.txt"]), 0, FoldOp::Close),
+            FoldResult::NotFound
         );
     }
 

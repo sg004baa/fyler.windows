@@ -7,7 +7,9 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 
 use eframe::egui;
-use fyler_core::editor::{CmdlineState, EditorEngine, EditorEvent, EditorMessage, Mode};
+use fyler_core::editor::{
+    CmdlineState, EditorEngine, EditorEvent, EditorMessage, Mode, PopupmenuState,
+};
 use fyler_core::fileinfo::FileInfo;
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::id::EntryId;
@@ -107,6 +109,11 @@ pub enum GuiEvent {
     },
     /// 指定された表示用パスをクリップボードへコピーする。
     CopyPath(String),
+    /// open-with候補を表示する。
+    ShowOpenWith {
+        file_name: String,
+        choices: Vec<String>,
+    },
     /// 保存planと実行前に確認すべき警告を表示する。
     ShowPlan {
         plan: OperationPlan,
@@ -180,6 +187,11 @@ enum DialogState {
     },
     TransferReport(CommitReport<TransferOp>),
     ValidationErrors(Vec<ValidateError>),
+    OpenWith {
+        file_name: String,
+        choices: Vec<String>,
+        selected: usize,
+    },
     UndoRecovery {
         descriptions: Vec<String>,
     },
@@ -205,6 +217,7 @@ pub struct FylerApp {
     active: Option<PaneId>,
     event_rx: mpsc::Receiver<GuiEvent>,
     cmdline: Option<CmdlineState>,
+    popupmenu: Option<PopupmenuState>,
     message: Option<EditorMessage>,
     pending_copy: Option<String>,
     fatal_error: Option<String>,
@@ -253,6 +266,7 @@ impl FylerApp {
             active: None,
             event_rx,
             cmdline: None,
+            popupmenu: None,
             message: None,
             pending_copy: None,
             fatal_error: None,
@@ -305,11 +319,14 @@ impl FylerApp {
                 GuiEvent::Editor { pane_id, event } => match event {
                     EditorEvent::SnapshotUpdated => {}
                     EditorEvent::ActivateLine { .. } => {}
+                    EditorEvent::OpenWith { .. } => {}
                     EditorEvent::YankPath { .. } => {}
                     EditorEvent::NavigateInto { .. } => {}
                     EditorEvent::NavigateParent => {}
                     EditorEvent::ChangeDirectory { .. } => {}
+                    EditorEvent::ChangeSort { .. } => {}
                     EditorEvent::ToggleHidden => {}
+                    EditorEvent::Fold { .. } => {}
                     EditorEvent::JumpBookmark { .. } => {}
                     EditorEvent::OpenFilePicker => {}
                     EditorEvent::ShowHelp => self.dialog = Some(DialogState::Help),
@@ -323,8 +340,23 @@ impl FylerApp {
                     EditorEvent::CmdlineShow(_) => {}
                     EditorEvent::CmdlineHide if self.active == Some(pane_id) => {
                         self.cmdline = None;
+                        self.popupmenu = None;
                     }
                     EditorEvent::CmdlineHide => {}
+                    EditorEvent::PopupmenuShow(state) if self.active == Some(pane_id) => {
+                        self.popupmenu = Some(state);
+                    }
+                    EditorEvent::PopupmenuShow(_) => {}
+                    EditorEvent::PopupmenuSelect { selected } if self.active == Some(pane_id) => {
+                        if let Some(state) = &mut self.popupmenu {
+                            state.selected = selected;
+                        }
+                    }
+                    EditorEvent::PopupmenuSelect { .. } => {}
+                    EditorEvent::PopupmenuHide if self.active == Some(pane_id) => {
+                        self.popupmenu = None;
+                    }
+                    EditorEvent::PopupmenuHide => {}
                     EditorEvent::Message(message) => self.message = Some(message),
                     EditorEvent::EngineCrashed { reason } => {
                         if matches!(
@@ -376,6 +408,13 @@ impl FylerApp {
                     self.picker_needs_focus = true;
                 }
                 GuiEvent::CopyPath(path) => self.pending_copy = Some(path),
+                GuiEvent::ShowOpenWith { file_name, choices } => {
+                    self.dialog = Some(DialogState::OpenWith {
+                        file_name,
+                        choices,
+                        selected: 0,
+                    });
+                }
                 GuiEvent::ShowPlan {
                     plan,
                     warnings,
@@ -517,6 +556,9 @@ impl eframe::App for FylerApp {
         }
 
         egui::Panel::bottom("global-command-area").show(ui, |ui| {
+            if let Some(state) = &self.popupmenu {
+                cmdline::draw_popupmenu(ui, state);
+            }
             if let Some(state) = &self.cmdline {
                 cmdline::draw_cmdline(ui, state);
             } else if let Some(message) = &self.message {
@@ -562,6 +604,7 @@ impl eframe::App for FylerApp {
         let mut cancel_apply = false;
         let mut dismiss_errors = false;
         let mut dismiss_report = false;
+        let mut open_with_choice = None;
         let mut picker_result = None;
         match &mut self.dialog {
             Some(DialogState::Plan {
@@ -625,6 +668,18 @@ impl eframe::App for FylerApp {
                     })
                     .inner;
             }
+            Some(DialogState::OpenWith {
+                file_name,
+                choices,
+                selected,
+            }) => {
+                let (choice, next_selected) =
+                    confirm::draw_open_with(ui, file_name, choices, *selected);
+                if let Some(next_selected) = next_selected {
+                    *selected = next_selected;
+                }
+                open_with_choice = choice;
+            }
             Some(DialogState::FilePicker {
                 pane_id,
                 candidates,
@@ -655,6 +710,12 @@ impl eframe::App for FylerApp {
             && self.action_tx.send(GuiAction::Confirm(choice)).is_err()
         {
             self.fatal_error = Some("Failed to send confirmation result to app".to_owned());
+        }
+        if let Some(choice) = open_with_choice {
+            self.dialog = None;
+            if self.action_tx.send(GuiAction::Confirm(choice)).is_err() {
+                self.fatal_error = Some("Failed to send open-with result to app".to_owned());
+            }
         }
         if cancel_apply
             && self
@@ -957,6 +1018,7 @@ fn draw_help(ui: &mut egui::Ui) -> bool {
                 "g.    Toggle hidden files",
                 "g/    Find file",
                 "gy    Copy path",
+                "go    Open with",
                 "gm/gc Move/copy to previous pane",
                 "<C-w>s/v  Split pane",
                 "<C-w>h/j/k/l/w/p  Focus pane",
@@ -1120,6 +1182,7 @@ mod tests {
                 active: None,
                 event_rx,
                 cmdline: None,
+                popupmenu: None,
                 message: None,
                 pending_copy: None,
                 fatal_error: None,
@@ -1250,6 +1313,7 @@ mod tests {
             active: Some(first),
             event_rx,
             cmdline: None,
+            popupmenu: None,
             message: None,
             pending_copy: None,
             fatal_error: None,

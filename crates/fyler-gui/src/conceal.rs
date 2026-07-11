@@ -1,7 +1,8 @@
 //! IDプレフィックスの隠蔽とカーソル列補正(DESIGN.md「行フォーマット」)。
 //!
 //! nvimのconcealは使わない(Rust側描画なので漏れない)。バッファの生テキストから
-//! `/012 ` プレフィックスを取り除いて表示し、カーソル列をそのぶん補正する。
+//! `/012 ` プレフィックスとインデントタブを取り除いて表示し、
+//! カーソル列をそのぶん補正する。
 //! **プレフィックスの解釈は必ず `fyler_core::grammar` を使う**(再実装禁止)。
 
 use fyler_core::editor::Cursor;
@@ -10,25 +11,30 @@ use fyler_core::grammar;
 /// 1行の表示形。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConcealedLine<'a> {
-    /// 表示するテキスト(IDプレフィックス除去後。インデントと名前)。
+    /// 名前部分(タブの後)から始まる表示テキスト。
     pub display: &'a str,
-    /// 隠したプレフィックスのバイト長(`grammar::id_prefix_len`)。
+    /// 隠したバイト数(IDプレフィックス + インデントタブ)。
     pub concealed_bytes: usize,
+    /// インデント深さ(タブ数)。アイコンの描画位置決定に使う。
+    pub depth: usize,
 }
 
 /// 行の表示形を作る。
 ///
 /// 実装契約:
 /// - `grammar::split_id_prefix` が `WithId` → プレフィックスを隠す
-/// - `NoId` → そのまま表示
-/// - `Broken` → **隠さずそのまま表示**する(ユーザーが壊れたプレフィックスを
-///   視認・修復できるように。validateエラーにもなる)
+/// - `NoId` → 行頭インデントだけ隠す
+/// - `Broken` → IDとしては隠さず、行頭インデントだけ隠す
 pub fn conceal_line(raw: &str) -> ConcealedLine<'_> {
-    // grammar::id_prefix_len は WithId のみ非0、NoId/Broken は0(そのまま表示)。
-    let concealed_bytes = grammar::id_prefix_len(raw);
+    // grammar::id_prefix_len は WithId のみ非0、NoId/Broken は0。
+    let prefix_bytes = grammar::id_prefix_len(raw);
+    let rest = &raw[prefix_bytes..];
+    let (depth, display) = grammar::split_indent(rest);
+    let indent_bytes = rest.len() - display.len();
     ConcealedLine {
-        display: &raw[concealed_bytes..],
-        concealed_bytes,
+        display,
+        concealed_bytes: prefix_bytes + indent_bytes,
+        depth,
     }
 }
 
@@ -36,7 +42,7 @@ pub fn conceal_line(raw: &str) -> ConcealedLine<'_> {
 ///
 /// 実装契約:
 /// - `cursor.col`(バイトオフセット)からその行の `concealed_bytes` を引く
-/// - カーソルがプレフィックス領域内にある場合は表示列0へクランプする
+/// - カーソルがプレフィックス/インデント領域内にある場合は表示列0へクランプする
 ///   (M0で「カーソルがプレフィックス領域に入らない補正」の実現方法を検証。
 ///   破綻したらDESIGN.md「リスクと撤退ルート」のfallbackへ)
 /// - バイトオフセット → 表示列の変換はUTF-8文字境界を考慮する
@@ -63,18 +69,20 @@ mod tests {
             ConcealedLine {
                 display: "src/",
                 concealed_bytes: 5,
+                depth: 0,
             }
         );
     }
 
     #[test]
-    fn conceal_line_keeps_indent_in_display() {
-        // 隠すのはプレフィックスのみ。tabインデントは名前側なので display に残る。
+    fn conceal_line_hides_indent_tabs_after_id_prefix() {
+        // プレフィックス直後のtabインデントは装飾扱いとして隠す。
         assert_eq!(
-            conceal_line("/013 	main.rs"),
+            conceal_line("/013 \t\tmain.rs"),
             ConcealedLine {
-                display: "\tmain.rs",
-                concealed_bytes: 5,
+                display: "main.rs",
+                concealed_bytes: 7,
+                depth: 2,
             }
         );
     }
@@ -87,30 +95,55 @@ mod tests {
             ConcealedLine {
                 display: "新規ファイル.txt",
                 concealed_bytes: 5,
+                depth: 0,
             }
         );
     }
 
     #[test]
     fn conceal_line_passes_through_create_candidate() {
-        // IDなし行(CREATE候補)は何も隠さず入力そのまま。マルチバイト名でも変わらない。
+        // インデントなしのIDなし行(CREATE候補)は入力そのまま。
+        // マルチバイト名でも変わらない。
         assert_eq!(
             conceal_line("新規ファイル.txt"),
             ConcealedLine {
                 display: "新規ファイル.txt",
                 concealed_bytes: 0,
+                depth: 0,
             }
         );
     }
 
     #[test]
-    fn conceal_line_shows_broken_prefix_verbatim() {
-        // 破損プレフィックスは隠さずそのまま見せる(ユーザーが視認・修復できるように)。
+    fn conceal_line_hides_indent_tabs_without_id_prefix() {
+        // IDなしCREATE候補でも行頭tabは装飾扱いとして隠す。
+        assert_eq!(
+            conceal_line("\tnew.txt"),
+            ConcealedLine {
+                display: "new.txt",
+                concealed_bytes: 1,
+                depth: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn conceal_line_shows_broken_prefix_but_still_hides_leading_indent() {
+        // 破損プレフィックス自体は見せる。行頭tabだけは装飾扱いとして隠す。
         assert_eq!(
             conceal_line("/0"),
             ConcealedLine {
                 display: "/0",
                 concealed_bytes: 0,
+                depth: 0,
+            }
+        );
+        assert_eq!(
+            conceal_line("\t/0"),
+            ConcealedLine {
+                display: "/0",
+                concealed_bytes: 1,
+                depth: 1,
             }
         );
     }
@@ -136,6 +169,19 @@ mod tests {
                 "raw col {raw_col} should map to display col {disp_col}"
             );
         }
+    }
+
+    #[test]
+    fn display_cursor_shifts_by_prefix_and_indent() {
+        let raw = "/013 \tmain.rs";
+        assert_eq!(
+            display_cursor(raw, Cursor { line: 1, col: 6 }),
+            Cursor { line: 1, col: 0 }
+        );
+        assert_eq!(
+            display_cursor(raw, Cursor { line: 1, col: 10 }),
+            Cursor { line: 1, col: 4 }
+        );
     }
 
     #[test]
@@ -169,7 +215,7 @@ mod tests {
 
     #[test]
     fn display_cursor_is_identity_without_prefix() {
-        // IDなし行は concealed=0 なので col は不変(補正なし)。line も保持。
+        // インデントなしのIDなし行は concealed=0 なので col は不変。line も保持。
         let raw = "新規ファイル.txt";
         for col in [0usize, 3, 6, 15] {
             assert_eq!(

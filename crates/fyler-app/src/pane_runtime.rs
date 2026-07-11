@@ -21,7 +21,7 @@ use fyler_fsops::watch::{ExternalChange, FsWatcher};
 use fyler_gui::app::{GuiAction, GuiEvent, GuiOptions};
 use fyler_gui::confirm::ConfirmChoice;
 
-use super::save_flow::{SaveController, SaveFlowResult};
+use super::save_flow::{FoldResult, SaveController, SaveFlowResult};
 use super::transfer_flow::{
     TransferController, TransferFlowResult, TransferPaneState, build_plan, destination_directory,
     resolve_selection, resolve_target, start_rejection,
@@ -29,8 +29,9 @@ use super::transfer_flow::{
 use super::{
     AppEvent, BookmarkResolution, GitRefresher, after_root_change, bookmark_list_message,
     change_root_to, default_root, format_drive_paths, handle_activate_line, handle_external_change,
-    handle_open_file_picker, handle_picker_select, handle_yank_path, normalize_root,
-    resolve_bookmark_query, resolve_cd_target, send_gui_message, send_save_result, send_view_state,
+    handle_open_file_picker, handle_open_with, handle_picker_select, handle_yank_path,
+    normalize_root, parse_sort_query, resolve_bookmark_query, resolve_cd_target, send_gui_message,
+    send_save_result, send_view_state, sort_state_message,
 };
 use super::{undo_format, undo_journal};
 
@@ -138,6 +139,8 @@ pub(super) fn run() -> anyhow::Result<()> {
     let scan_options = ScanOptions {
         show_hidden: config.show_hidden,
         sort: config.sort,
+        key: config.sort_key,
+        reverse: config.sort_reverse,
     };
     let gui_options = GuiOptions {
         confirm_detail: config.confirm_detail,
@@ -237,6 +240,10 @@ pub(super) fn run() -> anyhow::Result<()> {
             let mut apply_owner = None;
             let mut transfer = TransferController::new();
             let mut pending_recovery = pending_recovery;
+            let mut pending_open_with: Option<(
+                PathBuf,
+                Vec<fyler_fsops::openwith::OpenWithHandler>,
+            )> = None;
 
             if send_view_state(
                 &gui_event_tx,
@@ -794,6 +801,194 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 }
                                 git.request(pane_id, session.root.clone());
                             }
+                            EditorEvent::Fold { op, line } => {
+                                let snapshot = session.engine.snapshot();
+                                if snapshot.dirty {
+                                    if send_gui_message(
+                                        &gui_event_tx,
+                                        pane_id,
+                                        MessageKind::Info,
+                                        "編集中は折りたたみを変更できません(:w で確定するか元に戻してください)",
+                                    )
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
+
+                                match session.save_controller.fold(&snapshot.lines, line, op) {
+                                    FoldResult::Applied { lines, cursor_line } => {
+                                        if let Err(error) =
+                                            session.engine.send(EditorCommand::SetLines {
+                                                lines,
+                                                cursor_line,
+                                            })
+                                        {
+                                            if send_gui_message(
+                                                &gui_event_tx,
+                                                pane_id,
+                                                MessageKind::Error,
+                                                format!(
+                                                    "折りたたみ表示を更新できません: {error:#}"
+                                                ),
+                                            )
+                                            .is_err()
+                                            {
+                                                return;
+                                            }
+                                            continue;
+                                        }
+                                        if send_view_state(
+                                            &gui_event_tx,
+                                            pane_id,
+                                            &session.save_controller,
+                                        )
+                                        .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    FoldResult::NotFound => {
+                                        if send_gui_message(
+                                            &gui_event_tx,
+                                            pane_id,
+                                            MessageKind::Info,
+                                            "この行のエントリを解決できません",
+                                        )
+                                        .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    FoldResult::NoOp | FoldResult::Busy => {}
+                                }
+                            }
+                            EditorEvent::ChangeSort { query } => {
+                                let Some(query) = query else {
+                                    let (key, reverse) =
+                                        session.save_controller.sort_state();
+                                    if send_gui_message(
+                                        &gui_event_tx,
+                                        pane_id,
+                                        MessageKind::Info,
+                                        sort_state_message(key, reverse),
+                                    )
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                };
+
+                                let (key, reverse) = match parse_sort_query(&query) {
+                                    Ok(sort) => sort,
+                                    Err(error) => {
+                                        if send_gui_message(
+                                            &gui_event_tx,
+                                            pane_id,
+                                            MessageKind::Error,
+                                            error,
+                                        )
+                                        .is_err()
+                                        {
+                                            return;
+                                        }
+                                        continue;
+                                    }
+                                };
+                                if session.engine.snapshot().dirty {
+                                    if send_gui_message(
+                                        &gui_event_tx,
+                                        pane_id,
+                                        MessageKind::Info,
+                                        "編集中はソート条件を変更できません。保存または破棄してください",
+                                    )
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                if !session.save_controller.is_idle() {
+                                    continue;
+                                }
+
+                                let lines =
+                                    match session.save_controller.change_sort(key, reverse) {
+                                        Ok(lines) => lines,
+                                        Err(error) => {
+                                            if send_gui_message(
+                                                &gui_event_tx,
+                                                pane_id,
+                                                MessageKind::Error,
+                                                format!(
+                                                    "ソート条件を変更できません: {error:#}"
+                                                ),
+                                            )
+                                            .is_err()
+                                            {
+                                                return;
+                                            }
+                                            continue;
+                                        }
+                                    };
+                                if let Err(error) = session.engine.send(EditorCommand::SetLines {
+                                    lines,
+                                    cursor_line: None,
+                                }) {
+                                    if send_gui_message(
+                                        &gui_event_tx,
+                                        pane_id,
+                                        MessageKind::Error,
+                                        format!("ソート表示を更新できません: {error:#}"),
+                                    )
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                if send_view_state(
+                                    &gui_event_tx,
+                                    pane_id,
+                                    &session.save_controller,
+                                )
+                                .is_err()
+                                    || send_gui_message(
+                                        &gui_event_tx,
+                                        pane_id,
+                                        MessageKind::Info,
+                                        sort_state_message(key, reverse),
+                                    )
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            EditorEvent::OpenWith { line } => {
+                                if !session.save_controller.is_idle()
+                                    || pending_open_with.is_some()
+                                    || dialog_owner.is_some()
+                                    || apply_owner.is_some()
+                                    || transfer.is_awaiting()
+                                    || transfer.is_running()
+                                {
+                                    continue;
+                                }
+                                match handle_open_with(
+                                    pane_id,
+                                    &session.save_controller,
+                                    session.engine.as_ref(),
+                                    &session.root,
+                                    line,
+                                    &gui_event_tx,
+                                ) {
+                                    Ok(Some(pending)) => pending_open_with = Some(pending),
+                                    Ok(None) => {}
+                                    Err(_) => return,
+                                }
+                            }
                             event => {
                                 if gui_event_tx
                                     .send(GuiEvent::Editor { pane_id, event })
@@ -829,6 +1024,40 @@ pub(super) fn run() -> anyhow::Result<()> {
                         }
                     }
                     AppEvent::Confirm(choice) => {
+                        if let ConfirmChoice::OpenWithSelected(index) = choice {
+                            let Some((path, handlers)) = pending_open_with.take() else {
+                                continue;
+                            };
+                            let result = if index < handlers.len() {
+                                fyler_fsops::openwith::open_with_handler(
+                                    &path,
+                                    &handlers[index].key,
+                                )
+                            } else if index == handlers.len() {
+                                fyler_fsops::openwith::open_with_system_dialog(&path)
+                            } else {
+                                Err(anyhow::anyhow!(
+                                    "open-with候補の選択位置が範囲外です: {index}"
+                                ))
+                            };
+                            if let Err(error) = result
+                                && send_gui_message(
+                                    &gui_event_tx,
+                                    active,
+                                    MessageKind::Error,
+                                    format!("指定アプリで開けません: {error:#}"),
+                                )
+                                .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        if pending_open_with.is_some() {
+                            // open-withダイアログのキャンセル。保存フローへ流さない。
+                            pending_open_with = None;
+                            continue;
+                        }
                         if !pending_recovery.is_empty() {
                             if choice == ConfirmChoice::Approve
                                 && let Some(journal) = &journal
