@@ -35,6 +35,7 @@ use super::{
     send_gui_message, send_save_result, send_view_state, sort_state_message,
 };
 use super::{undo_format, undo_journal};
+use crate::queue_stats::{CountingSender, QueueGauge};
 
 const MAX_PANES: usize = 4;
 
@@ -61,7 +62,7 @@ fn create_pane(
     bindings: &[KeyBinding],
     scan_options: ScanOptions,
     shared_ids: Arc<Mutex<IdAllocator>>,
-    app_event_tx: &mpsc::Sender<AppEvent>,
+    app_event_tx: &CountingSender<AppEvent>,
 ) -> anyhow::Result<PaneSession> {
     // nvim起動はflaky回避のため呼び出し元イベントループで必ず直列に行う。
     let (engine, mut engine_events) = runtime.block_on(NvimEngine::start(NvimConfig {
@@ -94,6 +95,8 @@ fn create_pane(
     let editor_event_tx = app_event_tx.clone();
     thread::Builder::new()
         .name(format!("fyler-engine-events-{id}"))
+        // blocking_recvからapp channelへ転送するだけの非再帰ループ。
+        .stack_size(256 * 1024)
         .spawn(move || {
             while let Some(event) = engine_events.blocking_recv() {
                 if editor_event_tx.send(AppEvent::Editor(id, event)).is_err() {
@@ -106,6 +109,8 @@ fn create_pane(
     let watch_event_tx = app_event_tx.clone();
     thread::Builder::new()
         .name(format!("fyler-watch-events-{id}"))
+        // recvからapp channelへ転送するだけの非再帰ループ。
+        .stack_size(256 * 1024)
         .spawn(move || {
             while let Ok(change) = watch_rx.recv() {
                 if watch_event_tx
@@ -184,10 +189,15 @@ pub(super) fn run() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        // pane最大4個のnvim RPC非同期I/Oをホストする。CPU bound処理は載せない。
+        .worker_threads(2)
         .enable_all()
         .build()?;
 
-    let (app_event_tx, app_event_rx) = mpsc::channel();
+    // 一回性イベントを落とさないためunboundedのまま保ち、滞留は計測する。
+    let app_event_gauge = Arc::new(QueueGauge::new());
+    let (app_event_inner_tx, app_event_rx) = mpsc::channel();
+    let app_event_tx = CountingSender::new(app_event_inner_tx, Arc::clone(&app_event_gauge));
     let shared_ids = Arc::new(Mutex::new(IdAllocator::new()));
     let initial_id = PaneId::new(1);
     let initial = create_pane(
@@ -224,6 +234,8 @@ pub(super) fn run() -> anyhow::Result<()> {
     let action_event_tx = app_event_tx.clone();
     let action_bridge = thread::Builder::new()
         .name("fyler-gui-actions".to_owned())
+        // GUI actionをapp eventへ変換するだけの非再帰ループ。
+        .stack_size(256 * 1024)
         .spawn(move || {
             while let Ok(action) = action_rx.recv() {
                 let event = match action {
@@ -245,7 +257,9 @@ pub(super) fn run() -> anyhow::Result<()> {
         })
         .map_err(|error| anyhow::anyhow!("確認結果の配線を開始できません: {error}"))?;
 
-    let (gui_event_tx, gui_event_rx) = mpsc::channel();
+    let gui_event_gauge = Arc::new(QueueGauge::new());
+    let (gui_event_inner_tx, gui_event_rx) = mpsc::channel();
+    let gui_event_tx = CountingSender::new(gui_event_inner_tx, Arc::clone(&gui_event_gauge));
     gui_event_tx.send(GuiEvent::AddPane {
         pane_id: initial.id,
         engine: Arc::clone(&initial.engine),
@@ -258,6 +272,8 @@ pub(super) fn run() -> anyhow::Result<()> {
     })?;
 
     let event_tx = app_event_tx.clone();
+    let event_loop_gauge = Arc::clone(&app_event_gauge);
+    // rescanを含むapp event loopは再帰深度が読めないため既定stackを維持する。
     let event_bridge = thread::Builder::new()
         .name("fyler-app-events".to_owned())
         .spawn(move || {
@@ -335,7 +351,10 @@ pub(super) fn run() -> anyhow::Result<()> {
                 let event = match pending_events.pop_front() {
                     Some(event) => event,
                     None => match app_event_rx.recv() {
-                        Ok(event) => event,
+                        Ok(event) => {
+                            event_loop_gauge.dequeue();
+                            event
+                        }
                         Err(_) => return,
                     },
                 };
@@ -1158,6 +1177,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     }
                                     let worker_plan = plan.clone();
                                     let worker_event_tx = event_tx.clone();
+                                    // copy/moveは再帰深度が読めないため既定stackを維持する。
                                     let spawn_result = thread::Builder::new()
                                         .name("fyler-transfer".to_owned())
                                         .spawn(move || {
@@ -1271,6 +1291,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 let worker_root = session.root.clone();
                                 let worker_plan = plan.clone();
                                 let worker_event_tx = event_tx.clone();
+                                // scan/applyは再帰深度が読めないため既定stackを維持する。
                                 let spawn_result = thread::Builder::new()
                                     .name("fyler-apply".to_owned())
                                     .spawn(move || {
@@ -1349,6 +1370,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 }
                                 let worker_transaction = transaction.clone();
                                 let worker_event_tx = event_tx.clone();
+                                // undoの復元処理は再帰深度が読めないため既定stackを維持する。
                                 let spawn_result = thread::Builder::new()
                                     .name("fyler-undo".to_owned())
                                     .spawn(move || {
@@ -1697,6 +1719,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                         let mut by_pane = BTreeMap::<PaneId, BTreeSet<PathBuf>>::new();
                         by_pane.entry(pane_id).or_default().extend(change.paths);
                         while let Ok(queued_event) = app_event_rx.try_recv() {
+                            event_loop_gauge.dequeue();
                             match queued_event {
                                 AppEvent::ExternalChange(queued_id, change) => {
                                     by_pane.entry(queued_id).or_default().extend(change.paths);
@@ -1780,10 +1803,23 @@ pub(super) fn run() -> anyhow::Result<()> {
         })
         .map_err(|error| anyhow::anyhow!("GUIイベント配線を開始できません: {error}"))?;
 
-    let gui_result = fyler_gui::app::run(gui_event_rx, action_tx, gui_options);
+    let gui_dequeue_gauge = Arc::clone(&gui_event_gauge);
+    let gui_result = fyler_gui::app::run(
+        gui_event_rx,
+        action_tx,
+        gui_options,
+        Arc::new(move || gui_dequeue_gauge.dequeue()),
+    );
     let _ = app_event_tx.send(AppEvent::Shutdown);
     let _ = event_bridge.join();
     let _ = action_bridge.join();
+    if std::env::var_os("FYLER_QUEUE_STATS").as_deref() == Some(OsStr::new("1")) {
+        eprintln!(
+            "fyler queue high-water: app_event={} gui_event={}",
+            app_event_gauge.high_water(),
+            gui_event_gauge.high_water()
+        );
+    }
     gui_result
 }
 
@@ -1796,8 +1832,8 @@ fn handle_pane_action(
     bindings: &[KeyBinding],
     scan_options: ScanOptions,
     shared_ids: &Arc<Mutex<IdAllocator>>,
-    app_event_tx: &mpsc::Sender<AppEvent>,
-    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    app_event_tx: &CountingSender<AppEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
     panes: &mut BTreeMap<PaneId, PaneSession>,
     layout: &mut PaneLayout,
     active: &mut PaneId,
@@ -1952,7 +1988,7 @@ fn handle_transfer_request(
     panes: &BTreeMap<PaneId, PaneSession>,
     globally_busy: bool,
     transfer: &mut TransferController,
-    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     let Some(target) = resolve_target(source, last_active, panes.keys().copied()) else {
         return send_gui_message(
@@ -2148,7 +2184,7 @@ fn change_session_root(
     cursor_target: Option<&OsStr>,
     session: &mut PaneSession,
     shared_ids: &Arc<Mutex<IdAllocator>>,
-    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
     git: &mut GitRefresher,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     let changed = change_root_to(

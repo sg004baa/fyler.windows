@@ -8,6 +8,7 @@
 
 mod config;
 mod pane_runtime;
+mod queue_stats;
 pub mod save_flow;
 mod transfer_flow;
 mod undo_format;
@@ -34,6 +35,7 @@ use fyler_fsops::watch::{ExternalChange, FsWatcher};
 use fyler_gui::app::{GuiEvent, PickerAction};
 use fyler_gui::confirm::ConfirmChoice;
 
+use crate::queue_stats::CountingSender;
 use crate::save_flow::{RevealResult, SaveController, SaveFlowResult, ToggleCollapseResult};
 
 enum AppEvent {
@@ -68,7 +70,7 @@ struct ExternalChangeOutcome {
 ///
 /// paneごとに同時実行1本まで。pane内で再要求されたら完了後に1回だけ再実行する。
 struct GitRefresher {
-    event_tx: mpsc::Sender<AppEvent>,
+    event_tx: CountingSender<AppEvent>,
     slots: HashMap<PaneId, GitRefreshSlot>,
 }
 
@@ -79,7 +81,7 @@ struct GitRefreshSlot {
 }
 
 impl GitRefresher {
-    fn new(event_tx: mpsc::Sender<AppEvent>) -> Self {
+    fn new(event_tx: CountingSender<AppEvent>) -> Self {
         Self {
             event_tx,
             slots: HashMap::new(),
@@ -91,14 +93,20 @@ impl GitRefresher {
             return;
         };
         let event_tx = self.event_tx.clone();
-        drop(thread::spawn(move || {
-            let statuses = fyler_fsops::gitstatus::status_badges(&root).unwrap_or_default();
-            let _ = event_tx.send(AppEvent::GitStatus {
-                pane_id,
-                root,
-                statuses,
-            });
-        }));
+        drop(
+            thread::Builder::new()
+                .name("fyler-git-status".to_owned())
+                // Commandの起動と結果送信だけで再帰処理を持たないworker。
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    let statuses = fyler_fsops::gitstatus::status_badges(&root).unwrap_or_default();
+                    let _ = event_tx.send(AppEvent::GitStatus {
+                        pane_id,
+                        root,
+                        statuses,
+                    });
+                }),
+        );
     }
 
     fn prepare_request(&mut self, pane_id: PaneId, root: PathBuf) -> Option<PathBuf> {
@@ -174,7 +182,7 @@ fn handle_external_change(
     pane_id: PaneId,
     changed_paths: &BTreeSet<PathBuf>,
     save_controller: &mut SaveController,
-    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
     git: &mut GitRefresher,
     root: &Path,
 ) -> Result<ExternalChangeOutcome, mpsc::SendError<GuiEvent>> {
@@ -209,7 +217,7 @@ fn change_root_to(
     shared_ids: &Arc<std::sync::Mutex<IdAllocator>>,
     save_controller: &mut SaveController,
     engine: &dyn EditorEngine,
-    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
 ) -> Result<bool, mpsc::SendError<GuiEvent>> {
     let new_root = match normalize_root(&new_root) {
         Ok(new_root) => new_root,
@@ -321,7 +329,7 @@ fn change_root_to(
 
 fn after_root_change(
     pane_id: PaneId,
-    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
     save_controller: &SaveController,
     git: &mut GitRefresher,
     root: &Path,
@@ -477,7 +485,7 @@ fn handle_activate_line(
     engine: &dyn EditorEngine,
     root: &Path,
     line: usize,
-    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     let snapshot = engine.snapshot();
     let Some(editor_line) = snapshot.lines.get(line) else {
@@ -586,7 +594,7 @@ fn handle_open_with(
     engine: &dyn EditorEngine,
     root: &Path,
     line: usize,
-    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
 ) -> Result<Option<(PathBuf, Vec<OpenWithHandler>)>, mpsc::SendError<GuiEvent>> {
     let snapshot = engine.snapshot();
     let Some(editor_line) = snapshot.lines.get(line) else {
@@ -680,7 +688,7 @@ fn handle_yank_path(
     engine: &dyn EditorEngine,
     root: &Path,
     line: usize,
-    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     let snapshot = engine.snapshot();
     let Some(editor_line) = snapshot.lines.get(line) else {
@@ -798,7 +806,7 @@ fn handle_open_terminal(
     apply_running: bool,
     transfer_awaiting: bool,
     transfer_running: bool,
-    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     if let Some(message) = open_terminal_rejection(
         dialog_open,
@@ -832,7 +840,7 @@ fn handle_open_file_picker(
     apply_running: bool,
     transfer_awaiting: bool,
     transfer_running: bool,
-    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     if let Some(message) = open_file_picker_rejection(
         dialog_open,
@@ -880,7 +888,7 @@ fn handle_picker_select_with(
     save_controller: &mut SaveController,
     engine: &dyn EditorEngine,
     root: &Path,
-    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
     open_path: &mut dyn FnMut(&Path) -> anyhow::Result<()>,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     let Some(entry) = save_controller.baseline().get(entry_id).cloned() else {
@@ -987,7 +995,7 @@ fn handle_picker_select(
     save_controller: &mut SaveController,
     engine: &dyn EditorEngine,
     root: &Path,
-    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     handle_picker_select_with(
         pane_id,
@@ -1002,7 +1010,7 @@ fn handle_picker_select(
 }
 
 fn send_gui_message(
-    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
     pane_id: PaneId,
     kind: MessageKind,
     text: impl Into<String>,
@@ -1021,7 +1029,7 @@ fn send_gui_message(
 /// 可視行の集合が変わるたびに呼ぶ。折りたたみ集合は展開/折りたたみアイコンの
 /// 正典で、子を持たない空ディレクトリの展開状態も正しく描画するために必要。
 fn send_view_state(
-    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
     pane_id: PaneId,
     save_controller: &SaveController,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
@@ -1036,7 +1044,7 @@ fn send_view_state(
 }
 
 fn send_save_result(
-    gui_event_tx: &mpsc::Sender<GuiEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
     pane_id: PaneId,
     result: SaveFlowResult,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
@@ -1131,6 +1139,12 @@ mod tests {
     use fyler_core::tree::{BaselineEntry, BaselineTree};
 
     use super::*;
+
+    fn counting_channel<T>() -> (CountingSender<T>, mpsc::Receiver<T>) {
+        let (tx, rx) = mpsc::channel();
+        let gauge = Arc::new(crate::queue_stats::QueueGauge::new());
+        (CountingSender::new(tx, gauge), rx)
+    }
 
     struct PickerEngine {
         snapshot: Mutex<EditorSnapshot>,
@@ -1384,7 +1398,7 @@ mod tests {
 
     #[test]
     fn git_refresher_coalesces_inflight_requests_to_latest_root() {
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = counting_channel();
         let mut git = GitRefresher::new(event_tx);
         let first = PathBuf::from("first");
         let second = PathBuf::from("second");
@@ -1407,7 +1421,7 @@ mod tests {
 
     #[test]
     fn git_refresher_routes_slots_by_pane_id() {
-        let (event_tx, _event_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = counting_channel();
         let mut git = GitRefresher::new(event_tx);
         let first = PaneId::new(1);
         let second = PaneId::new(2);
@@ -1487,7 +1501,7 @@ mod tests {
     #[test]
     fn dirty_buffer_can_open_picker() {
         let (controller, _engine) = picker_controller(false, true);
-        let (gui_tx, gui_rx) = mpsc::channel();
+        let (gui_tx, gui_rx) = counting_channel();
 
         handle_open_file_picker(
             PaneId::new(1),
@@ -1515,7 +1529,7 @@ mod tests {
     #[test]
     fn stale_picker_selection_only_notifies() {
         let (mut controller, engine) = picker_controller(false, false);
-        let (gui_tx, gui_rx) = mpsc::channel();
+        let (gui_tx, gui_rx) = counting_channel();
         let mut opened = Vec::new();
 
         handle_picker_select_with(
@@ -1541,7 +1555,7 @@ mod tests {
     #[test]
     fn picker_jump_to_visible_entry_sends_cursor_only() {
         let (mut controller, engine) = picker_controller(false, false);
-        let (gui_tx, _gui_rx) = mpsc::channel();
+        let (gui_tx, _gui_rx) = counting_channel();
 
         handle_picker_select_with(
             PaneId::new(1),
@@ -1561,7 +1575,7 @@ mod tests {
     #[test]
     fn picker_jump_reveals_collapsed_ancestors_and_sends_view_state() {
         let (mut controller, engine) = picker_controller(true, false);
-        let (gui_tx, gui_rx) = mpsc::channel();
+        let (gui_tx, gui_rx) = counting_channel();
 
         handle_picker_select_with(
             PaneId::new(1),
@@ -1593,7 +1607,7 @@ mod tests {
     #[test]
     fn picker_jump_rejects_dirty_collapsed_entry() {
         let (mut controller, engine) = picker_controller(true, true);
-        let (gui_tx, gui_rx) = mpsc::channel();
+        let (gui_tx, gui_rx) = counting_channel();
 
         handle_picker_select_with(
             PaneId::new(1),
@@ -1618,7 +1632,7 @@ mod tests {
         let mut lines = controller.visible_lines();
         lines[1] = EditorLine::new("edited without id");
         engine.set_snapshot(lines, true);
-        let (gui_tx, gui_rx) = mpsc::channel();
+        let (gui_tx, gui_rx) = counting_channel();
 
         handle_picker_select_with(
             PaneId::new(1),
@@ -1639,7 +1653,7 @@ mod tests {
     #[test]
     fn picker_open_uses_default_open_path_for_every_entry_kind() {
         let (mut controller, engine) = picker_controller(true, true);
-        let (gui_tx, _gui_rx) = mpsc::channel();
+        let (gui_tx, _gui_rx) = counting_channel();
         let mut opened = Vec::new();
 
         for id in [EntryId(2), EntryId(3), EntryId(1)] {

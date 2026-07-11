@@ -1,6 +1,7 @@
 //! NvimEngine本体: snapshot + command channel型の `EditorEngine` 実装。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
 use fyler_core::editor::{
@@ -55,6 +56,7 @@ enum EngineCommand {
 /// - snapshotは [`ArcSwap`] で原子的に差し替える(GUIはロックなしで読む)
 pub struct NvimEngine {
     snapshot: Arc<ArcSwap<EditorSnapshot>>,
+    snapshot_notice: Arc<AtomicBool>,
     cmd_tx: mpsc::UnboundedSender<EngineCommand>,
 }
 
@@ -67,6 +69,10 @@ impl EditorEngine for NvimEngine {
 
     fn snapshot(&self) -> Arc<EditorSnapshot> {
         self.snapshot.load_full()
+    }
+
+    fn acknowledge_snapshot_update(&self) {
+        self.snapshot_notice.store(false, Ordering::Release);
     }
 }
 
@@ -218,6 +224,8 @@ impl NvimEngine {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let task_snapshot = Arc::clone(&shared_snapshot);
+        let snapshot_notice = Arc::new(AtomicBool::new(false));
+        let task_snapshot_notice = Arc::clone(&snapshot_notice);
 
         tokio::spawn(async move {
             let mut cmdline_state = None;
@@ -258,7 +266,7 @@ impl NvimEngine {
                             &lines_arc,
                             &mut revision,
                             &task_snapshot,
-                            &event_tx,
+                            (&event_tx, &task_snapshot_notice),
                             &mut snapshot_pending,
                             cmdline_state.as_ref(),
                         ).await {
@@ -560,7 +568,7 @@ impl NvimEngine {
                             &lines_arc,
                             &mut revision,
                             &task_snapshot,
-                            &event_tx,
+                            (&event_tx, &task_snapshot_notice),
                             &mut snapshot_pending,
                             cmdline_state.as_ref(),
                         ).await {
@@ -594,6 +602,7 @@ impl NvimEngine {
 
         let engine = Arc::new(Self {
             snapshot: shared_snapshot,
+            snapshot_notice,
             cmd_tx,
         });
         Ok((engine, event_rx))
@@ -941,7 +950,7 @@ async fn publish_pending_snapshot(
     lines: &Arc<[EditorLine]>,
     revision: &mut u64,
     shared_snapshot: &ArcSwap<EditorSnapshot>,
-    event_tx: &mpsc::UnboundedSender<EditorEvent>,
+    snapshot_notice: (&mpsc::UnboundedSender<EditorEvent>, &AtomicBool),
     snapshot_pending: &mut bool,
     cmdline: Option<&CmdlineState>,
 ) -> anyhow::Result<Option<Arc<EditorSnapshot>>> {
@@ -949,8 +958,15 @@ async fn publish_pending_snapshot(
         return Ok(None);
     }
 
-    let snapshot =
-        publish_snapshot(nvim, lines, revision, shared_snapshot, event_tx, cmdline).await?;
+    let snapshot = publish_snapshot(
+        nvim,
+        lines,
+        revision,
+        shared_snapshot,
+        snapshot_notice,
+        cmdline,
+    )
+    .await?;
     if snapshot.is_some() {
         *snapshot_pending = false;
     }
@@ -962,7 +978,7 @@ async fn publish_snapshot(
     lines: &Arc<[EditorLine]>,
     revision: &mut u64,
     shared_snapshot: &ArcSwap<EditorSnapshot>,
-    event_tx: &mpsc::UnboundedSender<EditorEvent>,
+    snapshot_notice: (&mpsc::UnboundedSender<EditorEvent>, &AtomicBool),
     cmdline: Option<&CmdlineState>,
 ) -> anyhow::Result<Option<Arc<EditorSnapshot>>> {
     if input_is_blocking(nvim).await? {
@@ -973,8 +989,19 @@ async fn publish_snapshot(
     *revision = revision.saturating_add(1);
     let snapshot = Arc::new(build_snapshot(*revision, lines, status, cmdline));
     shared_snapshot.store(Arc::clone(&snapshot));
-    let _ = event_tx.send(EditorEvent::SnapshotUpdated);
+    send_snapshot_notice(snapshot_notice.0, snapshot_notice.1);
     Ok(Some(snapshot))
+}
+
+fn send_snapshot_notice(
+    event_tx: &mpsc::UnboundedSender<EditorEvent>,
+    snapshot_notice: &AtomicBool,
+) {
+    // snapshotのstoreを先に完了してからゲートを立てる。表示側は通知をackした後の
+    // snapshot読み出しで、通知が表す世代以上の最新状態を取得できる。
+    if !snapshot_notice.swap(true, Ordering::AcqRel) {
+        let _ = event_tx.send(EditorEvent::SnapshotUpdated);
+    }
 }
 
 /// 追加入力待ちかをfast APIだけで判定する。
@@ -1279,6 +1306,45 @@ fn send_message(event_tx: &mpsc::UnboundedSender<EditorEvent>, kind: MessageKind
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_notice_coalesces_until_acknowledged() {
+        let notice = AtomicBool::new(false);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        send_snapshot_notice(&event_tx, &notice);
+        send_snapshot_notice(&event_tx, &notice);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(EditorEvent::SnapshotUpdated)
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        notice.store(false, Ordering::Release);
+        send_snapshot_notice(&event_tx, &notice);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(EditorEvent::SnapshotUpdated)
+        ));
+    }
+
+    #[test]
+    fn arc_swap_releases_the_old_snapshot_generation() {
+        let first = Arc::new(EditorSnapshot::empty());
+        let weak = Arc::downgrade(&first);
+        let shared = ArcSwap::from(Arc::clone(&first));
+        drop(first);
+
+        shared.store(Arc::new(EditorSnapshot::empty()));
+
+        assert!(
+            weak.upgrade().is_none(),
+            "engine must not retain an old snapshot after publishing its replacement"
+        );
+    }
 
     #[test]
     fn mode_names_are_normalized_without_leaking_engine_terms() {

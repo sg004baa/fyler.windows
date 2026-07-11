@@ -87,6 +87,8 @@ pub fn watch(root: &Path, tx: Sender<ExternalChange>) -> anyhow::Result<FsWatche
 
     let debounce_thread = thread::Builder::new()
         .name("fyler-fs-watch-debounce".to_owned())
+        // channel待機とパス集合化だけの非再帰ループなので小さいstackで十分。
+        .stack_size(256 * 1024)
         .spawn(move || run_debounce(notify_rx, tx))
         .context("ファイルシステム監視のdebounceスレッドを開始できません")?;
 
