@@ -7,7 +7,6 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use notify::event::ModifyKind;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 const DEBOUNCE_WINDOW: Duration = Duration::from_millis(200);
@@ -130,13 +129,10 @@ fn run_debounce(rx: Receiver<Vec<PathBuf>>, tx: Sender<ExternalChange>) {
     }
 }
 
+/// Access通知はツリー・metadata・git状態を変えないため除外し、それ以外は安全側で受理する。
+/// Modify(Data/Metadata)を落とすと外部編集後の表示やsort更新を見逃すため、未知種別も含める。
 fn is_tree_change(kind: &EventKind) -> bool {
-    matches!(
-        kind,
-        EventKind::Create(_)
-            | EventKind::Remove(_)
-            | EventKind::Modify(ModifyKind::Name(_) | ModifyKind::Any)
-    )
+    !matches!(kind, EventKind::Access(_))
 }
 
 #[cfg(test)]
@@ -148,6 +144,8 @@ mod tests {
     use std::time::Duration;
 
     use tempfile::tempdir;
+
+    use notify::event::{AccessKind, DataChange, MetadataKind, ModifyKind};
 
     use super::*;
 
@@ -164,6 +162,36 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("ファイル作成の通知が届きませんでした");
         assert!(change.paths.contains(&created));
+    }
+
+    #[test]
+    fn reports_overwritten_file_contents() {
+        let root = tempdir().unwrap();
+        let changed = root.path().join("changed.txt");
+        fs::write(&changed, b"before").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let _watcher = watch(root.path(), tx).unwrap();
+
+        fs::write(&changed, b"after with different length").unwrap();
+
+        let change = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("ファイル内容上書きの通知が届きませんでした");
+        assert!(change.paths.contains(&changed));
+    }
+
+    #[test]
+    fn tree_change_accepts_all_non_access_event_kinds() {
+        for kind in [
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Any,
+            EventKind::Other,
+        ] {
+            assert!(is_tree_change(&kind), "受理されませんでした: {kind:?}");
+        }
+        assert!(!is_tree_change(&EventKind::Access(AccessKind::Read)));
     }
 
     #[test]
