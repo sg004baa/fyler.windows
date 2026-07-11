@@ -4,6 +4,12 @@
 //! この変換は**このモジュールの外に出さない**(絶対ルール2)。
 
 use fyler_core::editor::{Key, KeyInput};
+use fyler_core::keymap::KeySequence;
+
+/// キーシーケンスを`vim.keymap.set`のlhs文字列へ変換する。
+pub(crate) fn sequence_to_lhs(sequence: &KeySequence) -> String {
+    sequence.0.iter().map(to_nvim_keycodes).collect()
+}
 
 /// `nvim_input` に渡すkeycode文字列へ変換する。
 ///
@@ -79,6 +85,19 @@ mod tests {
             key,
             mods: Modifiers::default(),
         }
+    }
+
+    fn sequence(input: &str) -> KeySequence {
+        fyler_core::keymap::parse_key_sequence(input, None).unwrap()
+    }
+
+    #[test]
+    fn sequence_lhs_concatenates_nvim_keycodes() {
+        assert_eq!(sequence_to_lhs(&sequence("g d")), "gd");
+        assert_eq!(sequence_to_lhs(&sequence("Ctrl+W Ctrl+W")), "<C-w><C-w>");
+        assert_eq!(sequence_to_lhs(&sequence("Space f")), " f");
+        assert_eq!(sequence_to_lhs(&sequence("?")), "?");
+        assert_eq!(sequence_to_lhs(&sequence("<")), "<lt>");
     }
 
     /// 明示的な修飾つきの `KeyInput` を組む。

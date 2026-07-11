@@ -12,6 +12,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use fyler_core::editor::{Key, KeyInput, Modifiers};
+use fyler_core::keymap;
 use fyler_core::options::{SortKey, SortOrder};
 use fyler_gui::confirm::{ConfirmDetail, IconStyle};
 
@@ -44,6 +46,8 @@ pub struct Config {
     pub icons: IconStyle,
     /// 名前と絶対パスのブックマーク。設定ファイルでの定義順を保持する。
     pub bookmarks: Vec<(String, PathBuf)>,
+    /// 解決済みkeymapバインディング(デフォルト+ユーザー上書き適用済み)。
+    pub bindings: Vec<keymap::KeyBinding>,
 }
 
 impl Default for Config {
@@ -58,6 +62,7 @@ impl Default for Config {
             font_y_offset_factor: DEFAULT_FONT_Y_OFFSET_FACTOR,
             icons: IconStyle::Ascii,
             bookmarks: Vec::new(),
+            bindings: keymap::default_bindings(),
         }
     }
 }
@@ -95,6 +100,26 @@ pub fn load() -> (Config, Vec<String>) {
     };
 
     let mut config = Config::default();
+    let default_leader = KeyInput {
+        key: Key::Char(' '),
+        mods: Modifiers::default(),
+    };
+    let leader = match table.get("leader") {
+        Some(value) => match value.as_str() {
+            Some(value) => match keymap::parse_leader(value) {
+                Ok(leader) => leader,
+                Err(error) => {
+                    warnings.push(format!("leaderの指定が不正なためSpaceを使います: {error}"));
+                    default_leader
+                }
+            },
+            None => {
+                warnings.push("leaderは文字列で指定してください。Spaceを使います".to_owned());
+                default_leader
+            }
+        },
+        None => default_leader,
+    };
     if let Some(value) = table.get("show_hidden") {
         match value.as_bool() {
             Some(show_hidden) => config.show_hidden = show_hidden,
@@ -195,6 +220,45 @@ pub fn load() -> (Config, Vec<String>) {
             None => warnings.push("bookmarksはテーブルで指定してください".to_owned()),
         }
     }
+    if let Some(value) = table.get("keymap") {
+        match value.as_table() {
+            Some(keymap_table) => {
+                let mut entries = Vec::new();
+                for section in keymap_table.keys() {
+                    if section != "normal" {
+                        warnings.push(format!("未対応のkeymapセクションを無視します: {section}"));
+                    }
+                }
+                if let Some(normal) = keymap_table.get("normal") {
+                    match normal.as_table() {
+                        Some(normal) => {
+                            for (sequence, value) in normal {
+                                match value.as_str() {
+                                    Some(action) => {
+                                        entries.push((sequence.clone(), action.to_owned()))
+                                    }
+                                    None => warnings.push(format!(
+                                        "keymap.normalの{sequence:?}は文字列で指定してください"
+                                    )),
+                                }
+                            }
+                        }
+                        None => {
+                            warnings.push("keymap.normalはテーブルで指定してください".to_owned())
+                        }
+                    }
+                }
+                let (bindings, keymap_warnings) = keymap::resolve_bindings(Some(leader), &entries);
+                config.bindings = bindings;
+                warnings.extend(
+                    keymap_warnings
+                        .into_iter()
+                        .map(|warning| format!("keymap: {warning}")),
+                );
+            }
+            None => warnings.push("keymapはテーブルで指定してください".to_owned()),
+        }
+    }
 
     for key in table.keys() {
         if !matches!(
@@ -208,6 +272,8 @@ pub fn load() -> (Config, Vec<String>) {
                 | "font_y_offset_factor"
                 | "icons"
                 | "bookmarks"
+                | "leader"
+                | "keymap"
         ) {
             warnings.push(format!("未知の設定キーを無視します: {key}"));
         }
@@ -416,6 +482,44 @@ mod tests {
         let (config, warnings) = load();
         assert_eq!(config, Config::default());
         assert!(warnings.iter().any(|warning| warning.contains("unknown")));
+
+        fs::write(
+            &path,
+            "leader = 'Space'\n[keymap.normal]\n'Leader f' = 'file_picker'\n'g d' = 'none'\n",
+        )
+        .unwrap();
+        let (config, warnings) = load();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(config.bindings.iter().any(|binding| {
+            binding.sequence.to_string() == "Space f"
+                && binding.action == keymap::EditorAction::FilePicker
+        }));
+        assert!(
+            !config
+                .bindings
+                .iter()
+                .any(|binding| binding.sequence.to_string() == "g d")
+        );
+
+        fs::write(
+            &path,
+            "leader = 123\n[keymap.normal]\nx = 1\ny = 'unknown_action'\n[keymap.visual]\nz = 'help'\n",
+        )
+        .unwrap();
+        let (config, warnings) = load();
+        assert_eq!(config.bindings, keymap::default_bindings());
+        assert!(warnings.iter().any(|warning| warning.contains("leader")));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("文字列で指定"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("未知のaction"))
+        );
+        assert!(warnings.iter().any(|warning| warning.contains("未対応")));
 
         fs::write(&path, "[bookmarks]\nrelative = 'child/path'\n").unwrap();
         let (config, warnings) = load();

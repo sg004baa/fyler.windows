@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use fyler_core::keymap::{KeyBinding, default_bindings};
+
 /// nvim起動引数。**この組み合わせから変えないこと**(DESIGN.md):
 ///
 /// - `--embed` 単体はUI attachを待ってブロックするため `--headless` を併用し、
@@ -32,4 +34,17 @@ pub struct NvimConfig {
     pub nvim_exe: PathBuf,
     /// ファイラーの表示ルートディレクトリ。
     pub root: PathBuf,
+    /// 解決済みkeymapバインディング。既定値は組み込みkeymap。
+    pub bindings: Vec<KeyBinding>,
+}
+
+impl NvimConfig {
+    /// 実行ファイルとルートを指定し、組み込みkeymapで起動設定を作る。
+    pub fn new(nvim_exe: PathBuf, root: PathBuf) -> Self {
+        Self {
+            nvim_exe,
+            root,
+            bindings: default_bindings(),
+        }
+    }
 }

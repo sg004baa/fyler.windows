@@ -10,6 +10,7 @@ use fyler_core::editor::{EditorCommand, EditorEngine, EditorEvent, MessageKind};
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::{EntryId, IdAllocator};
+use fyler_core::keymap::{EditorAction, KeyBinding};
 use fyler_core::pane::{FocusDirection, PaneAction, PaneId, PaneLayout, SplitDirection};
 use fyler_core::report::{ApplyProgress, CommitReport, OpOutcome, OpResult};
 use fyler_core::transfer::TransferKind;
@@ -57,6 +58,7 @@ fn create_pane(
     id: PaneId,
     root: PathBuf,
     nvim_exe: &Path,
+    bindings: &[KeyBinding],
     scan_options: ScanOptions,
     shared_ids: Arc<Mutex<IdAllocator>>,
     app_event_tx: &mpsc::Sender<AppEvent>,
@@ -65,6 +67,7 @@ fn create_pane(
     let (engine, mut engine_events) = runtime.block_on(NvimEngine::start(NvimConfig {
         nvim_exe: nvim_exe.to_path_buf(),
         root: root.clone(),
+        bindings: bindings.to_vec(),
     }))?;
     let baseline = {
         let mut ids = shared_ids
@@ -129,6 +132,30 @@ fn create_pane(
     })
 }
 
+fn help_lines(bindings: &[KeyBinding]) -> Vec<String> {
+    let mut actions = Vec::<(EditorAction, Vec<String>)>::new();
+    for binding in bindings {
+        if let Some((_, sequences)) = actions
+            .iter_mut()
+            .find(|(action, _)| *action == binding.action)
+        {
+            sequences.push(binding.sequence.to_string());
+        } else {
+            actions.push((binding.action, vec![binding.sequence.to_string()]));
+        }
+    }
+    let mut lines = actions
+        .into_iter()
+        .map(|(action, sequences)| format!("{}  {}", sequences.join(", "), action.description()))
+        .collect::<Vec<_>>();
+    lines.extend([
+        ":w  変更を保存".to_owned(),
+        ":cd  ルートを移動".to_owned(),
+        ":b  ブックマーク / 最近使ったルート".to_owned(),
+    ]);
+    lines
+}
+
 pub(super) fn run() -> anyhow::Result<()> {
     let root = match std::env::args_os().nth(1) {
         Some(root) => PathBuf::from(root),
@@ -142,11 +169,13 @@ pub(super) fn run() -> anyhow::Result<()> {
         key: config.sort_key,
         reverse: config.sort_reverse,
     };
+    let bindings = Arc::new(config.bindings);
     let gui_options = GuiOptions {
         confirm_detail: config.confirm_detail,
         font_path: config.font,
         font_y_offset_factor: config.font_y_offset_factor,
         icon_style: config.icons,
+        help_lines: help_lines(&bindings),
     };
     let bookmarks = config.bookmarks;
     let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
@@ -164,6 +193,7 @@ pub(super) fn run() -> anyhow::Result<()> {
         initial_id,
         root,
         &nvim_exe,
+        &bindings,
         scan_options,
         Arc::clone(&shared_ids),
         &app_event_tx,
@@ -314,6 +344,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                             pane_id,
                             &runtime,
                             &nvim_exe,
+                            &bindings,
                             scan_options,
                             &shared_ids,
                             &event_tx,
@@ -1739,6 +1770,7 @@ fn handle_pane_action(
     source: PaneId,
     runtime: &tokio::runtime::Runtime,
     nvim_exe: &Path,
+    bindings: &[KeyBinding],
     scan_options: ScanOptions,
     shared_ids: &Arc<Mutex<IdAllocator>>,
     app_event_tx: &mpsc::Sender<AppEvent>,
@@ -1783,6 +1815,7 @@ fn handle_pane_action(
                 new_id,
                 root,
                 nvim_exe,
+                bindings,
                 scan_options,
                 Arc::clone(shared_ids),
                 app_event_tx,
@@ -2122,6 +2155,33 @@ fn change_session_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_reflects_default_custom_and_unmapped_bindings() {
+        let defaults = fyler_core::keymap::default_bindings();
+        let default_lines = help_lines(&defaults);
+        assert!(default_lines.iter().any(|line| {
+            line.starts_with("Enter  ") && line.contains(EditorAction::Activate.description())
+        }));
+
+        let mut customized = defaults
+            .into_iter()
+            .filter(|binding| binding.action != EditorAction::ToggleHidden)
+            .collect::<Vec<_>>();
+        customized.push(KeyBinding {
+            sequence: fyler_core::keymap::parse_key_sequence("x", None).unwrap(),
+            action: EditorAction::FilePicker,
+        });
+        let custom_lines = help_lines(&customized);
+        assert!(
+            !custom_lines
+                .iter()
+                .any(|line| line.contains(EditorAction::ToggleHidden.description()))
+        );
+        assert!(custom_lines.iter().any(|line| {
+            line.starts_with("g /, x  ") && line.contains(EditorAction::FilePicker.description())
+        }));
+    }
 
     #[test]
     fn close_rejects_last_dirty_busy_and_applying_panes() {
