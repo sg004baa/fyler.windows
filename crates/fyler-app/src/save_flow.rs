@@ -2694,29 +2694,31 @@ mod tests {
 
     #[test]
     fn external_mtime_change_resorts_date_order_and_sends_lines() {
+        // WindowsのSetFileTimeは書き込みアクセスのハンドルを要求するため、
+        // File::open(読み取り専用)ではAccess deniedになる。
+        fn set_mtime(path: &Path, secs: u64) {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .unwrap();
+        }
+
         let temp_root = tempdir().unwrap();
         let first = temp_root.path().join("a.txt");
         let second = temp_root.path().join("b.txt");
         fs::write(&first, b"a").unwrap();
         fs::write(&second, b"b").unwrap();
-        fs::File::open(&first)
-            .unwrap()
-            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(10))
-            .unwrap();
-        fs::File::open(&second)
-            .unwrap()
-            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(20))
-            .unwrap();
+        set_mtime(&first, 10);
+        set_mtime(&second, 20);
         let options = ScanOptions {
             key: SortKey::Date,
             sort: SortOrder::Mixed,
             ..ScanOptions::default()
         };
         let (mut controller, engine) = scanned_controller(temp_root.path(), options);
-        fs::File::open(&first)
-            .unwrap()
-            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(30))
-            .unwrap();
+        set_mtime(&first, 30);
 
         let result = controller.on_external_change(&BTreeSet::from([first]));
 
