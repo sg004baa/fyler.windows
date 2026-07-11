@@ -23,7 +23,7 @@ use fyler_core::editor::{EditorCommand, EditorEngine, EditorEvent, EditorMessage
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::{EntryId, IdAllocator};
-use fyler_core::options::SortKey;
+use fyler_core::options::{SortKey, TerminalKind};
 use fyler_core::pane::PaneId;
 use fyler_core::report::{ApplyProgress, CommitReport};
 use fyler_core::transfer::TransferOp;
@@ -743,6 +743,86 @@ fn open_file_picker_rejection(
     }
 }
 
+/// 外部terminalのcwdをカーソル行から解決する。
+///
+/// ディレクトリ行はそのパス、ファイル・symlink行は親ディレクトリを返す。
+/// 未保存行、stale行、範囲外など解決できない行は現在rootへフォールバックする。
+fn resolve_terminal_cwd(
+    save_controller: &SaveController,
+    lines: &[fyler_core::editor::EditorLine],
+    line: usize,
+    root: &Path,
+) -> PathBuf {
+    match save_controller.resolve_line(lines, line) {
+        Some((path, EntryKind::Dir)) => path.to_fs_path(root),
+        Some((path, _)) => {
+            let fs_path = path.to_fs_path(root);
+            fs_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| root.to_path_buf())
+        }
+        None => root.to_path_buf(),
+    }
+}
+
+fn open_terminal_rejection(
+    dialog_open: bool,
+    apply_running: bool,
+    transfer_awaiting: bool,
+    transfer_running: bool,
+    crashed: bool,
+    save_idle: bool,
+) -> Option<&'static str> {
+    if dialog_open || apply_running || transfer_awaiting || transfer_running {
+        Some("別のダイアログまたはファイル操作が進行中のため、terminalを開けません")
+    } else if crashed {
+        Some("editor engineが停止しているため、terminalを開けません")
+    } else if !save_idle {
+        Some("保存処理中のため、terminalを開けません")
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_open_terminal(
+    pane_id: PaneId,
+    save_controller: &SaveController,
+    lines: &[fyler_core::editor::EditorLine],
+    root: &Path,
+    line: usize,
+    terminal_kind: TerminalKind,
+    crashed: bool,
+    dialog_open: bool,
+    apply_running: bool,
+    transfer_awaiting: bool,
+    transfer_running: bool,
+    gui_event_tx: &mpsc::Sender<GuiEvent>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    if let Some(message) = open_terminal_rejection(
+        dialog_open,
+        apply_running,
+        transfer_awaiting,
+        transfer_running,
+        crashed,
+        save_controller.is_idle(),
+    ) {
+        return send_gui_message(gui_event_tx, pane_id, MessageKind::Info, message);
+    }
+
+    let cwd = resolve_terminal_cwd(save_controller, lines, line, root);
+    if let Err(error) = fyler_fsops::terminal::open(&cwd, terminal_kind) {
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            format!("terminalを起動できません: {error:#}"),
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_open_file_picker(
     pane_id: PaneId,
@@ -1132,6 +1212,68 @@ mod tests {
             panic!("expected GUI message")
         };
         message
+    }
+
+    fn terminal_line(id: EntryId, name: &str) -> EditorLine {
+        EditorLine::new(format!(
+            "{}{name}",
+            fyler_core::grammar::format_id_prefix(id)
+        ))
+    }
+
+    #[test]
+    fn terminal_cwd_uses_directory_itself() {
+        let (controller, _) = picker_controller(false, false);
+        let lines = [terminal_line(EntryId(1), "dir/")];
+
+        assert_eq!(
+            resolve_terminal_cwd(&controller, &lines, 0, Path::new("root")),
+            PathBuf::from("root/dir")
+        );
+    }
+
+    #[test]
+    fn terminal_cwd_uses_file_parent() {
+        let (controller, _) = picker_controller(false, false);
+        let lines = [terminal_line(EntryId(2), "file.txt")];
+
+        assert_eq!(
+            resolve_terminal_cwd(&controller, &lines, 0, Path::new("root")),
+            PathBuf::from("root/dir")
+        );
+    }
+
+    #[test]
+    fn terminal_cwd_uses_symlink_parent() {
+        let (controller, _) = picker_controller(false, false);
+        let lines = [terminal_line(EntryId(3), "link")];
+
+        assert_eq!(
+            resolve_terminal_cwd(&controller, &lines, 0, Path::new("root")),
+            PathBuf::from("root")
+        );
+    }
+
+    #[test]
+    fn terminal_cwd_falls_back_to_root_for_unsaved_line() {
+        let (controller, _) = picker_controller(false, false);
+        let lines = [EditorLine::new("new.txt")];
+
+        assert_eq!(
+            resolve_terminal_cwd(&controller, &lines, 0, Path::new("root")),
+            PathBuf::from("root")
+        );
+    }
+
+    #[test]
+    fn terminal_cwd_falls_back_to_root_for_stale_entry() {
+        let (controller, _) = picker_controller(false, false);
+        let lines = [terminal_line(EntryId(999), "stale.txt")];
+
+        assert_eq!(
+            resolve_terminal_cwd(&controller, &lines, 0, Path::new("root")),
+            PathBuf::from("root")
+        );
     }
 
     #[test]

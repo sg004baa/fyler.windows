@@ -23,3 +23,17 @@ pub enum SortKey {
     /// 拡張子順。
     Extension,
 }
+
+/// `:terminal` で起動する外部terminal emulatorの種類。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TerminalKind {
+    /// Windows Terminal → PowerShell → cmd の順で利用可能なものを起動する。
+    #[default]
+    Auto,
+    /// Windows Terminal (`wt.exe`)。
+    WindowsTerminal,
+    /// PowerShell (`powershell.exe`)。
+    PowerShell,
+    /// cmd (`cmd.exe`)。
+    Cmd,
+}

@@ -903,6 +903,96 @@ async fn sort_alias_with_argument_reaches_fyler_sort() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a compatible nvim executable"]
+async fn terminal_alias_fires_open_terminal_event() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+
+    engine.set_initial_lines(vec![EditorLine::new("/001 alpha")])?;
+    wait_for(&engine, |line| line == "/001 alpha").await?;
+    engine.send(key_command(Key::Char(':')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::CmdlineShow(_))
+    })
+    .await
+    .context(": did not open the command line")?;
+    engine.send(EditorCommand::Text("terminal".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::OpenTerminal { line: 0 })
+    })
+    .await
+    .context(":terminal did not emit OpenTerminal")?;
+    wait_for(&engine, |line| line == "/001 alpha").await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn terminal_alias_with_argument_warns() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+
+    engine.set_initial_lines(vec![EditorLine::new("/001 alpha")])?;
+    wait_for(&engine, |line| line == "/001 alpha").await?;
+    engine.send(key_command(Key::Char(':')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::CmdlineShow(_))
+    })
+    .await
+    .context(": did not open the command line")?;
+    engine.send(EditorCommand::Text("terminal git log".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    let opened_before_warning = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut opened = false;
+        while let Some(event) = events.recv().await {
+            match event {
+                EditorEvent::OpenTerminal { .. } => opened = true,
+                EditorEvent::Message(message)
+                    if message.kind == MessageKind::Warn
+                        && message.text.contains("引数は未対応") =>
+                {
+                    return Some(opened);
+                }
+                _ => {}
+            }
+        }
+        None
+    })
+    .await
+    .context(":terminal with arguments did not emit a warning")?
+    .context("editor event channel closed before the warning")?;
+    assert!(
+        !opened_before_warning,
+        "argument form must not emit OpenTerminal"
+    );
+    let opened = tokio::time::timeout(Duration::from_millis(300), async {
+        loop {
+            match events.recv().await {
+                Some(EditorEvent::OpenTerminal { .. }) => return true,
+                Some(_) => {}
+                None => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(!opened, "argument form must not emit OpenTerminal");
+    wait_for(&engine, |line| line == "/001 alpha").await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
 async fn sort_alias_tab_completes_and_executes() -> anyhow::Result<()> {
     let _serial = NVIM_TEST_SERIAL.lock().await;
     let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")

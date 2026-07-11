@@ -350,8 +350,13 @@ end, {
   end,
 })
 
+vim.api.nvim_buf_create_user_command(buffer, "FylerTerminal", function(opts)
+  local line = vim.api.nvim_win_get_cursor(0)[1] - 1
+  vim.rpcnotify(channel, "fyler_terminal", line, opts.args)
+end, { nargs = "*", bang = true })
+
 vim.o.wildcharm = 26
-local command_aliases = { b = "FylerBookmark", cd = "FylerCd", sort = "FylerSort" }
+local command_aliases = { b = "FylerBookmark", cd = "FylerCd", sort = "FylerSort", terminal = "FylerTerminal" }
 -- nvim_paste経由ではcnoreabbrevが展開されないため、実行/補完直前に先頭語を正式コマンドへ書き換える。
 local function rewrite_command_alias()
   if vim.fn.getcmdtype() ~= ":" then return end

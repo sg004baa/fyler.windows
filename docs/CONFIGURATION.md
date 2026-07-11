@@ -31,6 +31,9 @@ sort = "dirs_first"
 sort_key = "name"
 sort_reverse = false
 
+# External terminal emulator used by :terminal
+terminal = "auto"
+
 # Show every operation in confirmation dialogs
 confirm_detail = "full"
 
@@ -64,6 +67,7 @@ projects = 'D:\projects'
 | `sort` | string | `"dirs_first"` | `"dirs_first"` or `"mixed"` |
 | `sort_key` | string | `"name"` | `"name"`, `"date"`, `"size"`, or `"ext"` |
 | `sort_reverse` | boolean | `false` | Reverse the selected sort key |
+| `terminal` | string | `"auto"` | `"auto"`, `"windows_terminal"`, `"powershell"`, or `"cmd"` |
 | `confirm_detail` | string | `"full"` | `"full"` or `"summary"` |
 | `font` | string | unset | Absolute path to a fallback font |
 | `font_y_offset_factor` | number | `0.12` | Downward CJK font offset as a font-size ratio; `0` disables it |
@@ -91,6 +95,13 @@ startup. The `toggle_hidden` action (`g .` by default) can also change this whil
 
 `sort_reverse = true` reverses the selected key. Directory grouping remains controlled separately
 by `sort`. At runtime, use `:sort name|date|size|ext`; add `!` to the command for descending order.
+
+### External terminal
+
+`terminal` selects the external terminal emulator opened by `:terminal`. The command uses the
+selected directory as its working directory. Supported values are `"auto"` (the default),
+`"windows_terminal"`, `"powershell"`, and `"cmd"`. On Windows, `"auto"` tries Windows Terminal,
+PowerShell, and cmd in that order. Non-Windows builds use `x-terminal-emulator` for development.
 
 ### Confirmation dialogs
 
