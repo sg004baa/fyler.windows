@@ -5,13 +5,136 @@
 //! cmdline(`:` / `/`)はユーザーに開放する(`:%s` バルクリネームは中核機能)。
 
 use anyhow::Context;
+use fyler_core::editor::{Key, Modifiers};
+use fyler_core::keymap::{EditorAction, KeyBinding};
 use nvim_rs::compat::tokio::Compat;
 use nvim_rs::{Buffer, Neovim};
 use rmpv::Value;
 use tokio::process::ChildStdin;
 
+use crate::translate::{sequence_to_lhs, to_nvim_keycodes};
+
 type NvimWriter = Compat<ChildStdin>;
 type Nvim = Neovim<NvimWriter>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BindingPayload {
+    kind: &'static str,
+    arg: Option<&'static str>,
+    modes: &'static [&'static str],
+}
+
+fn binding_payload(action: EditorAction) -> BindingPayload {
+    use EditorAction::*;
+    let (kind, arg, modes): (_, _, &'static [&'static str]) = match action {
+        Activate => ("activate", None, &["n", "x"]),
+        NavigateParent => ("navigate_parent", None, &["n"]),
+        NavigateInto => ("navigate_into", None, &["n"]),
+        ToggleHidden => ("toggle_hidden", None, &["n"]),
+        FoldClose => ("fold", Some("close"), &["n"]),
+        FoldOpen => ("fold", Some("open"), &["n"]),
+        FoldToggle => ("fold", Some("toggle"), &["n"]),
+        FoldCloseRecursive => ("fold", Some("close_rec"), &["n"]),
+        FoldOpenRecursive => ("fold", Some("open_rec"), &["n"]),
+        FoldCloseAll => ("fold", Some("close_all"), &["n"]),
+        FoldOpenAll => ("fold", Some("open_all"), &["n"]),
+        FilePicker => ("file_picker", None, &["n"]),
+        YankPath => ("yank_path", None, &["n"]),
+        OpenWith => ("open_with", None, &["n"]),
+        TransferMove => ("transfer", Some("move"), &["n", "x"]),
+        TransferCopy => ("transfer", Some("copy"), &["n", "x"]),
+        Help => ("help", None, &["n"]),
+        PaneSplitHorizontal => ("pane", Some("split_horizontal"), &["n"]),
+        PaneSplitVertical => ("pane", Some("split_vertical"), &["n"]),
+        PaneFocusLeft => ("pane", Some("focus_left"), &["n"]),
+        PaneFocusDown => ("pane", Some("focus_down"), &["n"]),
+        PaneFocusUp => ("pane", Some("focus_up"), &["n"]),
+        PaneFocusRight => ("pane", Some("focus_right"), &["n"]),
+        PaneFocusNext => ("pane", Some("focus_next"), &["n"]),
+        PaneFocusPrevious => ("pane", Some("focus_previous"), &["n"]),
+        PaneClose => ("pane", Some("close"), &["n"]),
+    };
+    BindingPayload { kind, arg, modes }
+}
+
+fn payload_value(payload: BindingPayload) -> Value {
+    let mut fields = vec![
+        (Value::from("kind"), Value::from(payload.kind)),
+        (
+            Value::from("modes"),
+            Value::Array(
+                payload
+                    .modes
+                    .iter()
+                    .map(|mode| Value::from(*mode))
+                    .collect(),
+            ),
+        ),
+    ];
+    if let Some(arg) = payload.arg {
+        fields.push((Value::from("arg"), Value::from(arg)));
+    }
+    Value::Map(fields)
+}
+
+fn is_ctrl_w(binding: &KeyBinding) -> bool {
+    binding.sequence.0.first().is_some_and(|stroke| {
+        stroke.key == Key::Char('w')
+            && stroke.mods
+                == Modifiers {
+                    ctrl: true,
+                    alt: false,
+                    shift: false,
+                }
+    })
+}
+
+#[derive(Default)]
+struct TrieNode {
+    leaf: Option<BindingPayload>,
+    children: std::collections::BTreeMap<String, TrieNode>,
+}
+
+fn binding_values(bindings: &[KeyBinding]) -> (Value, Value) {
+    let mut normal = Vec::new();
+    let mut ctrl_w = TrieNode::default();
+    for binding in bindings {
+        let payload = binding_payload(binding.action);
+        if is_ctrl_w(binding) {
+            let mut node = &mut ctrl_w;
+            for stroke in &binding.sequence.0[1..] {
+                node = node.children.entry(to_nvim_keycodes(stroke)).or_default();
+            }
+            debug_assert!(node.leaf.is_none() && node.children.is_empty());
+            if node.leaf.is_none() && node.children.is_empty() {
+                node.leaf = Some(payload);
+            }
+        } else {
+            let mut value = match payload_value(payload) {
+                Value::Map(fields) => fields,
+                _ => unreachable!(),
+            };
+            value.push((
+                Value::from("lhs"),
+                Value::from(sequence_to_lhs(&binding.sequence)),
+            ));
+            normal.push(Value::Map(value));
+        }
+    }
+    (Value::Array(normal), trie_value(ctrl_w))
+}
+
+fn trie_value(node: TrieNode) -> Value {
+    if let Some(leaf) = node.leaf {
+        return payload_value(leaf);
+    }
+    Value::Map(
+        node.children
+            .into_iter()
+            .map(|(key, child)| (Value::from(key), trie_value(child)))
+            .collect(),
+    )
+}
 
 /// fylerバッファの架空URIスキーム。バッファ名は `filer://C:/Users/...` 形式。
 pub const BUFFER_URI_SCHEME: &str = "filer://";
@@ -46,6 +169,7 @@ pub(crate) async fn install_guards(
     nvim: &Nvim,
     buffer: &Buffer<NvimWriter>,
     channel_id: i64,
+    bindings: &[KeyBinding],
 ) -> anyhow::Result<()> {
     let buffer_number = buffer
         .get_number()
@@ -55,10 +179,11 @@ pub(crate) async fn install_guards(
         .iter()
         .map(|event| Value::from(*event))
         .collect();
+    let (binding_values, ctrl_w_trie) = binding_values(bindings);
 
     nvim.exec_lua(
         r#"
-local buffer, channel, write_events = ...
+local buffer, channel, write_events, bindings, ctrlw_trie = ...
 
 vim.bo[buffer].buftype = "acwrite"
 vim.bo[buffer].bufhidden = "hide"
@@ -127,40 +252,6 @@ for lhs, delta in pairs({ [">"] = 1, ["<"] = -1 }) do
   end, { buffer = buffer, silent = true })
 end
 
-vim.keymap.set({ "n", "x" }, "<CR>", function()
-  local line = vim.api.nvim_win_get_cursor(0)[1] - 1
-  vim.rpcnotify(channel, "fyler_open", line)
-end, { buffer = buffer, silent = true, nowait = true })
-
-vim.keymap.set("n", "^", function()
-  vim.rpcnotify(channel, "fyler_parent")
-end, { buffer = buffer, silent = true, nowait = true })
-
-vim.keymap.set("n", "g.", function()
-  vim.rpcnotify(channel, "fyler_toggle_hidden")
-end, { buffer = buffer, silent = true, nowait = true })
-
-for lhs, op in pairs({ zc = "close", zo = "open", za = "toggle", ["zC"] = "close_rec", ["zO"] = "open_rec", ["zM"] = "close_all", ["zR"] = "open_all" }) do
-  vim.keymap.set("n", lhs, function()
-    vim.rpcnotify(channel, "fyler_fold", op, vim.api.nvim_win_get_cursor(0)[1] - 1)
-  end, { buffer = buffer, silent = true, nowait = true })
-end
-vim.keymap.set("n", "g/", function()
-  vim.rpcnotify(channel, "fyler_open_picker")
-end, { buffer = buffer, silent = true, nowait = true })
-
-vim.keymap.set("n", "gy", function()
-  vim.rpcnotify(channel, "fyler_yank_path", vim.api.nvim_win_get_cursor(0)[1] - 1)
-end, { buffer = buffer, silent = true, nowait = true })
-
-vim.keymap.set("n", "go", function()
-  vim.rpcnotify(channel, "fyler_open_with", vim.api.nvim_win_get_cursor(0)[1] - 1)
-end, { buffer = buffer, silent = true, nowait = true })
-
-vim.keymap.set("n", "gd", function()
-  vim.rpcnotify(channel, "fyler_navigate_into", vim.api.nvim_win_get_cursor(0)[1] - 1)
-end, { buffer = buffer, silent = true, nowait = true })
-
 local function request_transfer(kind, visual)
   local cursor = vim.api.nvim_win_get_cursor(0)[1] - 1
   local first, last = cursor, cursor
@@ -172,46 +263,63 @@ local function request_transfer(kind, visual)
   vim.rpcnotify(channel, "fyler_transfer", kind, first, last)
 end
 
-vim.keymap.set("n", "gm", function()
-  request_transfer("move", false)
-end, { buffer = buffer, silent = true, nowait = true })
-vim.keymap.set("x", "gm", function()
-  request_transfer("move", true)
-end, { buffer = buffer, silent = true, nowait = true })
-vim.keymap.set("n", "gc", function()
-  request_transfer("copy", false)
-end, { buffer = buffer, silent = true, nowait = true })
-vim.keymap.set("x", "gc", function()
-  request_transfer("copy", true)
-end, { buffer = buffer, silent = true, nowait = true })
+local function dispatch(binding)
+  local line = vim.api.nvim_win_get_cursor(0)[1] - 1
+  if binding.kind == "activate" then
+    vim.rpcnotify(channel, "fyler_open", line)
+  elseif binding.kind == "navigate_parent" then
+    vim.rpcnotify(channel, "fyler_parent")
+  elseif binding.kind == "navigate_into" then
+    vim.rpcnotify(channel, "fyler_navigate_into", line)
+  elseif binding.kind == "toggle_hidden" then
+    vim.rpcnotify(channel, "fyler_toggle_hidden")
+  elseif binding.kind == "fold" then
+    vim.rpcnotify(channel, "fyler_fold", binding.arg, line)
+  elseif binding.kind == "file_picker" then
+    vim.rpcnotify(channel, "fyler_open_picker")
+  elseif binding.kind == "yank_path" then
+    vim.rpcnotify(channel, "fyler_yank_path", line)
+  elseif binding.kind == "open_with" then
+    vim.rpcnotify(channel, "fyler_open_with", line)
+  elseif binding.kind == "transfer" then
+    request_transfer(binding.arg, vim.fn.mode():sub(1, 1) ~= "n")
+  elseif binding.kind == "help" then
+    vim.rpcnotify(channel, "fyler_help")
+  elseif binding.kind == "pane" then
+    vim.rpcnotify(channel, "fyler_pane", binding.arg)
+  end
+end
 
-vim.keymap.set("n", "?", function()
-  vim.rpcnotify(channel, "fyler_help")
-end, { buffer = buffer, silent = true, nowait = true })
+local function make_callback(binding)
+  return function()
+    dispatch(binding)
+  end
+end
+
+for _, binding in ipairs(bindings) do
+  vim.keymap.set(binding.modes, binding.lhs, make_callback(binding), { buffer = buffer, silent = true, nowait = true })
+end
 
 vim.keymap.set("n", "<C-w>", function()
-  local key = vim.fn.getcharstr()
-  local actions = {
-    s = "split_horizontal",
-    S = "split_horizontal",
-    v = "split_vertical",
-    h = "focus_left",
-    j = "focus_down",
-    k = "focus_up",
-    l = "focus_right",
-    w = "focus_next",
-    p = "focus_previous",
-    q = "close",
-    c = "close",
-  }
-  local action = actions[key]
-  if key == vim.keycode("<C-w>") then
-    action = "focus_next"
-  end
-  if action then
-    vim.rpcnotify(channel, "fyler_pane", action)
-  else
-    vim.rpcnotify(channel, "fyler_action_blocked", key)
+  local node = ctrlw_trie
+  while true do
+    local key = vim.fn.getcharstr()
+    local next_node = nil
+    for notation, child in pairs(node) do
+      if key == vim.keycode(notation) then
+        next_node = child
+        break
+      end
+    end
+    if next_node == nil then
+      vim.rpcnotify(channel, "fyler_action_blocked", key)
+      return
+    end
+    if next_node.kind ~= nil then
+      dispatch(next_node)
+      return
+    end
+    node = next_node
   end
 end, { buffer = buffer, silent = true, nowait = true })
 
@@ -327,6 +435,8 @@ vim.api.nvim_create_autocmd("BufEnter", {
             Value::from(buffer_number),
             Value::from(channel_id),
             Value::Array(write_events),
+            binding_values,
+            ctrl_w_trie,
         ],
     )
     .await
@@ -334,4 +444,75 @@ vim.api.nvim_create_autocmd("BufEnter", {
     .context("Neovim guard初期化エラー")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_action_maps_to_the_existing_rpc_contract() {
+        use EditorAction::*;
+        let cases = [
+            (Activate, "activate", None, &["n", "x"][..]),
+            (NavigateParent, "navigate_parent", None, &["n"][..]),
+            (NavigateInto, "navigate_into", None, &["n"][..]),
+            (ToggleHidden, "toggle_hidden", None, &["n"][..]),
+            (FoldClose, "fold", Some("close"), &["n"][..]),
+            (FoldOpen, "fold", Some("open"), &["n"][..]),
+            (FoldToggle, "fold", Some("toggle"), &["n"][..]),
+            (FoldCloseRecursive, "fold", Some("close_rec"), &["n"][..]),
+            (FoldOpenRecursive, "fold", Some("open_rec"), &["n"][..]),
+            (FoldCloseAll, "fold", Some("close_all"), &["n"][..]),
+            (FoldOpenAll, "fold", Some("open_all"), &["n"][..]),
+            (FilePicker, "file_picker", None, &["n"][..]),
+            (YankPath, "yank_path", None, &["n"][..]),
+            (OpenWith, "open_with", None, &["n"][..]),
+            (TransferMove, "transfer", Some("move"), &["n", "x"][..]),
+            (TransferCopy, "transfer", Some("copy"), &["n", "x"][..]),
+            (Help, "help", None, &["n"][..]),
+            (
+                PaneSplitHorizontal,
+                "pane",
+                Some("split_horizontal"),
+                &["n"][..],
+            ),
+            (
+                PaneSplitVertical,
+                "pane",
+                Some("split_vertical"),
+                &["n"][..],
+            ),
+            (PaneFocusLeft, "pane", Some("focus_left"), &["n"][..]),
+            (PaneFocusDown, "pane", Some("focus_down"), &["n"][..]),
+            (PaneFocusUp, "pane", Some("focus_up"), &["n"][..]),
+            (PaneFocusRight, "pane", Some("focus_right"), &["n"][..]),
+            (PaneFocusNext, "pane", Some("focus_next"), &["n"][..]),
+            (
+                PaneFocusPrevious,
+                "pane",
+                Some("focus_previous"),
+                &["n"][..],
+            ),
+            (PaneClose, "pane", Some("close"), &["n"][..]),
+        ];
+        for (action, kind, arg, modes) in cases {
+            assert_eq!(
+                binding_payload(action),
+                BindingPayload { kind, arg, modes },
+                "{}",
+                action.config_name()
+            );
+        }
+    }
+
+    #[test]
+    fn defaults_split_into_normal_maps_and_ctrl_w_trie() {
+        let bindings = fyler_core::keymap::default_bindings();
+        let (normal, trie) = binding_values(&bindings);
+        assert_eq!(normal.as_array().unwrap().len(), 17);
+        let trie = trie.as_map().unwrap();
+        assert_eq!(trie.len(), 12);
+        assert!(trie.iter().any(|(key, _)| key.as_str() == Some("<C-w>")));
+    }
 }

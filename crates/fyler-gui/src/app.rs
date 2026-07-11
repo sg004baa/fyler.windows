@@ -61,6 +61,8 @@ pub struct GuiOptions {
     pub font_y_offset_factor: f32,
     /// ツリーへ描画するファイルアイコンのスタイル。
     pub icon_style: IconStyle,
+    /// ヘルプダイアログへ表示する、エンジン非依存表記の行。
+    pub help_lines: Vec<String>,
 }
 
 /// app層からGUIへ渡す描画指示。
@@ -226,6 +228,7 @@ pub struct FylerApp {
     picker_needs_focus: bool,
     confirm_detail: ConfirmDetail,
     icon_style: IconStyle,
+    help_lines: Vec<String>,
 }
 
 struct PaneViewState {
@@ -245,6 +248,7 @@ impl FylerApp {
         action_tx: mpsc::Sender<GuiAction>,
         confirm_detail: ConfirmDetail,
         icon_style: IconStyle,
+        help_lines: Vec<String>,
         repaint_context: egui::Context,
     ) -> anyhow::Result<Self> {
         let (event_tx, event_rx) = mpsc::channel();
@@ -275,6 +279,7 @@ impl FylerApp {
             picker_needs_focus: false,
             confirm_detail,
             icon_style,
+            help_lines,
         })
     }
 
@@ -652,7 +657,7 @@ impl eframe::App for FylerApp {
                 );
             }
             Some(DialogState::Help) => {
-                dismiss_errors = draw_help(ui);
+                dismiss_errors = draw_help(ui, &self.help_lines);
             }
             Some(DialogState::ValidationErrors(errors)) => {
                 let dismiss_from_keyboard = ui.ctx().input(|input| {
@@ -1002,7 +1007,7 @@ fn draw_file_picker(
     apply_picker_keys(keys, pane_id, candidates, hits, selected)
 }
 
-fn draw_help(ui: &mut egui::Ui) -> bool {
+fn draw_help(ui: &mut egui::Ui, help_lines: &[String]) -> bool {
     let dismiss_from_keyboard = ui
         .ctx()
         .input(|input| input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape));
@@ -1011,23 +1016,7 @@ fn draw_help(ui: &mut egui::Ui) -> bool {
         .show(ui.ctx(), |ui| {
             ui.heading("Help");
             ui.add_space(8.0);
-            for line in [
-                "<CR>  Toggle directory / open file",
-                "gd    Enter directory",
-                "^     Go to parent",
-                "g.    Toggle hidden files",
-                "g/    Find file",
-                "gy    Copy path",
-                "go    Open with",
-                "gm/gc Move/copy to previous pane",
-                "<C-w>s/v  Split pane",
-                "<C-w>h/j/k/l/w/p  Focus pane",
-                "<C-w>q/c  Close pane",
-                ":w    Save changes",
-                ":cd   Change root",
-                ":b    Bookmarks and recent roots",
-                "?     Show this help",
-            ] {
+            for line in help_lines {
                 ui.monospace(line);
             }
             ui.add_space(12.0);
@@ -1057,6 +1046,7 @@ pub fn run(
                 font_path,
                 font_y_offset_factor,
                 icon_style,
+                help_lines,
             } = gui_options;
             install_fallback_font(
                 &creation_context.egui_ctx,
@@ -1068,6 +1058,7 @@ pub fn run(
                 action_tx,
                 confirm_detail,
                 icon_style,
+                help_lines,
                 creation_context.egui_ctx.clone(),
             )
             .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
@@ -1191,6 +1182,7 @@ mod tests {
                 picker_needs_focus: false,
                 confirm_detail: ConfirmDetail::Full,
                 icon_style: IconStyle::Ascii,
+                help_lines: Vec::new(),
             },
             event_tx,
             action_rx,
@@ -1322,6 +1314,7 @@ mod tests {
             picker_needs_focus: false,
             confirm_detail: ConfirmDetail::Full,
             icon_style: IconStyle::Ascii,
+            help_lines: Vec::new(),
         };
         let (tx, rx) = mpsc::channel();
         app.event_rx = rx;

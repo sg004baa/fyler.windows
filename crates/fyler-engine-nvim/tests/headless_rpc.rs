@@ -3,9 +3,10 @@ use std::time::Duration;
 
 use anyhow::Context;
 use fyler_core::editor::{
-    EditorCommand, EditorEngine, EditorEvent, EditorLine, FoldOp, Key, KeyInput, Mode, Modifiers,
-    SearchHighlight,
+    EditorCommand, EditorEngine, EditorEvent, EditorLine, FoldOp, Key, KeyInput, MessageKind, Mode,
+    Modifiers, SearchHighlight,
 };
+use fyler_core::keymap::resolve_bindings;
 use fyler_core::pane::PaneAction;
 use fyler_core::transfer::TransferKind;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
@@ -23,7 +24,7 @@ async fn spawn_attach_and_edit_updates_snapshot() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let root = std::env::current_dir()?;
-    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
 
     assert!(engine.snapshot().revision >= 1);
     engine.set_initial_lines(vec![EditorLine::new("/001 alpha")])?;
@@ -117,7 +118,7 @@ async fn pane_keymap_emits_split_action() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let root = std::env::current_dir()?;
-    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
 
     engine.send(EditorCommand::Key(KeyInput {
         key: Key::Char('w'),
@@ -144,7 +145,7 @@ async fn file_picker_keymap_emits_open_request() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let root = std::env::current_dir()?;
-    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
 
     engine.send(key_command(Key::Char('g')))?;
     engine.send(key_command(Key::Char('/')))?;
@@ -159,13 +160,99 @@ async fn file_picker_keymap_emits_open_request() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a compatible nvim executable"]
+async fn custom_leader_binding_fires_once_and_unmap_removes_default() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let space = KeyInput {
+        key: Key::Char(' '),
+        mods: Modifiers::default(),
+    };
+    let (bindings, warnings) = resolve_bindings(
+        Some(space),
+        &[
+            ("Leader f".into(), "file_picker".into()),
+            ("g .".into(), "none".into()),
+        ],
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let mut config = NvimConfig::new(nvim_exe, root);
+    config.bindings = bindings;
+    let (engine, mut events) = NvimEngine::start(config).await?;
+
+    engine.send(key_command(Key::Char(' ')))?;
+    engine.send(key_command(Key::Char('f')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::OpenFilePicker)
+    })
+    .await?;
+    assert_no_event(&mut events, |event| {
+        matches!(event, EditorEvent::OpenFilePicker)
+    })
+    .await?;
+
+    engine.send(key_command(Key::Char('g')))?;
+    engine.send(key_command(Key::Char('.')))?;
+    assert_no_event(&mut events, |event| {
+        matches!(event, EditorEvent::ToggleHidden)
+    })
+    .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn custom_ctrl_w_trie_dispatches_and_blocks_unknown_keys() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (bindings, warnings) =
+        resolve_bindings(None, &[("Ctrl+W x".into(), "pane_focus_next".into())]);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let mut config = NvimConfig::new(nvim_exe, root);
+    config.bindings = bindings;
+    let (engine, mut events) = NvimEngine::start(config).await?;
+
+    let ctrl_w = EditorCommand::Key(KeyInput {
+        key: Key::Char('w'),
+        mods: Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        },
+    });
+    engine.send(ctrl_w.clone())?;
+    engine.send(key_command(Key::Char('x')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::PaneAction(PaneAction::FocusNext))
+    })
+    .await?;
+
+    engine.send(ctrl_w)?;
+    engine.send(key_command(Key::Char('z')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            EditorEvent::Message(message)
+                if message.kind == MessageKind::Info && message.text == "このキーは無効です"
+        )
+    })
+    .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
 async fn transfer_keymaps_emit_normal_and_visual_requests() -> anyhow::Result<()> {
     let _serial = NVIM_TEST_SERIAL.lock().await;
     let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let root = std::env::current_dir()?;
-    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
     engine.set_initial_lines(vec![
         EditorLine::new("/001 a.txt"),
         EditorLine::new("/002 b.txt"),
@@ -214,7 +301,7 @@ async fn character_waiting_commands_do_not_block_following_input() -> anyhow::Re
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let root = std::env::current_dir()?;
-    let (engine, _events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+    let (engine, _events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
 
     engine.set_initial_lines(vec![EditorLine::new("/001 alpha.txt")])?;
     wait_for(&engine, |line| line == "/001 alpha.txt").await?;
@@ -248,7 +335,7 @@ async fn set_initial_lines_with_multiple_lines_has_no_duplication() -> anyhow::R
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let root = std::env::current_dir()?;
     // イベント受信端はエンジンのイベント送信が閉じないよう関数終了まで保持する。
-    let (engine, _events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+    let (engine, _events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
 
     // 3つの異なる行を投入する。旧バグでは末尾2行が重複して5行に化けた。
     engine.set_initial_lines(vec![
@@ -300,7 +387,7 @@ async fn modifiable_blocks_normal_mode_edits_until_reenabled() -> anyhow::Result
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let root = std::env::current_dir()?;
-    let (engine, _events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+    let (engine, _events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
 
     engine.send(EditorCommand::SetLines {
         lines: vec![EditorLine::new("/001 alpha")],
@@ -333,7 +420,7 @@ async fn bookmark_command_emits_jump_request() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let root = std::env::current_dir()?;
-    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
 
     engine.send(key_command(Key::Char(':')))?;
     engine.send(EditorCommand::Text("FylerBookmark x".to_owned()))?;
@@ -360,7 +447,7 @@ async fn undo_command_emits_undo_request() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let root = std::env::current_dir()?;
-    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
 
     engine.send(key_command(Key::Char(':')))?;
     engine.send(EditorCommand::Text("FylerUndo".to_owned()))?;
@@ -382,7 +469,7 @@ async fn navigate_into_and_cd_commands_emit_root_change_requests() -> anyhow::Re
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let root = std::env::current_dir()?;
-    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
 
     engine.set_initial_lines(vec![EditorLine::new("/001 directory/")])?;
     wait_for(&engine, |line| line == "/001 directory/").await?;
@@ -428,7 +515,7 @@ async fn search_state_surfaces_smartcase_and_hlsearch() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let root = std::env::current_dir()?;
-    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
 
     engine.set_initial_lines(vec![
         EditorLine::new("/001 alpha"),
@@ -602,6 +689,25 @@ async fn wait_for_event(
     .map_err(|_| anyhow::anyhow!("editor event timed out"))?
 }
 
+async fn assert_no_event(
+    events: &mut UnboundedReceiver<EditorEvent>,
+    predicate: impl Fn(&EditorEvent) -> bool,
+) -> anyhow::Result<()> {
+    let result = tokio::time::timeout(Duration::from_millis(300), async {
+        while let Some(event) = events.recv().await {
+            if predicate(&event) {
+                anyhow::bail!("unexpected editor event: {event:?}");
+            }
+        }
+        Ok(())
+    })
+    .await;
+    match result {
+        Err(_) => Ok(()),
+        Ok(result) => result,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a compatible nvim executable"]
 async fn zc_emits_fold_close_without_native_fold_error() -> anyhow::Result<()> {
@@ -610,7 +716,7 @@ async fn zc_emits_fold_close_without_native_fold_error() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let root = std::env::current_dir()?;
-    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
 
     engine.set_initial_lines(vec![
         EditorLine::new("/001 directory/"),
@@ -643,7 +749,7 @@ async fn shift_indents_after_id_prefix() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let root = std::env::current_dir()?;
-    let (engine, _events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+    let (engine, _events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
 
     engine.set_initial_lines(vec![
         EditorLine::new("/001 dir/"),
@@ -684,7 +790,7 @@ async fn shift_dedent_at_depth_zero_is_noop() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let root = std::env::current_dir()?;
-    let (engine, _events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+    let (engine, _events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
 
     engine.set_initial_lines(vec![EditorLine::new("/001 top.txt")])?;
     wait_for_lines(&engine, |lines| {
@@ -712,7 +818,7 @@ async fn cursor_clamps_to_name_start() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let root = std::env::current_dir()?;
-    let (engine, _events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+    let (engine, _events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
 
     engine.set_initial_lines(vec![EditorLine::new("/001 \tname.txt")])?;
     wait_for_lines(&engine, |lines| {
@@ -740,7 +846,7 @@ async fn sort_command_completion_emits_popupmenu() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let root = std::env::current_dir()?;
-    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
 
     engine.send(key_command(Key::Char(':')))?;
     wait_for_event(&mut events, |event| {
@@ -771,7 +877,7 @@ async fn sort_alias_with_argument_reaches_fyler_sort() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let root = std::env::current_dir()?;
-    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
 
     engine.send(key_command(Key::Char(':')))?;
     wait_for_event(&mut events, |event| {
@@ -803,7 +909,7 @@ async fn sort_alias_tab_completes_and_executes() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let root = std::env::current_dir()?;
-    let (engine, mut events) = NvimEngine::start(NvimConfig { nvim_exe, root }).await?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
 
     engine.send(key_command(Key::Char(':')))?;
     wait_for_event(&mut events, |event| {

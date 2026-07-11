@@ -192,7 +192,7 @@ impl NvimEngine {
                 .map_err(|error| anyhow::anyhow!("{name}オプションを設定できません: {error}"))?;
         }
 
-        guard::install_guards(&nvim, &buffer, channel_id).await?;
+        guard::install_guards(&nvim, &buffer, channel_id, &config.bindings).await?;
 
         let attached = buffer
             .attach(true, Vec::new())
