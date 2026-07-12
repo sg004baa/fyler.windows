@@ -21,6 +21,7 @@ pub(super) struct TransferPaneState {
     pub dirty: bool,
     pub idle: bool,
     pub crashed: bool,
+    pub offline: bool,
 }
 
 pub(super) fn resolve_target(
@@ -40,6 +41,8 @@ pub(super) fn start_rejection(
 ) -> Option<&'static str> {
     if globally_busy {
         Some("Another save or transfer is in progress")
+    } else if source.offline || target.offline {
+        Some("Cannot start a transfer with an offline or unreachable pane")
     } else if source.crashed || target.crashed {
         Some("Cannot start a transfer with a stopped pane")
     } else if source.dirty || target.dirty {
@@ -309,7 +312,22 @@ mod tests {
             dirty,
             idle,
             crashed,
+            offline: false,
         }
+    }
+
+    #[test]
+    fn start_rejects_offline_source_or_target() {
+        let mut offline = pane(false, true, false);
+        offline.offline = true;
+        assert_eq!(
+            start_rejection(offline, pane(false, true, false), false),
+            Some("Cannot start a transfer with an offline or unreachable pane")
+        );
+        assert_eq!(
+            start_rejection(pane(false, true, false), offline, false),
+            Some("Cannot start a transfer with an offline or unreachable pane")
+        );
     }
 
     #[test]

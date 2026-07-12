@@ -21,6 +21,21 @@ pub struct ExternalChange {
     pub paths: BTreeSet<PathBuf>,
 }
 
+/// watcherからapp層へ渡す通知。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchEvent {
+    /// 固定debounceウィンドウで集約したツリー変更。
+    Changed(ExternalChange),
+    /// notify backendが監視を継続できない、またはイベントを取りこぼした可能性がある。
+    Degraded(String),
+}
+
+#[derive(Debug)]
+enum RawWatchEvent {
+    Changed(Vec<PathBuf>),
+    Degraded(String),
+}
+
 /// ルート以下の監視ハンドル。
 ///
 /// drop時はnotify監視を先に停止して内部チャネルを切断し、保留中の変更を送信して
@@ -67,17 +82,21 @@ impl PendingPaths {
 ///   ユーザーの保存/破棄の判断を待つ(この判定はapp層の責務。watchは通知に徹する)
 /// - 自分自身のapply中の変更でイベントが再帰しないよう、apply中は抑制するか
 ///   イベントを間引く仕組みをapp層と取り決めること
-pub fn watch(root: &Path, tx: Sender<ExternalChange>) -> anyhow::Result<FsWatcher> {
-    let (notify_tx, notify_rx) = mpsc::channel::<Vec<PathBuf>>();
+pub fn watch(root: &Path, tx: Sender<WatchEvent>) -> anyhow::Result<FsWatcher> {
+    let (notify_tx, notify_rx) = mpsc::channel::<RawWatchEvent>();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-        let Ok(event) = event else {
-            return;
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                let _ = notify_tx.send(RawWatchEvent::Degraded(error.to_string()));
+                return;
+            }
         };
         if !is_tree_change(&event.kind) || event.paths.is_empty() {
             return;
         }
 
-        let _ = notify_tx.send(event.paths);
+        let _ = notify_tx.send(RawWatchEvent::Changed(event.paths));
     })
     .context("Failed to create file system watcher")?;
 
@@ -98,8 +117,17 @@ pub fn watch(root: &Path, tx: Sender<ExternalChange>) -> anyhow::Result<FsWatche
     })
 }
 
-fn run_debounce(rx: Receiver<Vec<PathBuf>>, tx: Sender<ExternalChange>) {
-    while let Ok(first_paths) = rx.recv() {
+fn run_debounce(rx: Receiver<RawWatchEvent>, tx: Sender<WatchEvent>) {
+    while let Ok(first) = rx.recv() {
+        let first_paths = match first {
+            RawWatchEvent::Changed(paths) => paths,
+            RawWatchEvent::Degraded(error) => {
+                if tx.send(WatchEvent::Degraded(error)).is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
         let deadline = Instant::now() + DEBOUNCE_WINDOW;
         let mut pending = PendingPaths::default();
         pending.extend(first_paths);
@@ -111,7 +139,12 @@ fn run_debounce(rx: Receiver<Vec<PathBuf>>, tx: Sender<ExternalChange>) {
             }
 
             match rx.recv_timeout(remaining) {
-                Ok(paths) => pending.extend(paths),
+                Ok(RawWatchEvent::Changed(paths)) => pending.extend(paths),
+                Ok(RawWatchEvent::Degraded(error)) => {
+                    if tx.send(WatchEvent::Degraded(error)).is_err() {
+                        return;
+                    }
+                }
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => {
                     source_disconnected = true;
@@ -121,7 +154,7 @@ fn run_debounce(rx: Receiver<Vec<PathBuf>>, tx: Sender<ExternalChange>) {
         }
 
         if let Some(change) = pending.into_change() {
-            if tx.send(change).is_err() {
+            if tx.send(WatchEvent::Changed(change)).is_err() {
                 break;
             }
         }
@@ -160,9 +193,12 @@ mod tests {
         let created = root.path().join("created.txt");
         fs::write(&created, b"content").unwrap();
 
-        let change = rx
+        let event = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("File creation notification was not received");
+        let WatchEvent::Changed(change) = event else {
+            panic!("Unexpected degraded watcher event");
+        };
         assert!(change.paths.contains(&created));
     }
 
@@ -176,9 +212,12 @@ mod tests {
 
         fs::write(&changed, b"after with different length").unwrap();
 
-        let change = rx
+        let event = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("File content overwrite notification was not received");
+        let WatchEvent::Changed(change) = event else {
+            panic!("Unexpected degraded watcher event");
+        };
         assert!(change.paths.contains(&changed));
     }
 
@@ -211,12 +250,17 @@ mod tests {
             fs::write(path, b"content").unwrap();
         }
 
-        let first_change = rx
+        let first_event = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("File creation notification was not received");
+        let WatchEvent::Changed(first_change) = first_event else {
+            panic!("Unexpected degraded watcher event");
+        };
         let mut changes = vec![first_change];
-        while let Ok(change) = rx.recv_timeout(Duration::from_millis(500)) {
-            changes.push(change);
+        while let Ok(event) = rx.recv_timeout(Duration::from_millis(500)) {
+            if let WatchEvent::Changed(change) = event {
+                changes.push(change);
+            }
         }
 
         let received_paths = changes
@@ -255,5 +299,22 @@ mod tests {
                 PathBuf::from("c.txt"),
             ])
         );
+    }
+
+    #[test]
+    fn debounce_forwards_degraded_events() {
+        let (raw_tx, raw_rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || run_debounce(raw_rx, tx));
+
+        raw_tx
+            .send(RawWatchEvent::Degraded("watch overflow".to_owned()))
+            .unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            WatchEvent::Degraded("watch overflow".to_owned())
+        );
+        drop(raw_tx);
+        thread.join().unwrap();
     }
 }

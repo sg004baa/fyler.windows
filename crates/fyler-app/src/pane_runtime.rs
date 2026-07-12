@@ -5,6 +5,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use fyler_core::editor::{EditorCommand, EditorEngine, EditorEvent, MessageKind};
 use fyler_core::feedback::{FeedbackPayload, validate_body};
@@ -19,7 +20,7 @@ use fyler_core::tree::EntryKind;
 use fyler_core::undo::UndoTransaction;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
 use fyler_fsops::scan::ScanOptions;
-use fyler_fsops::watch::{ExternalChange, FsWatcher};
+use fyler_fsops::watch::{FsWatcher, WatchEvent};
 use fyler_gui::app::{FeedbackResultKind, GuiAction, GuiEvent, GuiOptions};
 use fyler_gui::confirm::ConfirmChoice;
 
@@ -48,8 +49,9 @@ struct PaneSession {
     root: PathBuf,
     engine: Arc<dyn EditorEngine>,
     save_controller: SaveController,
-    _watcher: FsWatcher,
-    watch_tx: mpsc::Sender<ExternalChange>,
+    watcher: FsWatcher,
+    watch_tx: mpsc::Sender<WatchEvent>,
+    watch_degraded: bool,
     git_badges: HashMap<EntryId, GitBadge>,
     deferred_changes: BTreeSet<PathBuf>,
     undo_slot: Option<UndoTransaction>,
@@ -126,11 +128,12 @@ fn create_pane(
         // recvからapp channelへ転送するだけの非再帰ループ。
         .stack_size(256 * 1024)
         .spawn(move || {
-            while let Ok(change) = watch_rx.recv() {
-                if watch_event_tx
-                    .send(AppEvent::ExternalChange(id, change))
-                    .is_err()
-                {
+            while let Ok(event) = watch_rx.recv() {
+                let event = match event {
+                    WatchEvent::Changed(change) => AppEvent::ExternalChange(id, change),
+                    WatchEvent::Degraded(error) => AppEvent::WatchDegraded(id, error),
+                };
+                if watch_event_tx.send(event).is_err() {
                     return;
                 }
             }
@@ -144,8 +147,9 @@ fn create_pane(
         root,
         engine: save_engine,
         save_controller,
-        _watcher: watcher,
+        watcher,
         watch_tx,
+        watch_degraded: false,
         git_badges: HashMap::new(),
         deferred_changes: BTreeSet::new(),
         undo_slot: None,
@@ -218,6 +222,20 @@ pub(super) fn run() -> anyhow::Result<()> {
     let app_event_gauge = Arc::new(QueueGauge::new());
     let (app_event_inner_tx, app_event_rx) = mpsc::channel();
     let app_event_tx = CountingSender::new(app_event_inner_tx, Arc::clone(&app_event_gauge));
+    let retry_event_tx = app_event_tx.clone();
+    thread::Builder::new()
+        .name("fyler-offline-retry".to_owned())
+        // 5秒待機してtickを送るだけの非再帰ループ。
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(5));
+                if retry_event_tx.send(AppEvent::OfflineRetryTick).is_err() {
+                    break;
+                }
+            }
+        })
+        .map_err(|error| anyhow::anyhow!("Failed to start offline retry ticker: {error}"))?;
     let shared_ids = Arc::new(Mutex::new(IdAllocator::new()));
     let initial_id = PaneId::new(1);
     let initial = create_pane(
@@ -321,12 +339,11 @@ pub(super) fn run() -> anyhow::Result<()> {
                 Vec<fyler_fsops::openwith::OpenWithHandler>,
             )> = None;
 
-            if send_view_state(
-                &gui_event_tx,
-                initial_id,
-                &panes[&initial_id].save_controller,
-            )
-            .is_err()
+            let Some(initial_session) = panes.get_mut(&initial_id) else {
+                return;
+            };
+            if send_view_state(&gui_event_tx, initial_id, &mut initial_session.save_controller)
+                .is_err()
             {
                 return;
             }
@@ -573,6 +590,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 if let Some(reason) = undo_rejection(
                                     session.engine.snapshot().dirty,
                                     session.undo_slot.is_none(),
+                                    session.save_controller.is_offline(),
                                     apply_owner.is_some()
                                         || dialog_owner.is_some()
                                         || transfer.is_awaiting()
@@ -914,6 +932,16 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         {
                                             return;
                                         }
+                                        if session.save_controller.is_offline()
+                                            && send_view_state(
+                                                &gui_event_tx,
+                                                pane_id,
+                                                &mut session.save_controller,
+                                            )
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
                                         continue;
                                     }
                                 };
@@ -933,7 +961,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 if send_view_state(
                                     &gui_event_tx,
                                     pane_id,
-                                    &session.save_controller,
+                                    &mut session.save_controller,
                                 )
                                 .is_err()
                                 {
@@ -982,7 +1010,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         if send_view_state(
                                             &gui_event_tx,
                                             pane_id,
-                                            &session.save_controller,
+                                            &mut session.save_controller,
                                         )
                                         .is_err()
                                         {
@@ -1082,6 +1110,16 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             {
                                                 return;
                                             }
+                                            if session.save_controller.is_offline()
+                                                && send_view_state(
+                                                    &gui_event_tx,
+                                                    pane_id,
+                                                    &mut session.save_controller,
+                                                )
+                                                .is_err()
+                                            {
+                                                return;
+                                            }
                                             continue;
                                         }
                                     };
@@ -1104,7 +1142,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 if send_view_state(
                                     &gui_event_tx,
                                     pane_id,
-                                    &session.save_controller,
+                                    &mut session.save_controller,
                                 )
                                 .is_err()
                                     || send_gui_message(
@@ -1670,7 +1708,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                             || send_view_state(
                                 &gui_event_tx,
                                 pane_id,
-                                &session.save_controller,
+                                &mut session.save_controller,
                             )
                             .is_err()
                         {
@@ -1736,7 +1774,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                             || send_view_state(
                                 &gui_event_tx,
                                 pane_id,
-                                &session.save_controller,
+                                &mut session.save_controller,
                             )
                             .is_err()
                         {
@@ -1799,11 +1837,13 @@ pub(super) fn run() -> anyhow::Result<()> {
                             if let Err(error) = session.save_controller.reconcile_after_transfer() {
                                 reconcile_errors.push(format!("pane {pane_id}: {error:#}"));
                             }
-                            let _ = session.engine.send(EditorCommand::SetModifiable(true));
+                            if !session.save_controller.is_offline() {
+                                let _ = session.engine.send(EditorCommand::SetModifiable(true));
+                            }
                             if send_view_state(
                                 &gui_event_tx,
                                 pane_id,
-                                &session.save_controller,
+                                &mut session.save_controller,
                             )
                             .is_err()
                             {
@@ -1823,7 +1863,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 source,
                                 MessageKind::Error,
                                 format!(
-                                    "Failed to reload after transfer: {}",
+                                    "A folder became offline or unreachable after transfer and will retry automatically: {}",
                                     reconcile_errors.join(" / ")
                                 ),
                             )
@@ -1907,6 +1947,89 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 }
                                 if outcome.invalidated_dialog && dialog_owner == Some(changed_id) {
                                     dialog_owner = None;
+                                }
+                            }
+                        }
+                    }
+                    AppEvent::WatchDegraded(pane_id, error) => {
+                        let Some(session) = panes.get_mut(&pane_id) else {
+                            continue;
+                        };
+                        if !session.watch_degraded {
+                            session.watch_degraded = true;
+                            if send_gui_message(
+                                &gui_event_tx,
+                                pane_id,
+                                MessageKind::Warn,
+                                format!(
+                                    "File watching stopped and will retry automatically: {error}"
+                                ),
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    AppEvent::OfflineRetryTick => {
+                        if apply_owner.is_some() || transfer.is_running() {
+                            continue;
+                        }
+                        if panes.values().all(|session| {
+                            !session.save_controller.is_offline() && !session.watch_degraded
+                        }) {
+                            continue;
+                        }
+                        let pane_ids = panes.keys().copied().collect::<Vec<_>>();
+                        for pane_id in pane_ids {
+                            let Some(session) = panes.get_mut(&pane_id) else {
+                                continue;
+                            };
+                            if session.save_controller.is_offline() {
+                                let result = session.save_controller.retry_offline();
+                                if !matches!(result, SaveFlowResult::Reconnected(_)) {
+                                    continue;
+                                }
+                                match fyler_fsops::watch::watch(
+                                    &session.root,
+                                    session.watch_tx.clone(),
+                                ) {
+                                    Ok(watcher) => {
+                                        session.watcher = watcher;
+                                        session.watch_degraded = false;
+                                    }
+                                    Err(_) => session.watch_degraded = true,
+                                }
+                                if send_save_result(&gui_event_tx, pane_id, result).is_err()
+                                    || send_view_state(
+                                        &gui_event_tx,
+                                        pane_id,
+                                        &mut session.save_controller,
+                                    )
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                git.request(pane_id, session.root.clone());
+                            } else if session.watch_degraded {
+                                let Ok(watcher) = fyler_fsops::watch::watch(
+                                    &session.root,
+                                    session.watch_tx.clone(),
+                                ) else {
+                                    continue;
+                                };
+                                session.watcher = watcher;
+                                session.watch_degraded = false;
+                                let outcome = handle_external_change(
+                                    pane_id,
+                                    &BTreeSet::new(),
+                                    &mut session.save_controller,
+                                    &gui_event_tx,
+                                    &mut git,
+                                    &session.root,
+                                );
+                                if outcome.is_err() {
+                                    return;
                                 }
                             }
                         }
@@ -2043,7 +2166,12 @@ fn handle_pane_action(
                 engine: Arc::clone(&new_session.engine),
                 root: new_session.root.clone(),
             })?;
-            send_view_state(gui_event_tx, new_session.id, &new_session.save_controller)?;
+            let mut new_session = new_session;
+            send_view_state(
+                gui_event_tx,
+                new_session.id,
+                &mut new_session.save_controller,
+            )?;
             git.request(new_session.id, new_session.root.clone());
             panes.insert(new_id, new_session);
             *layout = new_layout;
@@ -2150,11 +2278,13 @@ fn handle_transfer_request(
         dirty: source_snapshot.dirty,
         idle: source_session.save_controller.is_idle(),
         crashed: source_session.crashed,
+        offline: source_session.save_controller.is_offline(),
     };
     let target_state = TransferPaneState {
         dirty: target_snapshot.dirty,
         idle: target_session.save_controller.is_idle(),
         crashed: target_session.crashed,
+        offline: target_session.save_controller.is_offline(),
     };
     if let Some(reason) = start_rejection(source_state, target_state, globally_busy) {
         return send_gui_message(gui_event_tx, source, MessageKind::Info, reason);
@@ -2286,9 +2416,16 @@ fn close_rejection(
     }
 }
 
-fn undo_rejection(dirty: bool, slot_empty: bool, busy: bool) -> Option<&'static str> {
+fn undo_rejection(
+    dirty: bool,
+    slot_empty: bool,
+    offline: bool,
+    busy: bool,
+) -> Option<&'static str> {
     if busy {
         Some("Another save is in progress")
+    } else if offline {
+        Some("Cannot undo while the folder is offline or unreachable")
     } else if dirty {
         Some("Cannot undo while editing. Save or discard changes.")
     } else if slot_empty {
@@ -2347,7 +2484,7 @@ fn change_session_root(
         new_root,
         cursor_target,
         &mut session.root,
-        &mut session._watcher,
+        &mut session.watcher,
         &session.watch_tx,
         shared_ids,
         &mut session.save_controller,
@@ -2355,10 +2492,11 @@ fn change_session_root(
         gui_event_tx,
     )?;
     if changed {
+        session.watch_degraded = false;
         after_root_change(
             pane_id,
             gui_event_tx,
-            &session.save_controller,
+            &mut session.save_controller,
             git,
             &session.root,
         )?;
@@ -2426,18 +2564,22 @@ mod tests {
     #[test]
     fn undo_rejects_busy_dirty_and_empty_slot() {
         assert_eq!(
-            undo_rejection(false, false, true),
+            undo_rejection(false, false, false, true),
             Some("Another save is in progress")
         );
         assert_eq!(
-            undo_rejection(true, false, false),
+            undo_rejection(true, false, false, false),
             Some("Cannot undo while editing. Save or discard changes.")
         );
         assert_eq!(
-            undo_rejection(false, true, false),
+            undo_rejection(false, true, false, false),
             Some("No operations are available to undo")
         );
-        assert_eq!(undo_rejection(false, false, false), None);
+        assert_eq!(
+            undo_rejection(false, false, true, false),
+            Some("Cannot undo while the folder is offline or unreachable")
+        );
+        assert_eq!(undo_rejection(false, false, false, false), None);
     }
 
     #[test]

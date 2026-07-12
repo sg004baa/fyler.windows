@@ -34,7 +34,7 @@ use fyler_core::transfer::TransferOp;
 use fyler_core::tree::EntryKind;
 use fyler_core::undo::{UndoStep, UndoTransaction};
 use fyler_fsops::openwith::OpenWithHandler;
-use fyler_fsops::watch::{ExternalChange, FsWatcher};
+use fyler_fsops::watch::{ExternalChange, FsWatcher, WatchEvent};
 use fyler_gui::app::{GuiEvent, PickerAction};
 use fyler_gui::confirm::ConfirmChoice;
 
@@ -56,6 +56,8 @@ enum AppEvent {
     FeedbackClosed,
     FeedbackFinished(feedback::FeedbackOutcome),
     ExternalChange(PaneId, ExternalChange),
+    WatchDegraded(PaneId, String),
+    OfflineRetryTick,
     GitStatus {
         pane_id: PaneId,
         root: PathBuf,
@@ -222,7 +224,7 @@ fn change_root_to(
     cursor_target: Option<&OsStr>,
     root: &mut PathBuf,
     watcher: &mut FsWatcher,
-    watch_tx: &mpsc::Sender<ExternalChange>,
+    watch_tx: &mpsc::Sender<WatchEvent>,
     shared_ids: &Arc<std::sync::Mutex<IdAllocator>>,
     save_controller: &mut SaveController,
     engine: &dyn EditorEngine,
@@ -241,7 +243,7 @@ fn change_root_to(
         }
     };
 
-    if engine.snapshot().dirty {
+    if engine.snapshot().dirty && !save_controller.is_offline() {
         send_gui_message(
             gui_event_tx,
             pane_id,
@@ -330,7 +332,7 @@ fn change_root_to(
 fn after_root_change(
     pane_id: PaneId,
     gui_event_tx: &CountingSender<GuiEvent>,
-    save_controller: &SaveController,
+    save_controller: &mut SaveController,
     git: &mut GitRefresher,
     root: &Path,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
@@ -1039,7 +1041,7 @@ fn send_gui_message(
 fn send_view_state(
     gui_event_tx: &CountingSender<GuiEvent>,
     pane_id: PaneId,
-    save_controller: &SaveController,
+    save_controller: &mut SaveController,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     gui_event_tx.send(GuiEvent::FileInfos {
         pane_id,
@@ -1048,7 +1050,20 @@ fn send_view_state(
     gui_event_tx.send(GuiEvent::CollapsedDirs {
         pane_id,
         dirs: save_controller.collapsed_dirs(),
-    })
+    })?;
+    gui_event_tx.send(GuiEvent::IncompleteDirs {
+        pane_id,
+        dirs: save_controller.incomplete_dir_ids(),
+    })?;
+    gui_event_tx.send(GuiEvent::PaneHealth {
+        pane_id,
+        offline: save_controller.is_offline(),
+        unreadable: save_controller.unreadable_count(),
+    })?;
+    if let Some((kind, message)) = save_controller.take_scan_health_message() {
+        send_gui_message(gui_event_tx, pane_id, kind, message)?;
+    }
+    Ok(())
 }
 
 fn send_save_result(
@@ -1091,11 +1106,28 @@ fn send_save_result(
             let (lines, any_failed) = undo_format::undo_report_lines(&report);
             gui_event_tx.send(GuiEvent::ShowUndoReport { lines, any_failed })
         }
+        SaveFlowResult::UndoReconcileFailed { report, error } => {
+            let (lines, any_failed) = undo_format::undo_report_lines(&report);
+            gui_event_tx.send(GuiEvent::ShowUndoReport { lines, any_failed })?;
+            send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Warn,
+                format!(
+                    "The folder became offline or unreachable after undo. Reconnect and it will refresh automatically. ({error})"
+                ),
+            )
+        }
         SaveFlowResult::ReconcileFailed { report, error } => {
             gui_event_tx.send(GuiEvent::ShowReport(report))?;
-            gui_event_tx.send(GuiEvent::FatalError(format!(
-                "Failed to reload after the operation. Editing has been disabled for safety: {error}"
-            )))
+            send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Warn,
+                format!(
+                    "The folder became offline or unreachable after the operation. Reconnect and it will refresh automatically. ({error})"
+                ),
+            )
         }
         SaveFlowResult::ExternalChanged => Ok(()),
         SaveFlowResult::ExternalChangeNotified(text) => {
@@ -1103,6 +1135,20 @@ fn send_save_result(
         }
         SaveFlowResult::ExternalChangeFailed(text) => {
             send_gui_message(gui_event_tx, pane_id, MessageKind::Error, text)
+        }
+        SaveFlowResult::WentOffline(text) => send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Warn,
+            format!(
+                "The folder is offline or unreachable. Reconnect and it will refresh automatically. ({text})"
+            ),
+        ),
+        SaveFlowResult::Reconnected(text) => {
+            send_gui_message(gui_event_tx, pane_id, MessageKind::Info, text)
+        }
+        SaveFlowResult::OfflineRejected(text) => {
+            send_gui_message(gui_event_tx, pane_id, MessageKind::Info, text)
         }
         SaveFlowResult::PlanInvalidated(text) => {
             gui_event_tx.send(GuiEvent::CloseDialog)?;
