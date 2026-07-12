@@ -31,6 +31,7 @@ pub mod transfer;
 pub mod tree;
 pub mod validate;
 pub mod win_naming;
+pub mod window;
 
 pub use editor::{EditorCommand, EditorEngine, EditorEvent, EditorLine, EditorSnapshot};
 pub use gitstatus::GitBadge;
@@ -44,3 +45,4 @@ pub use transfer::{TransferKind, TransferOp, TransferPlan};
 pub use tree::{BaselineEntry, BaselineTree, DesiredEntry, DesiredTree, EditContext, EntryKind};
 pub use undo::{UndoStep, UndoTransaction};
 pub use validate::ValidateError;
+pub use window::WindowGeometry;

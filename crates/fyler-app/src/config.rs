@@ -33,6 +33,8 @@ pub struct Config {
     pub sort_key: SortKey,
     /// ソートキー部分を降順にするか。
     pub sort_reverse: bool,
+    /// 正常終了した前回セッションのpane配置と表示状態を復元するか。
+    pub restore_session: bool,
     /// 外部terminal emulatorの起動方法。
     pub terminal: TerminalKind,
     /// 匿名フィードバック送信endpoint。空文字列は明示的無効化を表す。
@@ -61,6 +63,7 @@ impl Default for Config {
             sort: SortOrder::DirsFirst,
             sort_key: SortKey::Name,
             sort_reverse: false,
+            restore_session: true,
             terminal: TerminalKind::Auto,
             feedback_url: None,
             confirm_detail: ConfirmDetail::Full,
@@ -155,6 +158,12 @@ pub fn load() -> (Config, Vec<String>) {
         match value.as_bool() {
             Some(reverse) => config.sort_reverse = reverse,
             None => warnings.push("sort_reverse must be true or false".to_owned()),
+        }
+    }
+    if let Some(value) = table.get("restore_session") {
+        match value.as_bool() {
+            Some(restore_session) => config.restore_session = restore_session,
+            None => warnings.push("restore_session must be true or false".to_owned()),
         }
     }
     if let Some(value) = table.get("terminal") {
@@ -286,6 +295,7 @@ pub fn load() -> (Config, Vec<String>) {
                 | "sort"
                 | "sort_key"
                 | "sort_reverse"
+                | "restore_session"
                 | "terminal"
                 | "feedback_url"
                 | "confirm_detail"
@@ -388,7 +398,7 @@ pub fn record_recent_root(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn config_dir() -> anyhow::Result<PathBuf> {
+pub(crate) fn config_dir() -> anyhow::Result<PathBuf> {
     if let Some(path) = nonempty_env("FYLER_CONFIG_DIR") {
         return Ok(PathBuf::from(path));
     }
@@ -505,6 +515,19 @@ mod tests {
             warnings
                 .iter()
                 .any(|warning| warning.contains("sort_reverse"))
+        );
+        fs::write(&path, "restore_session = false\n").unwrap();
+        let (config, warnings) = load();
+        assert!(!config.restore_session);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        fs::write(&path, "restore_session = 'no'\n").unwrap();
+        let (config, warnings) = load();
+        assert!(config.restore_session);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("restore_session"))
         );
 
         for (value, expected) in [

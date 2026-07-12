@@ -13,6 +13,7 @@ mod pane_runtime;
 mod picker;
 mod queue_stats;
 pub mod save_flow;
+mod session;
 mod transfer_flow;
 mod undo_format;
 mod undo_journal;
@@ -90,7 +91,10 @@ enum AppEvent {
     UndoFinished(PaneId, CommitReport<UndoStep>),
     TransferProgress(ApplyProgress<TransferOp>),
     TransferFinished(CommitReport<TransferOp>),
-    Shutdown,
+    Shutdown {
+        save_session: bool,
+        window: Option<fyler_core::WindowGeometry>,
+    },
 }
 
 struct ExternalChangeOutcome {

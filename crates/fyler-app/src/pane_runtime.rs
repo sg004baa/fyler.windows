@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use fyler_core::WindowGeometry;
 use fyler_core::editor::{EditorCommand, EditorEngine, EditorEvent, FoldOp, MessageKind};
 use fyler_core::feedback::{FeedbackPayload, validate_body};
 use fyler_core::gitstatus::GitBadge;
@@ -30,6 +31,7 @@ use super::feedback::{FeedbackOutcome, resolve_endpoint, send_feedback};
 use super::nvim_locate;
 use super::picker::{ActivePicker, CatalogService, PickerSearchWorker};
 use super::save_flow::{FoldResult, SaveController, SaveFlowResult};
+use super::session::{self, SessionPane, SessionState};
 use super::transfer_flow::{
     TransferController, TransferFlowResult, TransferPaneState, build_plan, destination_directory,
     resolve_selection, resolve_target, start_rejection,
@@ -59,6 +61,7 @@ struct PaneSession {
     deferred_changes: BTreeSet<PathBuf>,
     undo_slot: Option<UndoTransaction>,
     crashed: bool,
+    restoration_warnings: Vec<String>,
 }
 
 /// app全体で同時に1本だけ実行する列挙workerの所有状態。
@@ -113,6 +116,7 @@ fn create_pane(
     shared_ids: Arc<Mutex<IdAllocator>>,
     app_event_tx: &CountingSender<AppEvent>,
     nvim_diagnostics: Option<&[String]>,
+    restored: Option<&SessionPane>,
 ) -> anyhow::Result<PaneSession> {
     // nvim起動はflaky回避のため呼び出し元イベントループで必ず直列に行う。
     let (engine, mut engine_events) = runtime
@@ -130,11 +134,36 @@ fn create_pane(
                 diagnostics.join("\n")
             ))
         })?;
+    let mut restoration_warnings = Vec::new();
     let baseline = {
         let mut ids = shared_ids
             .lock()
             .map_err(|_| anyhow::anyhow!("ID allocator lock is poisoned"))?;
-        fyler_fsops::scan::scan_baseline_shallow_with(&root, &mut ids, &scan_options)?
+        let mut baseline =
+            fyler_fsops::scan::scan_baseline_shallow_with(&root, &mut ids, &scan_options)?;
+        if let Some(restored) = restored {
+            let mut expanded = restored.expanded.clone();
+            expanded.sort_by_key(TreePath::depth);
+            for directory in expanded {
+                if !baseline.is_unloaded(&directory) {
+                    continue;
+                }
+                match fyler_fsops::scan::load_directory(
+                    &root,
+                    &directory,
+                    &mut ids,
+                    &baseline,
+                    &scan_options,
+                ) {
+                    Ok(loaded) => baseline = loaded,
+                    Err(error) => restoration_warnings.push(format!(
+                        "Could not restore expanded folder {}: {error:#}",
+                        directory
+                    )),
+                }
+            }
+        }
+        baseline
     };
     let save_engine: Arc<dyn EditorEngine> = engine.clone();
     let mut save_controller = SaveController::new_shared_with_scan_options(
@@ -144,8 +173,18 @@ fn create_pane(
         Arc::clone(&save_engine),
         scan_options,
     );
-    save_controller.collapse_all_dirs();
+    if let Some(restored) = restored {
+        save_controller.restore_collapsed_paths(&restored.collapsed);
+    } else {
+        save_controller.collapse_all_dirs();
+    }
     engine.set_initial_lines(save_controller.visible_lines())?;
+    if let Some(cursor_line) = restored
+        .and_then(|restored| restored.cursor.as_ref())
+        .and_then(|cursor| save_controller.visible_line_for_path(cursor))
+    {
+        engine.send(EditorCommand::SetCursorLine(cursor_line))?;
+    }
 
     // scanと初期行投入が成功した後にwatcherを作る。ここまでのどこかが失敗すれば
     // sessionを返さず、生成済みengineもdropされる。
@@ -198,6 +237,7 @@ fn create_pane(
         deferred_changes: BTreeSet::new(),
         undo_slot: None,
         crashed: false,
+        restoration_warnings,
     })
 }
 
@@ -227,13 +267,79 @@ fn help_lines(bindings: &[KeyBinding]) -> Vec<String> {
     lines
 }
 
+fn should_restore_session(explicit_root: bool, restore_session: bool) -> bool {
+    !explicit_root && restore_session
+}
+
+fn existing_root_or_ancestor(requested: &Path, fallback: &Path) -> PathBuf {
+    requested
+        .ancestors()
+        .find(|candidate| candidate.is_dir())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| fallback.to_path_buf())
+}
+
+fn capture_session(
+    panes: &BTreeMap<PaneId, PaneSession>,
+    layout: PaneLayout,
+    active: PaneId,
+    window: Option<WindowGeometry>,
+) -> SessionState {
+    let panes = panes
+        .iter()
+        .map(|(id, pane)| {
+            let snapshot = pane.engine.snapshot();
+            let cursor = pane
+                .save_controller
+                .resolve_line(&snapshot.lines, snapshot.cursor.line)
+                .map(|(path, _)| path);
+            let (collapsed, expanded) = pane.save_controller.session_directory_state();
+            (
+                *id,
+                SessionPane {
+                    root: pane.root.clone(),
+                    cursor,
+                    collapsed,
+                    expanded,
+                    scan_options: pane.save_controller.scan_options(),
+                },
+            )
+        })
+        .collect();
+    SessionState {
+        layout,
+        active,
+        panes,
+        window,
+    }
+}
+
 pub(super) fn run() -> anyhow::Result<()> {
-    let root = match std::env::args_os().nth(1) {
-        Some(root) => PathBuf::from(root),
-        None => default_root()?,
-    };
-    let root = normalize_root(&root)?;
+    let explicit_root = std::env::args_os().nth(1).map(PathBuf::from);
+    let fallback_root = normalize_root(&default_root()?)?;
     let (config, config_warnings) = super::config::load();
+    let mut startup_warnings = Vec::new();
+    let restored_session =
+        if should_restore_session(explicit_root.is_some(), config.restore_session) {
+            match session::load() {
+                Ok(session) => session,
+                Err(error) => {
+                    startup_warnings.push(format!(
+                        "Could not restore the previous session; starting with one pane: {error:#}"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    let initial_window = restored_session.as_ref().and_then(|session| session.window);
+    let window_geometry = Arc::new(Mutex::new(initial_window));
+    let root = explicit_root
+        .as_deref()
+        .map(normalize_root)
+        .transpose()?
+        .unwrap_or_else(|| fallback_root.clone());
     let feedback_endpoint = resolve_endpoint(
         config.feedback_url.as_deref(),
         option_env!("FYLER_FEEDBACK_URL"),
@@ -281,18 +387,107 @@ pub(super) fn run() -> anyhow::Result<()> {
         })
         .map_err(|error| anyhow::anyhow!("Failed to start offline retry ticker: {error}"))?;
     let shared_ids = Arc::new(Mutex::new(IdAllocator::new()));
-    let initial_id = PaneId::new(1);
-    let initial = create_pane(
-        &runtime,
-        initial_id,
-        root,
-        &nvim_exe,
-        &bindings,
-        scan_options,
-        Arc::clone(&shared_ids),
-        &app_event_tx,
-        Some(&resolved_nvim.diagnostics),
-    )?;
+    let mut startup_panes = BTreeMap::new();
+    let (requested_layout, requested_active) = match &restored_session {
+        Some(restored) => (restored.layout.clone(), restored.active),
+        None => {
+            let id = PaneId::new(1);
+            (PaneLayout::leaf(id), id)
+        }
+    };
+    for id in requested_layout.leaves() {
+        let restored = restored_session
+            .as_ref()
+            .and_then(|session| session.panes.get(&id));
+        let requested_root = restored.map_or(root.as_path(), |pane| pane.root.as_path());
+        let candidate = existing_root_or_ancestor(requested_root, &fallback_root);
+        if candidate != requested_root {
+            startup_warnings.push(format!(
+                "Pane {id} root is unavailable; using {}",
+                candidate.display()
+            ));
+        }
+        let restored_hint = restored.filter(|pane| pane.root == candidate);
+        let pane_options = restored.map_or(scan_options, |pane| pane.scan_options);
+        let created = create_pane(
+            &runtime,
+            id,
+            candidate.clone(),
+            &nvim_exe,
+            &bindings,
+            pane_options,
+            Arc::clone(&shared_ids),
+            &app_event_tx,
+            Some(&resolved_nvim.diagnostics),
+            restored_hint,
+        )
+        .or_else(|error| {
+            if candidate == fallback_root {
+                return Err(error);
+            }
+            startup_warnings.push(format!(
+                "Pane {id} could not open {} ({error:#}); using {}",
+                candidate.display(),
+                fallback_root.display()
+            ));
+            create_pane(
+                &runtime,
+                id,
+                fallback_root.clone(),
+                &nvim_exe,
+                &bindings,
+                pane_options,
+                Arc::clone(&shared_ids),
+                &app_event_tx,
+                Some(&resolved_nvim.diagnostics),
+                None,
+            )
+        });
+        match created {
+            Ok(pane) => {
+                startup_panes.insert(id, pane);
+            }
+            Err(error) if restored_session.is_some() => startup_warnings.push(format!(
+                "Pane {id} could not be restored and was removed: {error:#}"
+            )),
+            Err(error) => return Err(error),
+        }
+    }
+    if startup_panes.is_empty() {
+        let id = PaneId::new(1);
+        startup_panes.insert(
+            id,
+            create_pane(
+                &runtime,
+                id,
+                fallback_root.clone(),
+                &nvim_exe,
+                &bindings,
+                scan_options,
+                Arc::clone(&shared_ids),
+                &app_event_tx,
+                Some(&resolved_nvim.diagnostics),
+                None,
+            )?,
+        );
+    }
+    let available = startup_panes.keys().copied().collect::<BTreeSet<_>>();
+    let initial_layout = session::retain_available_layout(&requested_layout, &available)
+        .unwrap_or_else(|| PaneLayout::leaf(*available.first().expect("pane exists")));
+    let initial_active = if available.contains(&requested_active) {
+        requested_active
+    } else {
+        *initial_layout
+            .leaves()
+            .first()
+            .expect("layout contains pane")
+    };
+    let next_pane_id = available
+        .iter()
+        .map(|id| id.get())
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
     let (journal, journal_warning) = match undo_journal::UndoJournal::open() {
         Ok(journal) => (Some(journal), None),
         Err(error) => (
@@ -355,32 +550,37 @@ pub(super) fn run() -> anyhow::Result<()> {
     let (gui_event_inner_tx, gui_event_rx) = mpsc::channel();
     let gui_event_tx = CountingSender::new(gui_event_inner_tx, Arc::clone(&gui_event_gauge));
     let picker_search = PickerSearchWorker::new(gui_event_tx.clone())?;
-    gui_event_tx.send(GuiEvent::AddPane {
-        pane_id: initial.id,
-        engine: Arc::clone(&initial.engine),
-        root: initial.root.clone(),
-    })?;
-    let initial_layout = PaneLayout::leaf(initial_id);
+    for pane in startup_panes.values_mut() {
+        gui_event_tx.send(GuiEvent::AddPane {
+            pane_id: pane.id,
+            engine: Arc::clone(&pane.engine),
+            root: pane.root.clone(),
+        })?;
+        startup_warnings.append(&mut pane.restoration_warnings);
+    }
     gui_event_tx.send(GuiEvent::LayoutChanged {
         layout: initial_layout.clone(),
-        active: initial_id,
+        active: initial_active,
     })?;
 
     let event_tx = app_event_tx.clone();
     let event_loop_gauge = Arc::clone(&app_event_gauge);
+    let (shutdown_result_tx, shutdown_result_rx) = mpsc::sync_channel(1);
     // rescanを含むapp event loopは再帰深度が読めないため既定stackを維持する。
     let event_bridge = thread::Builder::new()
         .name("fyler-app-events".to_owned())
         .spawn(move || {
-            let mut panes = BTreeMap::from([(initial_id, initial)]);
+            let mut panes = startup_panes;
             let mut layout = initial_layout;
-            let mut active = initial_id;
-            let mut last_active = initial_id;
-            let mut next_pane_id = 2_u64;
+            let mut active = initial_active;
+            let mut last_active = initial_active;
+            let mut next_pane_id = next_pane_id;
             let mut pending_events = VecDeque::new();
             let mut git = GitRefresher::new(event_tx.clone());
             let mut catalogs = CatalogService::new(event_tx.clone());
-            catalogs.register_pane(initial_id, panes[&initial_id].root.clone());
+            for (pane_id, pane) in &panes {
+                catalogs.register_pane(*pane_id, pane.root.clone());
+            }
             let mut active_picker: Option<ActivePicker> = None;
             let mut dialog_owner = None;
             let mut feedback_open = false;
@@ -393,21 +593,30 @@ pub(super) fn run() -> anyhow::Result<()> {
                 Vec<fyler_fsops::openwith::OpenWithHandler>,
             )> = None;
 
-            let Some(initial_session) = panes.get_mut(&initial_id) else {
-                return;
-            };
-            if send_view_state(&gui_event_tx, initial_id, &mut initial_session.save_controller)
-                .is_err()
-            {
-                return;
+            for (pane_id, pane) in &mut panes {
+                if send_view_state(&gui_event_tx, *pane_id, &mut pane.save_controller).is_err() {
+                    return;
+                }
+                git.request(*pane_id, pane.root.clone());
             }
-            git.request(initial_id, panes[&initial_id].root.clone());
+            let initial_id = active;
             if !config_warnings.is_empty()
                 && send_gui_message(
                     &gui_event_tx,
                     initial_id,
                     MessageKind::Warn,
                     format!("Configuration: {}", config_warnings.join(" / ")),
+                )
+                .is_err()
+            {
+                return;
+            }
+            if !startup_warnings.is_empty()
+                && send_gui_message(
+                    &gui_event_tx,
+                    initial_id,
+                    MessageKind::Warn,
+                    format!("Session: {}", startup_warnings.join(" / ")),
                 )
                 .is_err()
             {
@@ -2586,7 +2795,18 @@ pub(super) fn run() -> anyhow::Result<()> {
                             return;
                         }
                     }
-                    AppEvent::Shutdown => return,
+                    AppEvent::Shutdown {
+                        save_session,
+                        window,
+                    } => {
+                        let result = if save_session {
+                            session::save(&capture_session(&panes, layout, active, window))
+                        } else {
+                            Ok(())
+                        };
+                        let _ = shutdown_result_tx.send(result);
+                        return;
+                    }
                 }
             }
         })
@@ -2598,8 +2818,14 @@ pub(super) fn run() -> anyhow::Result<()> {
         action_tx,
         gui_options,
         Arc::new(move || gui_dequeue_gauge.dequeue()),
+        initial_window,
+        Arc::clone(&window_geometry),
     );
-    let _ = app_event_tx.send(AppEvent::Shutdown);
+    let final_window = window_geometry.lock().ok().and_then(|window| *window);
+    let _ = app_event_tx.send(AppEvent::Shutdown {
+        save_session: gui_result.is_ok(),
+        window: final_window,
+    });
     let _ = event_bridge.join();
     let _ = action_bridge.join();
     if std::env::var_os("FYLER_QUEUE_STATS").as_deref() == Some(OsStr::new("1")) {
@@ -2609,7 +2835,11 @@ pub(super) fn run() -> anyhow::Result<()> {
             gui_event_gauge.high_water()
         );
     }
-    gui_result
+    gui_result?;
+    if let Ok(result) = shutdown_result_rx.try_recv() {
+        result?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2668,6 +2898,7 @@ fn handle_pane_action(
                 scan_options,
                 Arc::clone(shared_ids),
                 app_event_tx,
+                None,
                 None,
             ) {
                 Ok(session) => session,
@@ -3839,6 +4070,24 @@ mod tests {
         assert_eq!(
             controller.find_top_level_line(std::ffi::OsStr::new("child")),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn explicit_root_and_disabled_setting_bypass_session_restore() {
+        assert!(!should_restore_session(true, true));
+        assert!(!should_restore_session(false, false));
+        assert!(should_restore_session(false, true));
+    }
+
+    #[test]
+    fn unavailable_root_falls_back_to_nearest_existing_ancestor() {
+        let root = tempfile::tempdir().unwrap();
+        let requested = root.path().join("missing").join("nested");
+        let fallback = tempfile::tempdir().unwrap();
+        assert_eq!(
+            existing_root_or_ancestor(&requested, fallback.path()),
+            root.path()
         );
     }
 
