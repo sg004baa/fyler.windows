@@ -531,8 +531,11 @@ fn read_sorted_entries(
             stage: ScanStage::DirEntry,
             error,
         })?;
-        let path = entry.path();
         let file_name = entry.file_name();
+        // `DirEntry::path()`はWindowsで`\\?\`付きの親パス由来になる(read_dirへ
+        // long_path::to_fs適用済みのため)。警告・診断・降下パスへprefixを漏らさない
+        // よう、呼び出し側の論理パスから組み立てる(絶対ルール3)。
+        let path = directory.join(&file_name);
         let metadata = match fault_point("metadata", &path).and_then(|()| entry.metadata()) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
