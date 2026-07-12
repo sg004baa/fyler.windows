@@ -370,6 +370,23 @@ impl SaveController {
             .collect()
     }
 
+    /// 5秒tickerで再評価する不完全ディレクトリの実FSパスを返す。
+    ///
+    /// dirty中は回復してもbaselineを更新できず通知だけが反復するため休止する。
+    /// offlineまたは保存状態機械がbusyの場合も、既存の専用フローへ委ねる。
+    pub fn incomplete_probe_paths(&self) -> Option<BTreeSet<PathBuf>> {
+        if self.is_offline() || !self.is_idle() || self.engine.snapshot().dirty {
+            return None;
+        }
+        let paths = self
+            .baseline
+            .incomplete_dirs()
+            .keys()
+            .map(|path| path.to_fs_path(&self.root))
+            .collect::<BTreeSet<_>>();
+        (!paths.is_empty()).then_some(paths)
+    }
+
     /// incomplete集合の変化時だけ、集約したユーザー向けメッセージを返す。
     pub fn take_scan_health_message(
         &mut self,
@@ -3041,6 +3058,98 @@ mod tests {
             ))
         );
         assert!(controller.take_scan_health_message().is_none());
+    }
+
+    #[test]
+    fn incomplete_probe_pauses_while_dirty() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("blocked")).unwrap();
+        let mut ids = IdAllocator::new();
+        let mut baseline = fyler_fsops::scan::scan_baseline(root.path(), &mut ids).unwrap();
+        baseline.mark_incomplete(
+            TreePath::parse("blocked"),
+            fyler_core::scanwarn::ScanErrorKind::PermissionDenied,
+        );
+        let engine = Arc::new(RecordingEngine::default());
+        let controller = SaveController::new(
+            root.path().to_path_buf(),
+            ids,
+            baseline,
+            Arc::<RecordingEngine>::clone(&engine),
+        );
+
+        assert_eq!(
+            controller.incomplete_probe_paths(),
+            Some(BTreeSet::from([root.path().join("blocked")]))
+        );
+        engine.set_dirty(true);
+        assert!(controller.incomplete_probe_paths().is_none());
+    }
+
+    #[test]
+    fn incomplete_probe_reports_recovery_once() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("blocked")).unwrap();
+        fs::write(root.path().join("blocked/kept.txt"), b"kept").unwrap();
+        let mut ids = IdAllocator::new();
+        let mut baseline = fyler_fsops::scan::scan_baseline(root.path(), &mut ids).unwrap();
+        baseline.mark_incomplete(
+            TreePath::parse("blocked"),
+            fyler_core::scanwarn::ScanErrorKind::PermissionDenied,
+        );
+        let engine = Arc::new(RecordingEngine::default());
+        let mut controller = SaveController::new(
+            root.path().to_path_buf(),
+            ids,
+            baseline,
+            Arc::<RecordingEngine>::clone(&engine),
+        );
+        assert_eq!(
+            controller.take_scan_health_message().unwrap().0,
+            fyler_core::editor::MessageKind::Warn
+        );
+
+        let paths = controller.incomplete_probe_paths().unwrap();
+        assert_eq!(
+            controller.on_external_change(&paths),
+            SaveFlowResult::NoChanges
+        );
+        assert_eq!(
+            controller.take_scan_health_message(),
+            Some((
+                fyler_core::editor::MessageKind::Info,
+                "All locations are readable again".to_owned()
+            ))
+        );
+        assert!(controller.take_scan_health_message().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_probe_is_silent_while_directory_remains_incomplete() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path()
+                .join(std::ffi::OsString::from_vec(vec![b'x', 0xff])),
+            b"unrepresentable",
+        )
+        .unwrap();
+        let (mut controller, engine) = scanned_controller(root.path(), ScanOptions::default());
+        assert_eq!(
+            controller.take_scan_health_message().unwrap().0,
+            fyler_core::editor::MessageKind::Warn
+        );
+        engine.commands.lock().unwrap().clear();
+
+        let paths = controller.incomplete_probe_paths().unwrap();
+        assert_eq!(
+            controller.on_external_change(&paths),
+            SaveFlowResult::NoChanges
+        );
+        assert!(controller.take_scan_health_message().is_none());
+        assert!(engine.commands.lock().unwrap().is_empty());
     }
 
     #[test]

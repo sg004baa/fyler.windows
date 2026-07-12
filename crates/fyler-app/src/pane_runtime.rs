@@ -1975,11 +1975,6 @@ pub(super) fn run() -> anyhow::Result<()> {
                         if apply_owner.is_some() || transfer.is_running() {
                             continue;
                         }
-                        if panes.values().all(|session| {
-                            !session.save_controller.is_offline() && !session.watch_degraded
-                        }) {
-                            continue;
-                        }
                         let pane_ids = panes.keys().copied().collect::<Vec<_>>();
                         for pane_id in pane_ids {
                             let Some(session) = panes.get_mut(&pane_id) else {
@@ -2023,6 +2018,24 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 let outcome = handle_external_change(
                                     pane_id,
                                     &BTreeSet::new(),
+                                    &mut session.save_controller,
+                                    &gui_event_tx,
+                                    &mut git,
+                                    &session.root,
+                                );
+                                if outcome.is_err() {
+                                    return;
+                                }
+                            } else if let Some(paths) = incomplete_probe_paths(
+                                &session.save_controller,
+                                dialog_owner.is_some(),
+                                session.crashed,
+                            ) {
+                                // 恒久的に読めないdirだけを差分rescanへ流す。未回復なら
+                                // carryされて無音、回復した範囲だけmarkerと表示を更新する。
+                                let outcome = handle_external_change(
+                                    pane_id,
+                                    &paths,
                                     &mut session.save_controller,
                                     &gui_event_tx,
                                     &mut git,
@@ -2439,6 +2452,18 @@ fn feedback_start_rejection(dialog_open: bool) -> Option<&'static str> {
     dialog_open.then_some("Close the other dialog before opening feedback")
 }
 
+fn incomplete_probe_paths(
+    save_controller: &SaveController,
+    dialog_open: bool,
+    crashed: bool,
+) -> Option<BTreeSet<PathBuf>> {
+    if dialog_open || crashed {
+        None
+    } else {
+        save_controller.incomplete_probe_paths()
+    }
+}
+
 fn feedback_result_kind(outcome: FeedbackOutcome) -> FeedbackResultKind {
     match outcome {
         FeedbackOutcome::Accepted => FeedbackResultKind::Accepted,
@@ -2507,6 +2532,18 @@ fn change_session_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ProbeEngine;
+
+    impl EditorEngine for ProbeEngine {
+        fn send(&self, _command: EditorCommand) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn snapshot(&self) -> Arc<fyler_core::editor::EditorSnapshot> {
+            Arc::new(fyler_core::editor::EditorSnapshot::empty())
+        }
+    }
 
     #[test]
     fn help_reflects_default_custom_and_unmapped_bindings() {
@@ -2589,6 +2626,28 @@ mod tests {
             feedback_start_rejection(true),
             Some("Close the other dialog before opening feedback")
         );
+    }
+
+    #[test]
+    fn incomplete_probe_pauses_while_dialog_is_open() {
+        let root = PathBuf::from("C:/root");
+        let mut baseline = fyler_core::tree::BaselineTree::new(&root);
+        baseline.mark_incomplete(
+            fyler_core::path::TreePath::parse("blocked"),
+            fyler_core::scanwarn::ScanErrorKind::PermissionDenied,
+        );
+        let controller = SaveController::new(
+            root.clone(),
+            IdAllocator::new(),
+            baseline,
+            Arc::new(ProbeEngine),
+        );
+
+        assert_eq!(
+            incomplete_probe_paths(&controller, false, false),
+            Some(BTreeSet::from([root.join("blocked")]))
+        );
+        assert!(incomplete_probe_paths(&controller, true, false).is_none());
     }
 
     #[test]
