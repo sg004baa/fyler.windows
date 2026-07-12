@@ -45,12 +45,16 @@ pub(crate) fn resolve_endpoint(
 /// JSONをendpointへPOSTする。レスポンスbodyは読み取らない。
 pub(crate) fn send_feedback(url: &str, json: &str, timeout: Duration) -> FeedbackOutcome {
     // NativeTls は自動選択されない(ureqの既定はRustls)ため明示指定する。
-    // Windowsでは SChannel = システム証明書ストアを使う。
+    // root_certs も既定が WebPki(同梱roots)のままだと native-tls/SChannel が
+    // 「ユーザー指定root」照合になり、Windowsがクロス署名経由で構築したチェーン
+    // (例: workers.dev の GTS 証明書)と不一致で handshake が失敗する。
+    // PlatformVerifier = OSの証明書ストアで検証(企業proxy含め本来の意図)。
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .tls_config(
             ureq::tls::TlsConfig::builder()
                 .provider(ureq::tls::TlsProvider::NativeTls)
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
                 .build(),
         )
         .build();
