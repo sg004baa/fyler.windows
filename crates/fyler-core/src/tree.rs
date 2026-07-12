@@ -1,6 +1,6 @@
 //! ツリーの中間表現: baseline(実FSの最終同期状態)と DesiredTree(編集後バッファの意図)。
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -39,6 +39,7 @@ pub struct BaselineTree {
     path_index: Arc<HashMap<TreePath, usize>>,
     meta: Arc<HashMap<EntryId, crate::fileinfo::EntryMeta>>,
     incomplete_dirs: Arc<BTreeMap<TreePath, ScanErrorKind>>,
+    unloaded_dirs: Arc<BTreeSet<TreePath>>,
     warnings: Arc<Vec<ScanWarning>>,
 }
 
@@ -60,6 +61,7 @@ impl BaselineTree {
             path_index: Arc::new(HashMap::new()),
             meta: Arc::new(HashMap::new()),
             incomplete_dirs: Arc::new(BTreeMap::new()),
+            unloaded_dirs: Arc::new(BTreeSet::new()),
             warnings: Arc::new(Vec::new()),
         }
     }
@@ -107,12 +109,47 @@ impl BaselineTree {
 
     /// 列挙が不完全だったディレクトリを記録する。
     pub fn mark_incomplete(&mut self, path: TreePath, kind: ScanErrorKind) {
+        debug_assert!(
+            !self.unloaded_dirs.contains(&path),
+            "Directory cannot be both incomplete and unloaded: {path}"
+        );
         Arc::make_mut(&mut self.incomplete_dirs).insert(path, kind);
     }
 
     /// 列挙が不完全だったディレクトリを決定的なパス順で返す。
     pub fn incomplete_dirs(&self) -> &BTreeMap<TreePath, ScanErrorKind> {
         &self.incomplete_dirs
+    }
+
+    /// 意図的に未列挙のディレクトリを記録する。
+    pub fn mark_unloaded(&mut self, path: TreePath) {
+        debug_assert!(
+            !self.incomplete_dirs.contains_key(&path),
+            "Directory cannot be both unloaded and incomplete: {path}"
+        );
+        Arc::make_mut(&mut self.unloaded_dirs).insert(path);
+    }
+
+    /// ディレクトリをロード済みにする。既にロード済みなら何もしない。
+    pub fn clear_unloaded(&mut self, path: &TreePath) {
+        Arc::make_mut(&mut self.unloaded_dirs).remove(path);
+    }
+
+    /// `path`自身が意図的に未列挙かを返す。
+    pub fn is_unloaded(&self, path: &TreePath) -> bool {
+        self.unloaded_dirs.contains(path)
+    }
+
+    /// `path`自身または祖先が意図的に未列挙かを返す。
+    pub fn is_within_unloaded(&self, path: &TreePath) -> bool {
+        self.unloaded_dirs
+            .iter()
+            .any(|dir| dir == path || dir.is_strict_ancestor_of(path))
+    }
+
+    /// 意図的に未列挙のディレクトリを決定的なパス順で返す。
+    pub fn unloaded_dirs(&self) -> &BTreeSet<TreePath> {
+        &self.unloaded_dirs
     }
 
     /// このscanで収集した回復可能な警告を返す。
@@ -329,5 +366,21 @@ mod tests {
         assert!(left.subtree_intersects_incomplete(&TreePath::parse("parent")));
         assert!(left.subtree_intersects_incomplete(&TreePath::parse("parent/blocked/child")));
         assert!(!left.subtree_intersects_incomplete(&TreePath::parse("sibling")));
+    }
+
+    #[test]
+    fn unloaded_sidecar_is_cow_equality_neutral_and_covers_ancestors() {
+        let mut original = BaselineTree::new("C:/root");
+        original.mark_unloaded(TreePath::parse("parent/lazy"));
+        let mut cloned = original.clone();
+
+        assert!(original.is_unloaded(&TreePath::parse("parent/lazy")));
+        assert!(original.is_within_unloaded(&TreePath::parse("parent/lazy/child")));
+        assert!(!original.is_within_unloaded(&TreePath::parse("parent")));
+        cloned.clear_unloaded(&TreePath::parse("parent/lazy"));
+
+        assert!(original.is_unloaded(&TreePath::parse("parent/lazy")));
+        assert!(!cloned.is_unloaded(&TreePath::parse("parent/lazy")));
+        assert_eq!(original, cloned);
     }
 }

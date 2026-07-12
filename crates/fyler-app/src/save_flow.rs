@@ -298,12 +298,13 @@ impl SaveController {
         baseline: BaselineTree,
         engine: Arc<dyn EditorEngine>,
     ) -> Self {
+        let context = context_with_unloaded_dirs(EditContext::default(), &baseline);
         Self {
             state: SaveState::Idle,
             root,
             ids,
             baseline,
-            context: EditContext::default(),
+            context,
             scan_options: ScanOptions::default(),
             pending_overwrites: HashSet::new(),
             apply_cancel: None,
@@ -921,7 +922,7 @@ impl SaveController {
         let was_offline = self.is_offline();
         self.root = root;
         self.baseline = baseline;
-        self.context = EditContext::default();
+        self.context = context_with_unloaded_dirs(EditContext::default(), &self.baseline);
         self.offline = None;
         self.reported_incomplete.clear();
         if was_offline && let Err(error) = self.engine.send(EditorCommand::SetModifiable(true)) {
@@ -1621,6 +1622,17 @@ fn carry_collapsed_dirs(
             .iter()
             .filter(|entry| entry.kind == EntryKind::Dir && old_baseline.get(entry.id).is_none())
             .map(|entry| entry.id),
+    );
+    context_with_unloaded_dirs(context, new_baseline)
+}
+
+/// 未ロードdirはdiff・表示の既存collapsed意味論へ必ず合流させる。
+fn context_with_unloaded_dirs(mut context: EditContext, baseline: &BaselineTree) -> EditContext {
+    context.collapsed_dirs.extend(
+        baseline
+            .unloaded_dirs()
+            .iter()
+            .filter_map(|path| baseline.get_by_path(path).map(|entry| entry.id)),
     );
     context
 }
@@ -4102,5 +4114,26 @@ mod tests {
             .find(|entry| entry.path == TreePath::parse(".hidden"))
             .unwrap();
         assert!(controller.context.collapsed_dirs.contains(&hidden_dir.id));
+    }
+
+    #[test]
+    fn new_controller_forces_unloaded_directories_into_collapsed_context() {
+        let root = tempdir().unwrap();
+        let mut baseline = BaselineTree::new(root.path());
+        baseline.insert(BaselineEntry {
+            id: EntryId(7),
+            path: TreePath::parse("lazy"),
+            kind: EntryKind::Dir,
+        });
+        baseline.mark_unloaded(TreePath::parse("lazy"));
+
+        let controller = SaveController::new(
+            root.path().to_path_buf(),
+            IdAllocator::new(),
+            baseline,
+            Arc::new(RecordingEngine::default()),
+        );
+
+        assert_eq!(controller.collapsed_dirs(), [EntryId(7)].into());
     }
 }
