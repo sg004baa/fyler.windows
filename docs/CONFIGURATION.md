@@ -30,6 +30,9 @@ show_hidden = false
 sort = "dirs_first"
 sort_key = "name"
 sort_reverse = false
+# Restore the last normally closed pane session
+restore_session = true
+
 
 # External terminal emulator used by :terminal
 terminal = "auto"
@@ -67,6 +70,7 @@ projects = 'D:\projects'
 | `sort` | string | `"dirs_first"` | `"dirs_first"` or `"mixed"` |
 | `sort_key` | string | `"name"` | `"name"`, `"date"`, `"size"`, or `"ext"` |
 | `sort_reverse` | boolean | `false` | Reverse the selected sort key |
+| `restore_session` | boolean | `true` | Restore pane layout, roots, cursor hints, folds, and per-pane display settings |
 | `terminal` | string | `"auto"` | `"auto"`, `"windows_terminal"`, `"powershell"`, or `"cmd"` |
 | `confirm_detail` | string | `"full"` | `"full"` or `"summary"` |
 | `font` | string | unset | Absolute path to a fallback font |
@@ -95,6 +99,26 @@ startup. The `toggle_hidden` action (`g .` by default) can also change this whil
 
 `sort_reverse = true` reverses the selected key. Directory grouping remains controlled separately
 by `sort`. At runtime, use `:sort name|date|size|ext`; add `!` to the command for descending order.
+### Session and window restoration
+
+With `restore_session = true`, a normally closed fyler window writes `session.toml` beside
+`config.toml` using schema version 1. The session contains only display state: the binary pane
+layout and split ratios, each pane's root, the active pane, root-relative cursor and fold hints,
+and per-pane hidden-file and sorting settings. Dirty buffer text, editor mode, dialogs,
+in-flight apply/transfer state, clipboard data, Neovim/RPC state, and undo transactions are never
+stored in the session.
+
+An explicit command-line root always starts one pane and takes precedence over `session.toml`.
+`restore_session = false` also starts one pane without reading the session. Invalid TOML and
+unknown schema versions produce a warning and use the default root. If one saved root is missing
+or inaccessible, fyler tries its nearest available ancestor and then the default root without
+discarding other valid panes. Invalid data above the four-pane limit is pruned to four panes.
+
+Session writes use a same-directory temporary file, flush it, and atomically rename it only during
+normal shutdown. A truncated temporary write therefore does not replace the previous session.
+Window size, position, and maximized state use eframe's separate native persistence. Before a
+persisted window exists, fyler opens at 1280 by 800 logical pixels.
+
 
 ### External terminal
 

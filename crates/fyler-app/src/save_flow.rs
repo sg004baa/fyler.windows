@@ -483,6 +483,48 @@ impl SaveController {
     pub fn baseline(&self) -> &BaselineTree {
         &self.baseline
     }
+    /// session保存用に、現在のcollapsed pathとloadedかつexpandedなdirectory pathを返す。
+    ///
+    /// EntryIdはprocess-localなので永続化せず、root相対pathへ変換する。
+    pub fn session_directory_state(&self) -> (Vec<TreePath>, Vec<TreePath>) {
+        self.baseline
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::Dir)
+            .fold((Vec::new(), Vec::new()), |mut state, entry| {
+                if self.context.collapsed_dirs.contains(&entry.id) {
+                    state.0.push(entry.path.clone());
+                } else if !self.baseline.is_unloaded(&entry.path) {
+                    state.1.push(entry.path.clone());
+                }
+                state
+            })
+    }
+
+    /// sessionから復元したroot相対path集合を現在baselineのEntryIdへ解決する。
+    ///
+    /// lazy baselineで未ロードのdirectoryは常にcollapsedとし、保存時に存在したが
+    /// 現在は消えているpathは無視する。
+    pub fn restore_collapsed_paths(&mut self, collapsed: &[TreePath]) {
+        self.context.collapsed_dirs = self
+            .baseline
+            .entries()
+            .iter()
+            .filter(|entry| {
+                entry.kind == EntryKind::Dir
+                    && (self.baseline.is_unloaded(&entry.path) || collapsed.contains(&entry.path))
+            })
+            .map(|entry| entry.id)
+            .collect();
+    }
+
+    /// sessionのcursor hintを現在の可視行へ解決する。
+    pub fn visible_line_for_path(&self, path: &TreePath) -> Option<usize> {
+        let id = self.baseline.get_by_path(path)?.id;
+        visible_entries(&self.baseline, &self.context)
+            .iter()
+            .position(|entry| entry.id == id)
+    }
 
     /// 指定IDのエントリを隠している折りたたみ祖先をすべて展開する。
     ///
@@ -4257,6 +4299,27 @@ mod tests {
         assert_eq!(
             controller.context.collapsed_dirs,
             [EntryId(1), EntryId(2)].into()
+        );
+    }
+    #[test]
+    fn session_directory_paths_restore_fold_and_cursor_hints_without_ids() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        controller.restore_collapsed_paths(&[TreePath::parse("a/nested")]);
+
+        let (collapsed, expanded) = controller.session_directory_state();
+        assert_eq!(collapsed, [TreePath::parse("a/nested")]);
+        assert_eq!(expanded, [TreePath::parse("a")]);
+        assert_eq!(
+            controller.visible_line_for_path(&TreePath::parse("a")),
+            Some(0)
+        );
+        assert_eq!(
+            controller.visible_line_for_path(&TreePath::parse("a/nested")),
+            Some(1)
+        );
+        assert_eq!(
+            controller.visible_line_for_path(&TreePath::parse("a/nested/leaf.txt")),
+            None
         );
     }
 

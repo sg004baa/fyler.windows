@@ -1448,6 +1448,15 @@ fn draw_help(ui: &mut egui::Ui, help_lines: &[String]) -> bool {
         .inner
 }
 
+fn native_options() -> eframe::NativeOptions {
+    eframe::NativeOptions {
+        // eframe persistence restores the previous native size/position/maximized state.
+        // This larger Explorer-like size is used only before a persisted window exists.
+        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]),
+        ..Default::default()
+    }
+}
+
 /// GUIを起動する(メインスレッドで呼ぶこと。eframeの制約)。
 ///
 /// 実装契約(M1):
@@ -1460,7 +1469,7 @@ pub fn run(
     gui_options: GuiOptions,
     event_dequeued: Arc<dyn Fn() + Send + Sync>,
 ) -> anyhow::Result<()> {
-    let native_options = eframe::NativeOptions::default();
+    let native_options = native_options();
     eframe::run_native(
         "fyler",
         native_options,
@@ -2006,5 +2015,11 @@ mod tests {
             .unwrap();
         app.receive_events();
         assert!(app.dialog.is_none());
+    }
+    #[test]
+    fn first_launch_uses_explorer_sized_window_and_native_persistence() {
+        let options = native_options();
+        assert_eq!(options.viewport.inner_size, Some(egui::vec2(1280.0, 800.0)));
+        assert!(options.persist_window);
     }
 }
