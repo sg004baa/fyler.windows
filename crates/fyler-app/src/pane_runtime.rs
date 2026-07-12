@@ -1879,6 +1879,10 @@ pub(super) fn run() -> anyhow::Result<()> {
                         let showed_dialog = owner.shows_dialog();
                         let loads_directory = owner.loads_directory();
                         let picker_reveal = matches!(owner.kind, LoaderKind::PickerReveal { .. });
+                        // Root loadはswap前で session.root が旧rootのままなので、
+                        // 新rootとの不一致を root_changed 扱いすると必ず破棄されてしまう。
+                        // loader_owner排他により競合root変更は起き得ないため除外する。
+                        let is_root_load = matches!(owner.kind, LoaderKind::Root { .. });
                         let load_target = match &owner.kind {
                             LoaderKind::Root { .. } => root.clone(),
                             LoaderKind::Directory { dir, .. } => dir.to_fs_path(&root),
@@ -1892,7 +1896,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                             loader_completion_is_stale(
                                 false,
                                 session.crashed,
-                                session.root != root,
+                                loader_root_changed(is_root_load, &session.root, &root),
                                 session.engine.snapshot().dirty,
                                 session.save_controller.is_idle(),
                             )
@@ -3578,6 +3582,17 @@ fn loader_completion_is_stale(
     pane_missing || crashed || root_changed || dirty || !idle
 }
 
+/// ロード完了時にpaneのrootが「別のroot」へ移ったかを判定する。
+///
+/// Root load自体はswapがこの判定より後に走るため session.root は旧rootのままで、
+/// 新rootとの不一致を変更扱いすると必ずstaleになる。loader_owner排他により
+/// Root load中に競合するroot変更は起き得ないので、Root loadでは常にfalse。
+/// Directory/Recursive/PickerReveal loadはsession.rootを基準に列挙したため、
+/// その間にrootが変わっていたらstaleとして破棄する。
+fn loader_root_changed(is_root_load: bool, session_root: &Path, loaded_root: &Path) -> bool {
+    !is_root_load && session_root != loaded_root
+}
+
 fn picker_reveal_start_rejection(
     dirty: bool,
     busy: bool,
@@ -3742,6 +3757,19 @@ mod tests {
         assert!(!loader_completion_is_stale(
             false, false, false, false, true
         ));
+    }
+
+    #[test]
+    fn root_load_completion_is_not_stale_despite_pending_root_swap() {
+        let old_root = Path::new("C:/Users");
+        let new_root = Path::new("C:/");
+        // Root loadはswap前で session.root(旧) != loaded_root(新)。ここでstale扱い
+        // すると gd/^/:cd/bookmark/recent/drive の移動が全て黙って破棄される(regression)。
+        assert!(!loader_root_changed(true, old_root, new_root));
+        // Directory/PickerReveal loadはsession.rootを基準に列挙したため、rootが
+        // 変わっていたら破棄する。同一rootなら破棄しない。
+        assert!(loader_root_changed(false, old_root, new_root));
+        assert!(!loader_root_changed(false, old_root, old_root));
     }
 
     #[test]
