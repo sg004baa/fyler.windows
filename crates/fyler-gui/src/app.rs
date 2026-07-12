@@ -41,6 +41,7 @@ pub enum PickerAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuiAction {
     Confirm(ConfirmChoice),
+    RootScanCancel,
     PickerSelect {
         pane_id: PaneId,
         entry_id: EntryId,
@@ -167,6 +168,16 @@ pub enum GuiEvent {
         /// 承認済みplanに含まれる操作総数。
         total: usize,
     },
+    /// root変更用scanの進捗ダイアログを表示する。
+    ShowRootScanProgress {
+        root: PathBuf,
+    },
+    /// root変更用scanで発見した累計entry数を表示へ反映する。
+    RootScanProgress {
+        entries: usize,
+    },
+    /// root変更用scanのキャンセル要求を受理済みとして操作を無効化する。
+    RootScanCancelRequested,
     /// apply workerから届いた操作単位の進捗を表示へ反映する。
     ApplyProgress(ApplyProgress),
     /// undo workerから届いた操作単位の進捗を表示へ反映する。
@@ -215,6 +226,11 @@ enum DialogState {
         total: usize,
         /// これから実行する操作の表示ラベル。
         current: Option<String>,
+        cancel_requested: bool,
+    },
+    RootScanProgress {
+        root: PathBuf,
+        entries: usize,
         cancel_requested: bool,
     },
     Report(CommitReport),
@@ -562,6 +578,29 @@ impl FylerApp {
                         cancel_requested: false,
                     });
                 }
+                GuiEvent::ShowRootScanProgress { root } => {
+                    self.dialog = Some(DialogState::RootScanProgress {
+                        root,
+                        entries: 0,
+                        cancel_requested: false,
+                    });
+                }
+                GuiEvent::RootScanProgress { entries } => {
+                    if let Some(DialogState::RootScanProgress {
+                        entries: current, ..
+                    }) = &mut self.dialog
+                    {
+                        *current = entries;
+                    }
+                }
+                GuiEvent::RootScanCancelRequested => {
+                    if let Some(DialogState::RootScanProgress {
+                        cancel_requested, ..
+                    }) = &mut self.dialog
+                    {
+                        *cancel_requested = true;
+                    }
+                }
                 GuiEvent::ApplyProgress(progress) => {
                     if let Some(DialogState::Progress {
                         completed,
@@ -716,6 +755,7 @@ impl eframe::App for FylerApp {
 
         let mut confirm_choice = None;
         let mut cancel_apply = false;
+        let mut cancel_root_scan = false;
         let mut dismiss_errors = false;
         let mut dismiss_report = false;
         let mut open_with_choice = None;
@@ -765,6 +805,14 @@ impl eframe::App for FylerApp {
                     current.as_deref(),
                     *cancel_requested,
                 );
+            }
+            Some(DialogState::RootScanProgress {
+                root,
+                entries,
+                cancel_requested,
+            }) => {
+                cancel_root_scan =
+                    confirm::draw_root_scan_progress(ui, root, *entries, *cancel_requested);
             }
             Some(DialogState::Help) => {
                 dismiss_errors = draw_help(ui, &self.help_lines);
@@ -843,6 +891,9 @@ impl eframe::App for FylerApp {
                 .is_err()
         {
             self.fatal_error = Some("Failed to send cancel request to app".to_owned());
+        }
+        if cancel_root_scan && self.action_tx.send(GuiAction::RootScanCancel).is_err() {
+            self.fatal_error = Some("Failed to send root scan cancel request to app".to_owned());
         }
         if let Some(result) = picker_result {
             self.dialog = None;
