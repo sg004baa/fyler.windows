@@ -1,19 +1,34 @@
 //! ファイルpicker向けの、エンジン・GUI・ファイルシステム非依存検索。
 
-use crate::path::TreePath;
-use crate::tree::{BaselineTree, EntryKind};
+use crate::tree::EntryKind;
 
 /// 検索時に毎回変換しない情報をキャッシュした候補。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchCandidate {
-    pub path: TreePath,
     pub kind: EntryKind,
+    /// 自身または祖先がhiddenなら`true`。
+    pub hidden: bool,
     /// `/` 区切りのルート相対パス。
-    pub display: String,
+    pub display: Box<str>,
     /// [`SearchCandidate::display`] をUnicode小文字化した検索key。
-    pub key: String,
+    pub key: Box<str>,
     /// [`SearchCandidate::key`] 上のbasename開始バイトオフセット。
     pub name_offset: usize,
+}
+
+impl SearchCandidate {
+    /// 表示用相対パスから、検索時に再利用する小文字keyを一度だけ構築する。
+    pub fn new(display: String, kind: EntryKind, hidden: bool) -> Self {
+        let key = display.to_lowercase().into_boxed_str();
+        let name_offset = key.rfind('/').map_or(0, |offset| offset + 1);
+        Self {
+            kind,
+            hidden,
+            display: display.into_boxed_str(),
+            key,
+            name_offset,
+        }
+    }
 }
 
 /// 検索結果。`index`は入力候補slice上の位置である。
@@ -21,28 +36,6 @@ pub struct SearchCandidate {
 pub struct SearchHit {
     pub index: usize,
     pub score: u32,
-}
-
-/// baselineの表示順を維持して検索候補を構築する。
-///
-/// hidden設定はbaselineスキャン時に反映済みなので、この関数では再判定しない。
-pub fn build_candidates(baseline: &BaselineTree) -> Vec<SearchCandidate> {
-    baseline
-        .entries()
-        .iter()
-        .map(|entry| {
-            let display = entry.path.to_string();
-            let key = display.to_lowercase();
-            let name_offset = key.rfind('/').map_or(0, |offset| offset + 1);
-            SearchCandidate {
-                path: entry.path.clone(),
-                kind: entry.kind,
-                display,
-                key,
-                name_offset,
-            }
-        })
-        .collect()
 }
 
 /// queryを空白区切りtokenへ展開する。
@@ -57,23 +50,58 @@ pub fn expand_query(query: &str) -> Vec<String> {
 ///
 /// score降順、同点は入力候補順で安定させ、最大`limit`件に制限する。空queryは
 /// score 0のまま入力先頭から返す。
-pub fn search(candidates: &[SearchCandidate], query: &str, limit: usize) -> Vec<SearchHit> {
+pub fn search(
+    candidates: &[SearchCandidate],
+    query: &str,
+    limit: usize,
+    include_hidden: bool,
+) -> Vec<SearchHit> {
+    search_refs(candidates.iter(), query, limit, include_hidden)
+        .into_iter()
+        .map(|hit| SearchHit {
+            index: hit.index,
+            score: hit.score,
+        })
+        .collect()
+}
+
+/// 複数の共有chunkを連結したiteratorなどを、候補cloneなしで検索する。
+/// `index`はiterator上の位置で、同点時はその挿入順を維持する。
+pub fn search_refs<'a>(
+    candidates: impl IntoIterator<Item = &'a SearchCandidate>,
+    query: &str,
+    limit: usize,
+    include_hidden: bool,
+) -> Vec<SearchRefHit<'a>> {
     if limit == 0 {
         return Vec::new();
     }
 
     let tokens = expand_query(query);
     if tokens.is_empty() {
-        return (0..candidates.len().min(limit))
-            .map(|index| SearchHit { index, score: 0 })
+        return candidates
+            .into_iter()
+            .enumerate()
+            .filter(|(_, candidate)| include_hidden || !candidate.hidden)
+            .take(limit)
+            .map(|(index, candidate)| SearchRefHit {
+                index,
+                score: 0,
+                candidate,
+            })
             .collect();
     }
 
     let mut hits = candidates
-        .iter()
+        .into_iter()
         .enumerate()
+        .filter(|(_, candidate)| include_hidden || !candidate.hidden)
         .filter_map(|(index, candidate)| {
-            score_candidate(candidate, &tokens).map(|score| SearchHit { index, score })
+            score_candidate(candidate, &tokens).map(|score| SearchRefHit {
+                index,
+                score,
+                candidate,
+            })
         })
         .collect::<Vec<_>>();
     hits.sort_unstable_by(|left, right| {
@@ -84,6 +112,13 @@ pub fn search(candidates: &[SearchCandidate], query: &str, limit: usize) -> Vec<
     });
     hits.truncate(limit);
     hits
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SearchRefHit<'a> {
+    pub index: usize,
+    pub score: u32,
+    pub candidate: &'a SearchCandidate,
 }
 
 fn score_candidate(candidate: &SearchCandidate, tokens: &[String]) -> Option<u32> {
@@ -170,19 +205,10 @@ fn longest_contiguous_run(positions: &[(usize, usize)]) -> usize {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use crate::id::EntryId;
-    use crate::tree::BaselineEntry;
-
     use super::*;
 
     fn candidate(path: &str) -> SearchCandidate {
-        let mut baseline = BaselineTree::new("C:/root");
-        baseline.insert(BaselineEntry {
-            id: EntryId(1),
-            path: TreePath::parse(path),
-            kind: EntryKind::File,
-        });
-        build_candidates(&baseline).remove(0)
+        SearchCandidate::new(path.to_owned(), EntryKind::File, false)
     }
 
     #[test]
@@ -195,7 +221,7 @@ mod tests {
             candidate("far/other/output.txt"),
         ];
 
-        let hits = search(&candidates, "foo", candidates.len());
+        let hits = search(&candidates, "foo", candidates.len(), true);
 
         assert_eq!(
             hits.iter().map(|hit| hit.index).collect::<Vec<_>>(),
@@ -207,12 +233,12 @@ mod tests {
     #[test]
     fn continuous_matches_and_earlier_starts_receive_bonuses() {
         let continuity = [candidate("ab--c.txt"), candidate("a-b-c.txt")];
-        let hits = search(&continuity, "abc", 2);
+        let hits = search(&continuity, "abc", 2, true);
         assert_eq!(hits.iter().map(|hit| hit.index).collect::<Vec<_>>(), [0, 1]);
         assert!(hits[0].score > hits[1].score);
 
         let start = [candidate("xaxbxc.txt"), candidate("axbxc.txt")];
-        let hits = search(&start, "abc", 2);
+        let hits = search(&start, "abc", 2, true);
         assert_eq!(hits.iter().map(|hit| hit.index).collect::<Vec<_>>(), [1, 0]);
         assert!(hits[0].score > hits[1].score);
     }
@@ -226,10 +252,10 @@ mod tests {
             candidate("Foo.txt"),
         ];
 
-        assert_eq!(search(&candidates, "src main", 10)[0].index, 0);
-        assert_eq!(search(&candidates, "src main", 10).len(), 1);
-        assert_eq!(search(&candidates, "Foo", 10)[0].index, 3);
-        assert!(search(&candidates, "missing", 10).is_empty());
+        assert_eq!(search(&candidates, "src main", 10, true)[0].index, 0);
+        assert_eq!(search(&candidates, "src main", 10, true).len(), 1);
+        assert_eq!(search(&candidates, "Foo", 10, true)[0].index, 3);
+        assert!(search(&candidates, "missing", 10, true).is_empty());
         assert_eq!(expand_query("  SRC\tMain  "), ["src", "main"]);
     }
 
@@ -242,15 +268,15 @@ mod tests {
         ];
 
         assert_eq!(
-            search(&candidates, "  ", 2)
+            search(&candidates, "  ", 2, true)
                 .iter()
                 .map(|hit| hit.index)
                 .collect::<Vec<_>>(),
             [0, 1]
         );
-        assert!(search(&candidates, "same", 0).is_empty());
+        assert!(search(&candidates, "same", 0, true).is_empty());
         assert_eq!(
-            search(&candidates, "same", 10)
+            search(&candidates, "same", 10, true)
                 .iter()
                 .map(|hit| hit.index)
                 .collect::<Vec<_>>(),
@@ -262,39 +288,29 @@ mod tests {
     fn unicode_names_are_lowercased_and_searchable() {
         let candidates = [candidate("資料/設計書.txt"), candidate("MÜNCHEN/Äpfel.txt")];
 
-        assert_eq!(search(&candidates, "設計", 10)[0].index, 0);
-        assert_eq!(search(&candidates, "münchen äPF", 10)[0].index, 1);
+        assert_eq!(search(&candidates, "設計", 10, true)[0].index, 0);
+        assert_eq!(search(&candidates, "münchen äPF", 10, true)[0].index, 1);
     }
 
     #[test]
-    fn build_candidates_preserves_baseline_order_and_caches_fields() {
-        let mut baseline = BaselineTree::new("C:/root");
-        baseline.insert(BaselineEntry {
-            id: EntryId(7),
-            path: TreePath::parse("Zed/Äpfel.txt"),
-            kind: EntryKind::File,
-        });
-        baseline.insert(BaselineEntry {
-            id: EntryId(8),
-            path: TreePath::parse("alpha"),
-            kind: EntryKind::Dir,
-        });
-
-        let candidates = build_candidates(&baseline);
-
-        assert_eq!(candidates[0].path, TreePath::parse("Zed/Äpfel.txt"));
-        assert_eq!(candidates[1].path, TreePath::parse("alpha"));
-        assert_eq!(candidates[0].display, "Zed/Äpfel.txt");
-        assert_eq!(candidates[0].key, "zed/äpfel.txt");
-        assert_eq!(&candidates[0].key[candidates[0].name_offset..], "äpfel.txt");
-        assert_eq!(candidates[1].kind, EntryKind::Dir);
+    fn constructor_caches_compact_search_fields() {
+        let candidate = SearchCandidate::new("Zed/Äpfel.txt".to_owned(), EntryKind::Dir, true);
+        assert_eq!(&*candidate.display, "Zed/Äpfel.txt");
+        assert_eq!(&*candidate.key, "zed/äpfel.txt");
+        assert_eq!(&candidate.key[candidate.name_offset..], "äpfel.txt");
+        assert_eq!(candidate.kind, EntryKind::Dir);
+        assert!(candidate.hidden);
     }
 
     #[test]
-    fn build_candidates_only_contains_entries_present_in_baseline() {
-        let visible = candidate("visible.txt");
-        assert_eq!(visible.display, "visible.txt");
-        assert_ne!(visible.display, ".hidden.txt");
+    fn search_filters_hidden_candidates_when_requested() {
+        let candidates = [
+            SearchCandidate::new("visible.txt".to_owned(), EntryKind::File, false),
+            SearchCandidate::new(".hidden.txt".to_owned(), EntryKind::File, true),
+        ];
+        assert_eq!(search(&candidates, "", 10, false).len(), 1);
+        assert_eq!(search(&candidates, "", 10, true).len(), 2);
+        assert!(search(&candidates, "hidden", 10, false).is_empty());
     }
 
     #[test]
@@ -305,7 +321,7 @@ mod tests {
             .collect::<Vec<_>>();
         let started = Instant::now();
 
-        let hits = search(&candidates, "item_49999", 100);
+        let hits = search(&candidates, "item_49999", 100, true);
 
         let elapsed = started.elapsed();
         eprintln!("50k candidate search elapsed: {elapsed:?}");

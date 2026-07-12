@@ -26,6 +26,7 @@ use fyler_gui::confirm::ConfirmChoice;
 
 use super::feedback::{FeedbackOutcome, resolve_endpoint, send_feedback};
 use super::nvim_locate;
+use super::picker::{ActivePicker, CatalogService, PickerSearchWorker};
 use super::save_flow::{FoldResult, SaveController, SaveFlowResult};
 use super::transfer_flow::{
     TransferController, TransferFlowResult, TransferPaneState, build_plan, destination_directory,
@@ -288,6 +289,10 @@ pub(super) fn run() -> anyhow::Result<()> {
                         path,
                         action,
                     },
+                    GuiAction::PickerQuery { pane_id, query } => {
+                        AppEvent::PickerQuery { pane_id, query }
+                    }
+                    GuiAction::PickerClosed { pane_id } => AppEvent::PickerClosed(pane_id),
                     GuiAction::FeedbackSubmit { kind, body } => {
                         AppEvent::FeedbackSubmit { kind, body }
                     }
@@ -305,6 +310,7 @@ pub(super) fn run() -> anyhow::Result<()> {
     let gui_event_gauge = Arc::new(QueueGauge::new());
     let (gui_event_inner_tx, gui_event_rx) = mpsc::channel();
     let gui_event_tx = CountingSender::new(gui_event_inner_tx, Arc::clone(&gui_event_gauge));
+    let picker_search = PickerSearchWorker::new(gui_event_tx.clone())?;
     gui_event_tx.send(GuiEvent::AddPane {
         pane_id: initial.id,
         engine: Arc::clone(&initial.engine),
@@ -329,6 +335,9 @@ pub(super) fn run() -> anyhow::Result<()> {
             let mut next_pane_id = 2_u64;
             let mut pending_events = VecDeque::new();
             let mut git = GitRefresher::new(event_tx.clone());
+            let mut catalogs = CatalogService::new(event_tx.clone());
+            catalogs.register_pane(initial_id, panes[&initial_id].root.clone());
+            let mut active_picker: Option<ActivePicker> = None;
             let mut dialog_owner = None;
             let mut feedback_open = false;
             let mut apply_owner = None;
@@ -421,6 +430,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                             &mut last_active,
                             &mut next_pane_id,
                             &mut git,
+                            &mut catalogs,
                             journal.as_ref(),
                             dialog_owner,
                             apply_owner.is_some()
@@ -431,12 +441,26 @@ pub(super) fn run() -> anyhow::Result<()> {
                         {
                             return;
                         }
+                        if active_picker
+                            .as_ref()
+                            .is_some_and(|picker| !panes.contains_key(&picker.pane_id))
+                        {
+                            active_picker = None;
+                            picker_search.invalidate_pending();
+                        }
                     }
                     AppEvent::Editor(pane_id, EditorEvent::EngineCrashed { reason }) => {
                         let Some(session) = panes.get_mut(&pane_id) else {
                             continue;
                         };
                         session.crashed = true;
+                        if active_picker
+                            .as_ref()
+                            .is_some_and(|picker| picker.pane_id == pane_id)
+                        {
+                            active_picker = None;
+                            picker_search.invalidate_pending();
+                        }
                         if dialog_owner == Some(pane_id) {
                             if let SaveFlowResult::UndoCancelled { transaction } =
                                 session.save_controller.on_choice(ConfirmChoice::Cancel)
@@ -545,7 +569,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 }
                             }
                             EditorEvent::OpenFilePicker => {
-                                if handle_open_file_picker(
+                                let opened = match handle_open_file_picker(
                                     pane_id,
                                     &session.save_controller,
                                     session.crashed,
@@ -554,10 +578,27 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     transfer.is_awaiting(),
                                     transfer.is_running(),
                                     &gui_event_tx,
-                                )
-                                .is_err()
-                                {
-                                    return;
+                                ) {
+                                    Ok(opened) => opened,
+                                    Err(_) => return,
+                                };
+                                if opened {
+                                    let root = session.root.clone();
+                                    let include_hidden =
+                                        session.save_controller.scan_options().show_hidden;
+                                    let catalog = catalogs.ensure(&root);
+                                    active_picker = Some(ActivePicker {
+                                        pane_id,
+                                        root,
+                                        query: String::new(),
+                                        include_hidden,
+                                    });
+                                    picker_search.request(
+                                        pane_id,
+                                        String::new(),
+                                        include_hidden,
+                                        catalog,
+                                    );
                                 }
                             }
                             EditorEvent::CommitRequested { changedtick, lines } => {
@@ -707,6 +748,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     &shared_ids,
                                     &gui_event_tx,
                                     &mut git,
+                                    &mut catalogs,
                                 )
                                 .is_err()
                                 {
@@ -781,6 +823,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     &shared_ids,
                                     &gui_event_tx,
                                     &mut git,
+                                    &mut catalogs,
                                 )
                                 .is_err()
                                 {
@@ -835,6 +878,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     &shared_ids,
                                     &gui_event_tx,
                                     &mut git,
+                                    &mut catalogs,
                                 )
                                 .is_err()
                                 {
@@ -866,6 +910,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             &shared_ids,
                                             &gui_event_tx,
                                             &mut git,
+                                            &mut catalogs,
                                         )
                                         .is_err()
                                         {
@@ -1194,6 +1239,10 @@ pub(super) fn run() -> anyhow::Result<()> {
                         path,
                         action,
                     } => {
+                        if active_picker.as_ref().is_some_and(|picker| picker.pane_id == pane_id) {
+                            active_picker = None;
+                            picker_search.invalidate_pending();
+                        }
                         let Some(session) = panes.get_mut(&pane_id) else {
                             continue;
                         };
@@ -1211,6 +1260,56 @@ pub(super) fn run() -> anyhow::Result<()> {
                         .is_err()
                         {
                             return;
+                        }
+                    }
+                    AppEvent::PickerQuery { pane_id, query } => {
+                        let Some(picker) = active_picker.as_mut() else {
+                            continue;
+                        };
+                        if picker.pane_id != pane_id {
+                            continue;
+                        }
+                        picker.query = query.clone();
+                        if let Some(catalog) = catalogs.get(&picker.root) {
+                            picker_search.request(
+                                pane_id,
+                                query,
+                                picker.include_hidden,
+                                catalog,
+                            );
+                        }
+                    }
+                    AppEvent::PickerClosed(pane_id) => {
+                        if active_picker.as_ref().is_some_and(|picker| picker.pane_id == pane_id) {
+                            active_picker = None;
+                            picker_search.invalidate_pending();
+                        }
+                    }
+                    AppEvent::CatalogChanged { root, error } => {
+                        if let Some(error) = error
+                            && send_gui_message(
+                                &gui_event_tx,
+                                active,
+                                MessageKind::Warn,
+                                error,
+                            )
+                            .is_err()
+                        {
+                            return;
+                        }
+                        let Some(picker) = active_picker.as_ref() else {
+                            continue;
+                        };
+                        if picker.root != root {
+                            continue;
+                        }
+                        if let Some(catalog) = catalogs.get(&root) {
+                            picker_search.request(
+                                picker.pane_id,
+                                picker.query.clone(),
+                                picker.include_hidden,
+                                catalog,
+                            );
                         }
                     }
                     AppEvent::Confirm(choice) => {
@@ -1906,6 +2005,29 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 event => pending_events.push_back(event),
                             }
                         }
+                        let mut catalog_changes = HashMap::<PathBuf, BTreeSet<PathBuf>>::new();
+                        for (changed_id, paths) in &by_pane {
+                            if let Some(session) = panes.get(changed_id) {
+                                catalog_changes
+                                    .entry(session.root.clone())
+                                    .or_default()
+                                    .extend(paths.iter().cloned());
+                            }
+                        }
+                        for (root, paths) in catalog_changes {
+                            if catalogs.update(&root, &paths)
+                                && let Some(picker) = active_picker.as_ref()
+                                && picker.root == root
+                                && let Some(catalog) = catalogs.get(&root)
+                            {
+                                picker_search.request(
+                                    picker.pane_id,
+                                    picker.query.clone(),
+                                    picker.include_hidden,
+                                    catalog,
+                                );
+                            }
+                        }
                         for (changed_id, changed_paths) in by_pane {
                             let Some(session) = panes.get_mut(&changed_id) else {
                                 continue;
@@ -1955,6 +2077,19 @@ pub(super) fn run() -> anyhow::Result<()> {
                         let Some(session) = panes.get_mut(&pane_id) else {
                             continue;
                         };
+                        let root = session.root.clone();
+                        catalogs.invalidate(&root);
+                        if let Some(picker) = active_picker.as_ref()
+                            && picker.root == root
+                        {
+                            let catalog = catalogs.ensure(&root);
+                            picker_search.request(
+                                picker.pane_id,
+                                picker.query.clone(),
+                                picker.include_hidden,
+                                catalog,
+                            );
+                        }
                         if !session.watch_degraded {
                             session.watch_degraded = true;
                             if send_gui_message(
@@ -2115,6 +2250,7 @@ fn handle_pane_action(
     last_active: &mut PaneId,
     next_pane_id: &mut u64,
     git: &mut GitRefresher,
+    catalogs: &mut CatalogService,
     journal: Option<&undo_journal::UndoJournal>,
     dialog_owner: Option<PaneId>,
     workspace_applying: bool,
@@ -2187,6 +2323,7 @@ fn handle_pane_action(
             )?;
             git.request(new_session.id, new_session.root.clone());
             panes.insert(new_id, new_session);
+            catalogs.register_pane(new_id, panes[&new_id].root.clone());
             *layout = new_layout;
             *last_active = *active;
             *active = new_id;
@@ -2227,6 +2364,7 @@ fn handle_pane_action(
                 discard_undo_slot(session, journal);
             }
             panes.remove(&source);
+            catalogs.remove_pane(source);
             git.remove(source);
             *layout = new_layout;
             *last_active = target;
@@ -2495,6 +2633,7 @@ fn discard_undo_slot(session: &mut PaneSession, journal: Option<&undo_journal::U
     }
 }
 
+#[allow(clippy::too_many_arguments)] // pane固有状態とroot共有catalogの差し替えを一括する。
 fn change_session_root(
     pane_id: PaneId,
     new_root: PathBuf,
@@ -2503,6 +2642,7 @@ fn change_session_root(
     shared_ids: &Arc<Mutex<IdAllocator>>,
     gui_event_tx: &CountingSender<GuiEvent>,
     git: &mut GitRefresher,
+    catalogs: &mut CatalogService,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     let changed = change_root_to(
         pane_id,
@@ -2517,6 +2657,7 @@ fn change_session_root(
         gui_event_tx,
     )?;
     if changed {
+        catalogs.change_root(pane_id, session.root.clone());
         session.watch_degraded = false;
         after_root_change(
             pane_id,

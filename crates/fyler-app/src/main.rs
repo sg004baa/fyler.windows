@@ -10,6 +10,7 @@ mod config;
 mod feedback;
 mod nvim_locate;
 mod pane_runtime;
+mod picker;
 mod queue_stats;
 pub mod save_flow;
 mod transfer_flow;
@@ -49,6 +50,15 @@ enum AppEvent {
         pane_id: PaneId,
         path: TreePath,
         action: PickerAction,
+    },
+    PickerQuery {
+        pane_id: PaneId,
+        query: String,
+    },
+    PickerClosed(PaneId),
+    CatalogChanged {
+        root: PathBuf,
+        error: Option<String>,
     },
     FeedbackSubmit {
         kind: FeedbackKind,
@@ -852,7 +862,7 @@ fn handle_open_file_picker(
     transfer_awaiting: bool,
     transfer_running: bool,
     gui_event_tx: &CountingSender<GuiEvent>,
-) -> Result<(), mpsc::SendError<GuiEvent>> {
+) -> Result<bool, mpsc::SendError<GuiEvent>> {
     if let Some(message) = open_file_picker_rejection(
         dialog_open,
         apply_running,
@@ -861,12 +871,11 @@ fn handle_open_file_picker(
         crashed,
         save_controller.is_idle(),
     ) {
-        return send_gui_message(gui_event_tx, pane_id, MessageKind::Info, message);
+        send_gui_message(gui_event_tx, pane_id, MessageKind::Info, message)?;
+        return Ok(false);
     }
-    gui_event_tx.send(GuiEvent::ShowFilePicker {
-        pane_id,
-        candidates: fyler_core::search::build_candidates(save_controller.baseline()),
-    })
+    gui_event_tx.send(GuiEvent::ShowFilePicker { pane_id })?;
+    Ok(true)
 }
 
 fn visible_line_for_entry(save_controller: &SaveController, entry_id: EntryId) -> Option<usize> {
@@ -1562,27 +1571,24 @@ mod tests {
         let (controller, _engine) = picker_controller(false, true);
         let (gui_tx, gui_rx) = counting_channel();
 
-        handle_open_file_picker(
-            PaneId::new(1),
-            &controller,
-            false,
-            false,
-            false,
-            false,
-            false,
-            &gui_tx,
-        )
-        .unwrap();
+        assert!(
+            handle_open_file_picker(
+                PaneId::new(1),
+                &controller,
+                false,
+                false,
+                false,
+                false,
+                false,
+                &gui_tx,
+            )
+            .unwrap()
+        );
 
-        let GuiEvent::ShowFilePicker {
-            pane_id,
-            candidates,
-        } = gui_rx.recv().unwrap()
-        else {
+        let GuiEvent::ShowFilePicker { pane_id } = gui_rx.recv().unwrap() else {
             panic!("expected picker event")
         };
         assert_eq!(pane_id, PaneId::new(1));
-        assert_eq!(candidates.len(), 4);
     }
 
     #[test]

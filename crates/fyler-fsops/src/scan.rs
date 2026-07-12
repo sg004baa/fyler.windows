@@ -732,7 +732,7 @@ fn extension_sort_key(lowercase_name: &str) -> &str {
     }
 }
 
-fn is_hidden(file_name: &OsStr, metadata: &Metadata) -> bool {
+pub(crate) fn is_hidden(file_name: &OsStr, metadata: &Metadata) -> bool {
     if file_name.as_encoded_bytes().first() == Some(&b'.') {
         return true;
     }
@@ -871,8 +871,6 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime};
 
     use tempfile::tempdir;
-
-    use fyler_core::search::build_candidates;
 
     use super::*;
 
@@ -1600,13 +1598,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             [TreePath::parse("visible.txt")]
         );
-        assert_eq!(
-            build_candidates(&hidden)
-                .into_iter()
-                .map(|candidate| candidate.display)
-                .collect::<Vec<_>>(),
-            ["visible.txt"]
-        );
 
         let mut shown_ids = IdAllocator::new();
         let shown = scan_baseline_with(
@@ -1629,17 +1620,6 @@ mod tests {
                 .entries()
                 .iter()
                 .any(|entry| entry.path == TreePath::parse(".hidden-dir/child.txt"))
-        );
-        let shown_candidates = build_candidates(&shown);
-        assert!(
-            shown_candidates
-                .iter()
-                .any(|candidate| candidate.display == ".hidden.txt")
-        );
-        assert!(
-            shown_candidates
-                .iter()
-                .any(|candidate| candidate.display == ".hidden-dir/child.txt")
         );
     }
 
