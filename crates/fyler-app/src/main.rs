@@ -93,6 +93,7 @@ enum AppEvent {
     TransferFinished(CommitReport<TransferOp>),
     Shutdown {
         save_session: bool,
+        window: Option<fyler_core::WindowGeometry>,
     },
 }
 

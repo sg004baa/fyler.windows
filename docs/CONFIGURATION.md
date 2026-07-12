@@ -104,9 +104,9 @@ by `sort`. At runtime, use `:sort name|date|size|ext`; add `!` to the command fo
 With `restore_session = true`, a normally closed fyler window writes `session.toml` beside
 `config.toml` using schema version 1. The session contains only display state: the binary pane
 layout and split ratios, each pane's root, the active pane, root-relative cursor and fold hints,
-and per-pane hidden-file and sorting settings. Dirty buffer text, editor mode, dialogs,
-in-flight apply/transfer state, clipboard data, Neovim/RPC state, and undo transactions are never
-stored in the session.
+per-pane hidden-file and sorting settings, and native window size, position, and maximized state.
+Dirty buffer text, editor mode, dialogs, in-flight apply/transfer state, clipboard data,
+Neovim/RPC state, and undo transactions are never stored in the session.
 
 An explicit command-line root always starts one pane and takes precedence over `session.toml`.
 `restore_session = false` also starts one pane without reading the session. Invalid TOML and
@@ -116,8 +116,8 @@ discarding other valid panes. Invalid data above the four-pane limit is pruned t
 
 Session writes use a same-directory temporary file, flush it, and atomically rename it only during
 normal shutdown. A truncated temporary write therefore does not replace the previous session.
-Window size, position, and maximized state use eframe's separate native persistence. Before a
-persisted window exists, fyler opens centered at 80% of the current display's width and height.
+Window geometry follows the same normal-shutdown atomic session contract. Before a persisted
+window exists, fyler opens centered at 70% of the current display's width and height.
 
 
 ### External terminal

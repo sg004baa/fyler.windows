@@ -9,6 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use fyler_core::WindowGeometry;
 use fyler_core::options::{SortKey, SortOrder};
 use fyler_core::pane::{PaneId, PaneLayout, SplitDirection};
 use fyler_core::path::TreePath;
@@ -26,6 +27,7 @@ pub struct SessionState {
     pub layout: PaneLayout,
     pub active: PaneId,
     pub panes: BTreeMap<PaneId, SessionPane>,
+    pub window: Option<WindowGeometry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +97,9 @@ fn encode(state: &SessionState) -> anyhow::Result<toml::Table> {
     table.insert("version".to_owned(), toml::Value::Integer(SESSION_VERSION));
     table.insert("active".to_owned(), pane_id_value(state.active)?);
     table.insert("layout".to_owned(), encode_layout(&state.layout)?);
+    if let Some(window) = state.window {
+        table.insert("window".to_owned(), encode_window(window));
+    }
     let panes = state
         .panes
         .iter()
@@ -221,10 +226,12 @@ fn parse(source: &str) -> anyhow::Result<SessionState> {
     } else {
         *retained.first().context("session contains no panes")?
     };
+    let window = table.get("window").map(parse_window).transpose()?;
     let state = SessionState {
         layout,
         active,
         panes,
+        window,
     };
     validate(&state)?;
     Ok(state)
@@ -245,7 +252,56 @@ fn validate(state: &SessionState) -> anyhow::Result<()> {
     if !leaf_set.contains(&state.active) {
         bail!("active pane is not present in layout");
     }
+    if state.window.is_some_and(|window| !window.is_valid()) {
+        bail!("session window geometry is invalid");
+    }
     Ok(())
+}
+fn encode_window(window: WindowGeometry) -> toml::Value {
+    let mut table = toml::Table::new();
+    table.insert(
+        "inner_width".to_owned(),
+        toml::Value::Float(f64::from(window.inner_width)),
+    );
+    table.insert(
+        "inner_height".to_owned(),
+        toml::Value::Float(f64::from(window.inner_height)),
+    );
+    table.insert(
+        "outer_x".to_owned(),
+        toml::Value::Float(f64::from(window.outer_x)),
+    );
+    table.insert(
+        "outer_y".to_owned(),
+        toml::Value::Float(f64::from(window.outer_y)),
+    );
+    table.insert(
+        "maximized".to_owned(),
+        toml::Value::Boolean(window.maximized),
+    );
+    toml::Value::Table(table)
+}
+
+fn parse_window(value: &toml::Value) -> anyhow::Result<WindowGeometry> {
+    let table = value.as_table().context("window must be a table")?;
+    WindowGeometry::new(
+        required_number(table, "inner_width")?,
+        required_number(table, "inner_height")?,
+        required_number(table, "outer_x")?,
+        required_number(table, "outer_y")?,
+        required(table, "maximized")?
+            .as_bool()
+            .context("window maximized must be a boolean")?,
+    )
+    .context("window geometry contains invalid values")
+}
+
+fn required_number(table: &toml::Table, key: &str) -> anyhow::Result<f32> {
+    match required(table, key)? {
+        toml::Value::Float(value) => Ok(*value as f32),
+        toml::Value::Integer(value) => Ok(*value as f32),
+        _ => bail!("window {key} must be a number"),
+    }
 }
 
 pub fn retain_available_layout(
@@ -508,6 +564,7 @@ mod tests {
                 (two, pane("//server/share/長い path")),
                 (three, pane(absolute_root("three").to_str().unwrap())),
             ]),
+            window: WindowGeometry::new(1280.0, 720.0, 30.0, 40.0, true),
         };
         let encoded = encode(&state).unwrap().to_string();
         assert_eq!(parse(&encoded).unwrap(), state);
@@ -541,6 +598,7 @@ mod tests {
                 .copied()
                 .map(|id| (id, pane(absolute_root(&id.to_string()).to_str().unwrap())))
                 .collect(),
+            window: None,
         };
         let parsed = parse(&encode(&state).unwrap().to_string()).unwrap();
         assert_eq!(parsed.layout.leaves(), ids[..4]);
@@ -566,6 +624,7 @@ mod tests {
                     .copied()
                     .map(|id| (id, pane(absolute_root(&id.to_string()).to_str().unwrap())))
                     .collect(),
+                window: None,
             };
             assert_eq!(parse(&encode(&state).unwrap().to_string()).unwrap(), state);
         }
@@ -578,6 +637,7 @@ mod tests {
             layout: PaneLayout::Leaf(id),
             active: id,
             panes: BTreeMap::from([(id, pane(absolute_root("clean").to_str().unwrap()))]),
+            window: None,
         };
         let table = encode(&state).unwrap();
         let pane = table["panes"].as_array().unwrap()[0].as_table().unwrap();

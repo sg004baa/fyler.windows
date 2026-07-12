@@ -3,10 +3,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use eframe::egui;
+use fyler_core::WindowGeometry;
 use fyler_core::editor::{
     CmdlineState, EditorEngine, EditorEvent, EditorMessage, Mode, PopupmenuState,
 };
@@ -26,8 +27,6 @@ use crate::{cmdline, confirm, input, modeline, tree_view};
 
 const CJK_FONT_NAME: &str = "fyler-cjk";
 const INITIAL_WINDOW_SCALE: f32 = 0.7;
-// eframe 0.35がnative window geometryに使うpersistence key。
-const EFRAME_WINDOW_STORAGE_KEY: &str = "window";
 /// ファイルpickerで候補を確定したときの動作。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerAction {
@@ -323,6 +322,7 @@ pub struct FylerApp {
     help_lines: Vec<String>,
     /// native window geometryが未保存の初回起動だけ、monitor比率でサイズを設定する。
     resize_to_monitor_on_first_frame: bool,
+    window_geometry: Arc<Mutex<Option<WindowGeometry>>>,
 }
 
 struct PaneViewState {
@@ -389,6 +389,7 @@ impl FylerApp {
             icon_style,
             help_lines,
             resize_to_monitor_on_first_frame: false,
+            window_geometry: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -737,6 +738,11 @@ impl eframe::App for FylerApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
             self.resize_to_monitor_on_first_frame = false;
+        }
+        if let Some(geometry) = current_window_geometry(ctx)
+            && let Ok(mut current) = self.window_geometry.lock()
+        {
+            *current = Some(geometry);
         }
         if let Some(path) = self.pending_copy.take() {
             ctx.copy_text(path.clone());
@@ -1462,6 +1468,22 @@ fn draw_help(ui: &mut egui::Ui, help_lines: &[String]) -> bool {
         .inner
 }
 
+fn current_window_geometry(context: &egui::Context) -> Option<WindowGeometry> {
+    context.input(|input| window_geometry_from_viewport(input.viewport()))
+}
+
+fn window_geometry_from_viewport(viewport: &egui::ViewportInfo) -> Option<WindowGeometry> {
+    let inner = viewport.inner_rect?;
+    let outer = viewport.outer_rect?;
+    WindowGeometry::new(
+        inner.width(),
+        inner.height(),
+        outer.min.x,
+        outer.min.y,
+        viewport.maximized.unwrap_or(false),
+    )
+}
+
 fn initial_window_geometry(monitor_size: Option<egui::Vec2>) -> Option<(egui::Vec2, egui::Pos2)> {
     let monitor_size = monitor_size?;
     if !monitor_size.is_finite() || monitor_size.x <= 0.0 || monitor_size.y <= 0.0 {
@@ -1472,10 +1494,20 @@ fn initial_window_geometry(monitor_size: Option<egui::Vec2>) -> Option<(egui::Ve
     Some((size, egui::pos2(margin.x, margin.y)))
 }
 
-fn native_options() -> eframe::NativeOptions {
-    // eframe persistence restores the previous native size/position/maximized state.
-    // A monitor-relative size is applied from the first frame only when this state is absent.
-    eframe::NativeOptions::default()
+fn native_options(window: Option<WindowGeometry>) -> eframe::NativeOptions {
+    let viewport = window.map_or_else(egui::ViewportBuilder::default, |window| {
+        egui::ViewportBuilder::default()
+            .with_inner_size([window.inner_width, window.inner_height])
+            .with_position([window.outer_x, window.outer_y])
+            .with_maximized(window.maximized)
+    });
+    eframe::NativeOptions {
+        viewport,
+        // Geometry is persisted in session.toml so it shares the same normal-shutdown contract
+        // as pane state and does not depend on eframe's optional persistence feature.
+        persist_window: false,
+        ..Default::default()
+    }
 }
 
 /// GUIを起動する(メインスレッドで呼ぶこと。eframeの制約)。
@@ -1489,8 +1521,10 @@ pub fn run(
     action_tx: mpsc::Sender<GuiAction>,
     gui_options: GuiOptions,
     event_dequeued: Arc<dyn Fn() + Send + Sync>,
+    initial_window: Option<WindowGeometry>,
+    window_geometry: Arc<Mutex<Option<WindowGeometry>>>,
 ) -> anyhow::Result<()> {
-    let native_options = native_options();
+    let native_options = native_options(initial_window);
     eframe::run_native(
         "fyler",
         native_options,
@@ -1502,10 +1536,7 @@ pub fn run(
                 icon_style,
                 help_lines,
             } = gui_options;
-            let resize_to_monitor_on_first_frame = creation_context
-                .storage
-                .and_then(|storage| storage.get_string(EFRAME_WINDOW_STORAGE_KEY))
-                .is_none();
+            let resize_to_monitor_on_first_frame = initial_window.is_none();
             install_fallback_font(
                 &creation_context.egui_ctx,
                 font_path.as_deref(),
@@ -1522,6 +1553,7 @@ pub fn run(
             )
             .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
             app.resize_to_monitor_on_first_frame = resize_to_monitor_on_first_frame;
+            app.window_geometry = window_geometry;
             Ok(Box::new(app))
         }),
     )
@@ -1640,6 +1672,7 @@ mod tests {
                 icon_style: IconStyle::Ascii,
                 help_lines: Vec::new(),
                 resize_to_monitor_on_first_frame: false,
+                window_geometry: Arc::new(Mutex::new(None)),
             },
             event_tx,
             action_rx,
@@ -1781,6 +1814,7 @@ mod tests {
             icon_style: IconStyle::Ascii,
             help_lines: Vec::new(),
             resize_to_monitor_on_first_frame: false,
+            window_geometry: Arc::new(Mutex::new(None)),
         };
         let (tx, rx) = mpsc::channel();
         app.event_rx = rx;
@@ -2045,12 +2079,39 @@ mod tests {
         assert!(app.dialog.is_none());
     }
     #[test]
-    fn first_launch_uses_eighty_percent_of_display_and_native_persistence() {
+    fn window_geometry_roundtrips_through_native_options() {
         let (size, position) = initial_window_geometry(Some(egui::vec2(1920.0, 1080.0))).unwrap();
-        assert_eq!(size, egui::vec2(1536.0, 864.0));
-        assert_eq!(position, egui::pos2(192.0, 108.0));
+        assert_eq!(size, egui::vec2(1344.0, 756.0));
+        assert_eq!(position, egui::pos2(288.0, 162.0));
         assert!(initial_window_geometry(None).is_none());
         assert!(initial_window_geometry(Some(egui::Vec2::ZERO)).is_none());
-        assert!(native_options().persist_window);
+
+        let geometry = WindowGeometry::new(1200.0, 700.0, 30.0, 40.0, true).unwrap();
+        let options = native_options(Some(geometry));
+        assert_eq!(options.viewport.inner_size, Some(egui::vec2(1200.0, 700.0)));
+        assert_eq!(options.viewport.position, Some(egui::pos2(30.0, 40.0)));
+        assert_eq!(options.viewport.maximized, Some(true));
+        assert!(!options.persist_window);
+    }
+
+    #[test]
+    fn viewport_geometry_capture_requires_size_and_position() {
+        let viewport = egui::ViewportInfo {
+            inner_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(35.0, 65.0),
+                egui::vec2(1000.0, 600.0),
+            )),
+            outer_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(30.0, 40.0),
+                egui::vec2(1010.0, 630.0),
+            )),
+            maximized: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            window_geometry_from_viewport(&viewport),
+            WindowGeometry::new(1000.0, 600.0, 30.0, 40.0, false)
+        );
+        assert!(window_geometry_from_viewport(&egui::ViewportInfo::default()).is_none());
     }
 }

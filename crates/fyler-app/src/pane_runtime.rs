@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use fyler_core::WindowGeometry;
 use fyler_core::editor::{EditorCommand, EditorEngine, EditorEvent, FoldOp, MessageKind};
 use fyler_core::feedback::{FeedbackPayload, validate_body};
 use fyler_core::gitstatus::GitBadge;
@@ -282,6 +283,7 @@ fn capture_session(
     panes: &BTreeMap<PaneId, PaneSession>,
     layout: PaneLayout,
     active: PaneId,
+    window: Option<WindowGeometry>,
 ) -> SessionState {
     let panes = panes
         .iter()
@@ -308,6 +310,7 @@ fn capture_session(
         layout,
         active,
         panes,
+        window,
     }
 }
 
@@ -330,6 +333,8 @@ pub(super) fn run() -> anyhow::Result<()> {
         } else {
             None
         };
+    let initial_window = restored_session.as_ref().and_then(|session| session.window);
+    let window_geometry = Arc::new(Mutex::new(initial_window));
     let root = explicit_root
         .as_deref()
         .map(normalize_root)
@@ -2790,9 +2795,12 @@ pub(super) fn run() -> anyhow::Result<()> {
                             return;
                         }
                     }
-                    AppEvent::Shutdown { save_session } => {
+                    AppEvent::Shutdown {
+                        save_session,
+                        window,
+                    } => {
                         let result = if save_session {
-                            session::save(&capture_session(&panes, layout, active))
+                            session::save(&capture_session(&panes, layout, active, window))
                         } else {
                             Ok(())
                         };
@@ -2810,9 +2818,13 @@ pub(super) fn run() -> anyhow::Result<()> {
         action_tx,
         gui_options,
         Arc::new(move || gui_dequeue_gauge.dequeue()),
+        initial_window,
+        Arc::clone(&window_geometry),
     );
+    let final_window = window_geometry.lock().ok().and_then(|window| *window);
     let _ = app_event_tx.send(AppEvent::Shutdown {
         save_session: gui_result.is_ok(),
+        window: final_window,
     });
     let _ = event_bridge.join();
     let _ = action_bridge.join();
