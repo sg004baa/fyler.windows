@@ -159,8 +159,20 @@ fn hidden_entries_at_desired_paths(
 ) -> Vec<(fyler_core::EntryId, TreePath)> {
     let mut hidden = Vec::new();
 
-    for collapsed_id in &ctx.collapsed_dirs {
-        let Some(collapsed) = baseline.get(*collapsed_id) else {
+    let collapsed_ids = ctx
+        .collapsed_dirs
+        .iter()
+        .copied()
+        .chain(
+            baseline
+                .incomplete_dirs()
+                .keys()
+                .filter_map(|path| baseline.get_by_path(path).map(|entry| entry.id)),
+        )
+        .collect::<HashSet<_>>();
+
+    for collapsed_id in collapsed_ids {
+        let Some(collapsed) = baseline.get(collapsed_id) else {
             continue;
         };
         if collapsed.kind != EntryKind::Dir {
@@ -170,7 +182,7 @@ fn hidden_entries_at_desired_paths(
         for desired_root in desired
             .entries
             .iter()
-            .filter(|entry| entry.id == Some(*collapsed_id))
+            .filter(|entry| entry.id == Some(collapsed_id))
         {
             for descendant in baseline
                 .entries()

@@ -573,6 +573,14 @@ fn handle_activate_line(
                         "Target line is not a directory",
                     )?;
                 }
+                ToggleCollapseResult::CannotExpandIncomplete => {
+                    send_gui_message(
+                        gui_event_tx,
+                        pane_id,
+                        MessageKind::Info,
+                        "Cannot expand: directory could not be read (access denied or unavailable)",
+                    )?;
+                }
                 ToggleCollapseResult::NotFound => {
                     send_gui_message(
                         gui_event_tx,

@@ -567,7 +567,8 @@ fn validation_error_label(error: &ValidateError) -> String {
         ValidateError::DuplicateName { .. }
         | ValidateError::MoveIntoSelf { .. }
         | ValidateError::MoveCycle { .. }
-        | ValidateError::TargetOccupiedByDirectory { .. } => None,
+        | ValidateError::TargetOccupiedByDirectory { .. }
+        | ValidateError::IncompleteDirectory { .. } => None,
     };
 
     let label = error.to_string();

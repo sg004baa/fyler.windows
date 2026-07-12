@@ -206,6 +206,8 @@ pub enum ToggleCollapseResult {
     NotFound,
     /// 対象行はディレクトリではない。
     NotADirectory,
+    /// scan不完全なディレクトリはstale子孫を見せないため展開できない。
+    CannotExpandIncomplete,
     /// 保存状態機械が`Idle`ではないため、状態を変更しなかった。
     Busy,
 }
@@ -222,6 +224,8 @@ pub enum FoldResult {
     NoOp,
     /// 行を解決できない(ID無し行・baseline不在)。
     NotFound,
+    /// scan不完全なディレクトリを展開しようとした。
+    CannotExpandIncomplete,
     /// 保存状態機械がIdleでない。
     Busy,
 }
@@ -532,6 +536,13 @@ impl SaveController {
         else {
             return ToggleCollapseResult::NotFound;
         };
+        if self
+            .baseline
+            .get(id)
+            .is_some_and(|entry| self.baseline.is_within_incomplete(&entry.path))
+        {
+            return ToggleCollapseResult::CannotExpandIncomplete;
+        }
         if !self.context.collapsed_dirs.remove(&id) {
             self.context.collapsed_dirs.insert(id);
         }
@@ -553,6 +564,20 @@ impl SaveController {
         }
 
         let before = self.context.collapsed_dirs.clone();
+        let expansion_intersects_incomplete = match op {
+            FoldOp::Open | FoldOp::Toggle => {
+                entry.kind == EntryKind::Dir && self.baseline.is_within_incomplete(&entry.path)
+            }
+            FoldOp::OpenRecursive => {
+                entry.kind == EntryKind::Dir
+                    && self.baseline.subtree_intersects_incomplete(&entry.path)
+            }
+            FoldOp::OpenAll => !self.baseline.incomplete_dirs().is_empty(),
+            FoldOp::Close | FoldOp::CloseRecursive | FoldOp::CloseAll => false,
+        };
+        if expansion_intersects_incomplete {
+            return FoldResult::CannotExpandIncomplete;
+        }
         let cursor_id = match op {
             FoldOp::Close => {
                 let Some(target) = self.close_target_for_entry(&entry) else {
@@ -1421,7 +1446,10 @@ fn visible_entries<'a>(
             }
             skip_prefix = None;
         }
-        if entry.kind == EntryKind::Dir && context.collapsed_dirs.contains(&entry.id) {
+        if entry.kind == EntryKind::Dir
+            && (context.collapsed_dirs.contains(&entry.id)
+                || baseline.incomplete_dirs().contains_key(&entry.path))
+        {
             skip_prefix = Some(&entry.path);
         }
         visible.push(entry);
@@ -3015,6 +3043,52 @@ mod tests {
             result => panic!("unexpected expand result: {result:?}"),
         };
         assert_eq!(expanded_again, expanded);
+    }
+
+    #[test]
+    fn incomplete_directory_is_forced_closed_without_polluting_collapsed_context() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        controller.baseline.mark_incomplete(
+            TreePath::parse("a"),
+            fyler_core::scanwarn::ScanErrorKind::PermissionDenied,
+        );
+
+        let visible = controller.visible_lines();
+
+        assert_eq!(visible.len(), 2);
+        assert!(visible[0].text.ends_with("a/"));
+        assert!(visible[1].text.ends_with("top.txt"));
+        assert!(controller.context.collapsed_dirs.is_empty());
+        assert_eq!(
+            controller.toggle_collapse(&visible, 0),
+            ToggleCollapseResult::CannotExpandIncomplete
+        );
+        assert!(controller.context.collapsed_dirs.is_empty());
+    }
+
+    #[test]
+    fn fold_rejects_expanding_incomplete_directory() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        controller.baseline.mark_incomplete(
+            TreePath::parse("a/nested"),
+            fyler_core::scanwarn::ScanErrorKind::PermissionDenied,
+        );
+        controller.context.collapsed_dirs.insert(EntryId(2));
+        let lines = controller.visible_lines();
+
+        assert_eq!(
+            controller.fold(&lines, 1, FoldOp::Open),
+            FoldResult::CannotExpandIncomplete
+        );
+        assert_eq!(
+            controller.fold(&lines, 0, FoldOp::OpenRecursive),
+            FoldResult::CannotExpandIncomplete
+        );
+        assert_eq!(
+            controller.fold(&lines, 0, FoldOp::OpenAll),
+            FoldResult::CannotExpandIncomplete
+        );
+        assert!(controller.context.collapsed_dirs.contains(&EntryId(2)));
     }
 
     #[test]

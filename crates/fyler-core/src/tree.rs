@@ -1,11 +1,12 @@
 //! ツリーの中間表現: baseline(実FSの最終同期状態)と DesiredTree(編集後バッファの意図)。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::id::EntryId;
 use crate::path::TreePath;
+use crate::scanwarn::{ScanErrorKind, ScanWarning};
 
 /// エントリ種別。
 ///
@@ -37,6 +38,8 @@ pub struct BaselineTree {
     index: Arc<HashMap<EntryId, usize>>,
     path_index: Arc<HashMap<TreePath, usize>>,
     meta: Arc<HashMap<EntryId, crate::fileinfo::EntryMeta>>,
+    incomplete_dirs: Arc<BTreeMap<TreePath, ScanErrorKind>>,
+    warnings: Arc<Vec<ScanWarning>>,
 }
 
 impl PartialEq for BaselineTree {
@@ -56,6 +59,8 @@ impl BaselineTree {
             index: Arc::new(HashMap::new()),
             path_index: Arc::new(HashMap::new()),
             meta: Arc::new(HashMap::new()),
+            incomplete_dirs: Arc::new(BTreeMap::new()),
+            warnings: Arc::new(Vec::new()),
         }
     }
 
@@ -98,6 +103,43 @@ impl BaselineTree {
         let mut cloned = self.clone();
         Arc::make_mut(&mut cloned.meta).extend(updates);
         cloned
+    }
+
+    /// 列挙が不完全だったディレクトリを記録する。
+    pub fn mark_incomplete(&mut self, path: TreePath, kind: ScanErrorKind) {
+        Arc::make_mut(&mut self.incomplete_dirs).insert(path, kind);
+    }
+
+    /// 列挙が不完全だったディレクトリを決定的なパス順で返す。
+    pub fn incomplete_dirs(&self) -> &BTreeMap<TreePath, ScanErrorKind> {
+        &self.incomplete_dirs
+    }
+
+    /// このscanで収集した回復可能な警告を返す。
+    pub fn scan_warnings(&self) -> &[ScanWarning] {
+        &self.warnings
+    }
+
+    /// 回復可能なscan警告を追加する。
+    pub fn push_warning(&mut self, warning: ScanWarning) {
+        Arc::make_mut(&mut self.warnings).push(warning);
+    }
+
+    /// `path`自身または祖先が不完全ディレクトリかを返す。
+    pub fn is_within_incomplete(&self, path: &TreePath) -> bool {
+        self.incomplete_dirs
+            .keys()
+            .any(|dir| dir == path || dir.is_strict_ancestor_of(path))
+    }
+
+    /// `path`の部分木と不完全範囲が交差するかを返す。
+    ///
+    /// `path`が不完全範囲の内側にある場合と、`path`の子孫に不完全dirがある場合の
+    /// 双方を含む。move/deleteのplan gatingに使う。
+    pub fn subtree_intersects_incomplete(&self, path: &TreePath) -> bool {
+        self.incomplete_dirs.keys().any(|dir| {
+            dir == path || dir.is_strict_ancestor_of(path) || path.is_strict_ancestor_of(dir)
+        })
     }
 
     /// IDに対応する表示用メタデータを返す。スキャン以外で構築したbaselineはNone。
@@ -264,5 +306,28 @@ mod tests {
         right.insert(entry);
 
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn access_sidecars_do_not_affect_equality_and_cover_both_intersection_directions() {
+        let mut left = BaselineTree::new("C:/root");
+        let right = BaselineTree::new("C:/root");
+        left.mark_incomplete(
+            TreePath::parse("parent/blocked"),
+            ScanErrorKind::PermissionDenied,
+        );
+        left.push_warning(ScanWarning {
+            path: PathBuf::from("C:/root/parent/blocked"),
+            stage: crate::scanwarn::ScanStage::EnumerateDir,
+            kind: ScanErrorKind::PermissionDenied,
+        });
+
+        assert_eq!(left, right);
+        assert!(left.is_within_incomplete(&TreePath::parse("parent/blocked")));
+        assert!(left.is_within_incomplete(&TreePath::parse("parent/blocked/child")));
+        assert!(!left.is_within_incomplete(&TreePath::parse("parent")));
+        assert!(left.subtree_intersects_incomplete(&TreePath::parse("parent")));
+        assert!(left.subtree_intersects_incomplete(&TreePath::parse("parent/blocked/child")));
+        assert!(!left.subtree_intersects_incomplete(&TreePath::parse("sibling")));
     }
 }

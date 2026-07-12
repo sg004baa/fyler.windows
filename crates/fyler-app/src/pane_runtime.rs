@@ -1001,6 +1001,18 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             return;
                                         }
                                     }
+                                    FoldResult::CannotExpandIncomplete => {
+                                        if send_gui_message(
+                                            &gui_event_tx,
+                                            pane_id,
+                                            MessageKind::Info,
+                                            "Cannot expand: directory could not be read (access denied or unavailable)",
+                                        )
+                                        .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
                                     FoldResult::NoOp | FoldResult::Busy => {}
                                 }
                             }

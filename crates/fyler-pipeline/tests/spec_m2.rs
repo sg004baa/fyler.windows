@@ -426,6 +426,139 @@ fn diff_collapsed_dir_moves_as_one_op_and_children_are_not_deleted() {
 }
 
 #[test]
+fn diff_incomplete_dir_hides_missing_descendants_without_deletes() {
+    let mut base = baseline(&[
+        (1, "src", EntryKind::Dir),
+        (2, "src/main.rs", EntryKind::File),
+    ]);
+    base.mark_incomplete(
+        TreePath::parse("src"),
+        fyler_core::scanwarn::ScanErrorKind::PermissionDenied,
+    );
+    let desired = DesiredTree {
+        entries: vec![desired_entry(Some(1), "src", EntryKind::Dir, 0)],
+    };
+
+    let plan = diff::build_plan(&base, &desired, &no_collapse()).unwrap();
+
+    assert!(plan.is_empty());
+}
+
+#[test]
+fn validate_treats_incomplete_descendants_as_hidden_existing_entries() {
+    let mut base = baseline(&[
+        (1, "src", EntryKind::Dir),
+        (2, "src/main.rs", EntryKind::File),
+        (3, "outside.rs", EntryKind::File),
+    ]);
+    base.mark_incomplete(
+        TreePath::parse("src"),
+        fyler_core::scanwarn::ScanErrorKind::PermissionDenied,
+    );
+    let desired = DesiredTree {
+        entries: vec![
+            desired_entry(Some(1), "src", EntryKind::Dir, 0),
+            desired_entry(Some(3), "src/main.rs", EntryKind::File, 1),
+        ],
+    };
+
+    let errors = validate::validate(&base, &desired, &no_collapse());
+
+    assert!(errors.contains(&ValidateError::DuplicateName {
+        path: TreePath::parse("src/main.rs"),
+    }));
+}
+
+#[test]
+fn diff_rejects_rename_and_delete_of_incomplete_directory() {
+    let mut base = baseline(&[(1, "blocked", EntryKind::Dir)]);
+    base.mark_incomplete(
+        TreePath::parse("blocked"),
+        fyler_core::scanwarn::ScanErrorKind::PermissionDenied,
+    );
+    let renamed = DesiredTree {
+        entries: vec![desired_entry(Some(1), "renamed", EntryKind::Dir, 0)],
+    };
+
+    for desired in [renamed, DesiredTree::default()] {
+        let errors = diff::build_plan(&base, &desired, &no_collapse()).unwrap_err();
+        assert!(errors.contains(&ValidateError::IncompleteDirectory {
+            path: TreePath::parse("blocked"),
+        }));
+    }
+}
+
+#[test]
+fn diff_rejects_create_inside_incomplete_directory() {
+    let mut base = baseline(&[(1, "blocked", EntryKind::Dir)]);
+    base.mark_incomplete(
+        TreePath::parse("blocked"),
+        fyler_core::scanwarn::ScanErrorKind::PermissionDenied,
+    );
+    let desired = DesiredTree {
+        entries: vec![
+            desired_entry(Some(1), "blocked", EntryKind::Dir, 0),
+            desired_entry(None, "blocked/new.txt", EntryKind::File, 1),
+        ],
+    };
+
+    let errors = diff::build_plan(&base, &desired, &no_collapse()).unwrap_err();
+
+    assert!(errors.contains(&ValidateError::IncompleteDirectory {
+        path: TreePath::parse("blocked"),
+    }));
+}
+
+#[test]
+fn diff_rejects_deleting_ancestor_that_contains_incomplete_directory() {
+    let mut base = baseline(&[
+        (1, "parent", EntryKind::Dir),
+        (2, "parent/blocked", EntryKind::Dir),
+    ]);
+    base.mark_incomplete(
+        TreePath::parse("parent/blocked"),
+        fyler_core::scanwarn::ScanErrorKind::PermissionDenied,
+    );
+
+    let errors = diff::build_plan(&base, &DesiredTree::default(), &no_collapse()).unwrap_err();
+
+    assert!(errors.contains(&ValidateError::IncompleteDirectory {
+        path: TreePath::parse("parent"),
+    }));
+}
+
+#[test]
+fn diff_allows_operations_outside_incomplete_range() {
+    let mut base = baseline(&[
+        (1, "blocked", EntryKind::Dir),
+        (2, "safe.txt", EntryKind::File),
+    ]);
+    base.mark_incomplete(
+        TreePath::parse("blocked"),
+        fyler_core::scanwarn::ScanErrorKind::PermissionDenied,
+    );
+    let desired = DesiredTree {
+        entries: vec![
+            desired_entry(Some(1), "blocked", EntryKind::Dir, 0),
+            desired_entry(Some(2), "renamed.txt", EntryKind::File, 1),
+            desired_entry(None, "created.txt", EntryKind::File, 2),
+        ],
+    };
+
+    let plan = diff::build_plan(&base, &desired, &no_collapse()).unwrap();
+
+    assert!(plan.ops.contains(&FsOperation::Move {
+        id: EntryId(2),
+        from: TreePath::parse("safe.txt"),
+        to: TreePath::parse("renamed.txt"),
+    }));
+    assert!(plan.ops.contains(&FsOperation::Create {
+        path: TreePath::parse("created.txt"),
+        kind: EntryKind::File,
+    }));
+}
+
+#[test]
 fn diff_expanded_dir_missing_children_are_deleted() {
     // 展開中(collapsedでない)ディレクトリの子孫がバッファから消えていればDELETE
     let base = baseline(&[
