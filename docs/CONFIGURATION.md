@@ -108,11 +108,12 @@ per-pane hidden-file and sorting settings, and native window size, position, and
 Dirty buffer text, editor mode, dialogs, in-flight apply/transfer state, clipboard data,
 Neovim/RPC state, and undo transactions are never stored in the session.
 
-An explicit command-line root always starts one pane and takes precedence over `session.toml`.
-`restore_session = false` also starts one pane without reading the session. Invalid TOML and
-unknown schema versions produce a warning and use the default root. If one saved root is missing
-or inaccessible, fyler tries its nearest available ancestor and then the default root without
-discarding other valid panes. Invalid data above the four-pane limit is pruned to four panes.
+An explicit command-line root always starts one pane and bypasses `session.toml` entirely.
+`restore_session = false` also starts one pane without reading the session. When session loading
+is enabled and no command-line root was supplied, invalid TOML and unknown schema versions produce
+a warning and use the default root. If one saved root is missing or inaccessible, fyler tries its
+nearest available ancestor and then the default root without discarding other valid panes. Invalid
+data above the four-pane limit is pruned to four panes.
 
 Session writes use a same-directory temporary file, flush it, and atomically rename it only during
 normal shutdown. A truncated temporary write therefore does not replace the previous session.
