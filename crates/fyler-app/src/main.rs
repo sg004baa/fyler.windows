@@ -18,16 +18,19 @@ mod undo_format;
 mod undo_journal;
 
 use std::collections::{BTreeSet, HashMap};
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+#[cfg(test)]
+use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 
 use fyler_core::editor::{EditorCommand, EditorEngine, EditorEvent, EditorMessage, MessageKind};
 use fyler_core::feedback::FeedbackKind;
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
-use fyler_core::id::{EntryId, IdAllocator};
+use fyler_core::id::EntryId;
+#[cfg(test)]
+use fyler_core::id::IdAllocator;
 use fyler_core::options::{SortKey, TerminalKind};
 use fyler_core::pane::PaneId;
 use fyler_core::path::TreePath;
@@ -36,7 +39,7 @@ use fyler_core::transfer::TransferOp;
 use fyler_core::tree::EntryKind;
 use fyler_core::undo::{UndoStep, UndoTransaction};
 use fyler_fsops::openwith::OpenWithHandler;
-use fyler_fsops::watch::{ExternalChange, FsWatcher, WatchEvent};
+use fyler_fsops::watch::ExternalChange;
 use fyler_gui::app::{GuiEvent, PickerAction};
 use fyler_gui::confirm::ConfirmChoice;
 
@@ -74,6 +77,13 @@ enum AppEvent {
         root: PathBuf,
         statuses: HashMap<PathBuf, GitBadge>,
     },
+    LoaderProgress(PaneId, usize),
+    LoaderFinished {
+        pane_id: PaneId,
+        root: PathBuf,
+        result: anyhow::Result<Option<fyler_core::tree::BaselineTree>>,
+    },
+    LoaderCancel,
     ApplyProgress(PaneId, ApplyProgress),
     ApplyFinished(PaneId, CommitReport, Option<UndoTransaction>),
     UndoProgress(PaneId, ApplyProgress<UndoStep>),
@@ -226,118 +236,6 @@ fn handle_external_change(
         invalidated_dialog,
         undo_transaction,
     })
-}
-
-#[allow(clippy::too_many_arguments)] // ルート差し替えの全状態とカーソル復元対象を明示する。
-fn change_root_to(
-    pane_id: PaneId,
-    new_root: PathBuf,
-    cursor_target: Option<&OsStr>,
-    root: &mut PathBuf,
-    watcher: &mut FsWatcher,
-    watch_tx: &mpsc::Sender<WatchEvent>,
-    shared_ids: &Arc<std::sync::Mutex<IdAllocator>>,
-    save_controller: &mut SaveController,
-    engine: &dyn EditorEngine,
-    gui_event_tx: &CountingSender<GuiEvent>,
-) -> Result<bool, mpsc::SendError<GuiEvent>> {
-    let new_root = match normalize_root(&new_root) {
-        Ok(new_root) => new_root,
-        Err(error) => {
-            send_gui_message(
-                gui_event_tx,
-                pane_id,
-                MessageKind::Error,
-                format!("Failed to normalize root ({}): {error}", new_root.display()),
-            )?;
-            return Ok(false);
-        }
-    };
-
-    if engine.snapshot().dirty && !save_controller.is_offline() {
-        send_gui_message(
-            gui_event_tx,
-            pane_id,
-            MessageKind::Info,
-            "You are editing. Save or discard changes before changing directories.",
-        )?;
-        return Ok(false);
-    }
-    if !save_controller.is_idle() {
-        return Ok(false);
-    }
-
-    let scan_options = save_controller.scan_options();
-    let new_baseline = match shared_ids.lock() {
-        Ok(mut ids) => fyler_fsops::scan::scan_baseline_with(&new_root, &mut ids, &scan_options),
-        Err(_) => Err(anyhow::anyhow!("ID allocator lock is poisoned")),
-    };
-    let new_baseline = match new_baseline {
-        Ok(baseline) => baseline,
-        Err(error) => {
-            send_gui_message(
-                gui_event_tx,
-                pane_id,
-                MessageKind::Error,
-                format!("Failed to load root ({}): {error:#}", new_root.display()),
-            )?;
-            return Ok(false);
-        }
-    };
-
-    // 新しい監視の作成に失敗した場合、現在のroot/baseline/watcherを
-    // そのまま維持できるよう、状態差し替え前に準備だけ済ませる。
-    let new_watcher = match fyler_fsops::watch::watch(&new_root, watch_tx.clone()) {
-        Ok(watcher) => watcher,
-        Err(error) => {
-            send_gui_message(
-                gui_event_tx,
-                pane_id,
-                MessageKind::Error,
-                format!("Failed to watch root ({}): {error:#}", new_root.display()),
-            )?;
-            return Ok(false);
-        }
-    };
-
-    if let Err(error) =
-        save_controller.change_root_preserving_allocator(new_root.clone(), new_baseline)
-    {
-        send_gui_message(
-            gui_event_tx,
-            pane_id,
-            MessageKind::Error,
-            format!("Failed to change root: {error:#}"),
-        )?;
-        return Ok(false);
-    }
-    save_controller.collapse_all_dirs();
-    let cursor_line = cursor_target.and_then(|name| save_controller.find_top_level_line(name));
-    let new_lines = save_controller.visible_lines();
-
-    *root = new_root;
-    *watcher = new_watcher;
-    if let Err(error) = engine.send(EditorCommand::SetLines {
-        lines: new_lines,
-        cursor_line,
-    }) {
-        send_gui_message(
-            gui_event_tx,
-            pane_id,
-            MessageKind::Error,
-            format!("Failed to display new directory: {error:#}"),
-        )?;
-    }
-    // GUIへのpane tag付けは呼び出し元の`after_root_change`で行う。
-    if let Err(error) = config::record_recent_root(root) {
-        send_gui_message(
-            gui_event_tx,
-            pane_id,
-            MessageKind::Warn,
-            format!("Failed to record recent root: {error:#}"),
-        )?;
-    }
-    Ok(true)
 }
 
 fn after_root_change(
@@ -499,44 +397,48 @@ fn handle_activate_line(
     root: &Path,
     line: usize,
     gui_event_tx: &CountingSender<GuiEvent>,
-) -> Result<(), mpsc::SendError<GuiEvent>> {
+) -> Result<Option<TreePath>, mpsc::SendError<GuiEvent>> {
     let snapshot = engine.snapshot();
     let Some(editor_line) = snapshot.lines.get(line) else {
-        return send_gui_message(
+        send_gui_message(
             gui_event_tx,
             pane_id,
             MessageKind::Error,
             "Line to open was not found",
-        );
+        )?;
+        return Ok(None);
     };
 
     match fyler_core::grammar::split_id_prefix(&editor_line.text) {
         PrefixParse::NoId { .. } => {
-            return send_gui_message(
+            send_gui_message(
                 gui_event_tx,
                 pane_id,
                 MessageKind::Info,
                 "This line has not been saved",
-            );
+            )?;
+            return Ok(None);
         }
         PrefixParse::Broken => {
-            return send_gui_message(
+            send_gui_message(
                 gui_event_tx,
                 pane_id,
                 MessageKind::Error,
                 "Cannot open a line with a broken ID prefix",
-            );
+            )?;
+            return Ok(None);
         }
         PrefixParse::WithId { .. } => {}
     }
 
     let Some((path, kind)) = save_controller.resolve_line(&snapshot.lines, line) else {
-        return send_gui_message(
+        send_gui_message(
             gui_event_tx,
             pane_id,
             MessageKind::Error,
             "File for this line was not found in the current tree",
-        );
+        )?;
+        return Ok(None);
     };
 
     match kind {
@@ -553,12 +455,13 @@ fn handle_activate_line(
         }
         EntryKind::Dir => {
             if snapshot.dirty {
-                return send_gui_message(
+                send_gui_message(
                     gui_event_tx,
                     pane_id,
                     MessageKind::Info,
                     "Cannot change folds while editing. Save or discard changes.",
-                );
+                )?;
+                return Ok(None);
             }
 
             match save_controller.toggle_collapse(&snapshot.lines, line) {
@@ -594,6 +497,7 @@ fn handle_activate_line(
                         "Cannot expand: directory could not be read (access denied or unavailable)",
                     )?;
                 }
+                ToggleCollapseResult::NeedsLoad { dir } => return Ok(Some(dir)),
                 ToggleCollapseResult::NotFound => {
                     send_gui_message(
                         gui_event_tx,
@@ -606,7 +510,7 @@ fn handle_activate_line(
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn handle_open_with(

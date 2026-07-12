@@ -46,6 +46,7 @@ pub struct PickerHit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuiAction {
     Confirm(ConfirmChoice),
+    LoaderCancel,
     PickerSelect {
         pane_id: PaneId,
         path: TreePath,
@@ -186,6 +187,17 @@ pub enum GuiEvent {
         /// 承認済みplanに含まれる操作総数。
         total: usize,
     },
+    /// root scanまたは再帰directory loadの進捗ダイアログを表示する。
+    ShowLoaderProgress {
+        title: String,
+        path: PathBuf,
+    },
+    /// loaderが発見した累計entry数を表示へ反映する。
+    LoaderProgress {
+        entries: usize,
+    },
+    /// loaderのキャンセル要求を受理済みとして操作を無効化する。
+    LoaderCancelRequested,
     /// apply workerから届いた操作単位の進捗を表示へ反映する。
     ApplyProgress(ApplyProgress),
     /// undo workerから届いた操作単位の進捗を表示へ反映する。
@@ -234,6 +246,12 @@ enum DialogState {
         total: usize,
         /// これから実行する操作の表示ラベル。
         current: Option<String>,
+        cancel_requested: bool,
+    },
+    LoaderProgress {
+        title: String,
+        path: PathBuf,
+        entries: usize,
         cancel_requested: bool,
     },
     Report(CommitReport),
@@ -605,6 +623,30 @@ impl FylerApp {
                         cancel_requested: false,
                     });
                 }
+                GuiEvent::ShowLoaderProgress { title, path } => {
+                    self.dialog = Some(DialogState::LoaderProgress {
+                        title,
+                        path,
+                        entries: 0,
+                        cancel_requested: false,
+                    });
+                }
+                GuiEvent::LoaderProgress { entries } => {
+                    if let Some(DialogState::LoaderProgress {
+                        entries: current, ..
+                    }) = &mut self.dialog
+                    {
+                        *current = entries;
+                    }
+                }
+                GuiEvent::LoaderCancelRequested => {
+                    if let Some(DialogState::LoaderProgress {
+                        cancel_requested, ..
+                    }) = &mut self.dialog
+                    {
+                        *cancel_requested = true;
+                    }
+                }
                 GuiEvent::ApplyProgress(progress) => {
                     if let Some(DialogState::Progress {
                         completed,
@@ -759,6 +801,7 @@ impl eframe::App for FylerApp {
 
         let mut confirm_choice = None;
         let mut cancel_apply = false;
+        let mut cancel_loader = false;
         let mut dismiss_errors = false;
         let mut dismiss_report = false;
         let mut open_with_choice = None;
@@ -809,6 +852,15 @@ impl eframe::App for FylerApp {
                     current.as_deref(),
                     *cancel_requested,
                 );
+            }
+            Some(DialogState::LoaderProgress {
+                title,
+                path,
+                entries,
+                cancel_requested,
+            }) => {
+                cancel_loader =
+                    confirm::draw_loader_progress(ui, title, path, *entries, *cancel_requested);
             }
             Some(DialogState::Help) => {
                 dismiss_errors = draw_help(ui, &self.help_lines);
@@ -896,6 +948,9 @@ impl eframe::App for FylerApp {
                 .is_err()
         {
             self.fatal_error = Some("Failed to send cancel request to app".to_owned());
+        }
+        if cancel_loader && self.action_tx.send(GuiAction::LoaderCancel).is_err() {
+            self.fatal_error = Some("Failed to send loader cancel request to app".to_owned());
         }
         if let Some(result) = picker_result {
             self.dialog = None;
