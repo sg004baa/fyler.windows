@@ -29,3 +29,4 @@ winresource = "0.1.31"
 
 [dev-dependencies]
 tempfile = "3"
+fyler-fsops = { workspace = true, features = ["test-support"] }

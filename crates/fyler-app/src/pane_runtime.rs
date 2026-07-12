@@ -23,7 +23,7 @@ use fyler_core::undo::UndoTransaction;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
 use fyler_fsops::scan::ScanOptions;
 use fyler_fsops::watch::{FsWatcher, WatchEvent};
-use fyler_gui::app::{FeedbackResultKind, GuiAction, GuiEvent, GuiOptions};
+use fyler_gui::app::{FeedbackResultKind, GuiAction, GuiEvent, GuiOptions, PickerAction};
 use fyler_gui::confirm::ConfirmChoice;
 
 use super::feedback::{FeedbackOutcome, resolve_endpoint, send_feedback};
@@ -82,6 +82,11 @@ enum LoaderKind {
         line: usize,
         op: FoldOp,
     },
+    PickerReveal {
+        target: TreePath,
+        action: fyler_gui::app::PickerAction,
+        dir: TreePath,
+    },
 }
 
 impl LoaderOwner {
@@ -90,7 +95,10 @@ impl LoaderOwner {
     }
 
     fn shows_dialog(&self) -> bool {
-        !matches!(self.kind, LoaderKind::Directory { .. })
+        !matches!(
+            self.kind,
+            LoaderKind::Directory { .. } | LoaderKind::PickerReveal { .. }
+        )
     }
 }
 
@@ -1363,6 +1371,47 @@ pub(super) fn run() -> anyhow::Result<()> {
                         let Some(session) = panes.get_mut(&pane_id) else {
                             continue;
                         };
+                        if action == PickerAction::Jump
+                            && session.save_controller.baseline().get_by_path(&path).is_none()
+                            && let Some(dir) = super::next_picker_reveal_directory(
+                                session.save_controller.baseline(),
+                                &path,
+                            )
+                        {
+                            if let Some(message) = picker_reveal_start_rejection(
+                                session.engine.snapshot().dirty,
+                                loader_owner.is_some()
+                                    || dialog_owner.is_some()
+                                    || apply_owner.is_some()
+                                    || transfer.is_awaiting()
+                                    || transfer.is_running(),
+                                session.crashed,
+                                session.save_controller.is_idle(),
+                            ) {
+                                if send_gui_message(
+                                    &gui_event_tx,
+                                    pane_id,
+                                    MessageKind::Info,
+                                    message,
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                                continue;
+                            }
+                            request_picker_reveal_load(
+                                pane_id,
+                                path,
+                                action,
+                                dir,
+                                session,
+                                &shared_ids,
+                                &event_tx,
+                                &mut loader_owner,
+                            );
+                            continue;
+                        }
                         let engine = Arc::clone(&session.engine);
                         let root = session.root.clone();
                         if handle_picker_select(
@@ -1829,6 +1878,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                         }
                         let showed_dialog = owner.shows_dialog();
                         let loads_directory = owner.loads_directory();
+                        let picker_reveal = matches!(owner.kind, LoaderKind::PickerReveal { .. });
                         let load_target = match &owner.kind {
                             LoaderKind::Root { .. } => root.clone(),
                             LoaderKind::Directory { dir, .. } => dir.to_fs_path(&root),
@@ -1836,6 +1886,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 .first()
                                 .map(|dir| dir.to_fs_path(&root))
                                 .unwrap_or_else(|| root.clone()),
+                            LoaderKind::PickerReveal { dir, .. } => dir.to_fs_path(&root),
                         };
                         let pane_stale = panes.get(&pane_id).is_none_or(|session| {
                             loader_completion_is_stale(
@@ -1872,6 +1923,34 @@ pub(super) fn run() -> anyhow::Result<()> {
                                                 &mut catalogs,
                                             )
                                         }
+                                        LoaderKind::PickerReveal {
+                                            target, action, ..
+                                        } => {
+                                            let next = match finish_picker_reveal_load(
+                                                pane_id,
+                                                &target,
+                                                action,
+                                                baseline,
+                                                session,
+                                                &gui_event_tx,
+                                            ) {
+                                                Ok(next) => next,
+                                                Err(_) => return,
+                                            };
+                                            if let Some(dir) = next {
+                                                request_picker_reveal_load(
+                                                    pane_id,
+                                                    target,
+                                                    action,
+                                                    dir,
+                                                    session,
+                                                    &shared_ids,
+                                                    &event_tx,
+                                                    &mut loader_owner,
+                                                );
+                                            }
+                                            Ok(())
+                                        }
                                         kind => finish_directory_load(
                                             pane_id,
                                             kind,
@@ -1898,23 +1977,40 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     }
                                 }
                                 LoaderResult::Failed(error) => {
-                                    let kind = if loads_directory {
-                                        MessageKind::Warn
-                                    } else {
-                                        MessageKind::Error
-                                    };
-                                    if send_gui_message(
-                                        &gui_event_tx,
-                                        pane_id,
-                                        kind,
-                                        format!(
-                                            "Failed to load {}: {error:#}",
+                                    if picker_reveal {
+                                        if send_gui_message(
+                                            &gui_event_tx,
+                                            pane_id,
+                                            MessageKind::Warn,
+                                            "Search candidate was not found. It may have changed externally.",
+                                        )
+                                        .is_err()
+                                        {
+                                            return;
+                                        }
+                                        eprintln!(
+                                            "Failed to load picker reveal directory {}: {error:#}",
                                             load_target.display()
-                                        ),
-                                    )
-                                    .is_err()
-                                    {
-                                        return;
+                                        );
+                                    } else {
+                                        let kind = if loads_directory {
+                                            MessageKind::Warn
+                                        } else {
+                                            MessageKind::Error
+                                        };
+                                        if send_gui_message(
+                                            &gui_event_tx,
+                                            pane_id,
+                                            kind,
+                                            format!(
+                                                "Failed to load {}: {error:#}",
+                                                load_target.display()
+                                            ),
+                                        )
+                                        .is_err()
+                                        {
+                                            return;
+                                        }
                                     }
                                 }
                             }
@@ -1926,6 +2022,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                             }
                         }
                         if loads_directory
+                            && loader_owner.is_none()
                             && let Some(session) = panes.get_mut(&pane_id)
                             && !session.deferred_changes.is_empty()
                             && apply_owner.is_none()
@@ -3065,6 +3162,66 @@ fn request_directory_load(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn request_picker_reveal_load(
+    pane_id: PaneId,
+    target: TreePath,
+    action: fyler_gui::app::PickerAction,
+    dir: TreePath,
+    session: &PaneSession,
+    shared_ids: &Arc<Mutex<IdAllocator>>,
+    app_event_tx: &CountingSender<AppEvent>,
+    loader_owner: &mut Option<LoaderOwner>,
+) {
+    debug_assert!(loader_owner.is_none());
+    let root = session.root.clone();
+    let previous = session.save_controller.baseline().clone();
+    let options = session.save_controller.scan_options();
+    let cancel = Arc::new(AtomicBool::new(false));
+    *loader_owner = Some(LoaderOwner {
+        pane_id,
+        root: root.clone(),
+        kind: LoaderKind::PickerReveal {
+            target,
+            action,
+            dir: dir.clone(),
+        },
+        cancel: Arc::clone(&cancel),
+    });
+    let worker_ids = Arc::clone(shared_ids);
+    let worker_event_tx = app_event_tx.clone();
+    let worker_root = root.clone();
+    let spawn_result = thread::Builder::new()
+        .name("fyler-loader".to_owned())
+        .spawn(move || {
+            let result = worker_ids
+                .lock()
+                .map_err(|_| anyhow::anyhow!("ID allocator lock is poisoned"))
+                .and_then(|mut ids| {
+                    fyler_fsops::scan::load_directory(
+                        &worker_root,
+                        &dir,
+                        &mut ids,
+                        &previous,
+                        &options,
+                    )
+                    .map(Some)
+                });
+            let _ = worker_event_tx.send(AppEvent::LoaderFinished {
+                pane_id,
+                root: worker_root,
+                result,
+            });
+        });
+    if let Err(error) = spawn_result {
+        let _ = app_event_tx.send(AppEvent::LoaderFinished {
+            pane_id,
+            root,
+            result: Err(anyhow::anyhow!("Failed to start loader worker: {error}")),
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn request_recursive_load(
     pane_id: PaneId,
     dirs: Vec<TreePath>,
@@ -3336,6 +3493,9 @@ fn finish_directory_load(
                 }
             }
         }
+        LoaderKind::PickerReveal { .. } => {
+            unreachable!("picker reveal load has a separate completion path")
+        }
         LoaderKind::Root { .. } => unreachable!("root load has a separate completion path"),
     };
     if let Err(error) = session
@@ -3352,6 +3512,62 @@ fn finish_directory_load(
     send_view_state(gui_event_tx, pane_id, &mut session.save_controller)
 }
 
+fn finish_picker_reveal_load(
+    pane_id: PaneId,
+    target: &TreePath,
+    action: PickerAction,
+    baseline: BaselineTree,
+    session: &mut PaneSession,
+    gui_event_tx: &CountingSender<GuiEvent>,
+) -> Result<Option<TreePath>, mpsc::SendError<GuiEvent>> {
+    if let Err(error) = session
+        .save_controller
+        .replace_baseline_after_load(baseline)
+    {
+        send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Warn,
+            format!("Loaded search result was stale: {error:#}"),
+        )?;
+        return Ok(None);
+    }
+
+    if session
+        .save_controller
+        .baseline()
+        .get_by_path(target)
+        .is_some()
+    {
+        let engine = Arc::clone(&session.engine);
+        let root = session.root.clone();
+        handle_picker_select(
+            pane_id,
+            target.clone(),
+            action,
+            &mut session.save_controller,
+            engine.as_ref(),
+            &root,
+            gui_event_tx,
+        )?;
+        return Ok(None);
+    }
+
+    if let Some(dir) =
+        super::next_picker_reveal_directory(session.save_controller.baseline(), target)
+    {
+        return Ok(Some(dir));
+    }
+
+    send_gui_message(
+        gui_event_tx,
+        pane_id,
+        MessageKind::Warn,
+        "Search candidate was not found. It may have changed externally.",
+    )?;
+    Ok(None)
+}
+
 fn loader_completion_is_stale(
     pane_missing: bool,
     crashed: bool,
@@ -3360,6 +3576,21 @@ fn loader_completion_is_stale(
     idle: bool,
 ) -> bool {
     pane_missing || crashed || root_changed || dirty || !idle
+}
+
+fn picker_reveal_start_rejection(
+    dirty: bool,
+    busy: bool,
+    crashed: bool,
+    idle: bool,
+) -> Option<&'static str> {
+    if dirty {
+        Some("Cannot reveal a folded search candidate while editing. Save or discard changes.")
+    } else if busy || crashed || !idle {
+        Some("Another operation is in progress")
+    } else {
+        None
+    }
 }
 
 fn should_defer_external_change(applying: bool, transferring: bool, loading: bool) -> bool {
@@ -3511,6 +3742,22 @@ mod tests {
         assert!(!loader_completion_is_stale(
             false, false, false, false, true
         ));
+    }
+
+    #[test]
+    fn picker_reveal_start_rejects_dirty_and_busy_loader_owner() {
+        assert_eq!(
+            picker_reveal_start_rejection(true, false, false, true),
+            Some("Cannot reveal a folded search candidate while editing. Save or discard changes.")
+        );
+        assert_eq!(
+            picker_reveal_start_rejection(false, true, false, true),
+            Some("Another operation is in progress")
+        );
+        assert_eq!(
+            picker_reveal_start_rejection(false, false, false, true),
+            None
+        );
     }
 
     #[test]

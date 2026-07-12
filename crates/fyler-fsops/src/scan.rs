@@ -949,16 +949,16 @@ struct DirectoryReadFailure {
     error: io::Error,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 type FaultHook = Box<dyn FnMut(&str, &Path) -> Option<io::Error>>;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static FAULT_INJECTION: std::cell::RefCell<Option<FaultHook>> =
         std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn fault_point(stage: &str, path: &Path) -> io::Result<()> {
     FAULT_INJECTION.with(|hook| {
         let mut hook = hook.borrow_mut();
@@ -970,9 +970,28 @@ fn fault_point(stage: &str, path: &Path) -> io::Result<()> {
     })
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn fault_point(_stage: &str, _path: &Path) -> io::Result<()> {
     Ok(())
+}
+
+/// scanの失敗点を差し替えるテスト専用フック。
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn with_test_fault<R>(
+    hook: impl FnMut(&str, &Path) -> Option<io::Error> + 'static,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FAULT_INJECTION.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+
+    FAULT_INJECTION.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    let _reset = Reset;
+    run()
 }
 
 fn classify_io_error(error: &io::Error) -> ScanErrorKind {
@@ -3119,5 +3138,68 @@ mod tests {
         );
         assert!(rescanned.is_unloaded(&TreePath::parse("loaded/lazy")));
         assert!(rescanned.is_unloaded(&TreePath::parse(".new-hidden")));
+    }
+
+    #[test]
+    #[ignore = "環境依存性能計測"]
+    fn bench_lazy_loaded_range_on_deep_50k_tree() {
+        let root = tempdir().unwrap();
+        let expanded = root.path().join("expanded");
+        fs::create_dir(&expanded).unwrap();
+        for index in 0..100 {
+            fs::write(expanded.join(format!("file-{index:03}.txt")), b"x").unwrap();
+        }
+        for branch in 0..50 {
+            let branch = root.path().join(format!("branch-{branch:02}"));
+            for nested in 0..10 {
+                let nested = branch.join(format!("nested-{nested:02}"));
+                fs::create_dir_all(&nested).unwrap();
+                for file in 0..100 {
+                    fs::write(nested.join(format!("file-{file:03}.txt")), b"x").unwrap();
+                }
+            }
+        }
+
+        let options = ScanOptions::default();
+        let shallow_started = Instant::now();
+        let mut lazy_ids = IdAllocator::new();
+        let shallow = scan_baseline_shallow_with(root.path(), &mut lazy_ids, &options).unwrap();
+        let shallow_elapsed = shallow_started.elapsed();
+
+        let full_started = Instant::now();
+        let full = scan_baseline_with(root.path(), &mut IdAllocator::new(), &options).unwrap();
+        let full_elapsed = full_started.elapsed();
+
+        let load_started = Instant::now();
+        let loaded = load_directory(
+            root.path(),
+            &TreePath::parse("expanded"),
+            &mut lazy_ids,
+            &shallow,
+            &options,
+        )
+        .unwrap();
+        let load_elapsed = load_started.elapsed();
+
+        let watch_started = Instant::now();
+        let unchanged = rescan_changed_preserving_ids_with(
+            root.path(),
+            &mut lazy_ids,
+            &loaded,
+            &BTreeSet::from([root.path().join("branch-00/nested-00/file-000.txt")]),
+            &options,
+        )
+        .unwrap();
+        let watch_elapsed = watch_started.elapsed();
+
+        let expected_loaded = shallow.entries().len() + 100;
+        assert_eq!(loaded.entries().len(), expected_loaded);
+        assert_eq!(unchanged, loaded);
+        assert!(full.entries().len() >= 50_000);
+        eprintln!(
+            "lazy loaded-range bench: full_entries={}, loaded_entries={}, shallow={shallow_elapsed:?}, full={full_elapsed:?}, load_100={load_elapsed:?}, unloaded_watch={watch_elapsed:?}",
+            full.entries().len(),
+            loaded.entries().len(),
+        );
     }
 }

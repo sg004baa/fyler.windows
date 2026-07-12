@@ -815,18 +815,8 @@ fn handle_picker_select_with(
     gui_event_tx: &CountingSender<GuiEvent>,
     open_path: &mut dyn FnMut(&Path) -> anyhow::Result<()>,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
-    let Some(entry) = save_controller.baseline().get_by_path(&path).cloned() else {
-        return send_gui_message(
-            gui_event_tx,
-            pane_id,
-            MessageKind::Warn,
-            "Search candidate was not found. It may have changed externally.",
-        );
-    };
-    let entry_id = entry.id;
-
     if action == PickerAction::Open {
-        let path = entry.path.to_fs_path(root);
+        let path = path.to_fs_path(root);
         if let Err(error) = open_path(&path) {
             send_gui_message(
                 gui_event_tx,
@@ -837,6 +827,16 @@ fn handle_picker_select_with(
         }
         return Ok(());
     }
+
+    let Some(entry) = save_controller.baseline().get_by_path(&path).cloned() else {
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Warn,
+            "Search candidate was not found. It may have changed externally.",
+        );
+    };
+    let entry_id = entry.id;
 
     let snapshot = engine.snapshot();
     if let Some(line) = visible_line_for_entry(save_controller, entry_id) {
@@ -911,6 +911,16 @@ fn handle_picker_select_with(
         }
     }
     Ok(())
+}
+
+fn next_picker_reveal_directory(
+    baseline: &fyler_core::tree::BaselineTree,
+    target: &TreePath,
+) -> Option<TreePath> {
+    let parent_depth = target.depth().saturating_sub(1);
+    (1..=parent_depth)
+        .map(|depth| TreePath::from_components(target.components()[..depth].iter().cloned()))
+        .find(|path| baseline.is_unloaded(path))
 }
 
 fn handle_picker_select(
@@ -1109,6 +1119,7 @@ mod tests {
 
     use fyler_core::editor::{EditorLine, EditorSnapshot};
     use fyler_core::tree::{BaselineEntry, BaselineTree};
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -1523,6 +1534,130 @@ mod tests {
     }
 
     #[test]
+    fn picker_jump_loads_two_unloaded_ancestors_then_reveals_target() {
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("first/second")).unwrap();
+        std::fs::write(root.path().join("first/second/target.txt"), b"target").unwrap();
+        let target = TreePath::parse("first/second/target.txt");
+        let mut ids = IdAllocator::new();
+        let shallow = fyler_fsops::scan::scan_baseline_shallow_with(
+            root.path(),
+            &mut ids,
+            &fyler_fsops::scan::ScanOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            next_picker_reveal_directory(&shallow, &target),
+            Some(TreePath::parse("first"))
+        );
+        let first = fyler_fsops::scan::load_directory(
+            root.path(),
+            &TreePath::parse("first"),
+            &mut ids,
+            &shallow,
+            &fyler_fsops::scan::ScanOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            next_picker_reveal_directory(&first, &target),
+            Some(TreePath::parse("first/second"))
+        );
+        let loaded = fyler_fsops::scan::load_directory(
+            root.path(),
+            &TreePath::parse("first/second"),
+            &mut ids,
+            &first,
+            &fyler_fsops::scan::ScanOptions::default(),
+        )
+        .unwrap();
+        assert!(loaded.get_by_path(&target).is_some());
+        assert_eq!(next_picker_reveal_directory(&loaded, &target), None);
+
+        let engine = Arc::new(PickerEngine::default());
+        let save_engine: Arc<dyn EditorEngine> = engine.clone();
+        let mut controller =
+            SaveController::new(root.path().to_path_buf(), ids, loaded, save_engine);
+        controller.collapse_all_dirs();
+        engine.set_snapshot(controller.visible_lines(), false);
+        let (gui_tx, _gui_rx) = counting_channel();
+        handle_picker_select_with(
+            PaneId::new(1),
+            target,
+            PickerAction::Jump,
+            &mut controller,
+            engine.as_ref(),
+            root.path(),
+            &gui_tx,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            engine.commands().as_slice(),
+            [EditorCommand::SetLines {
+                cursor_line: Some(2),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn picker_reveal_warns_when_target_disappears_during_chain_load() {
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("first/second")).unwrap();
+        let target_path = root.path().join("first/second/target.txt");
+        std::fs::write(&target_path, b"target").unwrap();
+        let target = TreePath::parse("first/second/target.txt");
+        let mut ids = IdAllocator::new();
+        let shallow = fyler_fsops::scan::scan_baseline_shallow_with(
+            root.path(),
+            &mut ids,
+            &fyler_fsops::scan::ScanOptions::default(),
+        )
+        .unwrap();
+        let first = fyler_fsops::scan::load_directory(
+            root.path(),
+            &TreePath::parse("first"),
+            &mut ids,
+            &shallow,
+            &fyler_fsops::scan::ScanOptions::default(),
+        )
+        .unwrap();
+        std::fs::remove_file(target_path).unwrap();
+        let loaded = fyler_fsops::scan::load_directory(
+            root.path(),
+            &TreePath::parse("first/second"),
+            &mut ids,
+            &first,
+            &fyler_fsops::scan::ScanOptions::default(),
+        )
+        .unwrap();
+        assert!(loaded.get_by_path(&target).is_none());
+        assert_eq!(next_picker_reveal_directory(&loaded, &target), None);
+        let engine = Arc::new(PickerEngine::default());
+        let save_engine: Arc<dyn EditorEngine> = engine.clone();
+        let mut controller =
+            SaveController::new(root.path().to_path_buf(), ids, loaded, save_engine);
+        engine.set_snapshot(controller.visible_lines(), false);
+        let (gui_tx, gui_rx) = counting_channel();
+
+        handle_picker_select_with(
+            PaneId::new(1),
+            target,
+            PickerAction::Jump,
+            &mut controller,
+            engine.as_ref(),
+            root.path(),
+            &gui_tx,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+
+        assert!(received_message(&gui_rx).text.contains("externally"));
+        assert!(engine.commands().is_empty());
+    }
+
+    #[test]
     fn picker_jump_to_visible_entry_sends_cursor_only() {
         let (mut controller, engine) = picker_controller(false, false);
         let (gui_tx, _gui_rx) = counting_channel();
@@ -1651,5 +1786,30 @@ mod tests {
                 PathBuf::from("root/dir"),
             ]
         );
+    }
+
+    #[test]
+    fn picker_open_uses_catalog_path_without_loading_baseline() {
+        let (mut controller, engine) = picker_controller(true, true);
+        let (gui_tx, _gui_rx) = counting_channel();
+        let mut opened = Vec::new();
+
+        handle_picker_select_with(
+            PaneId::new(1),
+            TreePath::parse("unloaded/deep.txt"),
+            PickerAction::Open,
+            &mut controller,
+            engine.as_ref(),
+            Path::new("root"),
+            &gui_tx,
+            &mut |path| {
+                opened.push(path.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(opened, [PathBuf::from("root/unloaded/deep.txt")]);
+        assert!(engine.commands().is_empty());
     }
 }

@@ -1783,7 +1783,9 @@ pub(crate) fn baseline_to_lines(baseline: &BaselineTree, context: &EditContext) 
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::fs;
+    use std::rc::Rc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
@@ -1861,6 +1863,58 @@ mod tests {
             options,
         );
         (controller, engine)
+    }
+
+    fn lazy_controller(root: &Path) -> (SaveController, Arc<RecordingEngine>) {
+        let mut ids = IdAllocator::new();
+        let shallow =
+            fyler_fsops::scan::scan_baseline_shallow_with(root, &mut ids, &ScanOptions::default())
+                .unwrap();
+        let baseline = fyler_fsops::scan::load_directory(
+            root,
+            &TreePath::parse("loaded"),
+            &mut ids,
+            &shallow,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        let engine = Arc::new(RecordingEngine::default());
+        let controller = SaveController::new(
+            root.to_path_buf(),
+            ids,
+            baseline,
+            Arc::<RecordingEngine>::clone(&engine),
+        );
+        (controller, engine)
+    }
+
+    fn lazy_fixture(root: &Path) {
+        fs::create_dir_all(root.join("loaded/blocked")).unwrap();
+        fs::write(root.join("loaded/kept.txt"), b"kept").unwrap();
+        for index in 0..12 {
+            fs::create_dir_all(root.join(format!("lazy-{index:02}/deep"))).unwrap();
+            fs::write(
+                root.join(format!("lazy-{index:02}/deep/file.txt")),
+                b"hidden from baseline",
+            )
+            .unwrap();
+        }
+    }
+
+    fn enumerate_dirs<R>(run: impl FnOnce() -> R) -> (R, Vec<PathBuf>) {
+        let enumerated = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::clone(&enumerated);
+        let result = fyler_fsops::scan::with_test_fault(
+            move |stage, path| {
+                if stage == "enumerate_dir" {
+                    observed.borrow_mut().push(path.to_path_buf());
+                }
+                None
+            },
+            run,
+        );
+        let paths = enumerated.borrow().clone();
+        (result, paths)
     }
 
     fn begin_rename_apply(
@@ -3804,6 +3858,39 @@ mod tests {
     }
 
     #[test]
+    fn loaded_incomplete_directory_still_drives_unreadable_modeline_and_marker() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("blocked")).unwrap();
+        fs::create_dir(root.path().join("lazy")).unwrap();
+        let mut ids = IdAllocator::new();
+        let mut baseline = fyler_fsops::scan::scan_baseline_shallow_with(
+            root.path(),
+            &mut ids,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        baseline.clear_unloaded(&TreePath::parse("blocked"));
+        baseline.mark_incomplete(
+            TreePath::parse("blocked"),
+            fyler_core::scanwarn::ScanErrorKind::PermissionDenied,
+        );
+        let blocked_id = baseline
+            .get_by_path(&TreePath::parse("blocked"))
+            .unwrap()
+            .id;
+        let controller = SaveController::new(
+            root.path().to_path_buf(),
+            ids,
+            baseline,
+            Arc::new(RecordingEngine::default()),
+        );
+
+        assert_eq!(controller.unreadable_count(), 1);
+        assert_eq!(controller.incomplete_dir_ids(), HashSet::from([blocked_id]));
+        assert!(controller.baseline().is_unloaded(&TreePath::parse("lazy")));
+    }
+
+    #[test]
     fn incomplete_directory_is_forced_closed_without_polluting_collapsed_context() {
         let (mut controller, _) = hierarchy_controller("C:/test-root");
         controller.baseline.mark_incomplete(
@@ -4438,5 +4525,189 @@ mod tests {
         );
 
         assert_eq!(controller.collapsed_dirs(), [EntryId(7)].into());
+    }
+
+    #[test]
+    fn watch_tick_inside_unloaded_subtree_enumerates_nothing_and_keeps_baseline() {
+        let root = tempdir().unwrap();
+        lazy_fixture(root.path());
+        let (mut controller, _) = lazy_controller(root.path());
+        let before = controller.baseline().clone();
+
+        let (result, enumerated) = enumerate_dirs(|| {
+            controller
+                .on_external_change(&BTreeSet::from([root.path().join("lazy-00/deep/file.txt")]))
+        });
+
+        assert_eq!(result, SaveFlowResult::NoChanges);
+        assert!(enumerated.is_empty());
+        assert_eq!(controller.baseline(), &before);
+    }
+
+    #[test]
+    fn sort_and_hidden_rescan_only_loaded_directories() {
+        let root = tempdir().unwrap();
+        lazy_fixture(root.path());
+        let (mut controller, _) = lazy_controller(root.path());
+        let expected = [root.path().to_path_buf(), root.path().join("loaded")];
+
+        let (_, sorted_dirs) = enumerate_dirs(|| {
+            controller.change_sort(SortKey::Size, true).unwrap();
+        });
+        let (_, hidden_dirs) = enumerate_dirs(|| {
+            controller.toggle_hidden().unwrap();
+        });
+
+        assert_eq!(sorted_dirs, expected);
+        assert_eq!(hidden_dirs, expected);
+        assert_eq!(controller.baseline().unloaded_dirs().len(), 13);
+    }
+
+    #[test]
+    fn apply_reconcile_only_enumerates_loaded_directories() {
+        let root = tempdir().unwrap();
+        lazy_fixture(root.path());
+        fs::write(root.path().join("a.txt"), b"a").unwrap();
+        let (mut controller, _) = lazy_controller(root.path());
+        let entry_id = controller
+            .baseline()
+            .get_by_path(&TreePath::parse("a.txt"))
+            .unwrap()
+            .id;
+        let edited = controller
+            .visible_lines()
+            .into_iter()
+            .map(|line| {
+                if matches!(
+                    fyler_core::grammar::split_id_prefix(&line.text),
+                    fyler_core::grammar::PrefixParse::WithId { id, .. } if id == entry_id
+                ) {
+                    EditorLine::new(format!(
+                        "{}b.txt",
+                        fyler_core::grammar::format_id_prefix(entry_id)
+                    ))
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            controller.on_commit(1, &edited),
+            SaveFlowResult::ShowPlan { .. }
+        ));
+        let SaveFlowResult::StartApply {
+            plan, overwrites, ..
+        } = controller.on_choice(ConfirmChoice::Approve)
+        else {
+            panic!("expected apply start")
+        };
+        let report =
+            fyler_fsops::apply::apply_plan_with_overwrites(root.path(), &plan, &overwrites);
+
+        let (result, enumerated) = enumerate_dirs(|| controller.on_apply_finished(report));
+
+        assert!(matches!(result, SaveFlowResult::ShowReport(_)));
+        assert_eq!(
+            enumerated,
+            [root.path().to_path_buf(), root.path().join("loaded")]
+        );
+        assert_eq!(controller.baseline().unloaded_dirs().len(), 13);
+    }
+
+    #[test]
+    fn transfer_reconcile_keeps_unloaded_destination_opaque() {
+        let root = tempdir().unwrap();
+        lazy_fixture(root.path());
+        let (mut controller, _) = lazy_controller(root.path());
+        fs::write(root.path().join("lazy-00/transferred.txt"), b"moved").unwrap();
+
+        let (result, enumerated) = enumerate_dirs(|| controller.reconcile_after_transfer());
+
+        result.unwrap();
+        assert_eq!(
+            enumerated,
+            [root.path().to_path_buf(), root.path().join("loaded")]
+        );
+        assert!(
+            controller
+                .baseline()
+                .is_unloaded(&TreePath::parse("lazy-00"))
+        );
+        assert!(
+            controller
+                .baseline()
+                .get_by_path(&TreePath::parse("lazy-00/transferred.txt"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn offline_retry_only_enumerates_loaded_directories() {
+        let root = tempdir().unwrap();
+        lazy_fixture(root.path());
+        let (mut controller, _) = lazy_controller(root.path());
+        controller.offline = Some("disconnected".to_owned());
+
+        let (result, enumerated) = enumerate_dirs(|| controller.retry_offline());
+
+        assert!(matches!(result, SaveFlowResult::Reconnected(_)));
+        assert_eq!(
+            enumerated,
+            [root.path().to_path_buf(), root.path().join("loaded")]
+        );
+        assert_eq!(controller.baseline().unloaded_dirs().len(), 13);
+    }
+
+    #[test]
+    fn incomplete_probe_only_enumerates_the_loaded_probe_directory() {
+        let root = tempdir().unwrap();
+        lazy_fixture(root.path());
+        let mut ids = IdAllocator::new();
+        let shallow = fyler_fsops::scan::scan_baseline_shallow_with(
+            root.path(),
+            &mut ids,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        let loaded = fyler_fsops::scan::load_directory(
+            root.path(),
+            &TreePath::parse("loaded"),
+            &mut ids,
+            &shallow,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        let mut baseline = fyler_fsops::scan::load_directory(
+            root.path(),
+            &TreePath::parse("loaded/blocked"),
+            &mut ids,
+            &loaded,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        baseline.mark_incomplete(
+            TreePath::parse("loaded/blocked"),
+            fyler_core::scanwarn::ScanErrorKind::PermissionDenied,
+        );
+        let engine = Arc::new(RecordingEngine::default());
+        let mut controller = SaveController::new(
+            root.path().to_path_buf(),
+            ids,
+            baseline,
+            Arc::<RecordingEngine>::clone(&engine),
+        );
+        let paths = controller.incomplete_probe_paths().unwrap();
+
+        let (result, enumerated) = enumerate_dirs(|| controller.on_external_change(&paths));
+
+        assert_eq!(result, SaveFlowResult::NoChanges);
+        assert_eq!(
+            enumerated,
+            [
+                root.path().join("loaded"),
+                root.path().join("loaded/blocked")
+            ]
+        );
+        assert_eq!(controller.baseline().unloaded_dirs().len(), 12);
     }
 }
