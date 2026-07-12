@@ -59,4 +59,10 @@ pub enum ValidateError {
     /// 検出はfyler-fsopsのpreflight走査(plan確定時)で行う。
     #[error("target is occupied by an existing directory and cannot be overwritten: {path}")]
     TargetOccupiedByDirectory { path: TreePath },
+
+    /// scanが不完全な範囲へ触れる操作。既知の子孫を消失扱いにしないため保存を中断する。
+    #[error(
+        "directory was not completely read: {path}; restore access or the connection and it will be rescanned automatically"
+    )]
+    IncompleteDirectory { path: TreePath },
 }

@@ -110,6 +110,17 @@ pub enum GuiEvent {
         pane_id: PaneId,
         badges: HashMap<EntryId, GitBadge>,
     },
+    /// 読み取り不能なディレクトリの行末装飾を全件差し替える。
+    IncompleteDirs {
+        pane_id: PaneId,
+        dirs: HashSet<EntryId>,
+    },
+    /// paneのroot到達性と部分scan状態をmodelineへ反映する。
+    PaneHealth {
+        pane_id: PaneId,
+        offline: bool,
+        unreadable: usize,
+    },
     /// 表示中のエントリIDに対応する表示用メタデータを全件差し替える。
     FileInfos {
         pane_id: PaneId,
@@ -275,6 +286,9 @@ struct PaneViewState {
     engine: Arc<dyn EditorEngine>,
     root: PathBuf,
     git_badges: HashMap<EntryId, GitBadge>,
+    incomplete_dirs: HashSet<EntryId>,
+    offline: bool,
+    unreadable: usize,
     file_infos: HashMap<EntryId, FileInfo>,
     collapsed_dirs: HashSet<EntryId>,
     engine_error: Option<String>,
@@ -349,6 +363,9 @@ impl FylerApp {
                             engine,
                             root,
                             git_badges: HashMap::new(),
+                            incomplete_dirs: HashSet::new(),
+                            offline: false,
+                            unreadable: 0,
                             file_infos: HashMap::new(),
                             collapsed_dirs: HashSet::new(),
                             engine_error: None,
@@ -444,6 +461,21 @@ impl FylerApp {
                 GuiEvent::GitBadges { pane_id, badges } => {
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
                         pane.git_badges = badges;
+                    }
+                }
+                GuiEvent::IncompleteDirs { pane_id, dirs } => {
+                    if let Some(pane) = self.panes.get_mut(&pane_id) {
+                        pane.incomplete_dirs = dirs;
+                    }
+                }
+                GuiEvent::PaneHealth {
+                    pane_id,
+                    offline,
+                    unreadable,
+                } => {
+                    if let Some(pane) = self.panes.get_mut(&pane_id) {
+                        pane.offline = offline;
+                        pane.unreadable = unreadable;
                     }
                 }
                 GuiEvent::FileInfos { pane_id, infos } => {
@@ -910,6 +942,7 @@ fn draw_layout_in_rect(
                             ui,
                             snapshot,
                             &pane.git_badges,
+                            &pane.incomplete_dirs,
                             &pane.collapsed_dirs,
                             icon_style,
                             cursor_changed,
@@ -920,7 +953,15 @@ fn draw_layout_in_rect(
                 })
                 .inner;
             ui.scope_builder(egui::UiBuilder::new().max_rect(modeline_rect), |ui| {
-                modeline::draw(ui, snapshot, &pane.root, &pane.file_infos);
+                modeline::draw(
+                    ui,
+                    snapshot,
+                    &pane.root,
+                    &pane.file_infos,
+                    pane.offline,
+                    pane.unreadable,
+                    pane.engine_error.is_some(),
+                );
             });
             pane.last_cursor_line = snapshot.cursor.line;
             let output = output?;
@@ -1552,6 +1593,9 @@ mod tests {
                         engine: recording_engine(),
                         root: PathBuf::from("first"),
                         git_badges: HashMap::new(),
+                        incomplete_dirs: HashSet::new(),
+                        offline: false,
+                        unreadable: 0,
                         file_infos: HashMap::new(),
                         collapsed_dirs: HashSet::new(),
                         engine_error: None,
@@ -1565,6 +1609,9 @@ mod tests {
                         engine: recording_engine(),
                         root: PathBuf::from("second"),
                         git_badges: HashMap::new(),
+                        incomplete_dirs: HashSet::new(),
+                        offline: false,
+                        unreadable: 0,
                         file_infos: HashMap::new(),
                         collapsed_dirs: HashSet::new(),
                         engine_error: None,
@@ -1606,6 +1653,17 @@ mod tests {
             badges: HashMap::from([(EntryId(9), GitBadge::Modified)]),
         })
         .unwrap();
+        tx.send(GuiEvent::IncompleteDirs {
+            pane_id: second,
+            dirs: HashSet::from([EntryId(10)]),
+        })
+        .unwrap();
+        tx.send(GuiEvent::PaneHealth {
+            pane_id: second,
+            offline: true,
+            unreadable: 2,
+        })
+        .unwrap();
 
         app.receive_events();
 
@@ -1616,6 +1674,10 @@ mod tests {
             app.panes[&second].git_badges.get(&EntryId(9)),
             Some(&GitBadge::Modified)
         );
+        assert!(app.panes[&second].incomplete_dirs.contains(&EntryId(10)));
+        assert!(app.panes[&second].offline);
+        assert_eq!(app.panes[&second].unreadable, 2);
+        assert!(!app.panes[&first].offline);
     }
 
     #[test]

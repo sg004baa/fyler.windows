@@ -124,6 +124,11 @@ pub fn build_plan(
             }),
     );
 
+    let incomplete_errors = incomplete_operation_errors(baseline, &operations);
+    if !incomplete_errors.is_empty() {
+        return Err(incomplete_errors);
+    }
+
     rewrite_targets_to_pre_move_paths(&mut operations, &moved_dirs);
 
     match order_operations(operations) {
@@ -136,11 +141,52 @@ pub fn build_plan(
 }
 
 fn is_hidden_by_collapsed_dir(path: &TreePath, baseline: &BaselineTree, ctx: &EditContext) -> bool {
-    ctx.collapsed_dirs.iter().any(|id| {
-        baseline.get(*id).is_some_and(|entry| {
-            entry.kind == EntryKind::Dir && entry.path.is_strict_ancestor_of(path)
+    baseline
+        .incomplete_dirs()
+        .keys()
+        .any(|dir| dir.is_strict_ancestor_of(path))
+        || ctx.collapsed_dirs.iter().any(|id| {
+            baseline.get(*id).is_some_and(|entry| {
+                entry.kind == EntryKind::Dir && entry.path.is_strict_ancestor_of(path)
+            })
         })
-    })
+}
+
+fn incomplete_operation_errors(
+    baseline: &BaselineTree,
+    operations: &[FsOperation],
+) -> Vec<ValidateError> {
+    let mut paths = Vec::new();
+    for operation in operations {
+        let source = match operation {
+            FsOperation::Move { from, .. } | FsOperation::Copy { from, .. } => Some(from),
+            FsOperation::Delete { path, .. } => Some(path),
+            FsOperation::Create { .. } => None,
+        };
+        if let Some(source) = source
+            && baseline.subtree_intersects_incomplete(source)
+            && !paths.contains(source)
+        {
+            paths.push(source.clone());
+        }
+
+        let destination = match operation {
+            FsOperation::Create { path, .. } => Some(path),
+            FsOperation::Move { to, .. } | FsOperation::Copy { to, .. } => Some(to),
+            FsOperation::Delete { .. } => None,
+        };
+        if let Some(parent) = destination.and_then(TreePath::parent)
+            && baseline.is_within_incomplete(&parent)
+            && !paths.contains(&parent)
+        {
+            paths.push(parent);
+        }
+    }
+
+    paths
+        .into_iter()
+        .map(|path| ValidateError::IncompleteDirectory { path })
+        .collect()
 }
 
 fn planned_directory_moves(

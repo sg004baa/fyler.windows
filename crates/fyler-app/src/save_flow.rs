@@ -77,9 +77,19 @@ pub enum SaveFlowResult {
         report: CommitReport,
         error: String,
     },
+    UndoReconcileFailed {
+        report: CommitReport<UndoStep>,
+        error: String,
+    },
     ExternalChanged,
     ExternalChangeNotified(String),
     ExternalChangeFailed(String),
+    /// rootレベルの再スキャン失敗により、最後の成功表示を保持してofflineへ遷移した。
+    WentOffline(String),
+    /// offline rootの再スキャンに成功し、表示を再同期した。
+    Reconnected(String),
+    /// offline中の変更操作を拒否した。
+    OfflineRejected(String),
     /// 確認ダイアログ表示中に外部変更を検知し、表示中のplanを破棄した。
     /// 配線層はダイアログを閉じ、メッセージを表示すること。
     PlanInvalidated(String),
@@ -187,8 +197,21 @@ impl PartialEq for SaveFlowResult {
                     error: right_error,
                 },
             ) => left_report == right_report && left_error == right_error,
+            (
+                Self::UndoReconcileFailed {
+                    report: left_report,
+                    error: left_error,
+                },
+                Self::UndoReconcileFailed {
+                    report: right_report,
+                    error: right_error,
+                },
+            ) => left_report == right_report && left_error == right_error,
             (Self::ExternalChangeNotified(left), Self::ExternalChangeNotified(right))
             | (Self::ExternalChangeFailed(left), Self::ExternalChangeFailed(right))
+            | (Self::WentOffline(left), Self::WentOffline(right))
+            | (Self::Reconnected(left), Self::Reconnected(right))
+            | (Self::OfflineRejected(left), Self::OfflineRejected(right))
             | (Self::PlanInvalidated(left), Self::PlanInvalidated(right)) => left == right,
             _ => false,
         }
@@ -206,6 +229,8 @@ pub enum ToggleCollapseResult {
     NotFound,
     /// 対象行はディレクトリではない。
     NotADirectory,
+    /// scan不完全なディレクトリはstale子孫を見せないため展開できない。
+    CannotExpandIncomplete,
     /// 保存状態機械が`Idle`ではないため、状態を変更しなかった。
     Busy,
 }
@@ -222,6 +247,8 @@ pub enum FoldResult {
     NoOp,
     /// 行を解決できない(ID無し行・baseline不在)。
     NotFound,
+    /// scan不完全なディレクトリを展開しようとした。
+    CannotExpandIncomplete,
     /// 保存状態機械がIdleでない。
     Busy,
 }
@@ -248,6 +275,8 @@ pub struct SaveController {
     scan_options: ScanOptions,
     pending_overwrites: HashSet<TreePath>,
     apply_cancel: Option<Arc<AtomicBool>>,
+    offline: Option<String>,
+    reported_incomplete: BTreeSet<TreePath>,
     engine: Arc<dyn EditorEngine>,
 }
 
@@ -278,6 +307,8 @@ impl SaveController {
             scan_options: ScanOptions::default(),
             pending_overwrites: HashSet::new(),
             apply_cancel: None,
+            offline: None,
+            reported_incomplete: BTreeSet::new(),
             engine,
         }
     }
@@ -318,6 +349,84 @@ impl SaveController {
     /// 副作用を起こす前に拒否すること。
     pub fn is_idle(&self) -> bool {
         matches!(self.state, SaveState::Idle)
+    }
+
+    /// rootの再スキャンが失敗し、最後の成功表示を保持しているかを返す。
+    pub fn is_offline(&self) -> bool {
+        self.offline.is_some()
+    }
+
+    /// GUI modelineへ渡す、読み取り不能なディレクトリ数。
+    pub fn unreadable_count(&self) -> usize {
+        self.baseline.incomplete_dirs().len()
+    }
+
+    /// 読み取り不能ディレクトリを現在baselineのEntryIdへ対応付ける。
+    pub fn incomplete_dir_ids(&self) -> HashSet<EntryId> {
+        self.baseline
+            .incomplete_dirs()
+            .keys()
+            .filter_map(|path| self.baseline.get_by_path(path).map(|entry| entry.id))
+            .collect()
+    }
+
+    /// 5秒tickerで再評価する不完全ディレクトリの実FSパスを返す。
+    ///
+    /// dirty中は回復してもbaselineを更新できず通知だけが反復するため休止する。
+    /// offlineまたは保存状態機械がbusyの場合も、既存の専用フローへ委ねる。
+    pub fn incomplete_probe_paths(&self) -> Option<BTreeSet<PathBuf>> {
+        if self.is_offline() || !self.is_idle() || self.engine.snapshot().dirty {
+            return None;
+        }
+        let paths = self
+            .baseline
+            .incomplete_dirs()
+            .keys()
+            .map(|path| path.to_fs_path(&self.root))
+            .collect::<BTreeSet<_>>();
+        (!paths.is_empty()).then_some(paths)
+    }
+
+    /// incomplete集合の変化時だけ、集約したユーザー向けメッセージを返す。
+    pub fn take_scan_health_message(
+        &mut self,
+    ) -> Option<(fyler_core::editor::MessageKind, String)> {
+        let current = self
+            .baseline
+            .incomplete_dirs()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if current == self.reported_incomplete {
+            return None;
+        }
+        let was_incomplete = !self.reported_incomplete.is_empty();
+        self.reported_incomplete = current.clone();
+        if current.is_empty() {
+            return was_incomplete.then(|| {
+                (
+                    fyler_core::editor::MessageKind::Info,
+                    "All locations are readable again".to_owned(),
+                )
+            });
+        }
+        let first = current
+            .iter()
+            .next()
+            .map(|path| path.to_fs_path(&self.root).display().to_string())
+            .unwrap_or_else(|| self.root.display().to_string());
+        let noun = if current.len() == 1 {
+            "location"
+        } else {
+            "locations"
+        };
+        Some((
+            fyler_core::editor::MessageKind::Warn,
+            format!(
+                "{} {noun} could not be fully read (first: {first}). They are shown collapsed; fix access and they will rescan automatically.",
+                current.len(),
+            ),
+        ))
     }
 
     /// applyまたはundo workerの実行中かを返す。
@@ -532,6 +641,13 @@ impl SaveController {
         else {
             return ToggleCollapseResult::NotFound;
         };
+        if self
+            .baseline
+            .get(id)
+            .is_some_and(|entry| self.baseline.is_within_incomplete(&entry.path))
+        {
+            return ToggleCollapseResult::CannotExpandIncomplete;
+        }
         if !self.context.collapsed_dirs.remove(&id) {
             self.context.collapsed_dirs.insert(id);
         }
@@ -553,6 +669,20 @@ impl SaveController {
         }
 
         let before = self.context.collapsed_dirs.clone();
+        let expansion_intersects_incomplete = match op {
+            FoldOp::Open | FoldOp::Toggle => {
+                entry.kind == EntryKind::Dir && self.baseline.is_within_incomplete(&entry.path)
+            }
+            FoldOp::OpenRecursive => {
+                entry.kind == EntryKind::Dir
+                    && self.baseline.subtree_intersects_incomplete(&entry.path)
+            }
+            FoldOp::OpenAll => !self.baseline.incomplete_dirs().is_empty(),
+            FoldOp::Close | FoldOp::CloseRecursive | FoldOp::CloseAll => false,
+        };
+        if expansion_intersects_incomplete {
+            return FoldResult::CannotExpandIncomplete;
+        }
         let cursor_id = match op {
             FoldOp::Close => {
                 let Some(target) = self.close_target_for_entry(&entry) else {
@@ -680,6 +810,9 @@ impl SaveController {
     /// 保存状態機械が`Idle`のときだけ実行し、同じパスのIDと新baselineにも実在する
     /// 折りたたみIDを維持する。戻り値はバッファへ設定すべき全行である。
     pub fn toggle_hidden(&mut self) -> anyhow::Result<Vec<EditorLine>> {
+        if self.is_offline() {
+            anyhow::bail!("Cannot change hidden-file visibility while the folder is offline");
+        }
         if !self.is_idle() {
             anyhow::bail!("Cannot change hidden-file visibility while saving");
         }
@@ -692,14 +825,21 @@ impl SaveController {
             .ids
             .lock()
             .map_err(|_| anyhow::anyhow!("ID allocator lock is poisoned"))?;
-        let baseline = fyler_fsops::scan::rescan_preserving_ids_with(
+        let baseline_result = fyler_fsops::scan::rescan_preserving_ids_with(
             &self.root,
             &mut ids,
             &self.baseline,
             &options,
         )
-        .context("Failed to rescan file system after toggling hidden files")?;
+        .context("Failed to rescan file system after toggling hidden files");
         drop(ids);
+        let baseline = match baseline_result {
+            Ok(baseline) => baseline,
+            Err(error) => {
+                let _ = self.enter_offline(error.to_string());
+                return Err(error);
+            }
+        };
         let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
         let lines = baseline_to_lines(&baseline, &context);
 
@@ -714,6 +854,9 @@ impl SaveController {
     /// 保存状態機械が`Idle`のときだけ実行し、IDと折りたたみ状態を維持する。
     /// 戻り値はバッファへ設定すべき全行である。
     pub fn change_sort(&mut self, key: SortKey, reverse: bool) -> anyhow::Result<Vec<EditorLine>> {
+        if self.is_offline() {
+            anyhow::bail!("Cannot change sorting while the folder is offline");
+        }
         if !self.is_idle() {
             anyhow::bail!("Cannot change sorting while saving");
         }
@@ -731,14 +874,21 @@ impl SaveController {
             .ids
             .lock()
             .map_err(|_| anyhow::anyhow!("ID allocator lock is poisoned"))?;
-        let baseline = fyler_fsops::scan::rescan_preserving_ids_with(
+        let baseline_result = fyler_fsops::scan::rescan_preserving_ids_with(
             &self.root,
             &mut ids,
             &self.baseline,
             &options,
         )
-        .context("Failed to rescan file system after changing sorting")?;
+        .context("Failed to rescan file system after changing sorting");
         drop(ids);
+        let baseline = match baseline_result {
+            Ok(baseline) => baseline,
+            Err(error) => {
+                let _ = self.enter_offline(error.to_string());
+                return Err(error);
+            }
+        };
         let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
         let lines = baseline_to_lines(&baseline, &context);
 
@@ -768,13 +918,25 @@ impl SaveController {
                 baseline.root.display()
             );
         }
+        let was_offline = self.is_offline();
         self.root = root;
         self.baseline = baseline;
         self.context = EditContext::default();
+        self.offline = None;
+        self.reported_incomplete.clear();
+        if was_offline && let Err(error) = self.engine.send(EditorCommand::SetModifiable(true)) {
+            eprintln!("Failed to restore buffer modifiable setting after root change: {error:#}");
+        }
         Ok(())
     }
 
     pub fn on_commit(&mut self, changedtick: u64, lines: &[EditorLine]) -> SaveFlowResult {
+        if self.is_offline() {
+            return SaveFlowResult::OfflineRejected(
+                "The folder is offline or unreachable. Reconnect and it will refresh automatically."
+                    .to_owned(),
+            );
+        }
         let effects = self.apply_event(SaveEvent::CommitRequested { changedtick });
         if !effects
             .iter()
@@ -839,6 +1001,11 @@ impl SaveController {
     /// `preflight_undo`で現在の実FSに対するundo可否を検査し、実行可能なstepが
     /// 1つも残っていない場合は状態機械へ入らず理由だけを返す。
     pub fn request_undo(&mut self, transaction: UndoTransaction) -> SaveFlowResult {
+        if self.is_offline() {
+            return SaveFlowResult::OfflineRejected(
+                "Cannot undo while the folder is offline or unreachable".to_owned(),
+            );
+        }
         if !matches!(self.state, SaveState::Idle) {
             return SaveFlowResult::Ignored;
         }
@@ -982,7 +1149,11 @@ impl SaveController {
             .any(|effect| matches!(effect, SaveEffect::ReconcileFromFs))
             && let Err(error) = self.reconcile_from_fs()
         {
-            eprintln!("Failed to reload after undo: {error:#}");
+            self.apply_cancel = None;
+            return SaveFlowResult::UndoReconcileFailed {
+                report,
+                error: error.to_string(),
+            };
         }
 
         self.apply_cancel = None;
@@ -998,19 +1169,19 @@ impl SaveController {
                 );
             }
         };
-        let baseline = match fyler_fsops::scan::rescan_changed_preserving_ids_with(
+        let baseline_result = fyler_fsops::scan::rescan_changed_preserving_ids_with(
             &self.root,
             &mut ids,
             &self.baseline,
             changed_paths,
             &self.scan_options,
         )
-        .context("Failed to rescan file system after external change")
-        {
-            Ok(baseline) => baseline,
-            Err(error) => return SaveFlowResult::ExternalChangeFailed(error.to_string()),
-        };
+        .context("Failed to rescan file system after external change");
         drop(ids);
+        let baseline = match baseline_result {
+            Ok(baseline) => baseline,
+            Err(error) => return self.enter_offline(error.to_string()),
+        };
 
         if baseline == self.baseline {
             // 構造とIDが同一なら表示中planの前提は変わらない。メタデータだけは
@@ -1065,6 +1236,51 @@ impl SaveController {
         self.baseline = baseline;
         self.context = context;
         SaveFlowResult::ExternalChanged
+    }
+
+    /// 5秒retry tickからoffline rootをフル再スキャンする。
+    pub fn retry_offline(&mut self) -> SaveFlowResult {
+        if !self.is_offline() {
+            return SaveFlowResult::Ignored;
+        }
+        let mut ids = match self.ids.lock() {
+            Ok(ids) => ids,
+            Err(_) => {
+                return SaveFlowResult::ExternalChangeFailed(
+                    "ID allocator lock is poisoned".to_owned(),
+                );
+            }
+        };
+        let baseline = match fyler_fsops::scan::rescan_preserving_ids_with(
+            &self.root,
+            &mut ids,
+            &self.baseline,
+            &self.scan_options,
+        ) {
+            Ok(baseline) => baseline,
+            Err(error) => {
+                self.offline = Some(error.to_string());
+                return SaveFlowResult::Ignored;
+            }
+        };
+        drop(ids);
+
+        let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
+        if !self.engine.snapshot().dirty
+            && let Err(error) = self.engine.send(EditorCommand::SetLines {
+                lines: baseline_to_lines(&baseline, &context),
+                cursor_line: None,
+            })
+        {
+            return SaveFlowResult::ExternalChangeFailed(error.to_string());
+        }
+        self.baseline = baseline;
+        self.context = context;
+        self.offline = None;
+        if let Err(error) = self.engine.send(EditorCommand::SetModifiable(true)) {
+            eprintln!("Failed to restore buffer modifiable setting after reconnect: {error:#}");
+        }
+        SaveFlowResult::Reconnected(format!("Reconnected: {}", self.root.display()))
     }
 
     #[cfg(test)]
@@ -1131,7 +1347,7 @@ impl SaveController {
     }
 
     fn reconcile_from_fs(&mut self) -> anyhow::Result<()> {
-        self.reconcile_from_fs_preserving_state()?;
+        let result = self.reconcile_from_fs_preserving_state();
         let effects = self.apply_event(SaveEvent::ReconcileFinished);
         debug_assert!(matches!(self.state, SaveState::Idle));
         debug_assert!(
@@ -1139,7 +1355,13 @@ impl SaveController {
                 .iter()
                 .any(|effect| matches!(effect, SaveEffect::SetModifiable(true)))
         );
-        Ok(())
+        if result.is_err()
+            && self.is_offline()
+            && let Err(error) = self.engine.send(EditorCommand::SetModifiable(false))
+        {
+            eprintln!("Failed to keep offline buffer read-only: {error:#}");
+        }
+        result
     }
 
     /// pane間transfer完了後に、保存状態機械を変更せず実FSから再同期する。
@@ -1153,14 +1375,21 @@ impl SaveController {
             .ids
             .lock()
             .map_err(|_| anyhow::anyhow!("ID allocator lock is poisoned"))?;
-        let baseline = fyler_fsops::scan::rescan_preserving_ids_with(
+        let baseline_result = fyler_fsops::scan::rescan_preserving_ids_with(
             &self.root,
             &mut ids,
             &self.baseline,
             &self.scan_options,
         )
-        .context("Failed to rescan file system")?;
+        .context("Failed to rescan file system");
         drop(ids);
+        let baseline = match baseline_result {
+            Ok(baseline) => baseline,
+            Err(error) => {
+                let _ = self.enter_offline(error.to_string());
+                return Err(error);
+            }
+        };
         let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
         let lines = baseline_to_lines(&baseline, &context);
         self.engine
@@ -1195,6 +1424,22 @@ impl SaveController {
             if let Err(error) = self.engine.send(EditorCommand::SetModifiable(value)) {
                 eprintln!("Failed to send buffer modifiable setting to the engine: {error:#}");
             }
+        }
+    }
+
+    fn enter_offline(&mut self, message: String) -> SaveFlowResult {
+        let transitioned = self.offline.is_none();
+        self.offline = Some(message.clone());
+        if transitioned
+            && self.is_idle()
+            && let Err(error) = self.engine.send(EditorCommand::SetModifiable(false))
+        {
+            eprintln!("Failed to make offline buffer read-only: {error:#}");
+        }
+        if transitioned {
+            SaveFlowResult::WentOffline(message)
+        } else {
+            SaveFlowResult::Ignored
         }
     }
 }
@@ -1421,7 +1666,10 @@ fn visible_entries<'a>(
             }
             skip_prefix = None;
         }
-        if entry.kind == EntryKind::Dir && context.collapsed_dirs.contains(&entry.id) {
+        if entry.kind == EntryKind::Dir
+            && (context.collapsed_dirs.contains(&entry.id)
+                || baseline.incomplete_dirs().contains_key(&entry.path))
+        {
             skip_prefix = Some(&entry.path);
         }
         visible.push(entry);
@@ -2697,6 +2945,229 @@ mod tests {
     }
 
     #[test]
+    fn missing_root_goes_offline_preserves_view_and_reconnects() {
+        let parent = tempdir().unwrap();
+        let root = parent.path().join("root");
+        let parked = parent.path().join("parked");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+        let (mut controller, engine) = scanned_controller(&root, ScanOptions::default());
+        let before_entries = controller.baseline.entries().to_vec();
+        let before_lines = controller.visible_lines();
+        fs::rename(&root, &parked).unwrap();
+
+        let result = controller.on_external_change(&BTreeSet::new());
+
+        assert!(matches!(result, SaveFlowResult::WentOffline(_)));
+        assert!(controller.is_offline());
+        assert_eq!(controller.baseline.entries(), before_entries);
+        assert_eq!(controller.visible_lines(), before_lines);
+        assert_eq!(modifiable_values(&engine), [false]);
+        assert!(matches!(
+            controller.on_commit(1, &before_lines),
+            SaveFlowResult::OfflineRejected(message) if message.contains("offline or unreachable")
+        ));
+
+        fs::rename(&parked, &root).unwrap();
+        assert!(matches!(
+            controller.retry_offline(),
+            SaveFlowResult::Reconnected(message) if message.contains(root.to_string_lossy().as_ref())
+        ));
+        assert!(!controller.is_offline());
+        let commands = engine.commands.lock().unwrap();
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, EditorCommand::SetLines { .. }))
+        );
+        assert!(matches!(
+            commands.last(),
+            Some(EditorCommand::SetModifiable(true))
+        ));
+    }
+
+    #[test]
+    fn dirty_reconnect_updates_baseline_without_replacing_buffer() {
+        let parent = tempdir().unwrap();
+        let root = parent.path().join("root");
+        let parked = parent.path().join("parked");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+        let (mut controller, engine) = scanned_controller(&root, ScanOptions::default());
+        fs::rename(&root, &parked).unwrap();
+        assert!(matches!(
+            controller.on_external_change(&BTreeSet::new()),
+            SaveFlowResult::WentOffline(_)
+        ));
+        engine.commands.lock().unwrap().clear();
+        engine.set_dirty(true);
+        fs::write(parked.join("b.txt"), b"b").unwrap();
+        fs::rename(&parked, &root).unwrap();
+
+        assert!(matches!(
+            controller.retry_offline(),
+            SaveFlowResult::Reconnected(_)
+        ));
+        assert!(
+            controller
+                .baseline
+                .entries()
+                .iter()
+                .any(|entry| entry.path == TreePath::parse("b.txt"))
+        );
+        assert!(
+            engine
+                .commands
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|command| !matches!(command, EditorCommand::SetLines { .. }))
+        );
+    }
+
+    #[test]
+    fn scan_health_message_is_aggregated_until_incomplete_set_changes() {
+        let (mut controller, _) = controller("C:/test-root");
+        controller.baseline.insert(BaselineEntry {
+            id: EntryId(2),
+            path: TreePath::parse("blocked"),
+            kind: EntryKind::Dir,
+        });
+        controller.baseline.mark_incomplete(
+            TreePath::parse("blocked"),
+            fyler_core::scanwarn::ScanErrorKind::PermissionDenied,
+        );
+
+        let first = controller.take_scan_health_message().unwrap();
+        assert_eq!(first.0, fyler_core::editor::MessageKind::Warn);
+        assert!(first.1.contains("1 location could not be fully read"));
+        assert!(controller.take_scan_health_message().is_none());
+
+        let mut recovered = BaselineTree::new(controller.root.clone());
+        recovered.insert(BaselineEntry {
+            id: EntryId(1),
+            path: TreePath::parse("a.txt"),
+            kind: EntryKind::File,
+        });
+        controller.baseline = recovered;
+        assert_eq!(
+            controller.take_scan_health_message(),
+            Some((
+                fyler_core::editor::MessageKind::Info,
+                "All locations are readable again".to_owned()
+            ))
+        );
+        assert!(controller.take_scan_health_message().is_none());
+    }
+
+    #[test]
+    fn incomplete_probe_pauses_while_dirty() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("blocked")).unwrap();
+        let mut ids = IdAllocator::new();
+        let mut baseline = fyler_fsops::scan::scan_baseline(root.path(), &mut ids).unwrap();
+        baseline.mark_incomplete(
+            TreePath::parse("blocked"),
+            fyler_core::scanwarn::ScanErrorKind::PermissionDenied,
+        );
+        let engine = Arc::new(RecordingEngine::default());
+        let controller = SaveController::new(
+            root.path().to_path_buf(),
+            ids,
+            baseline,
+            Arc::<RecordingEngine>::clone(&engine),
+        );
+
+        assert_eq!(
+            controller.incomplete_probe_paths(),
+            Some(BTreeSet::from([root.path().join("blocked")]))
+        );
+        engine.set_dirty(true);
+        assert!(controller.incomplete_probe_paths().is_none());
+    }
+
+    #[test]
+    fn incomplete_probe_reports_recovery_once() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("blocked")).unwrap();
+        fs::write(root.path().join("blocked/kept.txt"), b"kept").unwrap();
+        let mut ids = IdAllocator::new();
+        let mut baseline = fyler_fsops::scan::scan_baseline(root.path(), &mut ids).unwrap();
+        baseline.mark_incomplete(
+            TreePath::parse("blocked"),
+            fyler_core::scanwarn::ScanErrorKind::PermissionDenied,
+        );
+        let engine = Arc::new(RecordingEngine::default());
+        let mut controller = SaveController::new(
+            root.path().to_path_buf(),
+            ids,
+            baseline,
+            Arc::<RecordingEngine>::clone(&engine),
+        );
+        assert_eq!(
+            controller.take_scan_health_message().unwrap().0,
+            fyler_core::editor::MessageKind::Warn
+        );
+
+        let paths = controller.incomplete_probe_paths().unwrap();
+        assert_eq!(
+            controller.on_external_change(&paths),
+            SaveFlowResult::NoChanges
+        );
+        assert_eq!(
+            controller.take_scan_health_message(),
+            Some((
+                fyler_core::editor::MessageKind::Info,
+                "All locations are readable again".to_owned()
+            ))
+        );
+        assert!(controller.take_scan_health_message().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_probe_is_silent_while_directory_remains_incomplete() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path()
+                .join(std::ffi::OsString::from_vec(vec![b'x', 0xff])),
+            b"unrepresentable",
+        )
+        .unwrap();
+        let (mut controller, engine) = scanned_controller(root.path(), ScanOptions::default());
+        assert_eq!(
+            controller.take_scan_health_message().unwrap().0,
+            fyler_core::editor::MessageKind::Warn
+        );
+        engine.commands.lock().unwrap().clear();
+
+        let paths = controller.incomplete_probe_paths().unwrap();
+        assert_eq!(
+            controller.on_external_change(&paths),
+            SaveFlowResult::NoChanges
+        );
+        assert!(controller.take_scan_health_message().is_none());
+        assert!(engine.commands.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn changing_root_clears_offline_state_and_restores_editing() {
+        let (mut controller, engine) = controller("C:/old-root");
+        controller.offline = Some("unreachable".to_owned());
+        let new_root = PathBuf::from("C:/new-root");
+        let new_baseline = BaselineTree::new(new_root.clone());
+
+        controller
+            .change_root_preserving_allocator(new_root, new_baseline)
+            .unwrap();
+
+        assert!(!controller.is_offline());
+        assert_eq!(modifiable_values(&engine), [true]);
+    }
+
+    #[test]
     fn external_change_does_not_replace_dirty_buffer_or_baseline() {
         let temp_root = tempdir().unwrap();
         fs::write(temp_root.path().join("a.txt"), b"a").unwrap();
@@ -3015,6 +3486,52 @@ mod tests {
             result => panic!("unexpected expand result: {result:?}"),
         };
         assert_eq!(expanded_again, expanded);
+    }
+
+    #[test]
+    fn incomplete_directory_is_forced_closed_without_polluting_collapsed_context() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        controller.baseline.mark_incomplete(
+            TreePath::parse("a"),
+            fyler_core::scanwarn::ScanErrorKind::PermissionDenied,
+        );
+
+        let visible = controller.visible_lines();
+
+        assert_eq!(visible.len(), 2);
+        assert!(visible[0].text.ends_with("a/"));
+        assert!(visible[1].text.ends_with("top.txt"));
+        assert!(controller.context.collapsed_dirs.is_empty());
+        assert_eq!(
+            controller.toggle_collapse(&visible, 0),
+            ToggleCollapseResult::CannotExpandIncomplete
+        );
+        assert!(controller.context.collapsed_dirs.is_empty());
+    }
+
+    #[test]
+    fn fold_rejects_expanding_incomplete_directory() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        controller.baseline.mark_incomplete(
+            TreePath::parse("a/nested"),
+            fyler_core::scanwarn::ScanErrorKind::PermissionDenied,
+        );
+        controller.context.collapsed_dirs.insert(EntryId(2));
+        let lines = controller.visible_lines();
+
+        assert_eq!(
+            controller.fold(&lines, 1, FoldOp::Open),
+            FoldResult::CannotExpandIncomplete
+        );
+        assert_eq!(
+            controller.fold(&lines, 0, FoldOp::OpenRecursive),
+            FoldResult::CannotExpandIncomplete
+        );
+        assert_eq!(
+            controller.fold(&lines, 0, FoldOp::OpenAll),
+            FoldResult::CannotExpandIncomplete
+        );
+        assert!(controller.context.collapsed_dirs.contains(&EntryId(2)));
     }
 
     #[test]

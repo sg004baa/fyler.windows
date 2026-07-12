@@ -1,16 +1,22 @@
 //! baselineスキャン: 実FS → BaselineTree(ID採番)。
+//!
+//! root自体の検証・列挙失敗だけをfatalとし、子subtreeのアクセス失敗は
+//! [`BaselineTree`]のaccess sidecarへ記録して兄弟の走査を継続する。非Unicode名は
+//! lossy表示の警告だけを残し、編集可能なentryへ偽装しない。
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, Metadata};
+use std::io;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use fyler_core::fileinfo::EntryMeta;
 use fyler_core::id::IdAllocator;
 use fyler_core::options::{SortKey, SortOrder};
 use fyler_core::path::TreePath;
+use fyler_core::scanwarn::{ScanErrorKind, ScanStage, ScanWarning};
 use fyler_core::tree::{BaselineEntry, BaselineTree, EntryKind};
 
 #[cfg(windows)]
@@ -57,7 +63,7 @@ pub fn scan_baseline_with(
     ids: &mut IdAllocator,
     options: &ScanOptions,
 ) -> anyhow::Result<BaselineTree> {
-    scan_with_id_resolver(root, options, |_: &TreePath| ids.allocate())
+    scan_with_id_resolver(root, options, None, |_: &TreePath| ids.allocate())
 }
 
 /// 実FSを再スキャンし、同じパスに存在し続けるエントリのIDを維持する。
@@ -79,7 +85,7 @@ pub fn rescan_preserving_ids_with(
     previous: &BaselineTree,
     options: &ScanOptions,
 ) -> anyhow::Result<BaselineTree> {
-    scan_with_id_resolver(root, options, |path| {
+    scan_with_id_resolver(root, options, Some(previous), |path| {
         previous
             .get_by_path(path)
             .map(|entry| entry.id)
@@ -93,8 +99,11 @@ pub fn rescan_preserving_ids_with(
 /// 実FSを列挙する領域にだけ現れ、部分再構築でも全再スキャンと同じDFS順で到達する。
 /// したがって新規IDの採番順も[`rescan_preserving_ids_with`]と一致する。
 ///
-/// 変更パスをルート相対UTF-8パスへ変換できない場合や、部分再構築中の列挙が
-/// ファイルシステムとの競合で失敗した場合は、安全のため全再スキャンへ戻る。
+/// 変更パスをルート相対UTF-8パスへ変換できない場合や、部分再構築中に親子関係の
+/// raceを検出した場合は、安全のため全再スキャンへ戻る。子ディレクトリのアクセス
+/// 失敗は全再スキャンせず、その部分木を`previous`から引き継いで不完全と記録する。
+/// 非影響の不完全ディレクトリは再評価しないため、実FSで既に回復していてもmarkerを
+/// 引き継ぐ。定期probeまたはその範囲のwatchイベントで再評価され、最終的に収束する。
 pub fn rescan_changed_preserving_ids_with(
     root: &Path,
     ids: &mut IdAllocator,
@@ -184,9 +193,21 @@ fn refresh_metadata_if_structure_unchanged(
     affected: &HashSet<TreePath>,
     options: &ScanOptions,
 ) -> anyhow::Result<Option<BaselineTree>> {
+    // 不完全dir自身がprobe対象ならmarker解消を判定する必要があるため、sidecarを
+    // そのままcloneするfast pathではなく再構築へ送る。
+    if affected
+        .iter()
+        .any(|relative| previous.incomplete_dirs().contains_key(relative))
+    {
+        return Ok(None);
+    }
+
     let mut updates = Vec::new();
     for relative in affected {
-        let scanned = read_sorted_entries(&relative.to_fs_path(root), options)?;
+        let scanned = match read_sorted_entries(&relative.to_fs_path(root), options) {
+            Ok(read) if read.incomplete_kind.is_none() && read.warnings.is_empty() => read.entries,
+            Ok(_) | Err(_) => return Ok(None),
+        };
         let parent = if relative.is_root() {
             None
         } else {
@@ -235,7 +256,29 @@ fn rebuild_directory(
 
     if should_scan {
         let directory = relative.to_fs_path(root);
-        for entry in read_sorted_entries(&directory, options)? {
+        let read = match read_sorted_entries(&directory, options) {
+            Ok(read) => read,
+            Err(failure) if !relative.is_root() => {
+                preserve_previous_subtree_after_failure(previous, relative, tree);
+                let kind = classify_io_error(&failure.error);
+                tree.mark_incomplete(relative.clone(), kind.clone());
+                tree.push_warning(ScanWarning {
+                    path: failure.path,
+                    stage: failure.stage,
+                    kind,
+                });
+                return Ok(());
+            }
+            Err(failure) => {
+                return Err(anyhow!(failure.error).context(format!(
+                    "Failed while {}: {}",
+                    failure.stage,
+                    failure.path.display()
+                )));
+            }
+        };
+        apply_read_access_state(tree, relative, &read);
+        for entry in read.entries {
             let name = entry.file_name.to_str().with_context(|| {
                 format!(
                     "File name cannot be represented as UTF-8: {}",
@@ -269,6 +312,7 @@ fn rebuild_directory(
             }
         }
     } else {
+        preserve_previous_access_state(previous, relative, tree);
         let parent = previous.index_by_path(relative);
         for index in previous.child_indices(parent) {
             let entry = previous.entries()[index].clone();
@@ -293,12 +337,20 @@ fn rebuild_directory(
 fn scan_with_id_resolver(
     root: &Path,
     options: &ScanOptions,
+    previous: Option<&BaselineTree>,
     mut resolve_id: impl FnMut(&TreePath) -> fyler_core::id::EntryId,
 ) -> anyhow::Result<BaselineTree> {
     validate_root(root)?;
 
     let mut tree = BaselineTree::new(root);
-    scan_directory(root, &TreePath::root(), options, &mut resolve_id, &mut tree)?;
+    scan_directory(
+        root,
+        &TreePath::root(),
+        options,
+        previous,
+        &mut resolve_id,
+        &mut tree,
+    )?;
     Ok(tree)
 }
 
@@ -321,11 +373,20 @@ fn scan_directory(
     directory: &Path,
     relative: &TreePath,
     options: &ScanOptions,
+    previous: Option<&BaselineTree>,
     resolve_id: &mut impl FnMut(&TreePath) -> fyler_core::id::EntryId,
     tree: &mut BaselineTree,
 ) -> anyhow::Result<()> {
+    let root_read = read_sorted_entries(directory, options).map_err(|failure| {
+        anyhow!(failure.error).context(format!(
+            "Failed while {}: {}",
+            failure.stage,
+            failure.path.display()
+        ))
+    })?;
+    apply_read_access_state(tree, relative, &root_read);
     let mut stack = vec![ScanFrame {
-        entries: read_sorted_entries(directory, options)?.into_iter(),
+        entries: root_read.entries.into_iter(),
         relative: relative.clone(),
     }];
 
@@ -335,13 +396,7 @@ fn scan_directory(
             continue;
         };
 
-        let name = entry.file_name.to_str().with_context(|| {
-            format!(
-                "File name cannot be represented as UTF-8: {}",
-                entry.path.display()
-            )
-        })?;
-        let path = frame.relative.child(name);
+        let path = frame.relative.child(entry.name);
         let kind = entry.kind;
 
         tree.insert_with_meta(
@@ -354,10 +409,27 @@ fn scan_directory(
         );
 
         if kind == EntryKind::Dir {
-            stack.push(ScanFrame {
-                entries: read_sorted_entries(&entry.path, options)?.into_iter(),
-                relative: path,
-            });
+            match read_sorted_entries(&entry.path, options) {
+                Ok(read) => {
+                    apply_read_access_state(tree, &path, &read);
+                    stack.push(ScanFrame {
+                        entries: read.entries.into_iter(),
+                        relative: path,
+                    });
+                }
+                Err(failure) => {
+                    let kind = classify_io_error(&failure.error);
+                    if let Some(previous) = previous {
+                        preserve_previous_subtree(previous, &path, tree);
+                    }
+                    tree.mark_incomplete(path.clone(), kind.clone());
+                    tree.push_warning(ScanWarning {
+                        path: failure.path,
+                        stage: failure.stage,
+                        kind,
+                    });
+                }
+            }
         }
     }
 
@@ -373,36 +445,208 @@ struct ScanFrame {
 struct ScannedEntry {
     path: PathBuf,
     file_name: OsString,
+    name: String,
     sort_key: String,
     extension_key: String,
     kind: EntryKind,
     meta: EntryMeta,
 }
 
+struct ReadEntries {
+    entries: Vec<ScannedEntry>,
+    warnings: Vec<ScanWarning>,
+    incomplete_kind: Option<ScanErrorKind>,
+}
+
+struct DirectoryReadFailure {
+    path: PathBuf,
+    stage: ScanStage,
+    error: io::Error,
+}
+
+#[cfg(test)]
+type FaultHook = Box<dyn FnMut(&str, &Path) -> Option<io::Error>>;
+
+#[cfg(test)]
+thread_local! {
+    static FAULT_INJECTION: std::cell::RefCell<Option<FaultHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn fault_point(stage: &str, path: &Path) -> io::Result<()> {
+    FAULT_INJECTION.with(|hook| {
+        let mut hook = hook.borrow_mut();
+        if let Some(error) = hook.as_mut().and_then(|hook| hook(stage, path)) {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(not(test))]
+fn fault_point(_stage: &str, _path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn classify_io_error(error: &io::Error) -> ScanErrorKind {
+    match error.kind() {
+        io::ErrorKind::PermissionDenied => ScanErrorKind::PermissionDenied,
+        io::ErrorKind::NotFound => ScanErrorKind::NotFound,
+        io::ErrorKind::TimedOut => ScanErrorKind::TimedOut,
+        _ => ScanErrorKind::Other(error.to_string()),
+    }
+}
+
+fn apply_read_access_state(tree: &mut BaselineTree, relative: &TreePath, read: &ReadEntries) {
+    if let Some(kind) = &read.incomplete_kind {
+        tree.mark_incomplete(relative.clone(), kind.clone());
+    }
+    for warning in &read.warnings {
+        tree.push_warning(warning.clone());
+    }
+}
+
+fn preserve_previous_subtree(
+    previous: &BaselineTree,
+    directory: &TreePath,
+    tree: &mut BaselineTree,
+) {
+    for entry in previous
+        .entries()
+        .iter()
+        .filter(|entry| directory.is_strict_ancestor_of(&entry.path))
+    {
+        if let Some(meta) = previous.meta(entry.id).copied() {
+            tree.insert_with_meta(entry.clone(), meta);
+        } else {
+            tree.insert(entry.clone());
+        }
+    }
+
+    for (path, kind) in previous.incomplete_dirs() {
+        if path == directory || directory.is_strict_ancestor_of(path) {
+            tree.mark_incomplete(path.clone(), kind.clone());
+        }
+    }
+
+    let fs_directory = directory.to_fs_path(&previous.root);
+    for warning in previous.scan_warnings() {
+        if warning.path != fs_directory && warning.path.starts_with(&fs_directory) {
+            tree.push_warning(warning.clone());
+        }
+    }
+}
+
+fn preserve_previous_access_state(
+    previous: &BaselineTree,
+    directory: &TreePath,
+    tree: &mut BaselineTree,
+) {
+    if let Some(kind) = previous.incomplete_dirs().get(directory) {
+        tree.mark_incomplete(directory.clone(), kind.clone());
+    }
+
+    let fs_directory = directory.to_fs_path(&previous.root);
+    for warning in previous.scan_warnings() {
+        if warning.path == fs_directory || warning.path.parent() == Some(fs_directory.as_path()) {
+            tree.push_warning(warning.clone());
+        }
+    }
+}
+
+fn preserve_previous_subtree_after_failure(
+    previous: &BaselineTree,
+    directory: &TreePath,
+    tree: &mut BaselineTree,
+) {
+    for entry in previous
+        .entries()
+        .iter()
+        .filter(|entry| directory.is_strict_ancestor_of(&entry.path))
+    {
+        if let Some(meta) = previous.meta(entry.id).copied() {
+            tree.insert_with_meta(entry.clone(), meta);
+        } else {
+            tree.insert(entry.clone());
+        }
+    }
+
+    for (path, kind) in previous.incomplete_dirs() {
+        if directory.is_strict_ancestor_of(path) {
+            tree.mark_incomplete(path.clone(), kind.clone());
+        }
+    }
+
+    let fs_directory = directory.to_fs_path(&previous.root);
+    for warning in previous.scan_warnings() {
+        if warning.path != fs_directory && warning.path.starts_with(&fs_directory) {
+            tree.push_warning(warning.clone());
+        }
+    }
+}
+
 fn read_sorted_entries(
     directory: &Path,
     options: &ScanOptions,
-) -> anyhow::Result<Vec<ScannedEntry>> {
-    let read_dir = fs::read_dir(crate::long_path::to_fs(directory))
-        .with_context(|| format!("Failed to enumerate directory: {}", directory.display()))?;
+) -> Result<ReadEntries, DirectoryReadFailure> {
+    let read_dir = fault_point("enumerate_dir", directory)
+        .and_then(|()| fs::read_dir(crate::long_path::to_fs(directory)))
+        .map_err(|error| DirectoryReadFailure {
+            path: directory.to_path_buf(),
+            stage: ScanStage::EnumerateDir,
+            error,
+        })?;
     let mut entries = Vec::new();
+    let mut warnings = Vec::new();
+    let mut incomplete_kind = None;
     for entry in read_dir {
-        let entry = entry
-            .with_context(|| format!("Failed to get directory entry: {}", directory.display()))?;
-        let path = entry.path();
+        fault_point("dir_entry", directory).map_err(|error| DirectoryReadFailure {
+            path: directory.to_path_buf(),
+            stage: ScanStage::DirEntry,
+            error,
+        })?;
+        let entry = entry.map_err(|error| DirectoryReadFailure {
+            path: directory.to_path_buf(),
+            stage: ScanStage::DirEntry,
+            error,
+        })?;
         let file_name = entry.file_name();
-        let metadata = entry
-            .metadata()
-            .with_context(|| format!("Failed to get entry metadata: {}", path.display()))?;
+        // `DirEntry::path()`はWindowsで`\\?\`付きの親パス由来になる(read_dirへ
+        // long_path::to_fs適用済みのため)。警告・診断・降下パスへprefixを漏らさない
+        // よう、呼び出し側の論理パスから組み立てる(絶対ルール3)。
+        let path = directory.join(&file_name);
+        let metadata = match fault_point("metadata", &path).and_then(|()| entry.metadata()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // 列挙とmetadata取得の間に消えたraceは次回scanで自然に収束する。
+                continue;
+            }
+            Err(error) => {
+                let kind = classify_io_error(&error);
+                incomplete_kind.get_or_insert_with(|| kind.clone());
+                warnings.push(ScanWarning {
+                    path,
+                    stage: ScanStage::Metadata,
+                    kind,
+                });
+                continue;
+            }
+        };
         if !options.show_hidden && is_hidden(&file_name, &metadata) {
             continue;
         }
-        let name = file_name.to_str().with_context(|| {
-            format!(
-                "File name cannot be represented as UTF-8: {}",
-                path.display()
-            )
-        })?;
+        let Some(name) = file_name.to_str() else {
+            incomplete_kind.get_or_insert(ScanErrorKind::NonUnicodeName);
+            warnings.push(ScanWarning {
+                path: PathBuf::from(path.to_string_lossy().into_owned()),
+                stage: ScanStage::Name,
+                kind: ScanErrorKind::NonUnicodeName,
+            });
+            continue;
+        };
+        let name = name.to_owned();
         let sort_key = name.to_lowercase();
         let extension_key = extension_sort_key(&sort_key).to_owned();
         let kind = kind_from_metadata(&metadata);
@@ -410,6 +654,7 @@ fn read_sorted_entries(
         entries.push(ScannedEntry {
             path,
             file_name,
+            name,
             sort_key,
             extension_key,
             kind,
@@ -420,7 +665,11 @@ fn read_sorted_entries(
     // read_dirの順序は未規定なので、設定された自然順で表示とID採番を
     // セッションごとに安定させる。同値時は元のOsStringで順序を確定する。
     entries.sort_by(|left, right| compare_scanned(left, right, options));
-    Ok(entries)
+    Ok(ReadEntries {
+        entries,
+        warnings,
+        incomplete_kind,
+    })
 }
 
 fn compare_scanned(left: &ScannedEntry, right: &ScannedEntry, options: &ScanOptions) -> Ordering {
@@ -615,8 +864,10 @@ pub(crate) fn kind_from_metadata(metadata: &Metadata) -> EntryKind {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::BTreeSet;
     use std::fs;
+    use std::rc::Rc;
     use std::time::{Duration, Instant, SystemTime};
 
     use tempfile::tempdir;
@@ -624,6 +875,19 @@ mod tests {
     use fyler_core::search::build_candidates;
 
     use super::*;
+
+    fn with_fault<R>(hook: FaultHook, run: impl FnOnce() -> R) -> R {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FAULT_INJECTION.with(|hook| *hook.borrow_mut() = None);
+            }
+        }
+
+        FAULT_INJECTION.with(|slot| *slot.borrow_mut() = Some(hook));
+        let _reset = Reset;
+        run()
+    }
 
     fn allocator_after(previous: &BaselineTree) -> IdAllocator {
         let next = previous
@@ -651,6 +915,7 @@ mod tests {
         ScannedEntry {
             path: PathBuf::from(name),
             file_name: OsString::from(name),
+            name: name.to_owned(),
             sort_key,
             extension_key,
             kind,
@@ -1466,6 +1731,529 @@ mod tests {
         assert_eq!(
             natural_cmp_case_insensitive(OsStr::new("b.txt"), OsStr::new("A.txt")),
             Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn dir_entry_failure_discards_partial_children_and_keeps_siblings() {
+        let root = tempdir().unwrap();
+        let blocked = root.path().join("blocked");
+        fs::create_dir(&blocked).unwrap();
+        fs::write(blocked.join("a.txt"), b"a").unwrap();
+        fs::write(blocked.join("b.txt"), b"b").unwrap();
+        fs::create_dir(root.path().join("readable")).unwrap();
+        fs::write(root.path().join("readable/ok.txt"), b"ok").unwrap();
+        let blocked_for_hook = blocked.clone();
+        let mut seen = 0;
+
+        let baseline = with_fault(
+            Box::new(move |stage, path| {
+                if stage == "dir_entry" && path == blocked_for_hook {
+                    seen += 1;
+                    (seen == 2).then(|| io::Error::other("injected"))
+                } else {
+                    None
+                }
+            }),
+            || scan_baseline(root.path(), &mut IdAllocator::new()).unwrap(),
+        );
+
+        assert!(baseline.get_by_path(&TreePath::parse("blocked")).is_some());
+        assert!(
+            baseline
+                .get_by_path(&TreePath::parse("blocked/a.txt"))
+                .is_none()
+        );
+        assert!(
+            baseline
+                .get_by_path(&TreePath::parse("blocked/b.txt"))
+                .is_none()
+        );
+        assert!(
+            baseline
+                .get_by_path(&TreePath::parse("readable/ok.txt"))
+                .is_some()
+        );
+        assert_eq!(
+            baseline.incomplete_dirs().get(&TreePath::parse("blocked")),
+            Some(&ScanErrorKind::Other("injected".to_owned()))
+        );
+        assert_eq!(baseline.scan_warnings()[0].stage, ScanStage::DirEntry);
+    }
+
+    #[test]
+    fn root_enumeration_failure_remains_fatal() {
+        let root = tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+
+        let result = with_fault(
+            Box::new(move |stage, path| {
+                (stage == "enumerate_dir" && path == root_path).then(|| {
+                    io::Error::new(io::ErrorKind::PermissionDenied, "injected root failure")
+                })
+            }),
+            || scan_baseline(root.path(), &mut IdAllocator::new()),
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("Failed while enumerating directory"));
+    }
+
+    #[test]
+    fn io_errors_are_classified_without_exposing_io_types_to_core() {
+        assert_eq!(
+            classify_io_error(&io::Error::from(io::ErrorKind::PermissionDenied)),
+            ScanErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            classify_io_error(&io::Error::from(io::ErrorKind::NotFound)),
+            ScanErrorKind::NotFound
+        );
+        assert_eq!(
+            classify_io_error(&io::Error::from(io::ErrorKind::TimedOut)),
+            ScanErrorKind::TimedOut
+        );
+        assert!(matches!(
+            classify_io_error(&io::Error::other("other")),
+            ScanErrorKind::Other(message) if message == "other"
+        ));
+    }
+
+    #[test]
+    fn metadata_failures_mark_parent_but_not_found_races_are_silent() {
+        let root = tempdir().unwrap();
+        let failed = root.path().join("failed.txt");
+        let raced = root.path().join("raced.txt");
+        fs::write(&failed, b"failed").unwrap();
+        fs::write(&raced, b"raced").unwrap();
+        fs::write(root.path().join("kept.txt"), b"kept").unwrap();
+        let failed_for_hook = failed.clone();
+        let raced_for_hook = raced.clone();
+
+        let baseline = with_fault(
+            Box::new(move |stage, path| {
+                if stage != "metadata" {
+                    return None;
+                }
+                if path == failed_for_hook {
+                    Some(io::Error::new(io::ErrorKind::PermissionDenied, "injected"))
+                } else if path == raced_for_hook {
+                    Some(io::Error::new(io::ErrorKind::NotFound, "injected race"))
+                } else {
+                    None
+                }
+            }),
+            || scan_baseline(root.path(), &mut IdAllocator::new()).unwrap(),
+        );
+
+        assert!(
+            baseline
+                .get_by_path(&TreePath::parse("failed.txt"))
+                .is_none()
+        );
+        assert!(
+            baseline
+                .get_by_path(&TreePath::parse("raced.txt"))
+                .is_none()
+        );
+        assert!(baseline.get_by_path(&TreePath::parse("kept.txt")).is_some());
+        assert_eq!(
+            baseline.incomplete_dirs().get(&TreePath::root()),
+            Some(&ScanErrorKind::PermissionDenied)
+        );
+        assert_eq!(baseline.scan_warnings().len(), 1);
+        assert_eq!(baseline.scan_warnings()[0].path, failed);
+        assert_eq!(baseline.scan_warnings()[0].stage, ScanStage::Metadata);
+    }
+
+    #[test]
+    fn rescan_preserves_unreadable_known_subtree_and_recovers_ids_and_metadata() {
+        let root = tempdir().unwrap();
+        let directory = root.path().join("directory");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("child.txt"), b"child").unwrap();
+        let mut ids = IdAllocator::new();
+        let previous = scan_baseline(root.path(), &mut ids).unwrap();
+        let child = previous
+            .get_by_path(&TreePath::parse("directory/child.txt"))
+            .unwrap();
+        let child_id = child.id;
+        let child_meta = previous.meta(child_id).copied();
+        let directory_for_hook = directory.clone();
+
+        let degraded = with_fault(
+            Box::new(move |stage, path| {
+                (stage == "enumerate_dir" && path == directory_for_hook).then(|| {
+                    io::Error::new(io::ErrorKind::PermissionDenied, "injected access denied")
+                })
+            }),
+            || rescan_preserving_ids(root.path(), &mut ids, &previous).unwrap(),
+        );
+
+        assert_eq!(degraded.entries(), previous.entries());
+        assert_eq!(degraded.meta(child_id).copied(), child_meta);
+        assert_eq!(
+            degraded
+                .incomplete_dirs()
+                .get(&TreePath::parse("directory")),
+            Some(&ScanErrorKind::PermissionDenied)
+        );
+
+        let recovered = rescan_preserving_ids(root.path(), &mut ids, &degraded).unwrap();
+        assert!(recovered.incomplete_dirs().is_empty());
+        assert!(recovered.scan_warnings().is_empty());
+        assert_eq!(
+            recovered
+                .get_by_path(&TreePath::parse("directory/child.txt"))
+                .unwrap()
+                .id,
+            child_id
+        );
+    }
+
+    #[test]
+    fn changed_rescan_carries_unreadable_affected_subtree_without_full_scan() {
+        let root = tempdir().unwrap();
+        let directory = root.path().join("directory");
+        let child = directory.join("child.txt");
+        fs::create_dir(&directory).unwrap();
+        fs::write(&child, b"child").unwrap();
+        let mut ids = IdAllocator::new();
+        let complete = scan_baseline(root.path(), &mut ids).unwrap();
+        let complete_child_id = complete
+            .get_by_path(&TreePath::parse("directory/child.txt"))
+            .unwrap()
+            .id;
+        let directory_for_hook = directory.clone();
+        let previous = with_fault(
+            Box::new(move |stage, path| {
+                (stage == "enumerate_dir" && path == directory_for_hook).then(|| {
+                    io::Error::new(io::ErrorKind::PermissionDenied, "injected access denied")
+                })
+            }),
+            || rescan_preserving_ids(root.path(), &mut ids, &complete).unwrap(),
+        );
+        assert!(
+            previous
+                .incomplete_dirs()
+                .contains_key(&TreePath::parse("directory"))
+        );
+        let directory_for_hook = directory.clone();
+        let enumerated = Rc::new(RefCell::new(Vec::new()));
+        let enumerated_for_hook = Rc::clone(&enumerated);
+        let changed = BTreeSet::from([child]);
+
+        let degraded = with_fault(
+            Box::new(move |stage, path| {
+                if stage != "enumerate_dir" {
+                    return None;
+                }
+                enumerated_for_hook.borrow_mut().push(path.to_path_buf());
+                (path == directory_for_hook).then(|| {
+                    io::Error::new(io::ErrorKind::PermissionDenied, "injected access denied")
+                })
+            }),
+            || {
+                rescan_changed_preserving_ids_with(
+                    root.path(),
+                    &mut ids,
+                    &previous,
+                    &changed,
+                    &ScanOptions::default(),
+                )
+                .unwrap()
+            },
+        );
+
+        assert_eq!(
+            enumerated.borrow().iter().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([directory])
+        );
+        assert_eq!(degraded.entries(), previous.entries());
+        assert_eq!(
+            degraded
+                .get_by_path(&TreePath::parse("directory/child.txt"))
+                .unwrap()
+                .id,
+            complete_child_id
+        );
+        assert!(
+            degraded
+                .incomplete_dirs()
+                .contains_key(&TreePath::parse("directory"))
+        );
+    }
+
+    #[test]
+    fn changed_rescan_repopulates_recovered_incomplete_directory_and_preserves_ids() {
+        let root = tempdir().unwrap();
+        let directory = root.path().join("directory");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("kept.txt"), b"kept").unwrap();
+        let mut ids = IdAllocator::new();
+        let complete = scan_baseline(root.path(), &mut ids).unwrap();
+        let kept_id = complete
+            .get_by_path(&TreePath::parse("directory/kept.txt"))
+            .unwrap()
+            .id;
+        let directory_for_hook = directory.clone();
+        let degraded = with_fault(
+            Box::new(move |stage, path| {
+                (stage == "enumerate_dir" && path == directory_for_hook).then(|| {
+                    io::Error::new(io::ErrorKind::PermissionDenied, "injected access denied")
+                })
+            }),
+            || rescan_preserving_ids(root.path(), &mut ids, &complete).unwrap(),
+        );
+        fs::write(directory.join("recovered.txt"), b"recovered").unwrap();
+
+        let recovered = rescan_changed_preserving_ids_with(
+            root.path(),
+            &mut ids,
+            &degraded,
+            &BTreeSet::from([directory.clone()]),
+            &ScanOptions::default(),
+        )
+        .unwrap();
+
+        assert!(recovered.incomplete_dirs().is_empty());
+        assert!(recovered.scan_warnings().is_empty());
+        assert_eq!(
+            recovered
+                .get_by_path(&TreePath::parse("directory/kept.txt"))
+                .unwrap()
+                .id,
+            kept_id
+        );
+        assert!(
+            recovered
+                .get_by_path(&TreePath::parse("directory/recovered.txt"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn changed_rescan_with_incomplete_sibling_only_enumerates_affected_directories() {
+        let root = tempdir().unwrap();
+        let blocked = root.path().join("blocked");
+        let unaffected = root.path().join("unaffected");
+        fs::create_dir(&blocked).unwrap();
+        fs::write(blocked.join("kept.txt"), b"kept").unwrap();
+        fs::create_dir(&unaffected).unwrap();
+        fs::write(unaffected.join("stable.txt"), b"stable").unwrap();
+        fs::write(root.path().join("changed.txt"), b"before").unwrap();
+        let blocked_for_hook = blocked.clone();
+        let mut ids = IdAllocator::new();
+        let previous = with_fault(
+            Box::new(move |stage, path| {
+                (stage == "enumerate_dir" && path == blocked_for_hook).then(|| {
+                    io::Error::new(io::ErrorKind::PermissionDenied, "injected access denied")
+                })
+            }),
+            || scan_baseline(root.path(), &mut ids).unwrap(),
+        );
+        assert!(
+            previous
+                .incomplete_dirs()
+                .contains_key(&TreePath::parse("blocked"))
+        );
+
+        fs::write(root.path().join("changed.txt"), b"after").unwrap();
+        let enumerated = Rc::new(RefCell::new(Vec::new()));
+        let enumerated_for_hook = Rc::clone(&enumerated);
+        let changed = BTreeSet::from([root.path().join("changed.txt")]);
+        let rescanned = with_fault(
+            Box::new(move |stage, path| {
+                if stage == "enumerate_dir" {
+                    enumerated_for_hook.borrow_mut().push(path.to_path_buf());
+                }
+                None
+            }),
+            || {
+                rescan_changed_preserving_ids_with(
+                    root.path(),
+                    &mut ids,
+                    &previous,
+                    &changed,
+                    &ScanOptions::default(),
+                )
+                .unwrap()
+            },
+        );
+
+        assert_eq!(&*enumerated.borrow(), &[root.path().to_path_buf()]);
+        assert!(
+            rescanned
+                .incomplete_dirs()
+                .contains_key(&TreePath::parse("blocked"))
+        );
+        assert_eq!(rescanned.scan_warnings(), previous.scan_warnings());
+    }
+
+    #[test]
+    fn partial_rescan_matches_full_scan_with_unaffected_incomplete_directory() {
+        let root = tempdir().unwrap();
+        let blocked = root.path().join("blocked");
+        fs::create_dir(&blocked).unwrap();
+        fs::write(blocked.join("kept.txt"), b"kept").unwrap();
+        fs::write(root.path().join("changed.txt"), b"before").unwrap();
+        let mut ids = IdAllocator::new();
+        let complete = scan_baseline(root.path(), &mut ids).unwrap();
+        let blocked_for_hook = blocked.clone();
+        let previous = with_fault(
+            Box::new(move |stage, path| {
+                (stage == "enumerate_dir" && path == blocked_for_hook).then(|| {
+                    io::Error::new(io::ErrorKind::PermissionDenied, "injected access denied")
+                })
+            }),
+            || rescan_preserving_ids(root.path(), &mut ids, &complete).unwrap(),
+        );
+        let changed = root.path().join("changed.txt");
+        fs::write(&changed, b"after").unwrap();
+        let changed_paths = BTreeSet::from([changed]);
+        let mut partial_ids = allocator_after(&previous);
+        let partial = rescan_changed_preserving_ids_with(
+            root.path(),
+            &mut partial_ids,
+            &previous,
+            &changed_paths,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        let blocked_for_hook = blocked.clone();
+        let mut full_ids = allocator_after(&previous);
+        let full = with_fault(
+            Box::new(move |stage, path| {
+                (stage == "enumerate_dir" && path == blocked_for_hook).then(|| {
+                    io::Error::new(io::ErrorKind::PermissionDenied, "injected access denied")
+                })
+            }),
+            || {
+                rescan_preserving_ids_with(
+                    root.path(),
+                    &mut full_ids,
+                    &previous,
+                    &ScanOptions::default(),
+                )
+                .unwrap()
+            },
+        );
+
+        assert_eq!(partial, full);
+        assert_eq!(partial.incomplete_dirs(), full.incomplete_dirs());
+        assert_eq!(partial.scan_warnings(), full.scan_warnings());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_name_is_skipped_and_marks_parent_incomplete() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join(OsString::from_vec(vec![b'x', 0xff])),
+            b"bad",
+        )
+        .unwrap();
+        fs::write(root.path().join("good.txt"), b"good").unwrap();
+
+        let baseline = scan_baseline(root.path(), &mut IdAllocator::new()).unwrap();
+
+        assert_eq!(baseline.entries().len(), 1);
+        assert_eq!(baseline.entries()[0].path, TreePath::parse("good.txt"));
+        assert_eq!(
+            baseline.incomplete_dirs().get(&TreePath::root()),
+            Some(&ScanErrorKind::NonUnicodeName)
+        );
+        assert_eq!(baseline.scan_warnings()[0].stage, ScanStage::Name);
+        assert_eq!(
+            baseline.scan_warnings()[0].kind,
+            ScanErrorKind::NonUnicodeName
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_sibling_does_not_hide_readable_subtree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePermissions(PathBuf, u32);
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(self.1));
+            }
+        }
+
+        let root = tempdir().unwrap();
+        let blocked = root.path().join("blocked");
+        fs::create_dir(&blocked).unwrap();
+        fs::write(blocked.join("hidden.txt"), b"hidden").unwrap();
+        fs::create_dir_all(root.path().join("readable/deep")).unwrap();
+        fs::write(root.path().join("readable/deep/ok.txt"), b"ok").unwrap();
+        let original_mode = fs::metadata(&blocked).unwrap().permissions().mode();
+        let _restore = RestorePermissions(blocked.clone(), original_mode);
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&blocked).is_ok() {
+            return;
+        }
+
+        let baseline = scan_baseline(root.path(), &mut IdAllocator::new()).unwrap();
+
+        assert!(
+            baseline
+                .get_by_path(&TreePath::parse("readable/deep/ok.txt"))
+                .is_some()
+        );
+        assert!(baseline.get_by_path(&TreePath::parse("blocked")).is_some());
+        assert!(
+            baseline
+                .get_by_path(&TreePath::parse("blocked/hidden.txt"))
+                .is_none()
+        );
+        assert_eq!(
+            baseline.incomplete_dirs().get(&TreePath::parse("blocked")),
+            Some(&ScanErrorKind::PermissionDenied)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deeply_unreadable_subtree_keeps_readable_ancestors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePermissions(PathBuf, u32);
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(self.1));
+            }
+        }
+
+        let root = tempdir().unwrap();
+        let blocked = root.path().join("top/middle/blocked");
+        fs::create_dir_all(&blocked).unwrap();
+        fs::write(blocked.join("hidden.txt"), b"hidden").unwrap();
+        fs::write(root.path().join("top/visible.txt"), b"visible").unwrap();
+        let original_mode = fs::metadata(&blocked).unwrap().permissions().mode();
+        let _restore = RestorePermissions(blocked.clone(), original_mode);
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&blocked).is_ok() {
+            return;
+        }
+
+        let baseline = scan_baseline(root.path(), &mut IdAllocator::new()).unwrap();
+
+        for path in ["top", "top/middle", "top/middle/blocked", "top/visible.txt"] {
+            assert!(baseline.get_by_path(&TreePath::parse(path)).is_some());
+        }
+        assert!(
+            baseline
+                .get_by_path(&TreePath::parse("top/middle/blocked/hidden.txt"))
+                .is_none()
+        );
+        assert!(
+            baseline
+                .incomplete_dirs()
+                .contains_key(&TreePath::parse("top/middle/blocked"))
         );
     }
 }

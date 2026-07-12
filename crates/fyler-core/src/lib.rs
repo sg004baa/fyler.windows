@@ -19,6 +19,7 @@ pub mod id;
 pub mod keymap;
 pub mod options;
 pub mod pane;
+pub mod scanwarn;
 pub mod search;
 pub mod undo;
 

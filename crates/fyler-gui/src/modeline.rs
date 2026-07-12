@@ -18,6 +18,9 @@ pub fn draw(
     snapshot: &EditorSnapshot,
     root: &Path,
     file_infos: &HashMap<EntryId, FileInfo>,
+    offline: bool,
+    unreadable: usize,
+    crashed: bool,
 ) {
     let mode = match &snapshot.mode {
         Mode::Normal => "NORMAL",
@@ -51,6 +54,14 @@ pub fn draw(
     ui.horizontal(|ui| {
         ui.monospace(format!("{mode}{dirty}"));
         ui.monospace(root.display().to_string());
+        if let Some((is_error, label)) = health_label(offline, unreadable, crashed) {
+            let color = if is_error {
+                ui.visuals().error_fg_color
+            } else {
+                egui::Color32::from_rgb(230, 190, 60)
+            };
+            ui.colored_label(color, label);
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.monospace(format!("{line}:{column}"));
             if let Some(file_info) = &file_info {
@@ -58,6 +69,18 @@ pub fn draw(
             }
         });
     });
+}
+
+fn health_label(offline: bool, unreadable: usize, crashed: bool) -> Option<(bool, String)> {
+    if crashed {
+        None
+    } else if offline {
+        Some((true, "[offline]".to_owned()))
+    } else if unreadable > 0 {
+        Some((false, format!("[! {unreadable} unreadable]")))
+    } else {
+        None
+    }
 }
 
 fn cursor_file_info(
@@ -80,4 +103,23 @@ fn cursor_file_info(
         parts.push("[cloud]".to_owned());
     }
     (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::health_label;
+
+    #[test]
+    fn pane_health_prefers_crash_then_offline_then_unreadable() {
+        assert_eq!(health_label(true, 3, true), None);
+        assert_eq!(
+            health_label(true, 3, false),
+            Some((true, "[offline]".to_owned()))
+        );
+        assert_eq!(
+            health_label(false, 3, false),
+            Some((false, "[! 3 unreadable]".to_owned()))
+        );
+        assert_eq!(health_label(false, 0, false), None);
+    }
 }

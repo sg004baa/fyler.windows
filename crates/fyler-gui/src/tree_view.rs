@@ -49,6 +49,7 @@ pub fn draw(
     ui: &mut egui::Ui,
     snapshot: &EditorSnapshot,
     git_badges: &HashMap<EntryId, GitBadge>,
+    incomplete_dirs: &HashSet<EntryId>,
     collapsed_dirs: &HashSet<EntryId>,
     icon_style: IconStyle,
     follow_cursor: bool,
@@ -120,10 +121,23 @@ pub fn draw(
                 text_color,
                 snapshot.search.as_ref(),
             );
+            let incomplete = incomplete_for_line(&line.text, incomplete_dirs);
+            let incomplete_galley = painter.layout_no_wrap(
+                if incomplete {
+                    " [unreadable]".to_owned()
+                } else {
+                    String::new()
+                },
+                font_id.clone(),
+                ui.visuals().error_fg_color,
+            );
             let icon_width = icon_galley.size().x;
             let badge_width = badge_galley.size().x;
+            let text_width = text_galley.size().x;
             let text_offset = indent_px + icon_width + badge_width;
-            let width = ui.available_width().max(text_offset + text_galley.size().x);
+            let width = ui
+                .available_width()
+                .max(text_offset + text_width + incomplete_galley.size().x);
             let (rect, _) =
                 ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::hover());
 
@@ -155,6 +169,13 @@ pub fn draw(
                 text_galley,
                 text_color,
             );
+            if incomplete {
+                painter.galley(
+                    egui::pos2(rect.left() + text_offset + text_width, rect.top()),
+                    incomplete_galley,
+                    ui.visuals().error_fg_color,
+                );
+            }
 
             if snapshot.cursor.line == line_index {
                 cursor_rect = Some(draw_cursor(
@@ -380,6 +401,13 @@ fn badge_for_line(raw: &str, git_badges: &HashMap<EntryId, GitBadge>) -> Option<
     git_badges.get(&id).copied()
 }
 
+fn incomplete_for_line(raw: &str, incomplete_dirs: &HashSet<EntryId>) -> bool {
+    let PrefixParse::WithId { id, .. } = fyler_core::grammar::split_id_prefix(raw) else {
+        return false;
+    };
+    incomplete_dirs.contains(&id)
+}
+
 fn badge_character(badge: GitBadge) -> &'static str {
     match badge {
         GitBadge::Modified => "M",
@@ -542,6 +570,15 @@ mod tests {
         );
         assert_eq!(badge_for_line("new.txt", &badges), None);
         assert_eq!(badge_for_line("/0", &badges), None);
+    }
+
+    #[test]
+    fn incomplete_marker_is_resolved_only_from_valid_id_prefix() {
+        let incomplete = HashSet::from([EntryId(7)]);
+
+        assert!(incomplete_for_line("/007 blocked/", &incomplete));
+        assert!(!incomplete_for_line("/008 readable/", &incomplete));
+        assert!(!incomplete_for_line("new/", &incomplete));
     }
 
     #[test]
