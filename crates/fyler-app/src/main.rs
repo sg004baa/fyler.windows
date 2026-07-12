@@ -10,6 +10,7 @@ mod config;
 mod feedback;
 mod nvim_locate;
 mod pane_runtime;
+mod picker;
 mod queue_stats;
 pub mod save_flow;
 mod transfer_flow;
@@ -17,24 +18,28 @@ mod undo_format;
 mod undo_journal;
 
 use std::collections::{BTreeSet, HashMap};
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+#[cfg(test)]
+use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 
 use fyler_core::editor::{EditorCommand, EditorEngine, EditorEvent, EditorMessage, MessageKind};
 use fyler_core::feedback::FeedbackKind;
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
-use fyler_core::id::{EntryId, IdAllocator};
+use fyler_core::id::EntryId;
+#[cfg(test)]
+use fyler_core::id::IdAllocator;
 use fyler_core::options::{SortKey, TerminalKind};
 use fyler_core::pane::PaneId;
+use fyler_core::path::TreePath;
 use fyler_core::report::{ApplyProgress, CommitReport};
 use fyler_core::transfer::TransferOp;
 use fyler_core::tree::EntryKind;
 use fyler_core::undo::{UndoStep, UndoTransaction};
 use fyler_fsops::openwith::OpenWithHandler;
-use fyler_fsops::watch::{ExternalChange, FsWatcher, WatchEvent};
+use fyler_fsops::watch::ExternalChange;
 use fyler_gui::app::{GuiEvent, PickerAction};
 use fyler_gui::confirm::ConfirmChoice;
 
@@ -46,8 +51,17 @@ enum AppEvent {
     Confirm(ConfirmChoice),
     PickerSelect {
         pane_id: PaneId,
-        entry_id: fyler_core::id::EntryId,
+        path: TreePath,
         action: PickerAction,
+    },
+    PickerQuery {
+        pane_id: PaneId,
+        query: String,
+    },
+    PickerClosed(PaneId),
+    CatalogChanged {
+        root: PathBuf,
+        error: Option<String>,
     },
     FeedbackSubmit {
         kind: FeedbackKind,
@@ -63,6 +77,13 @@ enum AppEvent {
         root: PathBuf,
         statuses: HashMap<PathBuf, GitBadge>,
     },
+    LoaderProgress(PaneId, usize),
+    LoaderFinished {
+        pane_id: PaneId,
+        root: PathBuf,
+        result: anyhow::Result<Option<fyler_core::tree::BaselineTree>>,
+    },
+    LoaderCancel,
     ApplyProgress(PaneId, ApplyProgress),
     ApplyFinished(PaneId, CommitReport, Option<UndoTransaction>),
     UndoProgress(PaneId, ApplyProgress<UndoStep>),
@@ -215,118 +236,6 @@ fn handle_external_change(
         invalidated_dialog,
         undo_transaction,
     })
-}
-
-#[allow(clippy::too_many_arguments)] // ルート差し替えの全状態とカーソル復元対象を明示する。
-fn change_root_to(
-    pane_id: PaneId,
-    new_root: PathBuf,
-    cursor_target: Option<&OsStr>,
-    root: &mut PathBuf,
-    watcher: &mut FsWatcher,
-    watch_tx: &mpsc::Sender<WatchEvent>,
-    shared_ids: &Arc<std::sync::Mutex<IdAllocator>>,
-    save_controller: &mut SaveController,
-    engine: &dyn EditorEngine,
-    gui_event_tx: &CountingSender<GuiEvent>,
-) -> Result<bool, mpsc::SendError<GuiEvent>> {
-    let new_root = match normalize_root(&new_root) {
-        Ok(new_root) => new_root,
-        Err(error) => {
-            send_gui_message(
-                gui_event_tx,
-                pane_id,
-                MessageKind::Error,
-                format!("Failed to normalize root ({}): {error}", new_root.display()),
-            )?;
-            return Ok(false);
-        }
-    };
-
-    if engine.snapshot().dirty && !save_controller.is_offline() {
-        send_gui_message(
-            gui_event_tx,
-            pane_id,
-            MessageKind::Info,
-            "You are editing. Save or discard changes before changing directories.",
-        )?;
-        return Ok(false);
-    }
-    if !save_controller.is_idle() {
-        return Ok(false);
-    }
-
-    let scan_options = save_controller.scan_options();
-    let new_baseline = match shared_ids.lock() {
-        Ok(mut ids) => fyler_fsops::scan::scan_baseline_with(&new_root, &mut ids, &scan_options),
-        Err(_) => Err(anyhow::anyhow!("ID allocator lock is poisoned")),
-    };
-    let new_baseline = match new_baseline {
-        Ok(baseline) => baseline,
-        Err(error) => {
-            send_gui_message(
-                gui_event_tx,
-                pane_id,
-                MessageKind::Error,
-                format!("Failed to load root ({}): {error:#}", new_root.display()),
-            )?;
-            return Ok(false);
-        }
-    };
-
-    // 新しい監視の作成に失敗した場合、現在のroot/baseline/watcherを
-    // そのまま維持できるよう、状態差し替え前に準備だけ済ませる。
-    let new_watcher = match fyler_fsops::watch::watch(&new_root, watch_tx.clone()) {
-        Ok(watcher) => watcher,
-        Err(error) => {
-            send_gui_message(
-                gui_event_tx,
-                pane_id,
-                MessageKind::Error,
-                format!("Failed to watch root ({}): {error:#}", new_root.display()),
-            )?;
-            return Ok(false);
-        }
-    };
-
-    if let Err(error) =
-        save_controller.change_root_preserving_allocator(new_root.clone(), new_baseline)
-    {
-        send_gui_message(
-            gui_event_tx,
-            pane_id,
-            MessageKind::Error,
-            format!("Failed to change root: {error:#}"),
-        )?;
-        return Ok(false);
-    }
-    save_controller.collapse_all_dirs();
-    let cursor_line = cursor_target.and_then(|name| save_controller.find_top_level_line(name));
-    let new_lines = save_controller.visible_lines();
-
-    *root = new_root;
-    *watcher = new_watcher;
-    if let Err(error) = engine.send(EditorCommand::SetLines {
-        lines: new_lines,
-        cursor_line,
-    }) {
-        send_gui_message(
-            gui_event_tx,
-            pane_id,
-            MessageKind::Error,
-            format!("Failed to display new directory: {error:#}"),
-        )?;
-    }
-    // GUIへのpane tag付けは呼び出し元の`after_root_change`で行う。
-    if let Err(error) = config::record_recent_root(root) {
-        send_gui_message(
-            gui_event_tx,
-            pane_id,
-            MessageKind::Warn,
-            format!("Failed to record recent root: {error:#}"),
-        )?;
-    }
-    Ok(true)
 }
 
 fn after_root_change(
@@ -488,44 +397,48 @@ fn handle_activate_line(
     root: &Path,
     line: usize,
     gui_event_tx: &CountingSender<GuiEvent>,
-) -> Result<(), mpsc::SendError<GuiEvent>> {
+) -> Result<Option<TreePath>, mpsc::SendError<GuiEvent>> {
     let snapshot = engine.snapshot();
     let Some(editor_line) = snapshot.lines.get(line) else {
-        return send_gui_message(
+        send_gui_message(
             gui_event_tx,
             pane_id,
             MessageKind::Error,
             "Line to open was not found",
-        );
+        )?;
+        return Ok(None);
     };
 
     match fyler_core::grammar::split_id_prefix(&editor_line.text) {
         PrefixParse::NoId { .. } => {
-            return send_gui_message(
+            send_gui_message(
                 gui_event_tx,
                 pane_id,
                 MessageKind::Info,
                 "This line has not been saved",
-            );
+            )?;
+            return Ok(None);
         }
         PrefixParse::Broken => {
-            return send_gui_message(
+            send_gui_message(
                 gui_event_tx,
                 pane_id,
                 MessageKind::Error,
                 "Cannot open a line with a broken ID prefix",
-            );
+            )?;
+            return Ok(None);
         }
         PrefixParse::WithId { .. } => {}
     }
 
     let Some((path, kind)) = save_controller.resolve_line(&snapshot.lines, line) else {
-        return send_gui_message(
+        send_gui_message(
             gui_event_tx,
             pane_id,
             MessageKind::Error,
             "File for this line was not found in the current tree",
-        );
+        )?;
+        return Ok(None);
     };
 
     match kind {
@@ -542,12 +455,13 @@ fn handle_activate_line(
         }
         EntryKind::Dir => {
             if snapshot.dirty {
-                return send_gui_message(
+                send_gui_message(
                     gui_event_tx,
                     pane_id,
                     MessageKind::Info,
                     "Cannot change folds while editing. Save or discard changes.",
-                );
+                )?;
+                return Ok(None);
             }
 
             match save_controller.toggle_collapse(&snapshot.lines, line) {
@@ -583,6 +497,7 @@ fn handle_activate_line(
                         "Cannot expand: directory could not be read (access denied or unavailable)",
                     )?;
                 }
+                ToggleCollapseResult::NeedsLoad { dir } => return Ok(Some(dir)),
                 ToggleCollapseResult::NotFound => {
                     send_gui_message(
                         gui_event_tx,
@@ -595,7 +510,7 @@ fn handle_activate_line(
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn handle_open_with(
@@ -851,7 +766,7 @@ fn handle_open_file_picker(
     transfer_awaiting: bool,
     transfer_running: bool,
     gui_event_tx: &CountingSender<GuiEvent>,
-) -> Result<(), mpsc::SendError<GuiEvent>> {
+) -> Result<bool, mpsc::SendError<GuiEvent>> {
     if let Some(message) = open_file_picker_rejection(
         dialog_open,
         apply_running,
@@ -860,12 +775,11 @@ fn handle_open_file_picker(
         crashed,
         save_controller.is_idle(),
     ) {
-        return send_gui_message(gui_event_tx, pane_id, MessageKind::Info, message);
+        send_gui_message(gui_event_tx, pane_id, MessageKind::Info, message)?;
+        return Ok(false);
     }
-    gui_event_tx.send(GuiEvent::ShowFilePicker {
-        pane_id,
-        candidates: fyler_core::search::build_candidates(save_controller.baseline()),
-    })
+    gui_event_tx.send(GuiEvent::ShowFilePicker { pane_id })?;
+    Ok(true)
 }
 
 fn visible_line_for_entry(save_controller: &SaveController, entry_id: EntryId) -> Option<usize> {
@@ -893,7 +807,7 @@ fn snapshot_line_matches_entry(
 #[allow(clippy::too_many_arguments)]
 fn handle_picker_select_with(
     pane_id: PaneId,
-    entry_id: EntryId,
+    path: TreePath,
     action: PickerAction,
     save_controller: &mut SaveController,
     engine: &dyn EditorEngine,
@@ -901,17 +815,8 @@ fn handle_picker_select_with(
     gui_event_tx: &CountingSender<GuiEvent>,
     open_path: &mut dyn FnMut(&Path) -> anyhow::Result<()>,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
-    let Some(entry) = save_controller.baseline().get(entry_id).cloned() else {
-        return send_gui_message(
-            gui_event_tx,
-            pane_id,
-            MessageKind::Warn,
-            "Search candidate was not found. It may have changed externally.",
-        );
-    };
-
     if action == PickerAction::Open {
-        let path = entry.path.to_fs_path(root);
+        let path = path.to_fs_path(root);
         if let Err(error) = open_path(&path) {
             send_gui_message(
                 gui_event_tx,
@@ -922,6 +827,16 @@ fn handle_picker_select_with(
         }
         return Ok(());
     }
+
+    let Some(entry) = save_controller.baseline().get_by_path(&path).cloned() else {
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Warn,
+            "Search candidate was not found. It may have changed externally.",
+        );
+    };
+    let entry_id = entry.id;
 
     let snapshot = engine.snapshot();
     if let Some(line) = visible_line_for_entry(save_controller, entry_id) {
@@ -998,9 +913,19 @@ fn handle_picker_select_with(
     Ok(())
 }
 
+fn next_picker_reveal_directory(
+    baseline: &fyler_core::tree::BaselineTree,
+    target: &TreePath,
+) -> Option<TreePath> {
+    let parent_depth = target.depth().saturating_sub(1);
+    (1..=parent_depth)
+        .map(|depth| TreePath::from_components(target.components()[..depth].iter().cloned()))
+        .find(|path| baseline.is_unloaded(path))
+}
+
 fn handle_picker_select(
     pane_id: PaneId,
-    entry_id: EntryId,
+    path: TreePath,
     action: PickerAction,
     save_controller: &mut SaveController,
     engine: &dyn EditorEngine,
@@ -1009,7 +934,7 @@ fn handle_picker_select(
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     handle_picker_select_with(
         pane_id,
-        entry_id,
+        path,
         action,
         save_controller,
         engine,
@@ -1194,6 +1119,7 @@ mod tests {
 
     use fyler_core::editor::{EditorLine, EditorSnapshot};
     use fyler_core::tree::{BaselineEntry, BaselineTree};
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -1560,39 +1486,36 @@ mod tests {
         let (controller, _engine) = picker_controller(false, true);
         let (gui_tx, gui_rx) = counting_channel();
 
-        handle_open_file_picker(
-            PaneId::new(1),
-            &controller,
-            false,
-            false,
-            false,
-            false,
-            false,
-            &gui_tx,
-        )
-        .unwrap();
+        assert!(
+            handle_open_file_picker(
+                PaneId::new(1),
+                &controller,
+                false,
+                false,
+                false,
+                false,
+                false,
+                &gui_tx,
+            )
+            .unwrap()
+        );
 
-        let GuiEvent::ShowFilePicker {
-            pane_id,
-            candidates,
-        } = gui_rx.recv().unwrap()
-        else {
+        let GuiEvent::ShowFilePicker { pane_id } = gui_rx.recv().unwrap() else {
             panic!("expected picker event")
         };
         assert_eq!(pane_id, PaneId::new(1));
-        assert_eq!(candidates.len(), 4);
     }
 
     #[test]
-    fn stale_picker_selection_only_notifies() {
-        let (mut controller, engine) = picker_controller(false, false);
+    fn stale_picker_path_warns_without_reveal_or_cursor_move() {
+        let (mut controller, engine) = picker_controller(true, false);
         let (gui_tx, gui_rx) = counting_channel();
         let mut opened = Vec::new();
 
         handle_picker_select_with(
             PaneId::new(1),
-            EntryId(999),
-            PickerAction::Open,
+            TreePath::parse("missing.txt"),
+            PickerAction::Jump,
             &mut controller,
             engine.as_ref(),
             Path::new("root"),
@@ -1606,7 +1529,132 @@ mod tests {
 
         assert!(opened.is_empty());
         assert!(engine.commands().is_empty());
+        assert!(controller.collapsed_dirs().contains(&EntryId(1)));
         assert!(received_message(&gui_rx).text.contains("externally"));
+    }
+
+    #[test]
+    fn picker_jump_loads_two_unloaded_ancestors_then_reveals_target() {
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("first/second")).unwrap();
+        std::fs::write(root.path().join("first/second/target.txt"), b"target").unwrap();
+        let target = TreePath::parse("first/second/target.txt");
+        let mut ids = IdAllocator::new();
+        let shallow = fyler_fsops::scan::scan_baseline_shallow_with(
+            root.path(),
+            &mut ids,
+            &fyler_fsops::scan::ScanOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            next_picker_reveal_directory(&shallow, &target),
+            Some(TreePath::parse("first"))
+        );
+        let first = fyler_fsops::scan::load_directory(
+            root.path(),
+            &TreePath::parse("first"),
+            &mut ids,
+            &shallow,
+            &fyler_fsops::scan::ScanOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            next_picker_reveal_directory(&first, &target),
+            Some(TreePath::parse("first/second"))
+        );
+        let loaded = fyler_fsops::scan::load_directory(
+            root.path(),
+            &TreePath::parse("first/second"),
+            &mut ids,
+            &first,
+            &fyler_fsops::scan::ScanOptions::default(),
+        )
+        .unwrap();
+        assert!(loaded.get_by_path(&target).is_some());
+        assert_eq!(next_picker_reveal_directory(&loaded, &target), None);
+
+        let engine = Arc::new(PickerEngine::default());
+        let save_engine: Arc<dyn EditorEngine> = engine.clone();
+        let mut controller =
+            SaveController::new(root.path().to_path_buf(), ids, loaded, save_engine);
+        controller.collapse_all_dirs();
+        engine.set_snapshot(controller.visible_lines(), false);
+        let (gui_tx, _gui_rx) = counting_channel();
+        handle_picker_select_with(
+            PaneId::new(1),
+            target,
+            PickerAction::Jump,
+            &mut controller,
+            engine.as_ref(),
+            root.path(),
+            &gui_tx,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            engine.commands().as_slice(),
+            [EditorCommand::SetLines {
+                cursor_line: Some(2),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn picker_reveal_warns_when_target_disappears_during_chain_load() {
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("first/second")).unwrap();
+        let target_path = root.path().join("first/second/target.txt");
+        std::fs::write(&target_path, b"target").unwrap();
+        let target = TreePath::parse("first/second/target.txt");
+        let mut ids = IdAllocator::new();
+        let shallow = fyler_fsops::scan::scan_baseline_shallow_with(
+            root.path(),
+            &mut ids,
+            &fyler_fsops::scan::ScanOptions::default(),
+        )
+        .unwrap();
+        let first = fyler_fsops::scan::load_directory(
+            root.path(),
+            &TreePath::parse("first"),
+            &mut ids,
+            &shallow,
+            &fyler_fsops::scan::ScanOptions::default(),
+        )
+        .unwrap();
+        std::fs::remove_file(target_path).unwrap();
+        let loaded = fyler_fsops::scan::load_directory(
+            root.path(),
+            &TreePath::parse("first/second"),
+            &mut ids,
+            &first,
+            &fyler_fsops::scan::ScanOptions::default(),
+        )
+        .unwrap();
+        assert!(loaded.get_by_path(&target).is_none());
+        assert_eq!(next_picker_reveal_directory(&loaded, &target), None);
+        let engine = Arc::new(PickerEngine::default());
+        let save_engine: Arc<dyn EditorEngine> = engine.clone();
+        let mut controller =
+            SaveController::new(root.path().to_path_buf(), ids, loaded, save_engine);
+        engine.set_snapshot(controller.visible_lines(), false);
+        let (gui_tx, gui_rx) = counting_channel();
+
+        handle_picker_select_with(
+            PaneId::new(1),
+            target,
+            PickerAction::Jump,
+            &mut controller,
+            engine.as_ref(),
+            root.path(),
+            &gui_tx,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+
+        assert!(received_message(&gui_rx).text.contains("externally"));
+        assert!(engine.commands().is_empty());
     }
 
     #[test]
@@ -1616,7 +1664,7 @@ mod tests {
 
         handle_picker_select_with(
             PaneId::new(1),
-            EntryId(2),
+            TreePath::parse("dir/file.txt"),
             PickerAction::Jump,
             &mut controller,
             engine.as_ref(),
@@ -1636,7 +1684,7 @@ mod tests {
 
         handle_picker_select_with(
             PaneId::new(1),
-            EntryId(2),
+            TreePath::parse("dir/file.txt"),
             PickerAction::Jump,
             &mut controller,
             engine.as_ref(),
@@ -1668,7 +1716,7 @@ mod tests {
 
         handle_picker_select_with(
             PaneId::new(1),
-            EntryId(2),
+            TreePath::parse("dir/file.txt"),
             PickerAction::Jump,
             &mut controller,
             engine.as_ref(),
@@ -1693,7 +1741,7 @@ mod tests {
 
         handle_picker_select_with(
             PaneId::new(1),
-            EntryId(2),
+            TreePath::parse("dir/file.txt"),
             PickerAction::Jump,
             &mut controller,
             engine.as_ref(),
@@ -1713,10 +1761,10 @@ mod tests {
         let (gui_tx, _gui_rx) = counting_channel();
         let mut opened = Vec::new();
 
-        for id in [EntryId(2), EntryId(3), EntryId(1)] {
+        for path in ["dir/file.txt", "link", "dir"] {
             handle_picker_select_with(
                 PaneId::new(1),
-                id,
+                TreePath::parse(path),
                 PickerAction::Open,
                 &mut controller,
                 engine.as_ref(),
@@ -1738,5 +1786,30 @@ mod tests {
                 PathBuf::from("root/dir"),
             ]
         );
+    }
+
+    #[test]
+    fn picker_open_uses_catalog_path_without_loading_baseline() {
+        let (mut controller, engine) = picker_controller(true, true);
+        let (gui_tx, _gui_rx) = counting_channel();
+        let mut opened = Vec::new();
+
+        handle_picker_select_with(
+            PaneId::new(1),
+            TreePath::parse("unloaded/deep.txt"),
+            PickerAction::Open,
+            &mut controller,
+            engine.as_ref(),
+            Path::new("root"),
+            &gui_tx,
+            &mut |path| {
+                opened.push(path.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(opened, [PathBuf::from("root/unloaded/deep.txt")]);
+        assert!(engine.commands().is_empty());
     }
 }

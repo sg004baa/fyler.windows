@@ -592,4 +592,76 @@ mod tests {
             ));
         }
     }
+
+    #[test]
+    fn transfer_into_unloaded_directory_confirms_reports_and_stays_unloaded() {
+        let temp = tempdir().unwrap();
+        let source_root = temp.path().join("source");
+        let target_root = temp.path().join("target");
+        fs::create_dir(&source_root).unwrap();
+        fs::create_dir_all(target_root.join("lazy")).unwrap();
+        fs::write(source_root.join("a.txt"), b"content").unwrap();
+        let ids = Arc::new(Mutex::new(IdAllocator::new()));
+        let target_baseline = fyler_fsops::scan::scan_baseline_shallow_with(
+            &target_root,
+            &mut ids.lock().unwrap(),
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        assert!(target_baseline.is_unloaded(&TreePath::parse("lazy")));
+        let target_engine = Arc::new(RecordingEngine::default());
+        let mut target_controller = SaveController::new_shared(
+            target_root.clone(),
+            Arc::clone(&ids),
+            target_baseline,
+            target_engine,
+        );
+        let destination =
+            destination_directory(false, Some((TreePath::parse("lazy"), EntryKind::Dir))).unwrap();
+        let plan = build_plan(
+            TransferKind::Copy,
+            source_root,
+            target_root,
+            &destination,
+            vec![(TreePath::parse("a.txt"), EntryKind::File)],
+        );
+        let preflight = fyler_fsops::preflight_transfer(&plan);
+        assert!(preflight.blocked.is_empty());
+        assert!(preflight.overwritable.is_empty());
+        assert_eq!(plan.ops[0].to, TreePath::parse("lazy/a.txt"));
+        let mut flow = TransferController::new();
+        flow.begin(PaneId::new(1), PaneId::new(2), plan, Vec::new());
+        let TransferFlowResult::StartApply {
+            plan,
+            overwrites,
+            cancel,
+            ..
+        } = flow.on_choice(ConfirmChoice::Approve)
+        else {
+            panic!("approval should start transfer")
+        };
+        let report = fyler_fsops::apply::apply_transfer_plan_cancellable(
+            &plan,
+            &overwrites,
+            &cancel,
+            &mut |_| {},
+        );
+        assert!(report.all_succeeded());
+        let TransferFlowResult::Finished { report, .. } = flow.on_finished(report) else {
+            panic!("report should finish transfer")
+        };
+        assert_eq!(report.results.len(), 1);
+        target_controller.reconcile_after_transfer().unwrap();
+        assert!(
+            target_controller
+                .baseline()
+                .is_unloaded(&TreePath::parse("lazy"))
+        );
+        assert!(
+            target_controller
+                .baseline()
+                .get_by_path(&TreePath::parse("lazy/a.txt"))
+                .is_none()
+        );
+    }
 }

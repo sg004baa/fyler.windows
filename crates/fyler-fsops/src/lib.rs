@@ -10,6 +10,7 @@
 pub mod apply;
 pub mod backup;
 pub mod case;
+pub mod catalog;
 pub mod classify;
 pub mod dialog;
 pub mod drives;

@@ -18,7 +18,6 @@ use fyler_core::pane::{PaneId, PaneLayout, SplitDirection};
 use fyler_core::path::TreePath;
 use fyler_core::plan::OperationPlan;
 use fyler_core::report::{ApplyProgress, CommitReport};
-use fyler_core::search::{SearchCandidate, SearchHit};
 use fyler_core::transfer::{TransferOp, TransferPlan};
 use fyler_core::validate::ValidateError;
 
@@ -26,8 +25,6 @@ use crate::confirm::{ConfirmChoice, ConfirmDetail, IconStyle};
 use crate::{cmdline, confirm, input, modeline, tree_view};
 
 const CJK_FONT_NAME: &str = "fyler-cjk";
-const PICKER_RESULT_LIMIT: usize = 100;
-
 /// ファイルpickerで候補を確定したときの動作。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerAction {
@@ -37,14 +34,30 @@ pub enum PickerAction {
     Open,
 }
 
+/// app側検索workerが返す、GUI表示に必要な情報だけを持つpicker結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickerHit {
+    pub path: TreePath,
+    pub display: String,
+    pub kind: fyler_core::tree::EntryKind,
+}
+
 /// GUIからapp層へ返すユーザー操作。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuiAction {
     Confirm(ConfirmChoice),
+    LoaderCancel,
     PickerSelect {
         pane_id: PaneId,
-        entry_id: EntryId,
+        path: TreePath,
         action: PickerAction,
+    },
+    PickerQuery {
+        pane_id: PaneId,
+        query: String,
+    },
+    PickerClosed {
+        pane_id: PaneId,
     },
     FeedbackSubmit {
         kind: FeedbackKind,
@@ -132,10 +145,17 @@ pub enum GuiEvent {
         pane_id: PaneId,
         dirs: HashSet<EntryId>,
     },
-    /// 指定paneのbaselineから構築した候補でファイルpickerを開く。
+    /// 指定paneのファイルpickerを候補待ち状態で即座に開く。
     ShowFilePicker {
         pane_id: PaneId,
-        candidates: Vec<SearchCandidate>,
+    },
+    /// 検索workerが返した最新のpicker結果。
+    PickerResults {
+        pane_id: PaneId,
+        query: String,
+        results: Vec<PickerHit>,
+        indexed_count: usize,
+        indexing: bool,
     },
     /// 匿名フィードバック入力モーダルを開く。
     ShowFeedback,
@@ -167,6 +187,17 @@ pub enum GuiEvent {
         /// 承認済みplanに含まれる操作総数。
         total: usize,
     },
+    /// root scanまたは再帰directory loadの進捗ダイアログを表示する。
+    ShowLoaderProgress {
+        title: String,
+        path: PathBuf,
+    },
+    /// loaderが発見した累計entry数を表示へ反映する。
+    LoaderProgress {
+        entries: usize,
+    },
+    /// loaderのキャンセル要求を受理済みとして操作を無効化する。
+    LoaderCancelRequested,
     /// apply workerから届いた操作単位の進捗を表示へ反映する。
     ApplyProgress(ApplyProgress),
     /// undo workerから届いた操作単位の進捗を表示へ反映する。
@@ -217,6 +248,12 @@ enum DialogState {
         current: Option<String>,
         cancel_requested: bool,
     },
+    LoaderProgress {
+        title: String,
+        path: PathBuf,
+        entries: usize,
+        cancel_requested: bool,
+    },
     Report(CommitReport),
     UndoReport {
         lines: Vec<String>,
@@ -234,10 +271,11 @@ enum DialogState {
     },
     FilePicker {
         pane_id: PaneId,
-        candidates: Vec<SearchCandidate>,
         query: String,
         selected: usize,
-        hits: Vec<SearchHit>,
+        results: Vec<PickerHit>,
+        indexed_count: usize,
+        indexing: bool,
     },
     Feedback {
         kind: FeedbackKind,
@@ -488,19 +526,42 @@ impl FylerApp {
                         pane.collapsed_dirs = dirs;
                     }
                 }
-                GuiEvent::ShowFilePicker {
-                    pane_id,
-                    candidates,
-                } => {
-                    let hits = fyler_core::search::search(&candidates, "", PICKER_RESULT_LIMIT);
+                GuiEvent::ShowFilePicker { pane_id } => {
                     self.dialog = Some(DialogState::FilePicker {
                         pane_id,
-                        candidates,
                         query: String::new(),
                         selected: 0,
-                        hits,
+                        results: Vec::new(),
+                        indexed_count: 0,
+                        indexing: true,
                     });
                     self.picker_needs_focus = true;
+                    let _ = self
+                        .action_tx
+                        .send(picker_query_action(pane_id, String::new()));
+                }
+                GuiEvent::PickerResults {
+                    pane_id,
+                    query: _,
+                    results,
+                    indexed_count,
+                    indexing,
+                } => {
+                    if let Some(DialogState::FilePicker {
+                        pane_id: owner,
+                        selected,
+                        results: current,
+                        indexed_count: current_count,
+                        indexing: current_indexing,
+                        ..
+                    }) = &mut self.dialog
+                        && *owner == pane_id
+                    {
+                        *current = results;
+                        *current_count = indexed_count;
+                        *current_indexing = indexing;
+                        *selected = (*selected).min(current.len().saturating_sub(1));
+                    }
                 }
                 GuiEvent::ShowFeedback => {
                     self.dialog = Some(DialogState::Feedback {
@@ -561,6 +622,30 @@ impl FylerApp {
                         current: None,
                         cancel_requested: false,
                     });
+                }
+                GuiEvent::ShowLoaderProgress { title, path } => {
+                    self.dialog = Some(DialogState::LoaderProgress {
+                        title,
+                        path,
+                        entries: 0,
+                        cancel_requested: false,
+                    });
+                }
+                GuiEvent::LoaderProgress { entries } => {
+                    if let Some(DialogState::LoaderProgress {
+                        entries: current, ..
+                    }) = &mut self.dialog
+                    {
+                        *current = entries;
+                    }
+                }
+                GuiEvent::LoaderCancelRequested => {
+                    if let Some(DialogState::LoaderProgress {
+                        cancel_requested, ..
+                    }) = &mut self.dialog
+                    {
+                        *cancel_requested = true;
+                    }
                 }
                 GuiEvent::ApplyProgress(progress) => {
                     if let Some(DialogState::Progress {
@@ -716,10 +801,12 @@ impl eframe::App for FylerApp {
 
         let mut confirm_choice = None;
         let mut cancel_apply = false;
+        let mut cancel_loader = false;
         let mut dismiss_errors = false;
         let mut dismiss_report = false;
         let mut open_with_choice = None;
         let mut picker_result = None;
+        let mut picker_owner = None;
         let mut feedback_result = None;
         match &mut self.dialog {
             Some(DialogState::Plan {
@@ -766,6 +853,15 @@ impl eframe::App for FylerApp {
                     *cancel_requested,
                 );
             }
+            Some(DialogState::LoaderProgress {
+                title,
+                path,
+                entries,
+                cancel_requested,
+            }) => {
+                cancel_loader =
+                    confirm::draw_loader_progress(ui, title, path, *entries, *cancel_requested);
+            }
             Some(DialogState::Help) => {
                 dismiss_errors = draw_help(ui, &self.help_lines);
             }
@@ -797,20 +893,29 @@ impl eframe::App for FylerApp {
             }
             Some(DialogState::FilePicker {
                 pane_id,
-                candidates,
                 query,
                 selected,
-                hits,
+                results,
+                indexed_count,
+                indexing,
             }) => {
-                picker_result = draw_file_picker(
+                picker_owner = Some(*pane_id);
+                let (closed, query_action) = draw_file_picker(
                     ui,
                     *pane_id,
-                    candidates,
                     query,
                     selected,
-                    hits,
+                    results,
+                    *indexed_count,
+                    *indexing,
                     &mut self.picker_needs_focus,
                 );
+                picker_result = closed;
+                if let Some(action) = query_action
+                    && self.action_tx.send(action).is_err()
+                {
+                    self.fatal_error = Some("Failed to send picker query to app".to_owned());
+                }
             }
             Some(DialogState::Feedback { kind, body, stage }) => {
                 feedback_result =
@@ -844,11 +949,13 @@ impl eframe::App for FylerApp {
         {
             self.fatal_error = Some("Failed to send cancel request to app".to_owned());
         }
+        if cancel_loader && self.action_tx.send(GuiAction::LoaderCancel).is_err() {
+            self.fatal_error = Some("Failed to send loader cancel request to app".to_owned());
+        }
         if let Some(result) = picker_result {
             self.dialog = None;
-            if let Some(action) = result
-                && self.action_tx.send(action).is_err()
-            {
+            let action = picker_completion_action(picker_owner.unwrap_or(PaneId::new(0)), result);
+            if self.action_tx.send(action).is_err() {
                 self.fatal_error = Some("Failed to send picker result to app".to_owned());
             }
         }
@@ -1044,14 +1151,13 @@ fn read_picker_keys(context: &egui::Context) -> PickerKeys {
 fn apply_picker_keys(
     keys: PickerKeys,
     pane_id: PaneId,
-    candidates: &[SearchCandidate],
-    hits: &[SearchHit],
+    results: &[PickerHit],
     selected: &mut usize,
 ) -> Option<Option<GuiAction>> {
     if keys.escape {
         return Some(None);
     }
-    if hits.is_empty() {
+    if results.is_empty() {
         *selected = 0;
         return None;
     }
@@ -1059,9 +1165,9 @@ fn apply_picker_keys(
         *selected = selected.saturating_sub(1);
     }
     if keys.next {
-        *selected = (*selected + 1).min(hits.len() - 1);
+        *selected = (*selected + 1).min(results.len() - 1);
     }
-    *selected = (*selected).min(hits.len() - 1);
+    *selected = (*selected).min(results.len() - 1);
 
     let action = if keys.ctrl_enter {
         Some(PickerAction::Open)
@@ -1070,35 +1176,36 @@ fn apply_picker_keys(
     } else {
         None
     }?;
-    let candidate = candidates.get(hits[*selected].index)?;
+    let candidate = results.get(*selected)?;
     Some(Some(GuiAction::PickerSelect {
         pane_id,
-        entry_id: candidate.id,
+        path: candidate.path.clone(),
         action,
     }))
 }
 
-fn update_picker_hits(
-    candidates: &[SearchCandidate],
-    query: &str,
-    selected: &mut usize,
-    hits: &mut Vec<SearchHit>,
-) {
-    *hits = fyler_core::search::search(candidates, query, PICKER_RESULT_LIMIT);
-    *selected = 0;
+fn picker_query_action(pane_id: PaneId, query: String) -> GuiAction {
+    GuiAction::PickerQuery { pane_id, query }
 }
 
+fn picker_completion_action(pane_id: PaneId, selection: Option<GuiAction>) -> GuiAction {
+    selection.unwrap_or(GuiAction::PickerClosed { pane_id })
+}
+
+#[allow(clippy::too_many_arguments)] // pickerの表示状態をDialogStateと同じ粒度で明示する。
 fn draw_file_picker(
     ui: &mut egui::Ui,
     pane_id: PaneId,
-    candidates: &[SearchCandidate],
     query: &mut String,
     selected: &mut usize,
-    hits: &mut Vec<SearchHit>,
+    results: &[PickerHit],
+    indexed_count: usize,
+    indexing: bool,
     needs_focus: &mut bool,
-) -> Option<Option<GuiAction>> {
+) -> (Option<Option<GuiAction>>, Option<GuiAction>) {
     let keys = read_picker_keys(ui.ctx());
     let mut clicked_selection = None;
+    let mut query_changed = false;
     egui::Modal::new(egui::Id::new("fyler-file-picker")).show(ui.ctx(), |ui| {
         ui.set_min_width(560.0);
         ui.heading("Find file");
@@ -1112,19 +1219,18 @@ fn draw_file_picker(
             response.request_focus();
             *needs_focus = false;
         }
-        if response.changed() {
-            update_picker_hits(candidates, query, selected, hits);
-        }
+        query_changed = response.changed();
 
         ui.add_space(6.0);
+        if indexing {
+            ui.weak(format!("Indexing… {indexed_count} entries"));
+            ui.add_space(4.0);
+        }
         egui::ScrollArea::vertical()
             .id_salt("fyler-file-picker-results")
             .max_height(360.0)
             .show(ui, |ui| {
-                for (position, hit) in hits.iter().enumerate() {
-                    let Some(candidate) = candidates.get(hit.index) else {
-                        continue;
-                    };
+                for (position, candidate) in results.iter().enumerate() {
                     let suffix = if candidate.kind == fyler_core::tree::EntryKind::Dir {
                         "/"
                     } else {
@@ -1148,7 +1254,11 @@ fn draw_file_picker(
     if let Some(position) = clicked_selection {
         *selected = position;
     }
-    apply_picker_keys(keys, pane_id, candidates, hits, selected)
+    let query_action = query_changed.then(|| picker_query_action(pane_id, query.clone()));
+    (
+        apply_picker_keys(keys, pane_id, results, selected),
+        query_action,
+    )
 }
 
 enum FeedbackUiResult {
@@ -1464,17 +1574,11 @@ mod tests {
         )))
     }
 
-    fn candidate(id: u64, path: &str, kind: fyler_core::tree::EntryKind) -> SearchCandidate {
-        let display = path.to_owned();
-        let key = display.to_lowercase();
-        let name_offset = key.rfind('/').map_or(0, |offset| offset + 1);
-        SearchCandidate {
-            id: EntryId(id),
+    fn candidate(path: &str, kind: fyler_core::tree::EntryKind) -> PickerHit {
+        PickerHit {
             path: TreePath::parse(path),
             kind,
-            display,
-            key,
-            name_offset,
+            display: path.to_owned(),
         }
     }
 
@@ -1681,29 +1785,57 @@ mod tests {
     }
 
     #[test]
-    fn picker_query_update_recalculates_hits_and_resets_selection() {
-        let candidates = vec![
-            candidate(1, "src/main.rs", fyler_core::tree::EntryKind::File),
-            candidate(2, "README.md", fyler_core::tree::EntryKind::File),
-        ];
-        let mut selected = 1;
-        let mut hits = fyler_core::search::search(&candidates, "", PICKER_RESULT_LIMIT);
+    fn picker_opens_immediately_and_accepts_progressive_results() {
+        let pane = PaneId::new(3);
+        let (mut app, event_tx, action_rx) = empty_test_app();
+        event_tx
+            .send(GuiEvent::ShowFilePicker { pane_id: pane })
+            .unwrap();
+        app.receive_events();
+        assert!(matches!(
+            app.dialog,
+            Some(DialogState::FilePicker {
+                indexing: true,
+                indexed_count: 0,
+                ..
+            })
+        ));
+        assert_eq!(
+            action_rx.try_recv().unwrap(),
+            GuiAction::PickerQuery {
+                pane_id: pane,
+                query: String::new(),
+            }
+        );
 
-        update_picker_hits(&candidates, "read", &mut selected, &mut hits);
-
-        assert_eq!(selected, 0);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(candidates[hits[0].index].id, EntryId(2));
+        event_tx
+            .send(GuiEvent::PickerResults {
+                pane_id: pane,
+                query: String::new(),
+                results: vec![candidate("README.md", fyler_core::tree::EntryKind::File)],
+                indexed_count: 42,
+                indexing: true,
+            })
+            .unwrap();
+        app.receive_events();
+        assert!(matches!(
+            app.dialog,
+            Some(DialogState::FilePicker {
+                ref results,
+                indexed_count: 42,
+                indexing: true,
+                ..
+            }) if results[0].display == "README.md"
+        ));
     }
 
     #[test]
     fn picker_keys_close_move_jump_and_open() {
         let pane = PaneId::new(3);
-        let candidates = vec![
-            candidate(1, "first", fyler_core::tree::EntryKind::File),
-            candidate(2, "second", fyler_core::tree::EntryKind::File),
+        let results = vec![
+            candidate("first", fyler_core::tree::EntryKind::File),
+            candidate("second", fyler_core::tree::EntryKind::File),
         ];
-        let hits = fyler_core::search::search(&candidates, "", PICKER_RESULT_LIMIT);
         let mut selected = 0;
 
         assert_eq!(
@@ -1713,8 +1845,7 @@ mod tests {
                     ..Default::default()
                 },
                 pane,
-                &candidates,
-                &hits,
+                &results,
                 &mut selected,
             ),
             None
@@ -1727,8 +1858,7 @@ mod tests {
                     ..Default::default()
                 },
                 pane,
-                &candidates,
-                &hits,
+                &results,
                 &mut selected,
             ),
             None
@@ -1741,13 +1871,12 @@ mod tests {
                     ..Default::default()
                 },
                 pane,
-                &candidates,
-                &hits,
+                &results,
                 &mut selected,
             ),
             Some(Some(GuiAction::PickerSelect {
                 pane_id: pane,
-                entry_id: EntryId(1),
+                path: TreePath::parse("first"),
                 action: PickerAction::Jump,
             }))
         );
@@ -1758,13 +1887,12 @@ mod tests {
                     ..Default::default()
                 },
                 pane,
-                &candidates,
-                &hits,
+                &results,
                 &mut selected,
             ),
             Some(Some(GuiAction::PickerSelect {
                 pane_id: pane,
-                entry_id: EntryId(1),
+                path: TreePath::parse("first"),
                 action: PickerAction::Open,
             }))
         );
@@ -1775,11 +1903,21 @@ mod tests {
                     ..Default::default()
                 },
                 pane,
-                &candidates,
-                &hits,
+                &results,
                 &mut selected,
             ),
             Some(None)
+        );
+        assert_eq!(
+            picker_completion_action(pane, None),
+            GuiAction::PickerClosed { pane_id: pane }
+        );
+        assert_eq!(
+            picker_query_action(pane, "read".to_owned()),
+            GuiAction::PickerQuery {
+                pane_id: pane,
+                query: "read".to_owned(),
+            }
         );
     }
 
@@ -1810,10 +1948,7 @@ mod tests {
                 })
                 .unwrap();
             event_tx
-                .send(GuiEvent::ShowFilePicker {
-                    pane_id: pane,
-                    candidates: vec![candidate(1, "file.txt", fyler_core::tree::EntryKind::File)],
-                })
+                .send(GuiEvent::ShowFilePicker { pane_id: pane })
                 .unwrap();
             app.receive_events();
             assert!(matches!(app.dialog, Some(DialogState::FilePicker { .. })));

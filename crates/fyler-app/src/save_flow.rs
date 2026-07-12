@@ -231,6 +231,8 @@ pub enum ToggleCollapseResult {
     NotADirectory,
     /// scan不完全なディレクトリはstale子孫を見せないため展開できない。
     CannotExpandIncomplete,
+    /// 対象ディレクトリは未列挙のため、app層で直下をロードしてから再試行する。
+    NeedsLoad { dir: TreePath },
     /// 保存状態機械が`Idle`ではないため、状態を変更しなかった。
     Busy,
 }
@@ -249,6 +251,10 @@ pub enum FoldResult {
     NotFound,
     /// scan不完全なディレクトリを展開しようとした。
     CannotExpandIncomplete,
+    /// 単一ディレクトリの直下ロード後に同じfold操作を再試行する。
+    NeedsLoad { dir: TreePath },
+    /// 再帰展開に必要な未ロード部分木をロードしてから同じfold操作を再試行する。
+    NeedsLoadRecursive { dirs: Vec<TreePath> },
     /// 保存状態機械がIdleでない。
     Busy,
 }
@@ -298,12 +304,13 @@ impl SaveController {
         baseline: BaselineTree,
         engine: Arc<dyn EditorEngine>,
     ) -> Self {
+        let context = context_with_unloaded_dirs(EditContext::default(), &baseline);
         Self {
             state: SaveState::Idle,
             root,
             ids,
             baseline,
-            context: EditContext::default(),
+            context,
             scan_options: ScanOptions::default(),
             pending_overwrites: HashSet::new(),
             apply_cancel: None,
@@ -648,6 +655,14 @@ impl SaveController {
         {
             return ToggleCollapseResult::CannotExpandIncomplete;
         }
+        if self.context.collapsed_dirs.contains(&id)
+            && let Some(entry) = self.baseline.get(id)
+            && self.baseline.is_unloaded(&entry.path)
+        {
+            return ToggleCollapseResult::NeedsLoad {
+                dir: entry.path.clone(),
+            };
+        }
         if !self.context.collapsed_dirs.remove(&id) {
             self.context.collapsed_dirs.insert(id);
         }
@@ -682,6 +697,25 @@ impl SaveController {
         };
         if expansion_intersects_incomplete {
             return FoldResult::CannotExpandIncomplete;
+        }
+        let unloaded = match op {
+            FoldOp::Open | FoldOp::Toggle
+                if entry.kind == EntryKind::Dir
+                    && self.context.collapsed_dirs.contains(&entry.id)
+                    && self.baseline.is_unloaded(&entry.path) =>
+            {
+                return FoldResult::NeedsLoad {
+                    dir: entry.path.clone(),
+                };
+            }
+            FoldOp::OpenRecursive if entry.kind == EntryKind::Dir => {
+                unloaded_roots_within(&self.baseline, &entry.path)
+            }
+            FoldOp::OpenAll => self.baseline.unloaded_dirs().iter().cloned().collect(),
+            _ => Vec::new(),
+        };
+        if !unloaded.is_empty() {
+            return FoldResult::NeedsLoadRecursive { dirs: unloaded };
         }
         let cursor_id = match op {
             FoldOp::Close => {
@@ -756,6 +790,24 @@ impl SaveController {
             return None;
         };
         self.baseline.get(id).cloned()
+    }
+
+    /// 非同期loaderが返した同一rootのbaselineを、現在の折りたたみ状態を保って受領する。
+    pub fn replace_baseline_after_load(&mut self, baseline: BaselineTree) -> anyhow::Result<()> {
+        if !self.is_idle() {
+            anyhow::bail!("Cannot install a loaded directory while saving");
+        }
+        if baseline.root != self.root {
+            anyhow::bail!(
+                "Root does not match loaded baseline: root={}, baseline={}",
+                self.root.display(),
+                baseline.root.display()
+            );
+        }
+        let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
+        self.baseline = baseline;
+        self.context = context;
+        Ok(())
     }
 
     fn close_target_for_entry(&self, entry: &BaselineEntry) -> Option<BaselineEntry> {
@@ -921,7 +973,7 @@ impl SaveController {
         let was_offline = self.is_offline();
         self.root = root;
         self.baseline = baseline;
-        self.context = EditContext::default();
+        self.context = context_with_unloaded_dirs(EditContext::default(), &self.baseline);
         self.offline = None;
         self.reported_incomplete.clear();
         if was_offline && let Err(error) = self.engine.send(EditorCommand::SetModifiable(true)) {
@@ -1622,7 +1674,36 @@ fn carry_collapsed_dirs(
             .filter(|entry| entry.kind == EntryKind::Dir && old_baseline.get(entry.id).is_none())
             .map(|entry| entry.id),
     );
+    context_with_unloaded_dirs(context, new_baseline)
+}
+
+/// 未ロードdirはdiff・表示の既存collapsed意味論へ必ず合流させる。
+fn context_with_unloaded_dirs(mut context: EditContext, baseline: &BaselineTree) -> EditContext {
+    context.collapsed_dirs.extend(
+        baseline
+            .unloaded_dirs()
+            .iter()
+            .filter_map(|path| baseline.get_by_path(path).map(|entry| entry.id)),
+    );
     context
+}
+
+/// 指定部分木内の未ロードdirから、別の未ロードdir配下にある重複対象を除く。
+fn unloaded_roots_within(baseline: &BaselineTree, root: &TreePath) -> Vec<TreePath> {
+    let mut roots = Vec::<TreePath>::new();
+    for path in baseline.unloaded_dirs() {
+        if path != root && !root.is_strict_ancestor_of(path) {
+            continue;
+        }
+        if roots
+            .iter()
+            .any(|ancestor| ancestor == path || ancestor.is_strict_ancestor_of(path))
+        {
+            continue;
+        }
+        roots.push(path.clone());
+    }
+    roots
 }
 
 fn entry_by_path<'a>(baseline: &'a BaselineTree, path: &TreePath) -> Option<&'a BaselineEntry> {
@@ -1702,7 +1783,9 @@ pub(crate) fn baseline_to_lines(baseline: &BaselineTree, context: &EditContext) 
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::fs;
+    use std::rc::Rc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
@@ -1780,6 +1863,58 @@ mod tests {
             options,
         );
         (controller, engine)
+    }
+
+    fn lazy_controller(root: &Path) -> (SaveController, Arc<RecordingEngine>) {
+        let mut ids = IdAllocator::new();
+        let shallow =
+            fyler_fsops::scan::scan_baseline_shallow_with(root, &mut ids, &ScanOptions::default())
+                .unwrap();
+        let baseline = fyler_fsops::scan::load_directory(
+            root,
+            &TreePath::parse("loaded"),
+            &mut ids,
+            &shallow,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        let engine = Arc::new(RecordingEngine::default());
+        let controller = SaveController::new(
+            root.to_path_buf(),
+            ids,
+            baseline,
+            Arc::<RecordingEngine>::clone(&engine),
+        );
+        (controller, engine)
+    }
+
+    fn lazy_fixture(root: &Path) {
+        fs::create_dir_all(root.join("loaded/blocked")).unwrap();
+        fs::write(root.join("loaded/kept.txt"), b"kept").unwrap();
+        for index in 0..12 {
+            fs::create_dir_all(root.join(format!("lazy-{index:02}/deep"))).unwrap();
+            fs::write(
+                root.join(format!("lazy-{index:02}/deep/file.txt")),
+                b"hidden from baseline",
+            )
+            .unwrap();
+        }
+    }
+
+    fn enumerate_dirs<R>(run: impl FnOnce() -> R) -> (R, Vec<PathBuf>) {
+        let enumerated = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::clone(&enumerated);
+        let result = fyler_fsops::scan::with_test_fault(
+            move |stage, path| {
+                if stage == "enumerate_dir" {
+                    observed.borrow_mut().push(path.to_path_buf());
+                }
+                None
+            },
+            run,
+        );
+        let paths = enumerated.borrow().clone();
+        (result, paths)
     }
 
     fn begin_rename_apply(
@@ -3489,6 +3624,273 @@ mod tests {
     }
 
     #[test]
+    fn shallow_baseline_starts_unloaded_directories_collapsed() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("lazy")).unwrap();
+        fs::write(root.path().join("lazy").join("child.txt"), b"child").unwrap();
+        let mut ids = IdAllocator::new();
+        let baseline = fyler_fsops::scan::scan_baseline_shallow_with(
+            root.path(),
+            &mut ids,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        let lazy_id = baseline.get_by_path(&TreePath::parse("lazy")).unwrap().id;
+        let controller = SaveController::new(
+            root.path().to_path_buf(),
+            ids,
+            baseline,
+            Arc::new(RecordingEngine::default()),
+        );
+
+        assert!(controller.collapsed_dirs().contains(&lazy_id));
+        assert_eq!(controller.visible_lines().len(), 1);
+    }
+
+    #[test]
+    fn unloaded_toggle_and_fold_request_load_without_mutating_folds() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        let dir = TreePath::parse("a");
+        controller.baseline.mark_unloaded(dir.clone());
+        let id = controller.baseline.get_by_path(&dir).unwrap().id;
+        controller.context.collapsed_dirs.insert(id);
+        let visible = controller.visible_lines();
+
+        assert_eq!(
+            controller.toggle_collapse(&visible, 0),
+            ToggleCollapseResult::NeedsLoad { dir: dir.clone() }
+        );
+        assert_eq!(
+            controller.fold(&visible, 0, FoldOp::Open),
+            FoldResult::NeedsLoad { dir: dir.clone() }
+        );
+        assert_eq!(
+            controller.fold(&visible, 0, FoldOp::OpenRecursive),
+            FoldResult::NeedsLoadRecursive { dirs: vec![dir] }
+        );
+        assert!(controller.collapsed_dirs().contains(&id));
+    }
+
+    #[test]
+    fn incomplete_rejection_remains_unchanged_after_adding_unloaded_results() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        let dir = TreePath::parse("a");
+        controller
+            .baseline
+            .mark_incomplete(dir, fyler_core::scanwarn::ScanErrorKind::PermissionDenied);
+        controller.collapse_all_dirs();
+        let visible = controller.visible_lines();
+
+        assert_eq!(
+            controller.toggle_collapse(&visible, 0),
+            ToggleCollapseResult::CannotExpandIncomplete
+        );
+        assert_eq!(
+            controller.fold(&visible, 0, FoldOp::OpenRecursive),
+            FoldResult::CannotExpandIncomplete
+        );
+    }
+
+    #[test]
+    fn single_directory_load_can_be_installed_and_expanded() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("lazy")).unwrap();
+        fs::write(root.path().join("lazy").join("child.txt"), b"child").unwrap();
+        let mut ids = IdAllocator::new();
+        let baseline = fyler_fsops::scan::scan_baseline_shallow_with(
+            root.path(),
+            &mut ids,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        let mut controller = SaveController::new(
+            root.path().to_path_buf(),
+            ids,
+            baseline,
+            Arc::new(RecordingEngine::default()),
+        );
+        let visible = controller.visible_lines();
+        let loaded = {
+            let mut ids = controller.ids.lock().unwrap();
+            fyler_fsops::scan::load_directory(
+                root.path(),
+                &TreePath::parse("lazy"),
+                &mut ids,
+                &controller.baseline,
+                &ScanOptions::default(),
+            )
+            .unwrap()
+        };
+        controller.replace_baseline_after_load(loaded).unwrap();
+
+        let ToggleCollapseResult::Toggled(lines) = controller.toggle_collapse(&visible, 0) else {
+            panic!("loaded directory did not expand");
+        };
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].text.ends_with("child.txt"));
+    }
+
+    #[test]
+    fn cancelled_recursive_load_keeps_the_previous_shallow_baseline() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("lazy").join("nested")).unwrap();
+        fs::write(
+            root.path().join("lazy").join("nested").join("child.txt"),
+            b"child",
+        )
+        .unwrap();
+        let mut ids = IdAllocator::new();
+        let baseline = fyler_fsops::scan::scan_baseline_shallow_with(
+            root.path(),
+            &mut ids,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        let before = baseline.clone();
+        let cancel = AtomicBool::new(true);
+
+        let loaded = fyler_fsops::scan::load_directory_recursive_cancellable(
+            root.path(),
+            &TreePath::parse("lazy"),
+            |_| Ok(ids.allocate()),
+            &baseline,
+            &ScanOptions::default(),
+            |_| {},
+            &cancel,
+        )
+        .unwrap();
+
+        assert!(loaded.is_none());
+        assert_eq!(baseline.entries(), before.entries());
+        assert_eq!(baseline.unloaded_dirs(), before.unloaded_dirs());
+    }
+
+    #[test]
+    fn failed_single_load_leaves_directory_unloaded_for_retry() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("lazy")).unwrap();
+        let mut ids = IdAllocator::new();
+        let baseline = fyler_fsops::scan::scan_baseline_shallow_with(
+            root.path(),
+            &mut ids,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        fs::remove_dir(root.path().join("lazy")).unwrap();
+
+        assert!(
+            fyler_fsops::scan::load_directory(
+                root.path(),
+                &TreePath::parse("lazy"),
+                &mut ids,
+                &baseline,
+                &ScanOptions::default(),
+            )
+            .is_err()
+        );
+        assert!(baseline.is_unloaded(&TreePath::parse("lazy")));
+    }
+
+    #[test]
+    fn offline_retry_preserves_shallow_coverage_instead_of_recursively_expanding() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("lazy")).unwrap();
+        fs::write(root.join("lazy").join("child.txt"), b"child").unwrap();
+        let mut ids = IdAllocator::new();
+        let baseline =
+            fyler_fsops::scan::scan_baseline_shallow_with(&root, &mut ids, &ScanOptions::default())
+                .unwrap();
+        let mut controller = SaveController::new(
+            root.clone(),
+            ids,
+            baseline,
+            Arc::new(RecordingEngine::default()),
+        );
+        fs::remove_dir_all(&root).unwrap();
+        assert!(matches!(
+            controller.on_external_change(&BTreeSet::new()),
+            SaveFlowResult::WentOffline(_)
+        ));
+        fs::create_dir_all(root.join("lazy")).unwrap();
+        fs::write(root.join("lazy").join("new-child.txt"), b"child").unwrap();
+
+        assert!(matches!(
+            controller.retry_offline(),
+            SaveFlowResult::Reconnected(_)
+        ));
+        assert_eq!(controller.baseline.entries().len(), 1);
+        assert!(controller.baseline.is_unloaded(&TreePath::parse("lazy")));
+        assert!(
+            controller
+                .baseline
+                .get_by_path(&TreePath::parse("lazy/new-child.txt"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn shallow_baseline_consumers_ignore_unloaded_descendants_without_health_errors() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("lazy")).unwrap();
+        fs::write(root.path().join("lazy").join("child.txt"), b"child").unwrap();
+        let mut ids = IdAllocator::new();
+        let baseline = fyler_fsops::scan::scan_baseline_shallow_with(
+            root.path(),
+            &mut ids,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        let controller = SaveController::new(
+            root.path().to_path_buf(),
+            ids,
+            baseline,
+            Arc::new(RecordingEngine::default()),
+        );
+        let statuses = HashMap::from([
+            (PathBuf::from("lazy"), GitBadge::Modified),
+            (PathBuf::from("lazy/child.txt"), GitBadge::Added),
+        ]);
+
+        assert_eq!(controller.map_git_badges(&statuses).len(), 1);
+        assert_eq!(controller.visible_file_infos().len(), 1);
+        assert_eq!(controller.unreadable_count(), 0);
+    }
+
+    #[test]
+    fn loaded_incomplete_directory_still_drives_unreadable_modeline_and_marker() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("blocked")).unwrap();
+        fs::create_dir(root.path().join("lazy")).unwrap();
+        let mut ids = IdAllocator::new();
+        let mut baseline = fyler_fsops::scan::scan_baseline_shallow_with(
+            root.path(),
+            &mut ids,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        baseline.clear_unloaded(&TreePath::parse("blocked"));
+        baseline.mark_incomplete(
+            TreePath::parse("blocked"),
+            fyler_core::scanwarn::ScanErrorKind::PermissionDenied,
+        );
+        let blocked_id = baseline
+            .get_by_path(&TreePath::parse("blocked"))
+            .unwrap()
+            .id;
+        let controller = SaveController::new(
+            root.path().to_path_buf(),
+            ids,
+            baseline,
+            Arc::new(RecordingEngine::default()),
+        );
+
+        assert_eq!(controller.unreadable_count(), 1);
+        assert_eq!(controller.incomplete_dir_ids(), HashSet::from([blocked_id]));
+        assert!(controller.baseline().is_unloaded(&TreePath::parse("lazy")));
+    }
+
+    #[test]
     fn incomplete_directory_is_forced_closed_without_polluting_collapsed_context() {
         let (mut controller, _) = hierarchy_controller("C:/test-root");
         controller.baseline.mark_incomplete(
@@ -4102,5 +4504,210 @@ mod tests {
             .find(|entry| entry.path == TreePath::parse(".hidden"))
             .unwrap();
         assert!(controller.context.collapsed_dirs.contains(&hidden_dir.id));
+    }
+
+    #[test]
+    fn new_controller_forces_unloaded_directories_into_collapsed_context() {
+        let root = tempdir().unwrap();
+        let mut baseline = BaselineTree::new(root.path());
+        baseline.insert(BaselineEntry {
+            id: EntryId(7),
+            path: TreePath::parse("lazy"),
+            kind: EntryKind::Dir,
+        });
+        baseline.mark_unloaded(TreePath::parse("lazy"));
+
+        let controller = SaveController::new(
+            root.path().to_path_buf(),
+            IdAllocator::new(),
+            baseline,
+            Arc::new(RecordingEngine::default()),
+        );
+
+        assert_eq!(controller.collapsed_dirs(), [EntryId(7)].into());
+    }
+
+    #[test]
+    fn watch_tick_inside_unloaded_subtree_enumerates_nothing_and_keeps_baseline() {
+        let root = tempdir().unwrap();
+        lazy_fixture(root.path());
+        let (mut controller, _) = lazy_controller(root.path());
+        let before = controller.baseline().clone();
+
+        let (result, enumerated) = enumerate_dirs(|| {
+            controller
+                .on_external_change(&BTreeSet::from([root.path().join("lazy-00/deep/file.txt")]))
+        });
+
+        assert_eq!(result, SaveFlowResult::NoChanges);
+        assert!(enumerated.is_empty());
+        assert_eq!(controller.baseline(), &before);
+    }
+
+    #[test]
+    fn sort_and_hidden_rescan_only_loaded_directories() {
+        let root = tempdir().unwrap();
+        lazy_fixture(root.path());
+        let (mut controller, _) = lazy_controller(root.path());
+        let expected = [root.path().to_path_buf(), root.path().join("loaded")];
+
+        let (_, sorted_dirs) = enumerate_dirs(|| {
+            controller.change_sort(SortKey::Size, true).unwrap();
+        });
+        let (_, hidden_dirs) = enumerate_dirs(|| {
+            controller.toggle_hidden().unwrap();
+        });
+
+        assert_eq!(sorted_dirs, expected);
+        assert_eq!(hidden_dirs, expected);
+        assert_eq!(controller.baseline().unloaded_dirs().len(), 13);
+    }
+
+    #[test]
+    fn apply_reconcile_only_enumerates_loaded_directories() {
+        let root = tempdir().unwrap();
+        lazy_fixture(root.path());
+        fs::write(root.path().join("a.txt"), b"a").unwrap();
+        let (mut controller, _) = lazy_controller(root.path());
+        let entry_id = controller
+            .baseline()
+            .get_by_path(&TreePath::parse("a.txt"))
+            .unwrap()
+            .id;
+        let edited = controller
+            .visible_lines()
+            .into_iter()
+            .map(|line| {
+                if matches!(
+                    fyler_core::grammar::split_id_prefix(&line.text),
+                    fyler_core::grammar::PrefixParse::WithId { id, .. } if id == entry_id
+                ) {
+                    EditorLine::new(format!(
+                        "{}b.txt",
+                        fyler_core::grammar::format_id_prefix(entry_id)
+                    ))
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            controller.on_commit(1, &edited),
+            SaveFlowResult::ShowPlan { .. }
+        ));
+        let SaveFlowResult::StartApply {
+            plan, overwrites, ..
+        } = controller.on_choice(ConfirmChoice::Approve)
+        else {
+            panic!("expected apply start")
+        };
+        let report =
+            fyler_fsops::apply::apply_plan_with_overwrites(root.path(), &plan, &overwrites);
+
+        let (result, enumerated) = enumerate_dirs(|| controller.on_apply_finished(report));
+
+        assert!(matches!(result, SaveFlowResult::ShowReport(_)));
+        assert_eq!(
+            enumerated,
+            [root.path().to_path_buf(), root.path().join("loaded")]
+        );
+        assert_eq!(controller.baseline().unloaded_dirs().len(), 13);
+    }
+
+    #[test]
+    fn transfer_reconcile_keeps_unloaded_destination_opaque() {
+        let root = tempdir().unwrap();
+        lazy_fixture(root.path());
+        let (mut controller, _) = lazy_controller(root.path());
+        fs::write(root.path().join("lazy-00/transferred.txt"), b"moved").unwrap();
+
+        let (result, enumerated) = enumerate_dirs(|| controller.reconcile_after_transfer());
+
+        result.unwrap();
+        assert_eq!(
+            enumerated,
+            [root.path().to_path_buf(), root.path().join("loaded")]
+        );
+        assert!(
+            controller
+                .baseline()
+                .is_unloaded(&TreePath::parse("lazy-00"))
+        );
+        assert!(
+            controller
+                .baseline()
+                .get_by_path(&TreePath::parse("lazy-00/transferred.txt"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn offline_retry_only_enumerates_loaded_directories() {
+        let root = tempdir().unwrap();
+        lazy_fixture(root.path());
+        let (mut controller, _) = lazy_controller(root.path());
+        controller.offline = Some("disconnected".to_owned());
+
+        let (result, enumerated) = enumerate_dirs(|| controller.retry_offline());
+
+        assert!(matches!(result, SaveFlowResult::Reconnected(_)));
+        assert_eq!(
+            enumerated,
+            [root.path().to_path_buf(), root.path().join("loaded")]
+        );
+        assert_eq!(controller.baseline().unloaded_dirs().len(), 13);
+    }
+
+    #[test]
+    fn incomplete_probe_only_enumerates_the_loaded_probe_directory() {
+        let root = tempdir().unwrap();
+        lazy_fixture(root.path());
+        let mut ids = IdAllocator::new();
+        let shallow = fyler_fsops::scan::scan_baseline_shallow_with(
+            root.path(),
+            &mut ids,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        let loaded = fyler_fsops::scan::load_directory(
+            root.path(),
+            &TreePath::parse("loaded"),
+            &mut ids,
+            &shallow,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        let mut baseline = fyler_fsops::scan::load_directory(
+            root.path(),
+            &TreePath::parse("loaded/blocked"),
+            &mut ids,
+            &loaded,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        baseline.mark_incomplete(
+            TreePath::parse("loaded/blocked"),
+            fyler_core::scanwarn::ScanErrorKind::PermissionDenied,
+        );
+        let engine = Arc::new(RecordingEngine::default());
+        let mut controller = SaveController::new(
+            root.path().to_path_buf(),
+            ids,
+            baseline,
+            Arc::<RecordingEngine>::clone(&engine),
+        );
+        let paths = controller.incomplete_probe_paths().unwrap();
+
+        let (result, enumerated) = enumerate_dirs(|| controller.on_external_change(&paths));
+
+        assert_eq!(result, SaveFlowResult::NoChanges);
+        assert_eq!(
+            enumerated,
+            [
+                root.path().join("loaded"),
+                root.path().join("loaded/blocked")
+            ]
+        );
+        assert_eq!(controller.baseline().unloaded_dirs().len(), 12);
     }
 }
