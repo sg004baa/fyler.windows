@@ -417,39 +417,6 @@ pub fn draw_apply_progress(
         .inner
 }
 
-/// root変更の再帰scanを、総数不明の進捗として表示する。
-pub fn draw_root_scan_progress(
-    ui: &mut egui::Ui,
-    root: &std::path::Path,
-    entries: usize,
-    cancel_requested: bool,
-) -> bool {
-    let cancel_from_keyboard =
-        !cancel_requested && ui.ctx().input(|input| input.key_pressed(egui::Key::Escape));
-
-    egui::Modal::new(egui::Id::new("root-scan-progress"))
-        .show(ui.ctx(), |ui| {
-            ui.heading("Loading folder");
-            ui.add_space(8.0);
-            ui.spinner();
-            ui.monospace(root.display().to_string());
-            ui.label(format!("{entries} entries found"));
-
-            ui.add_space(12.0);
-            if cancel_requested {
-                ui.colored_label(
-                    ui.visuals().warn_fg_color,
-                    "Cancel requested; stopping the scan",
-                );
-            }
-            let cancel_clicked = ui
-                .add_enabled(!cancel_requested, egui::Button::new("Cancel (Esc)"))
-                .clicked();
-            cancel_clicked || cancel_from_keyboard
-        })
-        .inner
-}
-
 /// open-with候補をモーダルで表示し、選択があれば返す。
 ///
 /// `choices` はapp層が構築した表示名の一覧で、末尾にOS標準ダイアログ項目を

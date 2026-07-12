@@ -1,9 +1,8 @@
 //! 複数paneのセッション所有とイベント配線。
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -17,7 +16,7 @@ use fyler_core::keymap::{EditorAction, KeyBinding};
 use fyler_core::pane::{FocusDirection, PaneAction, PaneId, PaneLayout, SplitDirection};
 use fyler_core::report::{ApplyProgress, CommitReport, OpOutcome, OpResult};
 use fyler_core::transfer::TransferKind;
-use fyler_core::tree::{BaselineTree, EntryKind};
+use fyler_core::tree::EntryKind;
 use fyler_core::undo::UndoTransaction;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
 use fyler_fsops::scan::ScanOptions;
@@ -34,7 +33,7 @@ use super::transfer_flow::{
 };
 use super::{
     AppEvent, BookmarkResolution, GitRefresher, after_root_change, bookmark_list_message,
-    default_root, format_drive_paths, handle_activate_line, handle_external_change,
+    change_root_to, default_root, format_drive_paths, handle_activate_line, handle_external_change,
     handle_open_file_picker, handle_open_terminal, handle_open_with, handle_picker_select,
     handle_yank_path, normalize_root, parse_sort_query, resolve_bookmark_query, resolve_cd_target,
     send_gui_message, send_save_result, send_view_state, sort_state_message,
@@ -57,14 +56,6 @@ struct PaneSession {
     deferred_changes: BTreeSet<PathBuf>,
     undo_slot: Option<UndoTransaction>,
     crashed: bool,
-}
-
-/// app全体で同時に1本だけ実行するroot変更scanの所有状態。
-struct RootScanOwner {
-    pane_id: PaneId,
-    root: PathBuf,
-    cursor_target: Option<OsString>,
-    cancel: Arc<AtomicBool>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -288,7 +279,6 @@ pub(super) fn run() -> anyhow::Result<()> {
             while let Ok(action) = action_rx.recv() {
                 let event = match action {
                     GuiAction::Confirm(choice) => AppEvent::Confirm(choice),
-                    GuiAction::RootScanCancel => AppEvent::RootScanCancel,
                     GuiAction::PickerSelect {
                         pane_id,
                         entry_id,
@@ -342,7 +332,6 @@ pub(super) fn run() -> anyhow::Result<()> {
             let mut dialog_owner = None;
             let mut feedback_open = false;
             let mut apply_owner = None;
-            let mut root_scan_owner: Option<RootScanOwner> = None;
             let mut transfer = TransferController::new();
             let mut pending_recovery = pending_recovery;
             let mut pending_open_with: Option<(
@@ -448,20 +437,6 @@ pub(super) fn run() -> anyhow::Result<()> {
                             continue;
                         };
                         session.crashed = true;
-                        if root_scan_owner
-                            .as_ref()
-                            .is_some_and(|owner| owner.pane_id == pane_id)
-                        {
-                            if let Some(owner) = &root_scan_owner {
-                                owner.cancel.store(true, Ordering::Relaxed);
-                            }
-                            if dialog_owner == Some(pane_id) {
-                                dialog_owner = None;
-                                if gui_event_tx.send(GuiEvent::CloseDialog).is_err() {
-                                    return;
-                                }
-                            }
-                        }
                         if dialog_owner == Some(pane_id) {
                             if let SaveFlowResult::UndoCancelled { transaction } =
                                 session.save_controller.on_choice(ConfirmChoice::Cancel)
@@ -724,20 +699,14 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     continue;
                                 };
                                 let new_root = path.to_fs_path(&session.root);
-                                if request_session_root_change(
+                                if change_session_root(
                                     pane_id,
                                     new_root,
                                     None,
                                     session,
                                     &shared_ids,
-                                    &event_tx,
                                     &gui_event_tx,
-                                    &mut root_scan_owner,
-                                    &mut dialog_owner,
-                                    feedback_open
-                                        || apply_owner.is_some()
-                                        || transfer.is_awaiting()
-                                        || transfer.is_running(),
+                                    &mut git,
                                 )
                                 .is_err()
                                 {
@@ -804,20 +773,14 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     }
                                     continue;
                                 };
-                                if request_session_root_change(
+                                if change_session_root(
                                     pane_id,
                                     new_root,
-                                    cursor_target,
+                                    cursor_target.as_deref(),
                                     session,
                                     &shared_ids,
-                                    &event_tx,
                                     &gui_event_tx,
-                                    &mut root_scan_owner,
-                                    &mut dialog_owner,
-                                    feedback_open
-                                        || apply_owner.is_some()
-                                        || transfer.is_awaiting()
-                                        || transfer.is_running(),
+                                    &mut git,
                                 )
                                 .is_err()
                                 {
@@ -864,20 +827,14 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     }
                                     continue;
                                 };
-                                if request_session_root_change(
+                                if change_session_root(
                                     pane_id,
                                     new_root,
                                     None,
                                     session,
                                     &shared_ids,
-                                    &event_tx,
                                     &gui_event_tx,
-                                    &mut root_scan_owner,
-                                    &mut dialog_owner,
-                                    feedback_open
-                                        || apply_owner.is_some()
-                                        || transfer.is_awaiting()
-                                        || transfer.is_running(),
+                                    &mut git,
                                 )
                                 .is_err()
                                 {
@@ -901,20 +858,14 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 };
                                 match resolve_bookmark_query(&query, &bookmarks, &recent) {
                                     BookmarkResolution::Resolved(new_root) => {
-                                        if request_session_root_change(
+                                        if change_session_root(
                                             pane_id,
                                             new_root,
                                             None,
                                             session,
                                             &shared_ids,
-                                            &event_tx,
                                             &gui_event_tx,
-                                            &mut root_scan_owner,
-                                            &mut dialog_owner,
-                                            feedback_open
-                                                || apply_owner.is_some()
-                                                || transfer.is_awaiting()
-                                                || transfer.is_running(),
+                                            &mut git,
                                         )
                                         .is_err()
                                         {
@@ -1623,154 +1574,6 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     return;
                                 }
                             }
-                        }
-                    }
-                    AppEvent::RootScanCancel => {
-                        let Some(owner) = &root_scan_owner else {
-                            continue;
-                        };
-                        if !owner.cancel.swap(true, Ordering::Relaxed)
-                            && gui_event_tx
-                                .send(GuiEvent::RootScanCancelRequested)
-                                .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    AppEvent::RootScanProgress(pane_id, entries) => {
-                        if root_scan_owner
-                            .as_ref()
-                            .is_some_and(|owner| owner.pane_id == pane_id)
-                            && gui_event_tx
-                                .send(GuiEvent::RootScanProgress { entries })
-                                .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    AppEvent::RootScanFinished {
-                        pane_id,
-                        root,
-                        result,
-                    } => {
-                        let Some(owner) = root_scan_owner.take() else {
-                            continue;
-                        };
-                        if owner.pane_id != pane_id || owner.root != root {
-                            root_scan_owner = Some(owner);
-                            continue;
-                        }
-                        if discard_root_scan_result(
-                            !panes.contains_key(&pane_id),
-                            panes.get(&pane_id).is_some_and(|session| session.crashed),
-                        ) {
-                            if close_root_scan_dialog(
-                                pane_id,
-                                &mut dialog_owner,
-                                &gui_event_tx,
-                            )
-                            .is_err()
-                            {
-                                return;
-                            }
-                            continue;
-                        }
-                        let Some(session) = panes.get_mut(&pane_id) else {
-                            continue;
-                        };
-                        let snapshot = session.engine.snapshot();
-                        if let Some(reason) = root_scan_completion_rejection(
-                            session.crashed,
-                            snapshot.dirty,
-                            session.save_controller.is_offline(),
-                            session.save_controller.is_idle(),
-                        ) {
-                            if close_root_scan_dialog(
-                                pane_id,
-                                &mut dialog_owner,
-                                &gui_event_tx,
-                            )
-                            .is_err()
-                            {
-                                return;
-                            }
-                            if send_gui_message(
-                                &gui_event_tx,
-                                pane_id,
-                                MessageKind::Info,
-                                reason,
-                            )
-                            .is_err()
-                            {
-                                return;
-                            }
-                            continue;
-                        }
-
-                        let baseline = match classify_root_scan_result(result) {
-                            RootScanResult::Ready(baseline) => baseline,
-                            RootScanResult::Cancelled => {
-                                if close_root_scan_dialog(
-                                    pane_id,
-                                    &mut dialog_owner,
-                                    &gui_event_tx,
-                                )
-                                .is_err()
-                                {
-                                    return;
-                                }
-                                if send_gui_message(
-                                    &gui_event_tx,
-                                    pane_id,
-                                    MessageKind::Info,
-                                    "Root change cancelled",
-                                )
-                                .is_err()
-                                {
-                                    return;
-                                }
-                                continue;
-                            }
-                            RootScanResult::Failed(error) => {
-                                if close_root_scan_dialog(
-                                    pane_id,
-                                    &mut dialog_owner,
-                                    &gui_event_tx,
-                                )
-                                .is_err()
-                                {
-                                    return;
-                                }
-                                if send_gui_message(
-                                    &gui_event_tx,
-                                    pane_id,
-                                    MessageKind::Error,
-                                    format!("Failed to load root ({}): {error:#}", root.display()),
-                                )
-                                .is_err()
-                                {
-                                    return;
-                                }
-                                continue;
-                            }
-                        };
-                        if finish_session_root_change(
-                            pane_id,
-                            root,
-                            owner.cursor_target.as_deref(),
-                            baseline,
-                            session,
-                            &gui_event_tx,
-                            &mut git,
-                        )
-                        .is_err()
-                        {
-                            return;
-                        }
-                        if close_root_scan_dialog(pane_id, &mut dialog_owner, &gui_event_tx)
-                            .is_err()
-                        {
-                            return;
                         }
                     }
                     AppEvent::ApplyProgress(pane_id, progress) => {
@@ -2692,233 +2495,38 @@ fn discard_undo_slot(session: &mut PaneSession, journal: Option<&undo_journal::U
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn request_session_root_change(
-    pane_id: PaneId,
-    new_root: PathBuf,
-    cursor_target: Option<OsString>,
-    session: &PaneSession,
-    shared_ids: &Arc<Mutex<IdAllocator>>,
-    app_event_tx: &CountingSender<AppEvent>,
-    gui_event_tx: &CountingSender<GuiEvent>,
-    root_scan_owner: &mut Option<RootScanOwner>,
-    dialog_owner: &mut Option<PaneId>,
-    globally_busy: bool,
-) -> Result<(), mpsc::SendError<GuiEvent>> {
-    let new_root = match normalize_root(&new_root) {
-        Ok(new_root) => new_root,
-        Err(error) => {
-            send_gui_message(
-                gui_event_tx,
-                pane_id,
-                MessageKind::Error,
-                format!("Failed to normalize root ({}): {error}", new_root.display()),
-            )?;
-            return Ok(());
-        }
-    };
-    match root_scan_start_gate(
-        session.engine.snapshot().dirty,
-        session.save_controller.is_offline(),
-        session.save_controller.is_idle(),
-        globally_busy || dialog_owner.is_some(),
-        root_scan_owner.is_some(),
-    ) {
-        RootScanStartGate::Allow => {}
-        RootScanStartGate::RejectSilently => return Ok(()),
-        RootScanStartGate::Reject(message) => {
-            send_gui_message(gui_event_tx, pane_id, MessageKind::Info, message)?;
-            return Ok(());
-        }
-    }
-
-    let cancel = Arc::new(AtomicBool::new(false));
-    gui_event_tx.send(GuiEvent::ShowRootScanProgress {
-        root: new_root.clone(),
-    })?;
-    *dialog_owner = Some(pane_id);
-    *root_scan_owner = Some(RootScanOwner {
-        pane_id,
-        root: new_root.clone(),
-        cursor_target,
-        cancel: Arc::clone(&cancel),
-    });
-
-    let scan_options = session.save_controller.scan_options();
-    let worker_ids = Arc::clone(shared_ids);
-    let worker_event_tx = app_event_tx.clone();
-    let worker_root = new_root.clone();
-    // 全再帰scanは深さが読めないため既定stackを維持する。
-    let spawn_result = thread::Builder::new()
-        .name("fyler-root-scan".to_owned())
-        .spawn(move || {
-            let progress_tx = worker_event_tx.clone();
-            let result = fyler_fsops::scan::scan_baseline_cancellable_with(
-                &worker_root,
-                move |_| {
-                    let mut ids = worker_ids
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("ID allocator lock is poisoned"))?;
-                    Ok(ids.allocate())
-                },
-                &scan_options,
-                move |entries| {
-                    let _ = progress_tx.send(AppEvent::RootScanProgress(pane_id, entries));
-                },
-                &cancel,
-            );
-            let _ = worker_event_tx.send(AppEvent::RootScanFinished {
-                pane_id,
-                root: worker_root,
-                result,
-            });
-        });
-    if let Err(error) = spawn_result {
-        let _ = app_event_tx.send(AppEvent::RootScanFinished {
-            pane_id,
-            root: new_root,
-            result: Err(anyhow::anyhow!("Failed to start root scan worker: {error}")),
-        });
-    }
-    Ok(())
-}
-
-fn root_scan_completion_rejection(
-    crashed: bool,
-    dirty: bool,
-    offline: bool,
-    idle: bool,
-) -> Option<&'static str> {
-    (crashed || (dirty && !offline) || !idle).then_some("Root change was cancelled")
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RootScanStartGate {
-    Allow,
-    RejectSilently,
-    Reject(&'static str),
-}
-
-fn root_scan_start_gate(
-    dirty: bool,
-    offline: bool,
-    idle: bool,
-    globally_busy: bool,
-    scan_active: bool,
-) -> RootScanStartGate {
-    if dirty && !offline {
-        return RootScanStartGate::Reject(
-            "You are editing. Save or discard changes before changing directories.",
-        );
-    }
-    if !idle {
-        return RootScanStartGate::RejectSilently;
-    }
-    if globally_busy || scan_active {
-        return RootScanStartGate::Reject("Another save is in progress");
-    }
-    RootScanStartGate::Allow
-}
-
-fn discard_root_scan_result(pane_missing: bool, crashed: bool) -> bool {
-    pane_missing || crashed
-}
-
-fn close_root_scan_dialog(
-    pane_id: PaneId,
-    dialog_owner: &mut Option<PaneId>,
-    gui_event_tx: &CountingSender<GuiEvent>,
-) -> Result<(), mpsc::SendError<GuiEvent>> {
-    if *dialog_owner == Some(pane_id) {
-        *dialog_owner = None;
-        gui_event_tx.send(GuiEvent::CloseDialog)?;
-    }
-    Ok(())
-}
-
-enum RootScanResult<T, E> {
-    Ready(T),
-    Cancelled,
-    Failed(E),
-}
-
-fn classify_root_scan_result<T, E>(result: Result<Option<T>, E>) -> RootScanResult<T, E> {
-    match result {
-        Ok(Some(value)) => RootScanResult::Ready(value),
-        Ok(None) => RootScanResult::Cancelled,
-        Err(error) => RootScanResult::Failed(error),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn finish_session_root_change(
+fn change_session_root(
     pane_id: PaneId,
     new_root: PathBuf,
     cursor_target: Option<&OsStr>,
-    new_baseline: BaselineTree,
     session: &mut PaneSession,
+    shared_ids: &Arc<Mutex<IdAllocator>>,
     gui_event_tx: &CountingSender<GuiEvent>,
     git: &mut GitRefresher,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
-    // 新しい監視の作成に失敗した場合も旧root/baseline/watcherを維持する。
-    let new_watcher = match fyler_fsops::watch::watch(&new_root, session.watch_tx.clone()) {
-        Ok(watcher) => watcher,
-        Err(error) => {
-            send_gui_message(
-                gui_event_tx,
-                pane_id,
-                MessageKind::Error,
-                format!("Failed to watch root ({}): {error:#}", new_root.display()),
-            )?;
-            return Ok(());
-        }
-    };
-    if let Err(error) = session
-        .save_controller
-        .change_root_preserving_allocator(new_root.clone(), new_baseline)
-    {
-        send_gui_message(
-            gui_event_tx,
-            pane_id,
-            MessageKind::Error,
-            format!("Failed to change root: {error:#}"),
-        )?;
-        return Ok(());
-    }
-    session.save_controller.collapse_all_dirs();
-    let cursor_line =
-        cursor_target.and_then(|name| session.save_controller.find_top_level_line(name));
-    let new_lines = session.save_controller.visible_lines();
-
-    session.root = new_root;
-    session.watcher = new_watcher;
-    session.watch_degraded = false;
-    if let Err(error) = session.engine.send(EditorCommand::SetLines {
-        lines: new_lines,
-        cursor_line,
-    }) {
-        send_gui_message(
-            gui_event_tx,
-            pane_id,
-            MessageKind::Error,
-            format!("Failed to display new directory: {error:#}"),
-        )?;
-    }
-    if let Err(error) = super::config::record_recent_root(&session.root) {
-        send_gui_message(
-            gui_event_tx,
-            pane_id,
-            MessageKind::Warn,
-            format!("Failed to record recent root: {error:#}"),
-        )?;
-    }
-    after_root_change(
+    let changed = change_root_to(
         pane_id,
-        gui_event_tx,
+        new_root,
+        cursor_target,
+        &mut session.root,
+        &mut session.watcher,
+        &session.watch_tx,
+        shared_ids,
         &mut session.save_controller,
-        git,
-        &session.root,
-    )
+        session.engine.as_ref(),
+        gui_event_tx,
+    )?;
+    if changed {
+        session.watch_degraded = false;
+        after_root_change(
+            pane_id,
+            gui_event_tx,
+            &mut session.save_controller,
+            git,
+            &session.root,
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3040,53 +2648,6 @@ mod tests {
             Some(BTreeSet::from([root.join("blocked")]))
         );
         assert!(incomplete_probe_paths(&controller, true, false).is_none());
-    }
-
-    #[test]
-    fn root_scan_completion_rejects_dirty_and_non_idle_panes() {
-        assert_eq!(
-            root_scan_completion_rejection(false, true, false, true),
-            Some("Root change was cancelled")
-        );
-        assert_eq!(
-            root_scan_completion_rejection(false, false, false, false),
-            Some("Root change was cancelled")
-        );
-        assert_eq!(
-            root_scan_completion_rejection(false, true, true, true),
-            None
-        );
-        assert_eq!(
-            root_scan_completion_rejection(false, false, false, true),
-            None
-        );
-    }
-
-    #[test]
-    fn cancelled_root_scan_does_not_commit_the_new_root() {
-        let mut current_root = PathBuf::from("old-root");
-        let result: Result<Option<()>, ()> = Ok(None);
-
-        if let RootScanResult::Ready(()) = classify_root_scan_result(result) {
-            current_root = PathBuf::from("new-root");
-        }
-
-        assert_eq!(current_root, PathBuf::from("old-root"));
-    }
-
-    #[test]
-    fn root_scan_start_rejects_a_second_request() {
-        assert_eq!(
-            root_scan_start_gate(false, false, true, false, true),
-            RootScanStartGate::Reject("Another save is in progress")
-        );
-    }
-
-    #[test]
-    fn root_scan_result_is_discarded_for_missing_or_crashed_pane() {
-        assert!(discard_root_scan_result(true, false));
-        assert!(discard_root_scan_result(false, true));
-        assert!(!discard_root_scan_result(false, false));
     }
 
     #[test]

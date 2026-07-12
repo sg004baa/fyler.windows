@@ -10,7 +10,6 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use anyhow::{Context, anyhow, bail};
 use fyler_core::fileinfo::EntryMeta;
@@ -65,30 +64,6 @@ pub fn scan_baseline_with(
     options: &ScanOptions,
 ) -> anyhow::Result<BaselineTree> {
     scan_with_id_resolver(root, options, None, |_: &TreePath| ids.allocate())
-}
-
-/// 指定した表示対象オプションで、キャンセル可能なルートスキャンを行う。
-///
-/// `resolve_id`は新しいentryごとに呼ばれる。共有採番器を使う呼び出し元は、
-/// スキャン全体ではなくこの呼び出し単位でlockを取得すること。`progress`は累計
-/// entry数がおおむね1000件増えるごとに通知される。キャンセル時は構築途中のtreeを
-/// 破棄して`Ok(None)`を返す。
-pub fn scan_baseline_cancellable_with(
-    root: &Path,
-    mut resolve_id: impl FnMut(&TreePath) -> anyhow::Result<fyler_core::id::EntryId> + Send,
-    options: &ScanOptions,
-    mut progress: impl FnMut(usize) + Send,
-    cancel: &AtomicBool,
-) -> anyhow::Result<Option<BaselineTree>> {
-    scan_with_fallible_id_resolver(
-        root,
-        options,
-        None,
-        &mut resolve_id,
-        &mut progress,
-        cancel,
-        true,
-    )
 }
 
 /// 実FSを再スキャンし、同じパスに存在し続けるエントリのIDを維持する。
@@ -365,54 +340,18 @@ fn scan_with_id_resolver(
     previous: Option<&BaselineTree>,
     mut resolve_id: impl FnMut(&TreePath) -> fyler_core::id::EntryId,
 ) -> anyhow::Result<BaselineTree> {
-    let cancel = AtomicBool::new(false);
-    let mut progress = |_| {};
-    let mut fallible_resolver = |path: &TreePath| Ok(resolve_id(path));
-    scan_with_fallible_id_resolver(
-        root,
-        options,
-        previous,
-        &mut fallible_resolver,
-        &mut progress,
-        &cancel,
-        false,
-    )?
-    .ok_or_else(|| anyhow!("Uncancellable scan was cancelled"))
-}
-
-fn scan_with_fallible_id_resolver(
-    root: &Path,
-    options: &ScanOptions,
-    previous: Option<&BaselineTree>,
-    resolve_id: &mut (impl FnMut(&TreePath) -> anyhow::Result<fyler_core::id::EntryId> + ?Sized),
-    progress: &mut dyn FnMut(usize),
-    cancel: &AtomicBool,
-    enabled: bool,
-) -> anyhow::Result<Option<BaselineTree>> {
-    if cancel.load(AtomicOrdering::Relaxed) {
-        return Ok(None);
-    }
     validate_root(root)?;
 
     let mut tree = BaselineTree::new(root);
-    let mut control = ScanControl {
-        cancel,
-        progress,
-        entries: 0,
-        enabled,
-    };
-    if !scan_directory(
+    scan_directory(
         root,
         &TreePath::root(),
         options,
         previous,
-        resolve_id,
+        &mut resolve_id,
         &mut tree,
-        &mut control,
-    )? {
-        return Ok(None);
-    }
-    Ok(Some(tree))
+    )?;
+    Ok(tree)
 }
 
 fn validate_root(root: &Path) -> anyhow::Result<()> {
@@ -435,24 +374,16 @@ fn scan_directory(
     relative: &TreePath,
     options: &ScanOptions,
     previous: Option<&BaselineTree>,
-    resolve_id: &mut (impl FnMut(&TreePath) -> anyhow::Result<fyler_core::id::EntryId> + ?Sized),
+    resolve_id: &mut impl FnMut(&TreePath) -> fyler_core::id::EntryId,
     tree: &mut BaselineTree,
-    control: &mut ScanControl<'_>,
-) -> anyhow::Result<bool> {
-    if control.cancelled() {
-        return Ok(false);
-    }
-    let root_read =
-        read_sorted_entries_cancellable(directory, options, control).map_err(|failure| {
-            anyhow!(failure.error).context(format!(
-                "Failed while {}: {}",
-                failure.stage,
-                failure.path.display()
-            ))
-        })?;
-    let Some(root_read) = root_read else {
-        return Ok(false);
-    };
+) -> anyhow::Result<()> {
+    let root_read = read_sorted_entries(directory, options).map_err(|failure| {
+        anyhow!(failure.error).context(format!(
+            "Failed while {}: {}",
+            failure.stage,
+            failure.path.display()
+        ))
+    })?;
     apply_read_access_state(tree, relative, &root_read);
     let mut stack = vec![ScanFrame {
         entries: root_read.entries.into_iter(),
@@ -460,9 +391,6 @@ fn scan_directory(
     }];
 
     while let Some(frame) = stack.last_mut() {
-        if control.cancelled() {
-            return Ok(false);
-        }
         let Some(entry) = frame.entries.next() else {
             stack.pop();
             continue;
@@ -473,25 +401,22 @@ fn scan_directory(
 
         tree.insert_with_meta(
             BaselineEntry {
-                id: resolve_id(&path)?,
+                id: resolve_id(&path),
                 path: path.clone(),
                 kind,
             },
             entry.meta,
         );
+
         if kind == EntryKind::Dir {
-            if control.cancelled() {
-                return Ok(false);
-            }
-            match read_sorted_entries_cancellable(&entry.path, options, control) {
-                Ok(Some(read)) => {
+            match read_sorted_entries(&entry.path, options) {
+                Ok(read) => {
                     apply_read_access_state(tree, &path, &read);
                     stack.push(ScanFrame {
                         entries: read.entries.into_iter(),
                         relative: path,
                     });
                 }
-                Ok(None) => return Ok(false),
                 Err(failure) => {
                     let kind = classify_io_error(&failure.error);
                     if let Some(previous) = previous {
@@ -508,31 +433,7 @@ fn scan_directory(
         }
     }
 
-    Ok(true)
-}
-
-struct ScanControl<'a> {
-    cancel: &'a AtomicBool,
-    progress: &'a mut dyn FnMut(usize),
-    entries: usize,
-    enabled: bool,
-}
-
-impl ScanControl<'_> {
-    fn cancelled(&self) -> bool {
-        self.enabled && self.cancel.load(AtomicOrdering::Relaxed)
-    }
-
-    fn record_entry(&mut self) -> bool {
-        if !self.enabled {
-            return true;
-        }
-        self.entries += 1;
-        if self.entries % 1000 == 0 {
-            (self.progress)(self.entries);
-        }
-        !self.cancelled()
-    }
+    Ok(())
 }
 
 struct ScanFrame {
@@ -690,29 +591,6 @@ fn read_sorted_entries(
     directory: &Path,
     options: &ScanOptions,
 ) -> Result<ReadEntries, DirectoryReadFailure> {
-    read_sorted_entries_impl(directory, options, None)
-        .map(|read| read.expect("read without cancellation control cannot be cancelled"))
-}
-
-fn read_sorted_entries_cancellable(
-    directory: &Path,
-    options: &ScanOptions,
-    control: &mut ScanControl<'_>,
-) -> Result<Option<ReadEntries>, DirectoryReadFailure> {
-    if !control.enabled {
-        return read_sorted_entries(directory, options).map(Some);
-    }
-    read_sorted_entries_impl(directory, options, Some(control))
-}
-
-fn read_sorted_entries_impl(
-    directory: &Path,
-    options: &ScanOptions,
-    mut control: Option<&mut ScanControl<'_>>,
-) -> Result<Option<ReadEntries>, DirectoryReadFailure> {
-    if control.as_deref().is_some_and(ScanControl::cancelled) {
-        return Ok(None);
-    }
     let read_dir = fault_point("enumerate_dir", directory)
         .and_then(|()| fs::read_dir(crate::long_path::to_fs(directory)))
         .map_err(|error| DirectoryReadFailure {
@@ -724,9 +602,6 @@ fn read_sorted_entries_impl(
     let mut warnings = Vec::new();
     let mut incomplete_kind = None;
     for entry in read_dir {
-        if control.as_deref().is_some_and(ScanControl::cancelled) {
-            return Ok(None);
-        }
         fault_point("dir_entry", directory).map_err(|error| DirectoryReadFailure {
             path: directory.to_path_buf(),
             stage: ScanStage::DirEntry,
@@ -785,24 +660,16 @@ fn read_sorted_entries_impl(
             kind,
             meta,
         });
-        if let Some(control) = control.as_deref_mut()
-            && !control.record_entry()
-        {
-            return Ok(None);
-        }
     }
 
-    if control.as_deref().is_some_and(ScanControl::cancelled) {
-        return Ok(None);
-    }
     // read_dirの順序は未規定なので、設定された自然順で表示とID採番を
     // セッションごとに安定させる。同値時は元のOsStringで順序を確定する。
     entries.sort_by(|left, right| compare_scanned(left, right, options));
-    Ok(Some(ReadEntries {
+    Ok(ReadEntries {
         entries,
         warnings,
         incomplete_kind,
-    }))
+    })
 }
 
 fn compare_scanned(left: &ScannedEntry, right: &ScannedEntry, options: &ScanOptions) -> Ordering {
@@ -1001,7 +868,6 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::rc::Rc;
-    use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant, SystemTime};
 
     use tempfile::tempdir;
@@ -1036,102 +902,6 @@ mod tests {
             ids.allocate();
         }
         ids
-    }
-
-    #[test]
-    fn cancellable_scan_matches_regular_scan_without_cancellation() {
-        let root = tempdir().unwrap();
-        fs::create_dir(root.path().join("dir")).unwrap();
-        fs::write(root.path().join("dir/child.txt"), b"child").unwrap();
-        fs::write(root.path().join("file.txt"), b"file").unwrap();
-        let options = ScanOptions::default();
-        let mut regular_ids = IdAllocator::new();
-        let regular = scan_baseline_with(root.path(), &mut regular_ids, &options).unwrap();
-        let mut cancellable_ids = IdAllocator::new();
-
-        let cancellable = scan_baseline_cancellable_with(
-            root.path(),
-            |_| Ok(cancellable_ids.allocate()),
-            &options,
-            |_| {},
-            &AtomicBool::new(false),
-        )
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(cancellable, regular);
-    }
-
-    #[test]
-    fn cancellable_scan_reports_monotonic_progress_and_stops_early() {
-        let root = tempdir().unwrap();
-        for index in 0..2500 {
-            fs::write(root.path().join(format!("file-{index:04}.txt")), b"x").unwrap();
-        }
-        let cancel = AtomicBool::new(false);
-        let resolved = AtomicUsize::new(0);
-        let mut progress = Vec::new();
-
-        let result = scan_baseline_cancellable_with(
-            root.path(),
-            |_| {
-                let id = resolved.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-                Ok(fyler_core::id::EntryId(id as u64))
-            },
-            &ScanOptions::default(),
-            |entries| {
-                progress.push(entries);
-                cancel.store(true, AtomicOrdering::Relaxed);
-            },
-            &cancel,
-        )
-        .unwrap();
-
-        assert!(result.is_none());
-        assert_eq!(progress, [1000]);
-        assert!(resolved.load(AtomicOrdering::Relaxed) < 2500);
-        assert!(progress.windows(2).all(|pair| pair[0] <= pair[1]));
-    }
-
-    #[test]
-    fn cancellable_scan_keeps_incomplete_directory_degradation() {
-        let root = tempdir().unwrap();
-        let blocked = root.path().join("blocked");
-        fs::create_dir(&blocked).unwrap();
-        fs::write(blocked.join("hidden.txt"), b"hidden").unwrap();
-        fs::write(root.path().join("visible.txt"), b"visible").unwrap();
-        let blocked_for_hook = blocked.clone();
-        let mut ids = IdAllocator::new();
-
-        let baseline = with_fault(
-            Box::new(move |stage, path| {
-                (stage == "enumerate_dir" && path == blocked_for_hook).then(|| {
-                    io::Error::new(io::ErrorKind::PermissionDenied, "injected access denied")
-                })
-            }),
-            || {
-                scan_baseline_cancellable_with(
-                    root.path(),
-                    |_| Ok(ids.allocate()),
-                    &ScanOptions::default(),
-                    |_| {},
-                    &AtomicBool::new(false),
-                )
-                .unwrap()
-                .unwrap()
-            },
-        );
-
-        assert!(
-            baseline
-                .entries()
-                .iter()
-                .any(|entry| entry.path == TreePath::parse("visible.txt"))
-        );
-        assert_eq!(
-            baseline.incomplete_dirs().get(&TreePath::parse("blocked")),
-            Some(&ScanErrorKind::PermissionDenied)
-        );
     }
 
     fn scanned_entry(
