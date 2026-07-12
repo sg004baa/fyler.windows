@@ -25,7 +25,7 @@ use crate::confirm::{ConfirmChoice, ConfirmDetail, IconStyle};
 use crate::{cmdline, confirm, input, modeline, tree_view};
 
 const CJK_FONT_NAME: &str = "fyler-cjk";
-const INITIAL_WINDOW_SCALE: f32 = 0.8;
+const INITIAL_WINDOW_SCALE: f32 = 0.7;
 // eframe 0.35がnative window geometryに使うpersistence key。
 const EFRAME_WINDOW_STORAGE_KEY: &str = "window";
 /// ファイルpickerで候補を確定したときの動作。
