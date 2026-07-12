@@ -10,6 +10,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use anyhow::{Context, anyhow, bail};
 use fyler_core::fileinfo::EntryMeta;
@@ -66,6 +67,166 @@ pub fn scan_baseline_with(
     scan_with_id_resolver(root, options, None, |_: &TreePath| ids.allocate())
 }
 
+/// 指定した表示対象オプションで、キャンセル可能な全再帰スキャンを行う。
+///
+/// 既存の全再帰経路との互換用APIであり、lazy baselineの初期構築には
+/// [`scan_baseline_shallow_cancellable_with`]を使う。
+pub fn scan_baseline_cancellable_with(
+    root: &Path,
+    mut resolve_id: impl FnMut(&TreePath) -> anyhow::Result<fyler_core::id::EntryId> + Send,
+    options: &ScanOptions,
+    mut progress: impl FnMut(usize) + Send,
+    cancel: &AtomicBool,
+) -> anyhow::Result<Option<BaselineTree>> {
+    scan_subtree_cancellable(
+        ScanStart {
+            root,
+            directory: root,
+            relative: &TreePath::root(),
+        },
+        None,
+        &mut resolve_id,
+        options,
+        &mut progress,
+        cancel,
+    )
+}
+
+/// ルート直下だけを列挙し、子ディレクトリを未ロードとして返す。
+pub fn scan_baseline_shallow_with(
+    root: &Path,
+    ids: &mut IdAllocator,
+    options: &ScanOptions,
+) -> anyhow::Result<BaselineTree> {
+    let cancel = AtomicBool::new(false);
+    scan_baseline_shallow_cancellable_with(root, |_| Ok(ids.allocate()), options, |_| {}, &cancel)?
+        .ok_or_else(|| anyhow!("Uncancellable shallow scan was cancelled"))
+}
+
+/// ルート直下だけをキャンセル可能に列挙する。
+pub fn scan_baseline_shallow_cancellable_with(
+    root: &Path,
+    mut resolve_id: impl FnMut(&TreePath) -> anyhow::Result<fyler_core::id::EntryId> + Send,
+    options: &ScanOptions,
+    mut progress: impl FnMut(usize) + Send,
+    cancel: &AtomicBool,
+) -> anyhow::Result<Option<BaselineTree>> {
+    if cancel.load(AtomicOrdering::Relaxed) {
+        return Ok(None);
+    }
+    validate_root(root)?;
+    let mut control = ScanControl::enabled(cancel, &mut progress);
+    let Some(read) =
+        read_sorted_entries_cancellable(root, options, &mut control).map_err(|failure| {
+            anyhow!(failure.error).context(format!(
+                "Failed while {}: {}",
+                failure.stage,
+                failure.path.display()
+            ))
+        })?
+    else {
+        return Ok(None);
+    };
+    let mut tree = BaselineTree::new(root);
+    apply_read_access_state(&mut tree, &TreePath::root(), &read);
+    for entry in read.entries {
+        if control.cancelled() {
+            return Ok(None);
+        }
+        let path = TreePath::root().child(entry.name);
+        let kind = entry.kind;
+        tree.insert_with_meta(
+            BaselineEntry {
+                id: resolve_id(&path)?,
+                path: path.clone(),
+                kind,
+            },
+            entry.meta,
+        );
+        if kind == EntryKind::Dir {
+            tree.mark_unloaded(path);
+        }
+    }
+    Ok(Some(tree))
+}
+
+/// 未ロードディレクトリの直下1階層を列挙してDFS位置へ挿入する。
+pub fn load_directory(
+    root: &Path,
+    dir: &TreePath,
+    ids: &mut IdAllocator,
+    previous: &BaselineTree,
+    options: &ScanOptions,
+) -> anyhow::Result<BaselineTree> {
+    validate_load_target(root, dir, previous)?;
+    if !previous.is_unloaded(dir) {
+        bail!("Load target is already loaded: {dir}");
+    }
+    let read = read_sorted_entries(&dir.to_fs_path(root), options).map_err(|failure| {
+        anyhow!(failure.error).context(format!(
+            "Failed while {}: {}",
+            failure.stage,
+            failure.path.display()
+        ))
+    })?;
+    let mut loaded = BaselineTree::new(root);
+    apply_read_access_state(&mut loaded, dir, &read);
+    for entry in read.entries {
+        let path = dir.child(entry.name);
+        let id = previous
+            .get_by_path(&path)
+            .map(|entry| entry.id)
+            .unwrap_or_else(|| ids.allocate());
+        let kind = entry.kind;
+        loaded.insert_with_meta(
+            BaselineEntry {
+                id,
+                path: path.clone(),
+                kind,
+            },
+            entry.meta,
+        );
+        if kind == EntryKind::Dir {
+            loaded.mark_unloaded(path);
+        }
+    }
+    Ok(splice_loaded_subtree(previous, dir, &loaded))
+}
+
+/// 未ロードディレクトリ以下を再帰的かつキャンセル可能にロードする。
+pub fn load_directory_recursive_cancellable(
+    root: &Path,
+    dir: &TreePath,
+    mut resolve_id: impl FnMut(&TreePath) -> anyhow::Result<fyler_core::id::EntryId> + Send,
+    previous: &BaselineTree,
+    options: &ScanOptions,
+    mut progress: impl FnMut(usize) + Send,
+    cancel: &AtomicBool,
+) -> anyhow::Result<Option<BaselineTree>> {
+    validate_load_target(root, dir, previous)?;
+    let Some(loaded) = scan_subtree_cancellable(
+        ScanStart {
+            root,
+            directory: &dir.to_fs_path(root),
+            relative: dir,
+        },
+        Some(previous),
+        &mut |path| {
+            previous
+                .get_by_path(path)
+                .map(|entry| Ok(entry.id))
+                .unwrap_or_else(|| resolve_id(path))
+        },
+        options,
+        &mut progress,
+        cancel,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(splice_loaded_subtree(previous, dir, &loaded)))
+}
+
 /// 実FSを再スキャンし、同じパスに存在し続けるエントリのIDを維持する。
 ///
 /// 前回baselineにないパスだけを [`IdAllocator`] から新規採番する。走査順、
@@ -85,7 +246,7 @@ pub fn rescan_preserving_ids_with(
     previous: &BaselineTree,
     options: &ScanOptions,
 ) -> anyhow::Result<BaselineTree> {
-    scan_with_id_resolver(root, options, Some(previous), |path| {
+    scan_with_coverage_id_resolver(root, options, previous, |path| {
         previous
             .get_by_path(path)
             .map(|entry| entry.id)
@@ -145,10 +306,15 @@ fn rebuild_changed(
     changed_paths: &[TreePath],
     options: &ScanOptions,
 ) -> anyhow::Result<BaselineTree> {
-    validate_root(root)?;
-
     let mut affected = HashSet::new();
     for path in changed_paths {
+        if previous
+            .unloaded_dirs()
+            .iter()
+            .any(|unloaded| unloaded.is_strict_ancestor_of(path))
+        {
+            continue;
+        }
         let mut ancestor = path.parent().unwrap_or_else(TreePath::root);
         loop {
             let is_existing_dir = previous
@@ -168,6 +334,12 @@ fn rebuild_changed(
             affected.insert(path.clone());
         }
     }
+
+    if affected.is_empty() {
+        return Ok(previous.clone());
+    }
+
+    validate_root(root)?;
 
     if let Some(tree) = refresh_metadata_if_structure_unchanged(root, previous, &affected, options)?
     {
@@ -204,6 +376,9 @@ fn refresh_metadata_if_structure_unchanged(
 
     let mut updates = Vec::new();
     for relative in affected {
+        if previous.is_unloaded(relative) {
+            continue;
+        }
         let scanned = match read_sorted_entries(&relative.to_fs_path(root), options) {
             Ok(read) if read.incomplete_kind.is_none() && read.warnings.is_empty() => read.entries,
             Ok(_) | Err(_) => return Ok(None),
@@ -248,6 +423,12 @@ fn rebuild_directory(
     options: &ScanOptions,
     tree: &mut BaselineTree,
 ) -> anyhow::Result<()> {
+    if previous.is_unloaded(relative) {
+        preserve_previous_access_state(previous, relative, tree);
+        tree.mark_unloaded(relative.clone());
+        return Ok(());
+    }
+
     let was_directory = relative.is_root()
         || previous
             .get_by_path(relative)
@@ -302,13 +483,17 @@ fn rebuild_directory(
             );
 
             if kind == EntryKind::Dir {
-                rebuild_directory(root, &path, ids, previous, affected, options, tree)
-                    .with_context(|| {
-                        format!(
-                            "Failed to rebuild changed directory: {}",
-                            child_directory.display()
-                        )
-                    })?;
+                if previous.get_by_path(&path).is_none() {
+                    tree.mark_unloaded(path);
+                } else {
+                    rebuild_directory(root, &path, ids, previous, affected, options, tree)
+                        .with_context(|| {
+                            format!(
+                                "Failed to rebuild changed directory: {}",
+                                child_directory.display()
+                            )
+                        })?;
+                }
             }
         }
     } else {
@@ -334,6 +519,79 @@ fn rebuild_directory(
     Ok(())
 }
 
+fn scan_with_coverage_id_resolver(
+    root: &Path,
+    options: &ScanOptions,
+    previous: &BaselineTree,
+    mut resolve_id: impl FnMut(&TreePath) -> fyler_core::id::EntryId,
+) -> anyhow::Result<BaselineTree> {
+    validate_root(root)?;
+    let mut tree = BaselineTree::new(root);
+    scan_directory_coverage(
+        root,
+        &TreePath::root(),
+        options,
+        previous,
+        &mut resolve_id,
+        &mut tree,
+    )?;
+    Ok(tree)
+}
+
+fn scan_directory_coverage(
+    directory: &Path,
+    relative: &TreePath,
+    options: &ScanOptions,
+    previous: &BaselineTree,
+    resolve_id: &mut impl FnMut(&TreePath) -> fyler_core::id::EntryId,
+    tree: &mut BaselineTree,
+) -> anyhow::Result<()> {
+    let read = read_sorted_entries(directory, options).map_err(|failure| {
+        anyhow!(failure.error).context(format!(
+            "Failed while {}: {}",
+            failure.stage,
+            failure.path.display()
+        ))
+    })?;
+    apply_read_access_state(tree, relative, &read);
+    for entry in read.entries {
+        let path = relative.child(entry.name);
+        let kind = entry.kind;
+        tree.insert_with_meta(
+            BaselineEntry {
+                id: resolve_id(&path),
+                path: path.clone(),
+                kind,
+            },
+            entry.meta,
+        );
+        if kind != EntryKind::Dir {
+            continue;
+        }
+        if previous.is_unloaded(&path) || previous.get_by_path(&path).is_none() {
+            tree.mark_unloaded(path);
+            continue;
+        }
+        match scan_directory_coverage(&entry.path, &path, options, previous, resolve_id, tree) {
+            Ok(()) => {}
+            Err(error) => {
+                preserve_previous_subtree(previous, &path, tree);
+                let kind = error
+                    .downcast_ref::<io::Error>()
+                    .map(classify_io_error)
+                    .unwrap_or_else(|| ScanErrorKind::Other(error.to_string()));
+                tree.mark_incomplete(path.clone(), kind.clone());
+                tree.push_warning(ScanWarning {
+                    path: entry.path,
+                    stage: ScanStage::EnumerateDir,
+                    kind,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn scan_with_id_resolver(
     root: &Path,
     options: &ScanOptions,
@@ -352,6 +610,233 @@ fn scan_with_id_resolver(
         &mut tree,
     )?;
     Ok(tree)
+}
+
+struct ScanStart<'a> {
+    root: &'a Path,
+    directory: &'a Path,
+    relative: &'a TreePath,
+}
+
+fn scan_subtree_cancellable(
+    start: ScanStart<'_>,
+    previous: Option<&BaselineTree>,
+    resolve_id: &mut (impl FnMut(&TreePath) -> anyhow::Result<fyler_core::id::EntryId> + ?Sized),
+    options: &ScanOptions,
+    progress: &mut dyn FnMut(usize),
+    cancel: &AtomicBool,
+) -> anyhow::Result<Option<BaselineTree>> {
+    if cancel.load(AtomicOrdering::Relaxed) {
+        return Ok(None);
+    }
+    validate_root(start.root)?;
+    let mut tree = BaselineTree::new(start.root);
+    let mut control = ScanControl::enabled(cancel, progress);
+    if !scan_directory_cancellable(
+        start.directory,
+        start.relative,
+        options,
+        previous,
+        resolve_id,
+        &mut tree,
+        &mut control,
+    )? {
+        return Ok(None);
+    }
+    Ok(Some(tree))
+}
+
+fn scan_directory_cancellable(
+    directory: &Path,
+    relative: &TreePath,
+    options: &ScanOptions,
+    previous: Option<&BaselineTree>,
+    resolve_id: &mut (impl FnMut(&TreePath) -> anyhow::Result<fyler_core::id::EntryId> + ?Sized),
+    tree: &mut BaselineTree,
+    control: &mut ScanControl<'_>,
+) -> anyhow::Result<bool> {
+    if control.cancelled() {
+        return Ok(false);
+    }
+    let root_read =
+        read_sorted_entries_cancellable(directory, options, control).map_err(|failure| {
+            anyhow!(failure.error).context(format!(
+                "Failed while {}: {}",
+                failure.stage,
+                failure.path.display()
+            ))
+        })?;
+    let Some(root_read) = root_read else {
+        return Ok(false);
+    };
+    apply_read_access_state(tree, relative, &root_read);
+    let mut stack = vec![ScanFrame {
+        entries: root_read.entries.into_iter(),
+        relative: relative.clone(),
+    }];
+
+    while let Some(frame) = stack.last_mut() {
+        if control.cancelled() {
+            return Ok(false);
+        }
+        let Some(entry) = frame.entries.next() else {
+            stack.pop();
+            continue;
+        };
+        let path = frame.relative.child(entry.name);
+        let kind = entry.kind;
+        tree.insert_with_meta(
+            BaselineEntry {
+                id: resolve_id(&path)?,
+                path: path.clone(),
+                kind,
+            },
+            entry.meta,
+        );
+
+        if kind == EntryKind::Dir {
+            if control.cancelled() {
+                return Ok(false);
+            }
+            match read_sorted_entries_cancellable(&entry.path, options, control) {
+                Ok(Some(read)) => {
+                    apply_read_access_state(tree, &path, &read);
+                    stack.push(ScanFrame {
+                        entries: read.entries.into_iter(),
+                        relative: path,
+                    });
+                }
+                Ok(None) => return Ok(false),
+                Err(failure) => {
+                    let kind = classify_io_error(&failure.error);
+                    if let Some(previous) = previous {
+                        preserve_previous_subtree(previous, &path, tree);
+                    }
+                    if previous.is_some_and(|previous| previous.is_unloaded(&path)) {
+                        tree.mark_unloaded(path.clone());
+                    } else {
+                        tree.mark_incomplete(path.clone(), kind.clone());
+                    }
+                    tree.push_warning(ScanWarning {
+                        path: failure.path,
+                        stage: failure.stage,
+                        kind,
+                    });
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+struct ScanControl<'a> {
+    cancel: &'a AtomicBool,
+    progress: &'a mut dyn FnMut(usize),
+    entries: usize,
+}
+
+impl<'a> ScanControl<'a> {
+    fn enabled(cancel: &'a AtomicBool, progress: &'a mut dyn FnMut(usize)) -> Self {
+        Self {
+            cancel,
+            progress,
+            entries: 0,
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(AtomicOrdering::Relaxed)
+    }
+
+    fn record_entry(&mut self) -> bool {
+        self.entries += 1;
+        if self.entries % 1000 == 0 {
+            (self.progress)(self.entries);
+        }
+        !self.cancelled()
+    }
+}
+
+fn validate_load_target(
+    root: &Path,
+    dir: &TreePath,
+    previous: &BaselineTree,
+) -> anyhow::Result<()> {
+    if previous.root != root {
+        bail!(
+            "Baseline root does not match load root: {} != {}",
+            previous.root.display(),
+            root.display()
+        );
+    }
+    if !dir.is_root()
+        && !previous
+            .get_by_path(dir)
+            .is_some_and(|entry| entry.kind == EntryKind::Dir)
+    {
+        bail!("Load target is not a baseline directory: {dir}");
+    }
+    Ok(())
+}
+
+fn splice_loaded_subtree(
+    previous: &BaselineTree,
+    dir: &TreePath,
+    loaded: &BaselineTree,
+) -> BaselineTree {
+    let mut tree = BaselineTree::new(&previous.root);
+    for entry in previous.entries() {
+        if dir.is_strict_ancestor_of(&entry.path) {
+            continue;
+        }
+        copy_entry(previous, entry, &mut tree);
+        if &entry.path == dir {
+            for loaded_entry in loaded.entries() {
+                copy_entry(loaded, loaded_entry, &mut tree);
+            }
+        }
+    }
+    if dir.is_root() {
+        for entry in loaded.entries() {
+            copy_entry(loaded, entry, &mut tree);
+        }
+    }
+
+    for (path, kind) in previous.incomplete_dirs() {
+        if path != dir && !dir.is_strict_ancestor_of(path) {
+            tree.mark_incomplete(path.clone(), kind.clone());
+        }
+    }
+    for (path, kind) in loaded.incomplete_dirs() {
+        tree.mark_incomplete(path.clone(), kind.clone());
+    }
+    for path in previous.unloaded_dirs() {
+        if path != dir && !dir.is_strict_ancestor_of(path) {
+            tree.mark_unloaded(path.clone());
+        }
+    }
+    for path in loaded.unloaded_dirs() {
+        tree.mark_unloaded(path.clone());
+    }
+
+    let fs_dir = dir.to_fs_path(&previous.root);
+    for warning in previous.scan_warnings() {
+        if !warning.path.starts_with(&fs_dir) {
+            tree.push_warning(warning.clone());
+        }
+    }
+    for warning in loaded.scan_warnings() {
+        tree.push_warning(warning.clone());
+    }
+    tree
+}
+
+fn copy_entry(source: &BaselineTree, entry: &BaselineEntry, target: &mut BaselineTree) {
+    if let Some(meta) = source.meta(entry.id).copied() {
+        target.insert_with_meta(entry.clone(), meta);
+    } else {
+        target.insert(entry.clone());
+    }
 }
 
 fn validate_root(root: &Path) -> anyhow::Result<()> {
@@ -464,16 +949,16 @@ struct DirectoryReadFailure {
     error: io::Error,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 type FaultHook = Box<dyn FnMut(&str, &Path) -> Option<io::Error>>;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static FAULT_INJECTION: std::cell::RefCell<Option<FaultHook>> =
         std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn fault_point(stage: &str, path: &Path) -> io::Result<()> {
     FAULT_INJECTION.with(|hook| {
         let mut hook = hook.borrow_mut();
@@ -485,9 +970,28 @@ fn fault_point(stage: &str, path: &Path) -> io::Result<()> {
     })
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn fault_point(_stage: &str, _path: &Path) -> io::Result<()> {
     Ok(())
+}
+
+/// scanの失敗点を差し替えるテスト専用フック。
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn with_test_fault<R>(
+    hook: impl FnMut(&str, &Path) -> Option<io::Error> + 'static,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FAULT_INJECTION.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+
+    FAULT_INJECTION.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    let _reset = Reset;
+    run()
 }
 
 fn classify_io_error(error: &io::Error) -> ScanErrorKind {
@@ -530,6 +1034,11 @@ fn preserve_previous_subtree(
             tree.mark_incomplete(path.clone(), kind.clone());
         }
     }
+    for path in previous.unloaded_dirs() {
+        if path == directory || directory.is_strict_ancestor_of(path) {
+            tree.mark_unloaded(path.clone());
+        }
+    }
 
     let fs_directory = directory.to_fs_path(&previous.root);
     for warning in previous.scan_warnings() {
@@ -546,6 +1055,9 @@ fn preserve_previous_access_state(
 ) {
     if let Some(kind) = previous.incomplete_dirs().get(directory) {
         tree.mark_incomplete(directory.clone(), kind.clone());
+    }
+    if previous.is_unloaded(directory) {
+        tree.mark_unloaded(directory.clone());
     }
 
     let fs_directory = directory.to_fs_path(&previous.root);
@@ -578,6 +1090,11 @@ fn preserve_previous_subtree_after_failure(
             tree.mark_incomplete(path.clone(), kind.clone());
         }
     }
+    for path in previous.unloaded_dirs() {
+        if directory.is_strict_ancestor_of(path) {
+            tree.mark_unloaded(path.clone());
+        }
+    }
 
     let fs_directory = directory.to_fs_path(&previous.root);
     for warning in previous.scan_warnings() {
@@ -591,6 +1108,26 @@ fn read_sorted_entries(
     directory: &Path,
     options: &ScanOptions,
 ) -> Result<ReadEntries, DirectoryReadFailure> {
+    read_sorted_entries_impl(directory, options, None)
+        .map(|read| read.expect("read without cancellation control cannot be cancelled"))
+}
+
+fn read_sorted_entries_cancellable(
+    directory: &Path,
+    options: &ScanOptions,
+    control: &mut ScanControl<'_>,
+) -> Result<Option<ReadEntries>, DirectoryReadFailure> {
+    read_sorted_entries_impl(directory, options, Some(control))
+}
+
+fn read_sorted_entries_impl(
+    directory: &Path,
+    options: &ScanOptions,
+    mut control: Option<&mut ScanControl<'_>>,
+) -> Result<Option<ReadEntries>, DirectoryReadFailure> {
+    if control.as_deref().is_some_and(ScanControl::cancelled) {
+        return Ok(None);
+    }
     let read_dir = fault_point("enumerate_dir", directory)
         .and_then(|()| fs::read_dir(crate::long_path::to_fs(directory)))
         .map_err(|error| DirectoryReadFailure {
@@ -602,6 +1139,9 @@ fn read_sorted_entries(
     let mut warnings = Vec::new();
     let mut incomplete_kind = None;
     for entry in read_dir {
+        if control.as_deref().is_some_and(ScanControl::cancelled) {
+            return Ok(None);
+        }
         fault_point("dir_entry", directory).map_err(|error| DirectoryReadFailure {
             path: directory.to_path_buf(),
             stage: ScanStage::DirEntry,
@@ -660,16 +1200,24 @@ fn read_sorted_entries(
             kind,
             meta,
         });
+        if let Some(control) = control.as_deref_mut()
+            && !control.record_entry()
+        {
+            return Ok(None);
+        }
     }
 
+    if control.as_deref().is_some_and(ScanControl::cancelled) {
+        return Ok(None);
+    }
     // read_dirの順序は未規定なので、設定された自然順で表示とID採番を
     // セッションごとに安定させる。同値時は元のOsStringで順序を確定する。
     entries.sort_by(|left, right| compare_scanned(left, right, options));
-    Ok(ReadEntries {
+    Ok(Some(ReadEntries {
         entries,
         warnings,
         incomplete_kind,
-    })
+    }))
 }
 
 fn compare_scanned(left: &ScannedEntry, right: &ScannedEntry, options: &ScanOptions) -> Ordering {
@@ -1205,7 +1753,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_rescan_matches_full_for_new_nested_directory_tree() {
+    fn partial_rescan_marks_new_nested_directory_unloaded() {
         let root = tempdir().unwrap();
         let parent = root.path().join("parent");
         fs::create_dir(&parent).unwrap();
@@ -1220,9 +1768,14 @@ mod tests {
 
         assert!(
             partial
-                .entries()
-                .iter()
-                .any(|entry| entry.path == TreePath::parse("parent/new/nested/leaf.txt"))
+                .get_by_path(&TreePath::parse("parent/new"))
+                .is_some()
+        );
+        assert!(partial.is_unloaded(&TreePath::parse("parent/new")));
+        assert!(
+            partial
+                .get_by_path(&TreePath::parse("parent/new/nested/leaf.txt"))
+                .is_none()
         );
     }
 
@@ -1399,13 +1952,6 @@ mod tests {
             .find(|entry| entry.path == TreePath::parse("a/sub"))
             .unwrap()
             .id;
-        let old_child_id = previous
-            .entries()
-            .iter()
-            .find(|entry| entry.path == TreePath::parse("a/sub/child.txt"))
-            .unwrap()
-            .id;
-
         fs::rename(&old, &new).unwrap();
         let partial = assert_partial_matches_full(root.path(), &previous, [old, new]);
         assert!(partial.entries().iter().all(|entry| {
@@ -1417,14 +1963,13 @@ mod tests {
             .iter()
             .find(|entry| entry.path == TreePath::parse("b/sub"))
             .unwrap();
-        let moved_child = partial
-            .entries()
-            .iter()
-            .find(|entry| entry.path == TreePath::parse("b/sub/child.txt"))
-            .unwrap();
-
         assert_ne!(moved_directory.id, old_directory_id);
-        assert_ne!(moved_child.id, old_child_id);
+        assert!(partial.is_unloaded(&TreePath::parse("b/sub")));
+        assert!(
+            partial
+                .get_by_path(&TreePath::parse("b/sub/child.txt"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -2234,6 +2779,427 @@ mod tests {
             baseline
                 .incomplete_dirs()
                 .contains_key(&TreePath::parse("top/middle/blocked"))
+        );
+    }
+
+    #[test]
+    fn shallow_scan_enumerates_root_once_and_marks_child_dirs_unloaded() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("a/nested")).unwrap();
+        fs::create_dir(root.path().join("b")).unwrap();
+        fs::write(root.path().join("a/child.txt"), b"child").unwrap();
+        let root_path = root.path().to_path_buf();
+        let enumerated = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::clone(&enumerated);
+
+        let baseline = with_fault(
+            Box::new(move |stage, path| {
+                if stage == "enumerate_dir" {
+                    observed.borrow_mut().push(path.to_path_buf());
+                }
+                None
+            }),
+            || {
+                scan_baseline_shallow_with(
+                    &root_path,
+                    &mut IdAllocator::new(),
+                    &ScanOptions::default(),
+                )
+                .unwrap()
+            },
+        );
+
+        assert_eq!(&*enumerated.borrow(), &[root.path().to_path_buf()]);
+        assert_eq!(baseline.entries().len(), 2);
+        assert_eq!(
+            baseline.unloaded_dirs(),
+            &BTreeSet::from([TreePath::parse("a"), TreePath::parse("b")])
+        );
+    }
+
+    #[test]
+    fn cancellable_full_scan_matches_existing_recursive_scan() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("dir/nested")).unwrap();
+        fs::write(root.path().join("dir/nested/file.txt"), b"x").unwrap();
+        let mut regular_ids = IdAllocator::new();
+        let regular = scan_baseline(root.path(), &mut regular_ids).unwrap();
+        let mut cancellable_ids = IdAllocator::new();
+
+        let cancellable = scan_baseline_cancellable_with(
+            root.path(),
+            |_| Ok(cancellable_ids.allocate()),
+            &ScanOptions::default(),
+            |_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(cancellable, regular);
+    }
+
+    #[test]
+    fn shallow_cancellable_scan_stops_at_progress_boundary() {
+        let root = tempdir().unwrap();
+        for index in 0..1100 {
+            fs::write(root.path().join(format!("file-{index:04}.txt")), b"x").unwrap();
+        }
+        let cancel = AtomicBool::new(false);
+        let mut progress = Vec::new();
+
+        let result = scan_baseline_shallow_cancellable_with(
+            root.path(),
+            |_| Ok(fyler_core::id::EntryId(1)),
+            &ScanOptions::default(),
+            |count| {
+                progress.push(count);
+                cancel.store(true, AtomicOrdering::Relaxed);
+            },
+            &cancel,
+        )
+        .unwrap();
+
+        assert!(result.is_none());
+        assert_eq!(progress, [1000]);
+    }
+
+    #[test]
+    fn load_directory_preserves_ids_inserts_at_dfs_position_and_propagates_unloaded() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("a/nested")).unwrap();
+        fs::write(root.path().join("a/nested/leaf.txt"), b"leaf").unwrap();
+        fs::write(root.path().join("a/child.txt"), b"child").unwrap();
+        fs::write(root.path().join("z.txt"), b"top").unwrap();
+        let mut ids = IdAllocator::new();
+        let shallow =
+            scan_baseline_shallow_with(root.path(), &mut ids, &ScanOptions::default()).unwrap();
+        let a_id = shallow.get_by_path(&TreePath::parse("a")).unwrap().id;
+        let z_id = shallow.get_by_path(&TreePath::parse("z.txt")).unwrap().id;
+
+        let loaded = load_directory(
+            root.path(),
+            &TreePath::parse("a"),
+            &mut ids,
+            &shallow,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(loaded.get_by_path(&TreePath::parse("a")).unwrap().id, a_id);
+        assert_eq!(
+            loaded.get_by_path(&TreePath::parse("z.txt")).unwrap().id,
+            z_id
+        );
+        let full = scan_baseline(root.path(), &mut IdAllocator::new()).unwrap();
+        let expected = full
+            .entries()
+            .iter()
+            .filter(|entry| !TreePath::parse("a/nested").is_strict_ancestor_of(&entry.path))
+            .map(|entry| (entry.path.clone(), entry.kind))
+            .collect::<Vec<_>>();
+        let actual = loaded
+            .entries()
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert!(!loaded.is_unloaded(&TreePath::parse("a")));
+        assert!(loaded.is_unloaded(&TreePath::parse("a/nested")));
+    }
+
+    #[test]
+    fn load_directory_failure_keeps_previous_unloaded_for_retry() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("lazy")).unwrap();
+        let mut ids = IdAllocator::new();
+        let previous =
+            scan_baseline_shallow_with(root.path(), &mut ids, &ScanOptions::default()).unwrap();
+        let blocked = root.path().join("lazy");
+
+        let result = with_fault(
+            Box::new(move |stage, path| {
+                (stage == "enumerate_dir" && path == blocked)
+                    .then(|| io::Error::new(io::ErrorKind::PermissionDenied, "blocked"))
+            }),
+            || {
+                load_directory(
+                    root.path(),
+                    &TreePath::parse("lazy"),
+                    &mut ids,
+                    &previous,
+                    &ScanOptions::default(),
+                )
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(previous.is_unloaded(&TreePath::parse("lazy")));
+        assert!(previous.incomplete_dirs().is_empty());
+    }
+
+    #[test]
+    fn recursive_load_fully_loads_and_reports_progress() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("lazy/nested")).unwrap();
+        for index in 0..1001 {
+            fs::write(
+                root.path().join(format!("lazy/nested/file-{index:04}.txt")),
+                b"x",
+            )
+            .unwrap();
+        }
+        let mut ids = IdAllocator::new();
+        let shallow =
+            scan_baseline_shallow_with(root.path(), &mut ids, &ScanOptions::default()).unwrap();
+        let previous = load_directory(
+            root.path(),
+            &TreePath::parse("lazy"),
+            &mut ids,
+            &shallow,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        assert!(previous.is_unloaded(&TreePath::parse("lazy/nested")));
+        let mut progress = Vec::new();
+
+        let loaded = load_directory_recursive_cancellable(
+            root.path(),
+            &TreePath::parse("lazy"),
+            |_| Ok(ids.allocate()),
+            &previous,
+            &ScanOptions::default(),
+            |count| progress.push(count),
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(loaded.unloaded_dirs().is_empty());
+        assert!(
+            loaded
+                .get_by_path(&TreePath::parse("lazy/nested/file-1000.txt"))
+                .is_some()
+        );
+        assert_eq!(progress, [1000]);
+    }
+
+    #[test]
+    fn recursive_load_cancellation_returns_none_without_partial_tree() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("lazy")).unwrap();
+        for index in 0..1100 {
+            fs::write(root.path().join(format!("lazy/file-{index:04}.txt")), b"x").unwrap();
+        }
+        let mut ids = IdAllocator::new();
+        let previous =
+            scan_baseline_shallow_with(root.path(), &mut ids, &ScanOptions::default()).unwrap();
+        let cancel = AtomicBool::new(false);
+
+        let loaded = load_directory_recursive_cancellable(
+            root.path(),
+            &TreePath::parse("lazy"),
+            |_| Ok(ids.allocate()),
+            &previous,
+            &ScanOptions::default(),
+            |_| cancel.store(true, AtomicOrdering::Relaxed),
+            &cancel,
+        )
+        .unwrap();
+
+        assert!(loaded.is_none());
+        assert!(previous.is_unloaded(&TreePath::parse("lazy")));
+    }
+
+    #[test]
+    fn changed_path_inside_unloaded_subtree_enumerates_nothing() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("lazy/deep")).unwrap();
+        fs::write(root.path().join("lazy/deep/file.txt"), b"x").unwrap();
+        let mut ids = IdAllocator::new();
+        let previous =
+            scan_baseline_shallow_with(root.path(), &mut ids, &ScanOptions::default()).unwrap();
+        let count = Rc::new(RefCell::new(0usize));
+        let observed = Rc::clone(&count);
+
+        let rescanned = with_fault(
+            Box::new(move |stage, _| {
+                if stage == "enumerate_dir" {
+                    *observed.borrow_mut() += 1;
+                }
+                None
+            }),
+            || {
+                rescan_changed_preserving_ids_with(
+                    root.path(),
+                    &mut ids,
+                    &previous,
+                    &BTreeSet::from([root.path().join("lazy/deep/file.txt")]),
+                    &ScanOptions::default(),
+                )
+                .unwrap()
+            },
+        );
+
+        assert_eq!(*count.borrow(), 0);
+        assert_eq!(rescanned, previous);
+        assert_eq!(rescanned.unloaded_dirs(), previous.unloaded_dirs());
+    }
+
+    #[test]
+    fn coverage_rescan_enumerates_loaded_dirs_only_and_carries_unloaded_marks() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("loaded/lazy")).unwrap();
+        fs::write(root.path().join("loaded/file.txt"), b"old").unwrap();
+        let mut ids = IdAllocator::new();
+        let shallow =
+            scan_baseline_shallow_with(root.path(), &mut ids, &ScanOptions::default()).unwrap();
+        let previous = load_directory(
+            root.path(),
+            &TreePath::parse("loaded"),
+            &mut ids,
+            &shallow,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        fs::write(root.path().join("loaded/file.txt"), b"new content").unwrap();
+        let enumerated = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::clone(&enumerated);
+
+        let rescanned = with_fault(
+            Box::new(move |stage, path| {
+                if stage == "enumerate_dir" {
+                    observed.borrow_mut().push(path.to_path_buf());
+                }
+                None
+            }),
+            || {
+                rescan_changed_preserving_ids_with(
+                    root.path(),
+                    &mut ids,
+                    &previous,
+                    &BTreeSet::from([root.path().join("loaded/file.txt")]),
+                    &ScanOptions::default(),
+                )
+                .unwrap()
+            },
+        );
+
+        assert_eq!(&*enumerated.borrow(), &[root.path().join("loaded")]);
+        assert!(rescanned.is_unloaded(&TreePath::parse("loaded/lazy")));
+    }
+
+    #[test]
+    fn options_rescan_does_not_descend_unloaded_and_marks_new_hidden_dir_unloaded() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("loaded/lazy")).unwrap();
+        fs::create_dir(root.path().join(".new-hidden")).unwrap();
+        let mut ids = IdAllocator::new();
+        let shallow =
+            scan_baseline_shallow_with(root.path(), &mut ids, &ScanOptions::default()).unwrap();
+        let previous = load_directory(
+            root.path(),
+            &TreePath::parse("loaded"),
+            &mut ids,
+            &shallow,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        let enumerated = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::clone(&enumerated);
+
+        let rescanned = with_fault(
+            Box::new(move |stage, path| {
+                if stage == "enumerate_dir" {
+                    observed.borrow_mut().push(path.to_path_buf());
+                }
+                None
+            }),
+            || {
+                rescan_preserving_ids_with(
+                    root.path(),
+                    &mut ids,
+                    &previous,
+                    &ScanOptions {
+                        show_hidden: true,
+                        reverse: true,
+                        ..ScanOptions::default()
+                    },
+                )
+                .unwrap()
+            },
+        );
+
+        assert_eq!(enumerated.borrow().len(), 2);
+        assert!(
+            !enumerated
+                .borrow()
+                .contains(&root.path().join("loaded/lazy"))
+        );
+        assert!(rescanned.is_unloaded(&TreePath::parse("loaded/lazy")));
+        assert!(rescanned.is_unloaded(&TreePath::parse(".new-hidden")));
+    }
+
+    #[test]
+    #[ignore = "環境依存性能計測"]
+    fn bench_lazy_loaded_range_on_deep_50k_tree() {
+        let root = tempdir().unwrap();
+        let expanded = root.path().join("expanded");
+        fs::create_dir(&expanded).unwrap();
+        for index in 0..100 {
+            fs::write(expanded.join(format!("file-{index:03}.txt")), b"x").unwrap();
+        }
+        for branch in 0..50 {
+            let branch = root.path().join(format!("branch-{branch:02}"));
+            for nested in 0..10 {
+                let nested = branch.join(format!("nested-{nested:02}"));
+                fs::create_dir_all(&nested).unwrap();
+                for file in 0..100 {
+                    fs::write(nested.join(format!("file-{file:03}.txt")), b"x").unwrap();
+                }
+            }
+        }
+
+        let options = ScanOptions::default();
+        let shallow_started = Instant::now();
+        let mut lazy_ids = IdAllocator::new();
+        let shallow = scan_baseline_shallow_with(root.path(), &mut lazy_ids, &options).unwrap();
+        let shallow_elapsed = shallow_started.elapsed();
+
+        let full_started = Instant::now();
+        let full = scan_baseline_with(root.path(), &mut IdAllocator::new(), &options).unwrap();
+        let full_elapsed = full_started.elapsed();
+
+        let load_started = Instant::now();
+        let loaded = load_directory(
+            root.path(),
+            &TreePath::parse("expanded"),
+            &mut lazy_ids,
+            &shallow,
+            &options,
+        )
+        .unwrap();
+        let load_elapsed = load_started.elapsed();
+
+        let watch_started = Instant::now();
+        let unchanged = rescan_changed_preserving_ids_with(
+            root.path(),
+            &mut lazy_ids,
+            &loaded,
+            &BTreeSet::from([root.path().join("branch-00/nested-00/file-000.txt")]),
+            &options,
+        )
+        .unwrap();
+        let watch_elapsed = watch_started.elapsed();
+
+        let expected_loaded = shallow.entries().len() + 100;
+        assert_eq!(loaded.entries().len(), expected_loaded);
+        assert_eq!(unchanged, loaded);
+        assert!(full.entries().len() >= 50_000);
+        eprintln!(
+            "lazy loaded-range bench: full_entries={}, loaded_entries={}, shallow={shallow_elapsed:?}, full={full_elapsed:?}, load_100={load_elapsed:?}, unloaded_watch={watch_elapsed:?}",
+            full.entries().len(),
+            loaded.entries().len(),
         );
     }
 }

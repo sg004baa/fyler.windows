@@ -428,6 +428,48 @@ mod tests {
     }
 
     #[test]
+    fn transfer_preflight_detects_collision_inside_unloaded_destination_directory() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir_all(target.join("lazy")).unwrap();
+        fs::write(source.join("a.txt"), b"source").unwrap();
+        fs::write(target.join("lazy/a.txt"), b"existing").unwrap();
+        let mut ids = fyler_core::id::IdAllocator::new();
+        let baseline = crate::scan::scan_baseline_shallow_with(
+            &target,
+            &mut ids,
+            &crate::scan::ScanOptions::default(),
+        )
+        .unwrap();
+        assert!(baseline.is_unloaded(&TreePath::parse("lazy")));
+        assert!(
+            baseline
+                .get_by_path(&TreePath::parse("lazy/a.txt"))
+                .is_none()
+        );
+        let plan = transfer_plan(
+            &source,
+            &target,
+            vec![transfer_op(
+                TransferKind::Copy,
+                "a.txt",
+                "lazy/a.txt",
+                EntryKind::File,
+            )],
+        );
+
+        let result = preflight_transfer(&plan);
+
+        assert_eq!(
+            result.overwritable,
+            [absolute_path(&target.join("lazy/a.txt"))]
+        );
+        assert!(result.blocked.is_empty());
+    }
+
+    #[test]
     fn transfer_blocks_missing_source() {
         let root = tempdir().unwrap();
         let plan = transfer_plan(

@@ -1,27 +1,29 @@
 //! 複数paneのセッション所有とイベント配線。
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use fyler_core::editor::{EditorCommand, EditorEngine, EditorEvent, MessageKind};
+use fyler_core::editor::{EditorCommand, EditorEngine, EditorEvent, FoldOp, MessageKind};
 use fyler_core::feedback::{FeedbackPayload, validate_body};
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::{EntryId, IdAllocator};
 use fyler_core::keymap::{EditorAction, KeyBinding};
 use fyler_core::pane::{FocusDirection, PaneAction, PaneId, PaneLayout, SplitDirection};
+use fyler_core::path::TreePath;
 use fyler_core::report::{ApplyProgress, CommitReport, OpOutcome, OpResult};
 use fyler_core::transfer::TransferKind;
-use fyler_core::tree::EntryKind;
+use fyler_core::tree::{BaselineTree, EntryKind};
 use fyler_core::undo::UndoTransaction;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
 use fyler_fsops::scan::ScanOptions;
 use fyler_fsops::watch::{FsWatcher, WatchEvent};
-use fyler_gui::app::{FeedbackResultKind, GuiAction, GuiEvent, GuiOptions};
+use fyler_gui::app::{FeedbackResultKind, GuiAction, GuiEvent, GuiOptions, PickerAction};
 use fyler_gui::confirm::ConfirmChoice;
 
 use super::feedback::{FeedbackOutcome, resolve_endpoint, send_feedback};
@@ -34,7 +36,7 @@ use super::transfer_flow::{
 };
 use super::{
     AppEvent, BookmarkResolution, GitRefresher, after_root_change, bookmark_list_message,
-    change_root_to, default_root, format_drive_paths, handle_activate_line, handle_external_change,
+    default_root, format_drive_paths, handle_activate_line, handle_external_change,
     handle_open_file_picker, handle_open_terminal, handle_open_with, handle_picker_select,
     handle_yank_path, normalize_root, parse_sort_query, resolve_bookmark_query, resolve_cd_target,
     send_gui_message, send_save_result, send_view_state, sort_state_message,
@@ -57,6 +59,47 @@ struct PaneSession {
     deferred_changes: BTreeSet<PathBuf>,
     undo_slot: Option<UndoTransaction>,
     crashed: bool,
+}
+
+/// app全体で同時に1本だけ実行する列挙workerの所有状態。
+struct LoaderOwner {
+    pane_id: PaneId,
+    root: PathBuf,
+    kind: LoaderKind,
+    cancel: Arc<AtomicBool>,
+}
+
+enum LoaderKind {
+    Root {
+        cursor_target: Option<OsString>,
+    },
+    Directory {
+        dir: TreePath,
+        line: usize,
+    },
+    Recursive {
+        dirs: Vec<TreePath>,
+        line: usize,
+        op: FoldOp,
+    },
+    PickerReveal {
+        target: TreePath,
+        action: fyler_gui::app::PickerAction,
+        dir: TreePath,
+    },
+}
+
+impl LoaderOwner {
+    fn loads_directory(&self) -> bool {
+        !matches!(self.kind, LoaderKind::Root { .. })
+    }
+
+    fn shows_dialog(&self) -> bool {
+        !matches!(
+            self.kind,
+            LoaderKind::Directory { .. } | LoaderKind::PickerReveal { .. }
+        )
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -91,7 +134,7 @@ fn create_pane(
         let mut ids = shared_ids
             .lock()
             .map_err(|_| anyhow::anyhow!("ID allocator lock is poisoned"))?;
-        fyler_fsops::scan::scan_baseline_with(&root, &mut ids, &scan_options)?
+        fyler_fsops::scan::scan_baseline_shallow_with(&root, &mut ids, &scan_options)?
     };
     let save_engine: Arc<dyn EditorEngine> = engine.clone();
     let mut save_controller = SaveController::new_shared_with_scan_options(
@@ -280,6 +323,7 @@ pub(super) fn run() -> anyhow::Result<()> {
             while let Ok(action) = action_rx.recv() {
                 let event = match action {
                     GuiAction::Confirm(choice) => AppEvent::Confirm(choice),
+                    GuiAction::LoaderCancel => AppEvent::LoaderCancel,
                     GuiAction::PickerSelect {
                         pane_id,
                         path,
@@ -341,6 +385,7 @@ pub(super) fn run() -> anyhow::Result<()> {
             let mut dialog_owner = None;
             let mut feedback_open = false;
             let mut apply_owner = None;
+            let mut loader_owner: Option<LoaderOwner> = None;
             let mut transfer = TransferController::new();
             let mut pending_recovery = pending_recovery;
             let mut pending_open_with: Option<(
@@ -435,7 +480,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                             dialog_owner,
                             apply_owner.is_some()
                                 || transfer.is_awaiting()
-                                || transfer.is_running(),
+                                || transfer.is_running()
+                                || loader_owner.is_some(),
                         )
                         .is_err()
                         {
@@ -454,6 +500,19 @@ pub(super) fn run() -> anyhow::Result<()> {
                             continue;
                         };
                         session.crashed = true;
+                        if loader_owner
+                            .as_ref()
+                            .is_some_and(|owner| owner.pane_id == pane_id)
+                        {
+                            let owner = loader_owner.as_ref().expect("checked loader owner");
+                            owner.cancel.store(true, Ordering::Relaxed);
+                            if owner.shows_dialog() && dialog_owner == Some(pane_id) {
+                                dialog_owner = None;
+                                if gui_event_tx.send(GuiEvent::CloseDialog).is_err() {
+                                    return;
+                                }
+                            }
+                        }
                         if active_picker
                             .as_ref()
                             .is_some_and(|picker| picker.pane_id == pane_id)
@@ -680,15 +739,28 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 }
                             }
                             EditorEvent::ActivateLine { line } => {
-                                if handle_activate_line(
+                                let load = match handle_activate_line(
                                     pane_id,
                                     &mut session.save_controller,
                                     session.engine.as_ref(),
                                     &session.root,
                                     line,
                                     &gui_event_tx,
-                                )
-                                .is_err()
+                                ) {
+                                    Ok(load) => load,
+                                    Err(_) => return,
+                                };
+                                if let Some(dir) = load
+                                    && request_directory_load(
+                                        pane_id,
+                                        dir,
+                                        line,
+                                        session,
+                                        &shared_ids,
+                                        &event_tx,
+                                        &mut loader_owner,
+                                    )
+                                    .is_err()
                                 {
                                     return;
                                 }
@@ -740,15 +812,20 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     continue;
                                 };
                                 let new_root = path.to_fs_path(&session.root);
-                                if change_session_root(
+                                if request_session_root_change(
                                     pane_id,
                                     new_root,
                                     None,
                                     session,
                                     &shared_ids,
+                                    &event_tx,
                                     &gui_event_tx,
-                                    &mut git,
-                                    &mut catalogs,
+                                    &mut loader_owner,
+                                    &mut dialog_owner,
+                                    feedback_open
+                                        || apply_owner.is_some()
+                                        || transfer.is_awaiting()
+                                        || transfer.is_running(),
                                 )
                                 .is_err()
                                 {
@@ -815,15 +892,20 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     }
                                     continue;
                                 };
-                                if change_session_root(
+                                if request_session_root_change(
                                     pane_id,
                                     new_root,
-                                    cursor_target.as_deref(),
+                                    cursor_target,
                                     session,
                                     &shared_ids,
+                                    &event_tx,
                                     &gui_event_tx,
-                                    &mut git,
-                                    &mut catalogs,
+                                    &mut loader_owner,
+                                    &mut dialog_owner,
+                                    feedback_open
+                                        || apply_owner.is_some()
+                                        || transfer.is_awaiting()
+                                        || transfer.is_running(),
                                 )
                                 .is_err()
                                 {
@@ -870,15 +952,20 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     }
                                     continue;
                                 };
-                                if change_session_root(
+                                if request_session_root_change(
                                     pane_id,
                                     new_root,
                                     None,
                                     session,
                                     &shared_ids,
+                                    &event_tx,
                                     &gui_event_tx,
-                                    &mut git,
-                                    &mut catalogs,
+                                    &mut loader_owner,
+                                    &mut dialog_owner,
+                                    feedback_open
+                                        || apply_owner.is_some()
+                                        || transfer.is_awaiting()
+                                        || transfer.is_running(),
                                 )
                                 .is_err()
                                 {
@@ -902,15 +989,20 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 };
                                 match resolve_bookmark_query(&query, &bookmarks, &recent) {
                                     BookmarkResolution::Resolved(new_root) => {
-                                        if change_session_root(
+                                        if request_session_root_change(
                                             pane_id,
                                             new_root,
                                             None,
                                             session,
                                             &shared_ids,
+                                            &event_tx,
                                             &gui_event_tx,
-                                            &mut git,
-                                            &mut catalogs,
+                                            &mut loader_owner,
+                                            &mut dialog_owner,
+                                            feedback_open
+                                                || apply_owner.is_some()
+                                                || transfer.is_awaiting()
+                                                || transfer.is_running(),
                                         )
                                         .is_err()
                                         {
@@ -1086,6 +1178,39 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             return;
                                         }
                                     }
+                                    FoldResult::NeedsLoad { dir } => {
+                                        if request_directory_load(
+                                            pane_id,
+                                            dir,
+                                            line,
+                                            session,
+                                            &shared_ids,
+                                            &event_tx,
+                                            &mut loader_owner,
+                                        )
+                                        .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    FoldResult::NeedsLoadRecursive { dirs } => {
+                                        if request_recursive_load(
+                                            pane_id,
+                                            dirs,
+                                            line,
+                                            op,
+                                            session,
+                                            &shared_ids,
+                                            &event_tx,
+                                            &gui_event_tx,
+                                            &mut loader_owner,
+                                            &mut dialog_owner,
+                                        )
+                                        .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
                                     FoldResult::NoOp | FoldResult::Busy => {}
                                 }
                             }
@@ -1246,6 +1371,47 @@ pub(super) fn run() -> anyhow::Result<()> {
                         let Some(session) = panes.get_mut(&pane_id) else {
                             continue;
                         };
+                        if action == PickerAction::Jump
+                            && session.save_controller.baseline().get_by_path(&path).is_none()
+                            && let Some(dir) = super::next_picker_reveal_directory(
+                                session.save_controller.baseline(),
+                                &path,
+                            )
+                        {
+                            if let Some(message) = picker_reveal_start_rejection(
+                                session.engine.snapshot().dirty,
+                                loader_owner.is_some()
+                                    || dialog_owner.is_some()
+                                    || apply_owner.is_some()
+                                    || transfer.is_awaiting()
+                                    || transfer.is_running(),
+                                session.crashed,
+                                session.save_controller.is_idle(),
+                            ) {
+                                if send_gui_message(
+                                    &gui_event_tx,
+                                    pane_id,
+                                    MessageKind::Info,
+                                    message,
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                                continue;
+                            }
+                            request_picker_reveal_load(
+                                pane_id,
+                                path,
+                                action,
+                                dir,
+                                session,
+                                &shared_ids,
+                                &event_tx,
+                                &mut loader_owner,
+                            );
+                            continue;
+                        }
                         let engine = Arc::clone(&session.engine);
                         let root = session.root.clone();
                         if handle_picker_select(
@@ -1675,6 +1841,212 @@ pub(super) fn run() -> anyhow::Result<()> {
                             }
                         }
                     }
+                    AppEvent::LoaderCancel => {
+                        let Some(owner) = &loader_owner else {
+                            continue;
+                        };
+                        if !owner.cancel.swap(true, Ordering::Relaxed)
+                            && owner.shows_dialog()
+                            && gui_event_tx
+                                .send(GuiEvent::LoaderCancelRequested)
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    AppEvent::LoaderProgress(pane_id, entries) => {
+                        if loader_owner.as_ref().is_some_and(|owner| {
+                            owner.pane_id == pane_id && owner.shows_dialog()
+                        }) && gui_event_tx
+                            .send(GuiEvent::LoaderProgress { entries })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    AppEvent::LoaderFinished {
+                        pane_id,
+                        root,
+                        result,
+                    } => {
+                        let Some(owner) = loader_owner.take() else {
+                            continue;
+                        };
+                        if owner.pane_id != pane_id || owner.root != root {
+                            loader_owner = Some(owner);
+                            continue;
+                        }
+                        let showed_dialog = owner.shows_dialog();
+                        let loads_directory = owner.loads_directory();
+                        let picker_reveal = matches!(owner.kind, LoaderKind::PickerReveal { .. });
+                        // Root loadはswap前で session.root が旧rootのままなので、
+                        // 新rootとの不一致を root_changed 扱いすると必ず破棄されてしまう。
+                        // loader_owner排他により競合root変更は起き得ないため除外する。
+                        let is_root_load = matches!(owner.kind, LoaderKind::Root { .. });
+                        let load_target = match &owner.kind {
+                            LoaderKind::Root { .. } => root.clone(),
+                            LoaderKind::Directory { dir, .. } => dir.to_fs_path(&root),
+                            LoaderKind::Recursive { dirs, .. } => dirs
+                                .first()
+                                .map(|dir| dir.to_fs_path(&root))
+                                .unwrap_or_else(|| root.clone()),
+                            LoaderKind::PickerReveal { dir, .. } => dir.to_fs_path(&root),
+                        };
+                        let pane_stale = panes.get(&pane_id).is_none_or(|session| {
+                            loader_completion_is_stale(
+                                false,
+                                session.crashed,
+                                loader_root_changed(is_root_load, &session.root, &root),
+                                session.engine.snapshot().dirty,
+                                session.save_controller.is_idle(),
+                            )
+                        });
+                        let other_busy = apply_owner.is_some()
+                            || transfer.is_awaiting()
+                            || transfer.is_running()
+                            || if showed_dialog {
+                                dialog_owner != Some(pane_id)
+                            } else {
+                                dialog_owner.is_some()
+                            };
+
+                        if !pane_stale && !other_busy {
+                            match classify_loader_result(result) {
+                                LoaderResult::Ready(baseline) => {
+                                    let session = panes.get_mut(&pane_id).expect("checked pane");
+                                    let finish = match owner.kind {
+                                        LoaderKind::Root { cursor_target } => {
+                                            finish_session_root_change(
+                                                pane_id,
+                                                root,
+                                                cursor_target.as_deref(),
+                                                baseline,
+                                                session,
+                                                &gui_event_tx,
+                                                &mut git,
+                                                &mut catalogs,
+                                            )
+                                        }
+                                        LoaderKind::PickerReveal {
+                                            target, action, ..
+                                        } => {
+                                            let next = match finish_picker_reveal_load(
+                                                pane_id,
+                                                &target,
+                                                action,
+                                                baseline,
+                                                session,
+                                                &gui_event_tx,
+                                            ) {
+                                                Ok(next) => next,
+                                                Err(_) => return,
+                                            };
+                                            if let Some(dir) = next {
+                                                request_picker_reveal_load(
+                                                    pane_id,
+                                                    target,
+                                                    action,
+                                                    dir,
+                                                    session,
+                                                    &shared_ids,
+                                                    &event_tx,
+                                                    &mut loader_owner,
+                                                );
+                                            }
+                                            Ok(())
+                                        }
+                                        kind => finish_directory_load(
+                                            pane_id,
+                                            kind,
+                                            baseline,
+                                            session,
+                                            &gui_event_tx,
+                                        ),
+                                    };
+                                    if finish.is_err() {
+                                        return;
+                                    }
+                                }
+                                LoaderResult::Cancelled => {
+                                    if showed_dialog
+                                        && send_gui_message(
+                                            &gui_event_tx,
+                                            pane_id,
+                                            MessageKind::Info,
+                                            "Loading cancelled",
+                                        )
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                LoaderResult::Failed(error) => {
+                                    if picker_reveal {
+                                        if send_gui_message(
+                                            &gui_event_tx,
+                                            pane_id,
+                                            MessageKind::Warn,
+                                            "Search candidate was not found. It may have changed externally.",
+                                        )
+                                        .is_err()
+                                        {
+                                            return;
+                                        }
+                                        eprintln!(
+                                            "Failed to load picker reveal directory {}: {error:#}",
+                                            load_target.display()
+                                        );
+                                    } else {
+                                        let kind = if loads_directory {
+                                            MessageKind::Warn
+                                        } else {
+                                            MessageKind::Error
+                                        };
+                                        if send_gui_message(
+                                            &gui_event_tx,
+                                            pane_id,
+                                            kind,
+                                            format!(
+                                                "Failed to load {}: {error:#}",
+                                                load_target.display()
+                                            ),
+                                        )
+                                        .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if showed_dialog && dialog_owner == Some(pane_id) {
+                            dialog_owner = None;
+                            if gui_event_tx.send(GuiEvent::CloseDialog).is_err() {
+                                return;
+                            }
+                        }
+                        if loads_directory
+                            && loader_owner.is_none()
+                            && let Some(session) = panes.get_mut(&pane_id)
+                            && !session.deferred_changes.is_empty()
+                            && apply_owner.is_none()
+                            && !transfer.is_running()
+                        {
+                            let changed_paths = std::mem::take(&mut session.deferred_changes);
+                            if handle_external_change(
+                                pane_id,
+                                &changed_paths,
+                                &mut session.save_controller,
+                                &gui_event_tx,
+                                &mut git,
+                                &session.root,
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
                     AppEvent::ApplyProgress(pane_id, progress) => {
                         if apply_owner == Some(pane_id)
                             && gui_event_tx
@@ -2032,7 +2404,14 @@ pub(super) fn run() -> anyhow::Result<()> {
                             let Some(session) = panes.get_mut(&changed_id) else {
                                 continue;
                             };
-                            if apply_owner.is_some() || transfer.is_running() {
+                            if should_defer_external_change(
+                                apply_owner.is_some(),
+                                transfer.is_running(),
+                                loader_owner.as_ref().is_some_and(|owner| {
+                                    owner.pane_id == changed_id && owner.loads_directory()
+                                }),
+                            )
+                            {
                                 session.deferred_changes.extend(changed_paths);
                             } else {
                                 let transfer_invalidated =
@@ -2633,41 +3012,604 @@ fn discard_undo_slot(session: &mut PaneSession, journal: Option<&undo_journal::U
     }
 }
 
-#[allow(clippy::too_many_arguments)] // pane固有状態とroot共有catalogの差し替えを一括する。
-fn change_session_root(
+#[allow(clippy::too_many_arguments)]
+fn request_session_root_change(
+    pane_id: PaneId,
+    new_root: PathBuf,
+    cursor_target: Option<OsString>,
+    session: &PaneSession,
+    shared_ids: &Arc<Mutex<IdAllocator>>,
+    app_event_tx: &CountingSender<AppEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
+    loader_owner: &mut Option<LoaderOwner>,
+    dialog_owner: &mut Option<PaneId>,
+    globally_busy: bool,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    let new_root = match normalize_root(&new_root) {
+        Ok(root) => root,
+        Err(error) => {
+            send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Error,
+                format!("Failed to normalize root ({}): {error}", new_root.display()),
+            )?;
+            return Ok(());
+        }
+    };
+    match loader_start_gate(
+        session.engine.snapshot().dirty,
+        session.save_controller.is_offline(),
+        session.save_controller.is_idle(),
+        globally_busy || dialog_owner.is_some(),
+        loader_owner.is_some(),
+    ) {
+        LoaderStartGate::Allow => {}
+        LoaderStartGate::RejectSilently => return Ok(()),
+        LoaderStartGate::Reject(message) => {
+            send_gui_message(gui_event_tx, pane_id, MessageKind::Info, message)?;
+            return Ok(());
+        }
+    }
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    gui_event_tx.send(GuiEvent::ShowLoaderProgress {
+        title: "Loading folder".to_owned(),
+        path: new_root.clone(),
+    })?;
+    *dialog_owner = Some(pane_id);
+    *loader_owner = Some(LoaderOwner {
+        pane_id,
+        root: new_root.clone(),
+        kind: LoaderKind::Root { cursor_target },
+        cancel: Arc::clone(&cancel),
+    });
+
+    let scan_options = session.save_controller.scan_options();
+    let worker_ids = Arc::clone(shared_ids);
+    let worker_event_tx = app_event_tx.clone();
+    let worker_root = new_root.clone();
+    let spawn_result = thread::Builder::new()
+        .name("fyler-loader".to_owned())
+        // network share上の列挙は再帰し得るため既定stackを維持する。
+        .spawn(move || {
+            let progress_tx = worker_event_tx.clone();
+            let result = fyler_fsops::scan::scan_baseline_shallow_cancellable_with(
+                &worker_root,
+                move |_| {
+                    let mut ids = worker_ids
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("ID allocator lock is poisoned"))?;
+                    Ok(ids.allocate())
+                },
+                &scan_options,
+                move |entries| {
+                    let _ = progress_tx.send(AppEvent::LoaderProgress(pane_id, entries));
+                },
+                &cancel,
+            );
+            let _ = worker_event_tx.send(AppEvent::LoaderFinished {
+                pane_id,
+                root: worker_root,
+                result,
+            });
+        });
+    if let Err(error) = spawn_result {
+        let _ = app_event_tx.send(AppEvent::LoaderFinished {
+            pane_id,
+            root: new_root,
+            result: Err(anyhow::anyhow!("Failed to start loader worker: {error}")),
+        });
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn request_directory_load(
+    pane_id: PaneId,
+    dir: TreePath,
+    line: usize,
+    session: &PaneSession,
+    shared_ids: &Arc<Mutex<IdAllocator>>,
+    app_event_tx: &CountingSender<AppEvent>,
+    loader_owner: &mut Option<LoaderOwner>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    if loader_owner.is_some() {
+        return Ok(());
+    }
+    let root = session.root.clone();
+    let previous = session.save_controller.baseline().clone();
+    let options = session.save_controller.scan_options();
+    let cancel = Arc::new(AtomicBool::new(false));
+    *loader_owner = Some(LoaderOwner {
+        pane_id,
+        root: root.clone(),
+        kind: LoaderKind::Directory {
+            dir: dir.clone(),
+            line,
+        },
+        cancel: Arc::clone(&cancel),
+    });
+    let worker_ids = Arc::clone(shared_ids);
+    let worker_event_tx = app_event_tx.clone();
+    let worker_root = root.clone();
+    let spawn_result = thread::Builder::new()
+        .name("fyler-loader".to_owned())
+        .spawn(move || {
+            let result = worker_ids
+                .lock()
+                .map_err(|_| anyhow::anyhow!("ID allocator lock is poisoned"))
+                .and_then(|mut ids| {
+                    fyler_fsops::scan::load_directory(
+                        &worker_root,
+                        &dir,
+                        &mut ids,
+                        &previous,
+                        &options,
+                    )
+                    .map(Some)
+                });
+            let _ = worker_event_tx.send(AppEvent::LoaderFinished {
+                pane_id,
+                root: worker_root,
+                result,
+            });
+        });
+    if let Err(error) = spawn_result {
+        let _ = app_event_tx.send(AppEvent::LoaderFinished {
+            pane_id,
+            root,
+            result: Err(anyhow::anyhow!("Failed to start loader worker: {error}")),
+        });
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn request_picker_reveal_load(
+    pane_id: PaneId,
+    target: TreePath,
+    action: fyler_gui::app::PickerAction,
+    dir: TreePath,
+    session: &PaneSession,
+    shared_ids: &Arc<Mutex<IdAllocator>>,
+    app_event_tx: &CountingSender<AppEvent>,
+    loader_owner: &mut Option<LoaderOwner>,
+) {
+    debug_assert!(loader_owner.is_none());
+    let root = session.root.clone();
+    let previous = session.save_controller.baseline().clone();
+    let options = session.save_controller.scan_options();
+    let cancel = Arc::new(AtomicBool::new(false));
+    *loader_owner = Some(LoaderOwner {
+        pane_id,
+        root: root.clone(),
+        kind: LoaderKind::PickerReveal {
+            target,
+            action,
+            dir: dir.clone(),
+        },
+        cancel: Arc::clone(&cancel),
+    });
+    let worker_ids = Arc::clone(shared_ids);
+    let worker_event_tx = app_event_tx.clone();
+    let worker_root = root.clone();
+    let spawn_result = thread::Builder::new()
+        .name("fyler-loader".to_owned())
+        .spawn(move || {
+            let result = worker_ids
+                .lock()
+                .map_err(|_| anyhow::anyhow!("ID allocator lock is poisoned"))
+                .and_then(|mut ids| {
+                    fyler_fsops::scan::load_directory(
+                        &worker_root,
+                        &dir,
+                        &mut ids,
+                        &previous,
+                        &options,
+                    )
+                    .map(Some)
+                });
+            let _ = worker_event_tx.send(AppEvent::LoaderFinished {
+                pane_id,
+                root: worker_root,
+                result,
+            });
+        });
+    if let Err(error) = spawn_result {
+        let _ = app_event_tx.send(AppEvent::LoaderFinished {
+            pane_id,
+            root,
+            result: Err(anyhow::anyhow!("Failed to start loader worker: {error}")),
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn request_recursive_load(
+    pane_id: PaneId,
+    dirs: Vec<TreePath>,
+    line: usize,
+    op: FoldOp,
+    session: &PaneSession,
+    shared_ids: &Arc<Mutex<IdAllocator>>,
+    app_event_tx: &CountingSender<AppEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
+    loader_owner: &mut Option<LoaderOwner>,
+    dialog_owner: &mut Option<PaneId>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    if loader_owner.is_some() || dialog_owner.is_some() {
+        return Ok(());
+    }
+    let root = session.root.clone();
+    let previous = session.save_controller.baseline().clone();
+    let options = session.save_controller.scan_options();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let display_path = dirs
+        .first()
+        .map(|dir| dir.to_fs_path(&root))
+        .unwrap_or_else(|| root.clone());
+    gui_event_tx.send(GuiEvent::ShowLoaderProgress {
+        title: "Loading folders".to_owned(),
+        path: display_path,
+    })?;
+    *dialog_owner = Some(pane_id);
+    *loader_owner = Some(LoaderOwner {
+        pane_id,
+        root: root.clone(),
+        kind: LoaderKind::Recursive {
+            dirs: dirs.clone(),
+            line,
+            op,
+        },
+        cancel: Arc::clone(&cancel),
+    });
+    let worker_ids = Arc::clone(shared_ids);
+    let worker_event_tx = app_event_tx.clone();
+    let worker_root = root.clone();
+    let spawn_result = thread::Builder::new()
+        .name("fyler-loader".to_owned())
+        // 再帰directory loadは深さが読めないため既定stackを維持する。
+        .spawn(move || {
+            let mut current = previous;
+            let mut result = Ok(Some(current.clone()));
+            let mut completed = 0_usize;
+            for dir in &dirs {
+                if cancel.load(Ordering::Relaxed) {
+                    result = Ok(None);
+                    break;
+                }
+                let mut local_progress = 0_usize;
+                let progress_tx = worker_event_tx.clone();
+                let loaded = fyler_fsops::scan::load_directory_recursive_cancellable(
+                    &worker_root,
+                    dir,
+                    |_| {
+                        let mut ids = worker_ids
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("ID allocator lock is poisoned"))?;
+                        Ok(ids.allocate())
+                    },
+                    &current,
+                    &options,
+                    |entries| {
+                        local_progress = entries;
+                        let _ = progress_tx
+                            .send(AppEvent::LoaderProgress(pane_id, completed + entries));
+                    },
+                    &cancel,
+                );
+                match loaded {
+                    Ok(Some(baseline)) => {
+                        current = baseline;
+                        completed += local_progress;
+                        result = Ok(Some(current.clone()));
+                    }
+                    Ok(None) => {
+                        result = Ok(None);
+                        break;
+                    }
+                    Err(error) => {
+                        result = Err(error);
+                        break;
+                    }
+                }
+            }
+            let _ = worker_event_tx.send(AppEvent::LoaderFinished {
+                pane_id,
+                root: worker_root,
+                result,
+            });
+        });
+    if let Err(error) = spawn_result {
+        let _ = app_event_tx.send(AppEvent::LoaderFinished {
+            pane_id,
+            root,
+            result: Err(anyhow::anyhow!("Failed to start loader worker: {error}")),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoaderStartGate {
+    Allow,
+    RejectSilently,
+    Reject(&'static str),
+}
+
+fn loader_start_gate(
+    dirty: bool,
+    offline: bool,
+    idle: bool,
+    globally_busy: bool,
+    loader_active: bool,
+) -> LoaderStartGate {
+    if dirty && !offline {
+        return LoaderStartGate::Reject(
+            "You are editing. Save or discard changes before changing directories.",
+        );
+    }
+    if !idle {
+        return LoaderStartGate::RejectSilently;
+    }
+    if globally_busy || loader_active {
+        return LoaderStartGate::Reject("Another operation is in progress");
+    }
+    LoaderStartGate::Allow
+}
+
+enum LoaderResult<T, E> {
+    Ready(T),
+    Cancelled,
+    Failed(E),
+}
+
+fn classify_loader_result<T, E>(result: Result<Option<T>, E>) -> LoaderResult<T, E> {
+    match result {
+        Ok(Some(value)) => LoaderResult::Ready(value),
+        Ok(None) => LoaderResult::Cancelled,
+        Err(error) => LoaderResult::Failed(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_session_root_change(
     pane_id: PaneId,
     new_root: PathBuf,
     cursor_target: Option<&OsStr>,
+    new_baseline: BaselineTree,
     session: &mut PaneSession,
-    shared_ids: &Arc<Mutex<IdAllocator>>,
     gui_event_tx: &CountingSender<GuiEvent>,
     git: &mut GitRefresher,
     catalogs: &mut CatalogService,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
-    let changed = change_root_to(
-        pane_id,
-        new_root,
-        cursor_target,
-        &mut session.root,
-        &mut session.watcher,
-        &session.watch_tx,
-        shared_ids,
-        &mut session.save_controller,
-        session.engine.as_ref(),
-        gui_event_tx,
-    )?;
-    if changed {
-        catalogs.change_root(pane_id, session.root.clone());
-        session.watch_degraded = false;
-        after_root_change(
-            pane_id,
+    let new_watcher = match fyler_fsops::watch::watch(&new_root, session.watch_tx.clone()) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Error,
+                format!("Failed to watch root ({}): {error:#}", new_root.display()),
+            )?;
+            return Ok(());
+        }
+    };
+    if let Err(error) = session
+        .save_controller
+        .change_root_preserving_allocator(new_root.clone(), new_baseline)
+    {
+        send_gui_message(
             gui_event_tx,
-            &mut session.save_controller,
-            git,
-            &session.root,
+            pane_id,
+            MessageKind::Error,
+            format!("Failed to change root: {error:#}"),
+        )?;
+        return Ok(());
+    }
+    session.save_controller.collapse_all_dirs();
+    let cursor_line =
+        cursor_target.and_then(|name| session.save_controller.find_top_level_line(name));
+    let new_lines = session.save_controller.visible_lines();
+    session.root = new_root;
+    session.watcher = new_watcher;
+    session.watch_degraded = false;
+    if let Err(error) = session.engine.send(EditorCommand::SetLines {
+        lines: new_lines,
+        cursor_line,
+    }) {
+        send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            format!("Failed to display new directory: {error:#}"),
         )?;
     }
-    Ok(())
+    catalogs.change_root(pane_id, session.root.clone());
+    if let Err(error) = super::config::record_recent_root(&session.root) {
+        send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Warn,
+            format!("Failed to record recent root: {error:#}"),
+        )?;
+    }
+    after_root_change(
+        pane_id,
+        gui_event_tx,
+        &mut session.save_controller,
+        git,
+        &session.root,
+    )
+}
+
+fn finish_directory_load(
+    pane_id: PaneId,
+    kind: LoaderKind,
+    baseline: BaselineTree,
+    session: &mut PaneSession,
+    gui_event_tx: &CountingSender<GuiEvent>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    if let Err(error) = session
+        .save_controller
+        .replace_baseline_after_load(baseline)
+    {
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Warn,
+            format!("Loaded directory result was stale: {error:#}"),
+        );
+    }
+    let snapshot = session.engine.snapshot();
+    let (lines, cursor_line) = match kind {
+        LoaderKind::Directory { dir, line } => {
+            match session
+                .save_controller
+                .toggle_collapse(&snapshot.lines, line)
+            {
+                super::save_flow::ToggleCollapseResult::Toggled(lines) => (lines, Some(line)),
+                _ => {
+                    return send_gui_message(
+                        gui_event_tx,
+                        pane_id,
+                        MessageKind::Warn,
+                        format!("Loaded directory is no longer expandable: {dir}"),
+                    );
+                }
+            }
+        }
+        LoaderKind::Recursive { dirs, line, op } => {
+            match session.save_controller.fold(&snapshot.lines, line, op) {
+                FoldResult::Applied { lines, cursor_line } => (lines, cursor_line),
+                FoldResult::NoOp => (session.save_controller.visible_lines(), Some(line)),
+                _ => {
+                    return send_gui_message(
+                        gui_event_tx,
+                        pane_id,
+                        MessageKind::Warn,
+                        format!(
+                            "Loaded directories are no longer expandable: {}",
+                            dirs.len()
+                        ),
+                    );
+                }
+            }
+        }
+        LoaderKind::PickerReveal { .. } => {
+            unreachable!("picker reveal load has a separate completion path")
+        }
+        LoaderKind::Root { .. } => unreachable!("root load has a separate completion path"),
+    };
+    if let Err(error) = session
+        .engine
+        .send(EditorCommand::SetLines { lines, cursor_line })
+    {
+        send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            format!("Failed to display loaded directory: {error:#}"),
+        )?;
+    }
+    send_view_state(gui_event_tx, pane_id, &mut session.save_controller)
+}
+
+fn finish_picker_reveal_load(
+    pane_id: PaneId,
+    target: &TreePath,
+    action: PickerAction,
+    baseline: BaselineTree,
+    session: &mut PaneSession,
+    gui_event_tx: &CountingSender<GuiEvent>,
+) -> Result<Option<TreePath>, mpsc::SendError<GuiEvent>> {
+    if let Err(error) = session
+        .save_controller
+        .replace_baseline_after_load(baseline)
+    {
+        send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Warn,
+            format!("Loaded search result was stale: {error:#}"),
+        )?;
+        return Ok(None);
+    }
+
+    if session
+        .save_controller
+        .baseline()
+        .get_by_path(target)
+        .is_some()
+    {
+        let engine = Arc::clone(&session.engine);
+        let root = session.root.clone();
+        handle_picker_select(
+            pane_id,
+            target.clone(),
+            action,
+            &mut session.save_controller,
+            engine.as_ref(),
+            &root,
+            gui_event_tx,
+        )?;
+        return Ok(None);
+    }
+
+    if let Some(dir) =
+        super::next_picker_reveal_directory(session.save_controller.baseline(), target)
+    {
+        return Ok(Some(dir));
+    }
+
+    send_gui_message(
+        gui_event_tx,
+        pane_id,
+        MessageKind::Warn,
+        "Search candidate was not found. It may have changed externally.",
+    )?;
+    Ok(None)
+}
+
+fn loader_completion_is_stale(
+    pane_missing: bool,
+    crashed: bool,
+    root_changed: bool,
+    dirty: bool,
+    idle: bool,
+) -> bool {
+    pane_missing || crashed || root_changed || dirty || !idle
+}
+
+/// ロード完了時にpaneのrootが「別のroot」へ移ったかを判定する。
+///
+/// Root load自体はswapがこの判定より後に走るため session.root は旧rootのままで、
+/// 新rootとの不一致を変更扱いすると必ずstaleになる。loader_owner排他により
+/// Root load中に競合するroot変更は起き得ないので、Root loadでは常にfalse。
+/// Directory/Recursive/PickerReveal loadはsession.rootを基準に列挙したため、
+/// その間にrootが変わっていたらstaleとして破棄する。
+fn loader_root_changed(is_root_load: bool, session_root: &Path, loaded_root: &Path) -> bool {
+    !is_root_load && session_root != loaded_root
+}
+
+fn picker_reveal_start_rejection(
+    dirty: bool,
+    busy: bool,
+    crashed: bool,
+    idle: bool,
+) -> Option<&'static str> {
+    if dirty {
+        Some("Cannot reveal a folded search candidate while editing. Save or discard changes.")
+    } else if busy || crashed || !idle {
+        Some("Another operation is in progress")
+    } else {
+        None
+    }
+}
+
+fn should_defer_external_change(applying: bool, transferring: bool, loading: bool) -> bool {
+    applying || transferring || loading
 }
 
 #[cfg(test)]
@@ -2789,6 +3731,115 @@ mod tests {
             Some(BTreeSet::from([root.join("blocked")]))
         );
         assert!(incomplete_probe_paths(&controller, true, false).is_none());
+    }
+
+    #[test]
+    fn root_change_loader_classifies_success_and_cancel_without_committing_cancelled_data() {
+        assert!(matches!(
+            classify_loader_result::<_, ()>(Ok(Some("new-root"))),
+            LoaderResult::Ready("new-root")
+        ));
+        assert!(matches!(
+            classify_loader_result::<(), ()>(Ok(None)),
+            LoaderResult::Cancelled
+        ));
+    }
+
+    #[test]
+    fn loader_completion_discards_missing_crashed_changed_dirty_and_busy_panes() {
+        assert!(loader_completion_is_stale(true, false, false, false, true));
+        assert!(loader_completion_is_stale(false, true, false, false, true));
+        assert!(loader_completion_is_stale(false, false, true, false, true));
+        assert!(loader_completion_is_stale(false, false, false, true, true));
+        assert!(loader_completion_is_stale(
+            false, false, false, false, false
+        ));
+        assert!(!loader_completion_is_stale(
+            false, false, false, false, true
+        ));
+    }
+
+    #[test]
+    fn root_load_completion_is_not_stale_despite_pending_root_swap() {
+        let old_root = Path::new("C:/Users");
+        let new_root = Path::new("C:/");
+        // Root loadはswap前で session.root(旧) != loaded_root(新)。ここでstale扱い
+        // すると gd/^/:cd/bookmark/recent/drive の移動が全て黙って破棄される(regression)。
+        assert!(!loader_root_changed(true, old_root, new_root));
+        // Directory/PickerReveal loadはsession.rootを基準に列挙したため、rootが
+        // 変わっていたら破棄する。同一rootなら破棄しない。
+        assert!(loader_root_changed(false, old_root, new_root));
+        assert!(!loader_root_changed(false, old_root, old_root));
+    }
+
+    #[test]
+    fn picker_reveal_start_rejects_dirty_and_busy_loader_owner() {
+        assert_eq!(
+            picker_reveal_start_rejection(true, false, false, true),
+            Some("Cannot reveal a folded search candidate while editing. Save or discard changes.")
+        );
+        assert_eq!(
+            picker_reveal_start_rejection(false, true, false, true),
+            Some("Another operation is in progress")
+        );
+        assert_eq!(
+            picker_reveal_start_rejection(false, false, false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn root_change_start_gate_preserves_existing_dirty_and_busy_rules() {
+        assert_eq!(
+            loader_start_gate(true, false, true, false, false),
+            LoaderStartGate::Reject(
+                "You are editing. Save or discard changes before changing directories."
+            )
+        );
+        assert_eq!(
+            loader_start_gate(false, false, false, false, false),
+            LoaderStartGate::RejectSilently
+        );
+        assert_eq!(
+            loader_start_gate(false, false, true, false, true),
+            LoaderStartGate::Reject("Another operation is in progress")
+        );
+        assert_eq!(
+            loader_start_gate(false, false, true, false, false),
+            LoaderStartGate::Allow
+        );
+    }
+
+    #[test]
+    fn directory_loader_participates_in_external_change_deferral() {
+        assert!(should_defer_external_change(false, false, true));
+        assert!(should_defer_external_change(true, false, false));
+        assert!(should_defer_external_change(false, true, false));
+        assert!(!should_defer_external_change(false, false, false));
+    }
+
+    #[test]
+    fn parent_navigation_cursor_target_finds_the_previous_child_in_shallow_baseline() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("child")).unwrap();
+        let mut ids = IdAllocator::new();
+        let baseline = fyler_fsops::scan::scan_baseline_shallow_with(
+            root.path(),
+            &mut ids,
+            &ScanOptions::default(),
+        )
+        .unwrap();
+        let controller = SaveController::new(
+            root.path().to_path_buf(),
+            ids,
+            baseline,
+            Arc::new(ProbeEngine),
+        );
+
+        assert_eq!(
+            controller.find_top_level_line(std::ffi::OsStr::new("child")),
+            Some(0)
+        );
     }
 
     #[test]

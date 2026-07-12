@@ -790,3 +790,94 @@ fn diff_expanded_dir_copy_emits_parent_copy_only_not_descendants() {
         }]
     );
 }
+
+fn unloaded_directory_baseline() -> BaselineTree {
+    let mut tree = baseline(&[(1, "lazy", EntryKind::Dir), (2, "target", EntryKind::Dir)]);
+    tree.mark_unloaded(TreePath::parse("lazy"));
+    tree
+}
+
+#[test]
+fn diff_unloaded_directory_rename_is_an_opaque_move() {
+    let base = unloaded_directory_baseline();
+    let desired = DesiredTree {
+        entries: vec![
+            desired_entry(Some(1), "renamed", EntryKind::Dir, 0),
+            desired_entry(Some(2), "target", EntryKind::Dir, 1),
+        ],
+    };
+
+    let plan = diff::build_plan(&base, &desired, &collapsed(&[1])).unwrap();
+
+    assert_eq!(
+        plan.ops,
+        [FsOperation::Move {
+            id: EntryId(1),
+            from: TreePath::parse("lazy"),
+            to: TreePath::parse("renamed"),
+        }]
+    );
+}
+
+#[test]
+fn diff_unloaded_directory_move_is_an_opaque_move() {
+    let base = unloaded_directory_baseline();
+    let desired = DesiredTree {
+        entries: vec![
+            desired_entry(Some(2), "target", EntryKind::Dir, 0),
+            desired_entry(Some(1), "target/lazy", EntryKind::Dir, 1),
+        ],
+    };
+
+    let plan = diff::build_plan(&base, &desired, &collapsed(&[1])).unwrap();
+
+    assert_eq!(
+        plan.ops,
+        [FsOperation::Move {
+            id: EntryId(1),
+            from: TreePath::parse("lazy"),
+            to: TreePath::parse("target/lazy"),
+        }]
+    );
+}
+
+#[test]
+fn diff_unloaded_directory_delete_is_opaque_and_not_incomplete() {
+    let base = unloaded_directory_baseline();
+    let desired = DesiredTree {
+        entries: vec![desired_entry(Some(2), "target", EntryKind::Dir, 0)],
+    };
+
+    let plan = diff::build_plan(&base, &desired, &collapsed(&[1])).unwrap();
+
+    assert_eq!(
+        plan.ops,
+        [FsOperation::Delete {
+            id: EntryId(1),
+            path: TreePath::parse("lazy"),
+        }]
+    );
+}
+
+#[test]
+fn diff_unloaded_directory_copy_is_an_opaque_copy() {
+    let base = unloaded_directory_baseline();
+    let desired = DesiredTree {
+        entries: vec![
+            desired_entry(Some(1), "lazy", EntryKind::Dir, 0),
+            desired_entry(Some(2), "target", EntryKind::Dir, 1),
+            desired_entry(Some(1), "target/lazy", EntryKind::Dir, 2),
+        ],
+    };
+
+    let plan = diff::build_plan(&base, &desired, &collapsed(&[1])).unwrap();
+
+    assert_eq!(
+        plan.ops,
+        [FsOperation::Copy {
+            src: EntryId(1),
+            from: TreePath::parse("lazy"),
+            to: TreePath::parse("target/lazy"),
+        }]
+    );
+}
