@@ -25,6 +25,9 @@ use crate::confirm::{ConfirmChoice, ConfirmDetail, IconStyle};
 use crate::{cmdline, confirm, input, modeline, tree_view};
 
 const CJK_FONT_NAME: &str = "fyler-cjk";
+const INITIAL_WINDOW_SCALE: f32 = 0.8;
+// eframe 0.35がnative window geometryに使うpersistence key。
+const EFRAME_WINDOW_STORAGE_KEY: &str = "window";
 /// ファイルpickerで候補を確定したときの動作。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerAction {
@@ -318,6 +321,8 @@ pub struct FylerApp {
     confirm_detail: ConfirmDetail,
     icon_style: IconStyle,
     help_lines: Vec<String>,
+    /// native window geometryが未保存の初回起動だけ、monitor比率でサイズを設定する。
+    resize_to_monitor_on_first_frame: bool,
 }
 
 struct PaneViewState {
@@ -383,6 +388,7 @@ impl FylerApp {
             confirm_detail,
             icon_style,
             help_lines,
+            resize_to_monitor_on_first_frame: false,
         })
     }
 
@@ -724,6 +730,14 @@ impl FylerApp {
 impl eframe::App for FylerApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_events();
+        if self.resize_to_monitor_on_first_frame
+            && let Some((size, position)) =
+                initial_window_geometry(ctx.input(|input| input.viewport().monitor_size))
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
+            self.resize_to_monitor_on_first_frame = false;
+        }
         if let Some(path) = self.pending_copy.take() {
             ctx.copy_text(path.clone());
             self.message = Some(EditorMessage {
@@ -1448,13 +1462,20 @@ fn draw_help(ui: &mut egui::Ui, help_lines: &[String]) -> bool {
         .inner
 }
 
-fn native_options() -> eframe::NativeOptions {
-    eframe::NativeOptions {
-        // eframe persistence restores the previous native size/position/maximized state.
-        // This larger Explorer-like size is used only before a persisted window exists.
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]),
-        ..Default::default()
+fn initial_window_geometry(monitor_size: Option<egui::Vec2>) -> Option<(egui::Vec2, egui::Pos2)> {
+    let monitor_size = monitor_size?;
+    if !monitor_size.is_finite() || monitor_size.x <= 0.0 || monitor_size.y <= 0.0 {
+        return None;
     }
+    let size = monitor_size * INITIAL_WINDOW_SCALE;
+    let margin = (monitor_size - size) * 0.5;
+    Some((size, egui::pos2(margin.x, margin.y)))
+}
+
+fn native_options() -> eframe::NativeOptions {
+    // eframe persistence restores the previous native size/position/maximized state.
+    // A monitor-relative size is applied from the first frame only when this state is absent.
+    eframe::NativeOptions::default()
 }
 
 /// GUIを起動する(メインスレッドで呼ぶこと。eframeの制約)。
@@ -1481,12 +1502,16 @@ pub fn run(
                 icon_style,
                 help_lines,
             } = gui_options;
+            let resize_to_monitor_on_first_frame = creation_context
+                .storage
+                .and_then(|storage| storage.get_string(EFRAME_WINDOW_STORAGE_KEY))
+                .is_none();
             install_fallback_font(
                 &creation_context.egui_ctx,
                 font_path.as_deref(),
                 font_y_offset_factor,
             );
-            let app = FylerApp::new(
+            let mut app = FylerApp::new(
                 event_rx,
                 action_tx,
                 confirm_detail,
@@ -1496,6 +1521,7 @@ pub fn run(
                 event_dequeued,
             )
             .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
+            app.resize_to_monitor_on_first_frame = resize_to_monitor_on_first_frame;
             Ok(Box::new(app))
         }),
     )
@@ -1613,6 +1639,7 @@ mod tests {
                 confirm_detail: ConfirmDetail::Full,
                 icon_style: IconStyle::Ascii,
                 help_lines: Vec::new(),
+                resize_to_monitor_on_first_frame: false,
             },
             event_tx,
             action_rx,
@@ -1753,6 +1780,7 @@ mod tests {
             confirm_detail: ConfirmDetail::Full,
             icon_style: IconStyle::Ascii,
             help_lines: Vec::new(),
+            resize_to_monitor_on_first_frame: false,
         };
         let (tx, rx) = mpsc::channel();
         app.event_rx = rx;
@@ -2017,9 +2045,12 @@ mod tests {
         assert!(app.dialog.is_none());
     }
     #[test]
-    fn first_launch_uses_explorer_sized_window_and_native_persistence() {
-        let options = native_options();
-        assert_eq!(options.viewport.inner_size, Some(egui::vec2(1280.0, 800.0)));
-        assert!(options.persist_window);
+    fn first_launch_uses_eighty_percent_of_display_and_native_persistence() {
+        let (size, position) = initial_window_geometry(Some(egui::vec2(1920.0, 1080.0))).unwrap();
+        assert_eq!(size, egui::vec2(1536.0, 864.0));
+        assert_eq!(position, egui::pos2(192.0, 108.0));
+        assert!(initial_window_geometry(None).is_none());
+        assert!(initial_window_geometry(Some(egui::Vec2::ZERO)).is_none());
+        assert!(native_options().persist_window);
     }
 }

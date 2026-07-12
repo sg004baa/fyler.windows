@@ -117,7 +117,7 @@ discarding other valid panes. Invalid data above the four-pane limit is pruned t
 Session writes use a same-directory temporary file, flush it, and atomically rename it only during
 normal shutdown. A truncated temporary write therefore does not replace the previous session.
 Window size, position, and maximized state use eframe's separate native persistence. Before a
-persisted window exists, fyler opens at 1280 by 800 logical pixels.
+persisted window exists, fyler opens centered at 80% of the current display's width and height.
 
 
 ### External terminal
