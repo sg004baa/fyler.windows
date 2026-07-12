@@ -43,7 +43,7 @@ pub enum GuiAction {
     Confirm(ConfirmChoice),
     PickerSelect {
         pane_id: PaneId,
-        entry_id: EntryId,
+        path: TreePath,
         action: PickerAction,
     },
     FeedbackSubmit {
@@ -1073,7 +1073,7 @@ fn apply_picker_keys(
     let candidate = candidates.get(hits[*selected].index)?;
     Some(Some(GuiAction::PickerSelect {
         pane_id,
-        entry_id: candidate.id,
+        path: candidate.path.clone(),
         action,
     }))
 }
@@ -1464,12 +1464,11 @@ mod tests {
         )))
     }
 
-    fn candidate(id: u64, path: &str, kind: fyler_core::tree::EntryKind) -> SearchCandidate {
+    fn candidate(path: &str, kind: fyler_core::tree::EntryKind) -> SearchCandidate {
         let display = path.to_owned();
         let key = display.to_lowercase();
         let name_offset = key.rfind('/').map_or(0, |offset| offset + 1);
         SearchCandidate {
-            id: EntryId(id),
             path: TreePath::parse(path),
             kind,
             display,
@@ -1683,8 +1682,8 @@ mod tests {
     #[test]
     fn picker_query_update_recalculates_hits_and_resets_selection() {
         let candidates = vec![
-            candidate(1, "src/main.rs", fyler_core::tree::EntryKind::File),
-            candidate(2, "README.md", fyler_core::tree::EntryKind::File),
+            candidate("src/main.rs", fyler_core::tree::EntryKind::File),
+            candidate("README.md", fyler_core::tree::EntryKind::File),
         ];
         let mut selected = 1;
         let mut hits = fyler_core::search::search(&candidates, "", PICKER_RESULT_LIMIT);
@@ -1693,15 +1692,15 @@ mod tests {
 
         assert_eq!(selected, 0);
         assert_eq!(hits.len(), 1);
-        assert_eq!(candidates[hits[0].index].id, EntryId(2));
+        assert_eq!(candidates[hits[0].index].path, TreePath::parse("README.md"));
     }
 
     #[test]
     fn picker_keys_close_move_jump_and_open() {
         let pane = PaneId::new(3);
         let candidates = vec![
-            candidate(1, "first", fyler_core::tree::EntryKind::File),
-            candidate(2, "second", fyler_core::tree::EntryKind::File),
+            candidate("first", fyler_core::tree::EntryKind::File),
+            candidate("second", fyler_core::tree::EntryKind::File),
         ];
         let hits = fyler_core::search::search(&candidates, "", PICKER_RESULT_LIMIT);
         let mut selected = 0;
@@ -1747,7 +1746,7 @@ mod tests {
             ),
             Some(Some(GuiAction::PickerSelect {
                 pane_id: pane,
-                entry_id: EntryId(1),
+                path: TreePath::parse("first"),
                 action: PickerAction::Jump,
             }))
         );
@@ -1764,7 +1763,7 @@ mod tests {
             ),
             Some(Some(GuiAction::PickerSelect {
                 pane_id: pane,
-                entry_id: EntryId(1),
+                path: TreePath::parse("first"),
                 action: PickerAction::Open,
             }))
         );
@@ -1812,7 +1811,7 @@ mod tests {
             event_tx
                 .send(GuiEvent::ShowFilePicker {
                     pane_id: pane,
-                    candidates: vec![candidate(1, "file.txt", fyler_core::tree::EntryKind::File)],
+                    candidates: vec![candidate("file.txt", fyler_core::tree::EntryKind::File)],
                 })
                 .unwrap();
             app.receive_events();

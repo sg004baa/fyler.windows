@@ -29,6 +29,7 @@ use fyler_core::grammar::PrefixParse;
 use fyler_core::id::{EntryId, IdAllocator};
 use fyler_core::options::{SortKey, TerminalKind};
 use fyler_core::pane::PaneId;
+use fyler_core::path::TreePath;
 use fyler_core::report::{ApplyProgress, CommitReport};
 use fyler_core::transfer::TransferOp;
 use fyler_core::tree::EntryKind;
@@ -46,7 +47,7 @@ enum AppEvent {
     Confirm(ConfirmChoice),
     PickerSelect {
         pane_id: PaneId,
-        entry_id: fyler_core::id::EntryId,
+        path: TreePath,
         action: PickerAction,
     },
     FeedbackSubmit {
@@ -893,7 +894,7 @@ fn snapshot_line_matches_entry(
 #[allow(clippy::too_many_arguments)]
 fn handle_picker_select_with(
     pane_id: PaneId,
-    entry_id: EntryId,
+    path: TreePath,
     action: PickerAction,
     save_controller: &mut SaveController,
     engine: &dyn EditorEngine,
@@ -901,7 +902,7 @@ fn handle_picker_select_with(
     gui_event_tx: &CountingSender<GuiEvent>,
     open_path: &mut dyn FnMut(&Path) -> anyhow::Result<()>,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
-    let Some(entry) = save_controller.baseline().get(entry_id).cloned() else {
+    let Some(entry) = save_controller.baseline().get_by_path(&path).cloned() else {
         return send_gui_message(
             gui_event_tx,
             pane_id,
@@ -909,6 +910,7 @@ fn handle_picker_select_with(
             "Search candidate was not found. It may have changed externally.",
         );
     };
+    let entry_id = entry.id;
 
     if action == PickerAction::Open {
         let path = entry.path.to_fs_path(root);
@@ -1000,7 +1002,7 @@ fn handle_picker_select_with(
 
 fn handle_picker_select(
     pane_id: PaneId,
-    entry_id: EntryId,
+    path: TreePath,
     action: PickerAction,
     save_controller: &mut SaveController,
     engine: &dyn EditorEngine,
@@ -1009,7 +1011,7 @@ fn handle_picker_select(
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     handle_picker_select_with(
         pane_id,
-        entry_id,
+        path,
         action,
         save_controller,
         engine,
@@ -1584,15 +1586,15 @@ mod tests {
     }
 
     #[test]
-    fn stale_picker_selection_only_notifies() {
-        let (mut controller, engine) = picker_controller(false, false);
+    fn stale_picker_path_warns_without_reveal_or_cursor_move() {
+        let (mut controller, engine) = picker_controller(true, false);
         let (gui_tx, gui_rx) = counting_channel();
         let mut opened = Vec::new();
 
         handle_picker_select_with(
             PaneId::new(1),
-            EntryId(999),
-            PickerAction::Open,
+            TreePath::parse("missing.txt"),
+            PickerAction::Jump,
             &mut controller,
             engine.as_ref(),
             Path::new("root"),
@@ -1606,6 +1608,7 @@ mod tests {
 
         assert!(opened.is_empty());
         assert!(engine.commands().is_empty());
+        assert!(controller.collapsed_dirs().contains(&EntryId(1)));
         assert!(received_message(&gui_rx).text.contains("externally"));
     }
 
@@ -1616,7 +1619,7 @@ mod tests {
 
         handle_picker_select_with(
             PaneId::new(1),
-            EntryId(2),
+            TreePath::parse("dir/file.txt"),
             PickerAction::Jump,
             &mut controller,
             engine.as_ref(),
@@ -1636,7 +1639,7 @@ mod tests {
 
         handle_picker_select_with(
             PaneId::new(1),
-            EntryId(2),
+            TreePath::parse("dir/file.txt"),
             PickerAction::Jump,
             &mut controller,
             engine.as_ref(),
@@ -1668,7 +1671,7 @@ mod tests {
 
         handle_picker_select_with(
             PaneId::new(1),
-            EntryId(2),
+            TreePath::parse("dir/file.txt"),
             PickerAction::Jump,
             &mut controller,
             engine.as_ref(),
@@ -1693,7 +1696,7 @@ mod tests {
 
         handle_picker_select_with(
             PaneId::new(1),
-            EntryId(2),
+            TreePath::parse("dir/file.txt"),
             PickerAction::Jump,
             &mut controller,
             engine.as_ref(),
@@ -1713,10 +1716,10 @@ mod tests {
         let (gui_tx, _gui_rx) = counting_channel();
         let mut opened = Vec::new();
 
-        for id in [EntryId(2), EntryId(3), EntryId(1)] {
+        for path in ["dir/file.txt", "link", "dir"] {
             handle_picker_select_with(
                 PaneId::new(1),
-                id,
+                TreePath::parse(path),
                 PickerAction::Open,
                 &mut controller,
                 engine.as_ref(),

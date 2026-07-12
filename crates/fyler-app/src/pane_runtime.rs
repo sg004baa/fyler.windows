@@ -281,11 +281,11 @@ pub(super) fn run() -> anyhow::Result<()> {
                     GuiAction::Confirm(choice) => AppEvent::Confirm(choice),
                     GuiAction::PickerSelect {
                         pane_id,
-                        entry_id,
+                        path,
                         action,
                     } => AppEvent::PickerSelect {
                         pane_id,
-                        entry_id,
+                        path,
                         action,
                     },
                     GuiAction::FeedbackSubmit { kind, body } => {
@@ -1191,7 +1191,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                     }
                     AppEvent::PickerSelect {
                         pane_id,
-                        entry_id,
+                        path,
                         action,
                     } => {
                         let Some(session) = panes.get_mut(&pane_id) else {
@@ -1201,7 +1201,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                         let root = session.root.clone();
                         if handle_picker_select(
                             pane_id,
-                            entry_id,
+                            path,
                             action,
                             &mut session.save_controller,
                             engine.as_ref(),

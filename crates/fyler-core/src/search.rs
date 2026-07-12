@@ -1,13 +1,11 @@
 //! ファイルpicker向けの、エンジン・GUI・ファイルシステム非依存検索。
 
-use crate::id::EntryId;
 use crate::path::TreePath;
 use crate::tree::{BaselineTree, EntryKind};
 
 /// 検索時に毎回変換しない情報をキャッシュした候補。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchCandidate {
-    pub id: EntryId,
     pub path: TreePath,
     pub kind: EntryKind,
     /// `/` 区切りのルート相対パス。
@@ -37,7 +35,6 @@ pub fn build_candidates(baseline: &BaselineTree) -> Vec<SearchCandidate> {
             let key = display.to_lowercase();
             let name_offset = key.rfind('/').map_or(0, |offset| offset + 1);
             SearchCandidate {
-                id: entry.id,
                 path: entry.path.clone(),
                 kind: entry.kind,
                 display,
@@ -173,14 +170,15 @@ fn longest_contiguous_run(positions: &[(usize, usize)]) -> usize {
 mod tests {
     use std::time::{Duration, Instant};
 
+    use crate::id::EntryId;
     use crate::tree::BaselineEntry;
 
     use super::*;
 
-    fn candidate(index: u64, path: &str) -> SearchCandidate {
+    fn candidate(path: &str) -> SearchCandidate {
         let mut baseline = BaselineTree::new("C:/root");
         baseline.insert(BaselineEntry {
-            id: EntryId(index),
+            id: EntryId(1),
             path: TreePath::parse(path),
             kind: EntryKind::File,
         });
@@ -190,11 +188,11 @@ mod tests {
     #[test]
     fn score_categories_follow_the_picker_contract() {
         let candidates = [
-            candidate(1, "docs/foo"),
-            candidate(2, "docs/foobar.txt"),
-            candidate(3, "docs/afoo.txt"),
-            candidate(4, "foo-dir/file.txt"),
-            candidate(5, "far/other/output.txt"),
+            candidate("docs/foo"),
+            candidate("docs/foobar.txt"),
+            candidate("docs/afoo.txt"),
+            candidate("foo-dir/file.txt"),
+            candidate("far/other/output.txt"),
         ];
 
         let hits = search(&candidates, "foo", candidates.len());
@@ -208,12 +206,12 @@ mod tests {
 
     #[test]
     fn continuous_matches_and_earlier_starts_receive_bonuses() {
-        let continuity = [candidate(1, "ab--c.txt"), candidate(2, "a-b-c.txt")];
+        let continuity = [candidate("ab--c.txt"), candidate("a-b-c.txt")];
         let hits = search(&continuity, "abc", 2);
         assert_eq!(hits.iter().map(|hit| hit.index).collect::<Vec<_>>(), [0, 1]);
         assert!(hits[0].score > hits[1].score);
 
-        let start = [candidate(3, "xaxbxc.txt"), candidate(4, "axbxc.txt")];
+        let start = [candidate("xaxbxc.txt"), candidate("axbxc.txt")];
         let hits = search(&start, "abc", 2);
         assert_eq!(hits.iter().map(|hit| hit.index).collect::<Vec<_>>(), [1, 0]);
         assert!(hits[0].score > hits[1].score);
@@ -222,10 +220,10 @@ mod tests {
     #[test]
     fn search_is_case_insensitive_and_all_tokens_must_match() {
         let candidates = [
-            candidate(1, "src/main.rs"),
-            candidate(2, "src/lib.rs"),
-            candidate(3, "tests/main.rs"),
-            candidate(4, "Foo.txt"),
+            candidate("src/main.rs"),
+            candidate("src/lib.rs"),
+            candidate("tests/main.rs"),
+            candidate("Foo.txt"),
         ];
 
         assert_eq!(search(&candidates, "src main", 10)[0].index, 0);
@@ -238,9 +236,9 @@ mod tests {
     #[test]
     fn empty_query_limit_zero_and_equal_scores_preserve_input_order() {
         let candidates = [
-            candidate(1, "same.txt"),
-            candidate(2, "same.txt"),
-            candidate(3, "other.txt"),
+            candidate("same.txt"),
+            candidate("same.txt"),
+            candidate("other.txt"),
         ];
 
         assert_eq!(
@@ -262,10 +260,7 @@ mod tests {
 
     #[test]
     fn unicode_names_are_lowercased_and_searchable() {
-        let candidates = [
-            candidate(1, "資料/設計書.txt"),
-            candidate(2, "MÜNCHEN/Äpfel.txt"),
-        ];
+        let candidates = [candidate("資料/設計書.txt"), candidate("MÜNCHEN/Äpfel.txt")];
 
         assert_eq!(search(&candidates, "設計", 10)[0].index, 0);
         assert_eq!(search(&candidates, "münchen äPF", 10)[0].index, 1);
@@ -287,13 +282,8 @@ mod tests {
 
         let candidates = build_candidates(&baseline);
 
-        assert_eq!(
-            candidates
-                .iter()
-                .map(|candidate| candidate.id)
-                .collect::<Vec<_>>(),
-            [EntryId(7), EntryId(8)]
-        );
+        assert_eq!(candidates[0].path, TreePath::parse("Zed/Äpfel.txt"));
+        assert_eq!(candidates[1].path, TreePath::parse("alpha"));
         assert_eq!(candidates[0].display, "Zed/Äpfel.txt");
         assert_eq!(candidates[0].key, "zed/äpfel.txt");
         assert_eq!(&candidates[0].key[candidates[0].name_offset..], "äpfel.txt");
@@ -302,7 +292,7 @@ mod tests {
 
     #[test]
     fn build_candidates_only_contains_entries_present_in_baseline() {
-        let visible = candidate(1, "visible.txt");
+        let visible = candidate("visible.txt");
         assert_eq!(visible.display, "visible.txt");
         assert_ne!(visible.display, ".hidden.txt");
     }
@@ -311,7 +301,7 @@ mod tests {
     #[ignore = "environment-dependent performance measurement with 50k candidates"]
     fn search_fifty_thousand_candidates_within_a_relaxed_limit() {
         let candidates = (0..50_000)
-            .map(|index| candidate(index + 1, &format!("src/item_{index:05}.txt")))
+            .map(|index| candidate(&format!("src/item_{index:05}.txt")))
             .collect::<Vec<_>>();
         let started = Instant::now();
 
