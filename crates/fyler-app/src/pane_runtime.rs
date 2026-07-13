@@ -518,6 +518,7 @@ pub(super) fn run() -> anyhow::Result<()> {
             while let Ok(action) = action_rx.recv() {
                 let event = match action {
                     GuiAction::Confirm(choice) => AppEvent::Confirm(choice),
+                    GuiAction::Editor { pane_id, event } => AppEvent::Editor(pane_id, event),
                     GuiAction::LoaderCancel => AppEvent::LoaderCancel,
                     GuiAction::PickerSelect {
                         pane_id,

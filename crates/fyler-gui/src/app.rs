@@ -23,7 +23,7 @@ use fyler_core::transfer::{TransferOp, TransferPlan};
 use fyler_core::validate::ValidateError;
 
 use crate::confirm::{ConfirmChoice, ConfirmDetail, IconStyle};
-use crate::{cmdline, confirm, input, modeline, tree_view};
+use crate::{chrome, cmdline, confirm, input, modeline, theme, tree_view};
 
 const CJK_FONT_NAME: &str = "fyler-cjk";
 const INITIAL_WINDOW_SCALE: f32 = 0.7;
@@ -48,6 +48,10 @@ pub struct PickerHit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuiAction {
     Confirm(ConfirmChoice),
+    Editor {
+        pane_id: PaneId,
+        event: EditorEvent,
+    },
     LoaderCancel,
     PickerSelect {
         pane_id: PaneId,
@@ -146,6 +150,11 @@ pub enum GuiEvent {
     CollapsedDirs {
         pane_id: PaneId,
         dirs: HashSet<EntryId>,
+    },
+    /// 隠しファイル表示状態をtoolbarへ反映する。
+    HiddenVisibility {
+        pane_id: PaneId,
+        shown: bool,
     },
     /// 指定paneのファイルpickerを候補待ち状態で即座に開く。
     ShowFilePicker {
@@ -284,6 +293,7 @@ enum DialogState {
         body: String,
         stage: FeedbackStage,
     },
+    Settings,
     Help,
 }
 
@@ -334,6 +344,7 @@ struct PaneViewState {
     unreadable: usize,
     file_infos: HashMap<EntryId, FileInfo>,
     collapsed_dirs: HashSet<EntryId>,
+    show_hidden: bool,
     engine_error: Option<String>,
     last_cursor_line: usize,
     tree_viewport: Option<tree_view::TreeViewport>,
@@ -413,6 +424,7 @@ impl FylerApp {
                             unreadable: 0,
                             file_infos: HashMap::new(),
                             collapsed_dirs: HashSet::new(),
+                            show_hidden: false,
                             engine_error: None,
                             last_cursor_line: 0,
                             tree_viewport: None,
@@ -531,6 +543,11 @@ impl FylerApp {
                 GuiEvent::CollapsedDirs { pane_id, dirs } => {
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
                         pane.collapsed_dirs = dirs;
+                    }
+                }
+                GuiEvent::HiddenVisibility { pane_id, shown } => {
+                    if let Some(pane) = self.panes.get_mut(&pane_id) {
+                        pane.show_hidden = shown;
                     }
                 }
                 GuiEvent::ShowFilePicker { pane_id } => {
@@ -760,6 +777,42 @@ impl eframe::App for FylerApp {
             .iter()
             .map(|(id, pane)| (*id, pane.engine.snapshot()))
             .collect::<BTreeMap<_, _>>();
+
+        let chrome_state = self.active.and_then(|pane_id| {
+            let pane = self.panes.get(&pane_id)?;
+            let snapshot = snapshots.get(&pane_id)?;
+            Some((pane_id, pane.root.clone(), pane.show_hidden, snapshot.dirty))
+        });
+        let mut chrome_action = None;
+        if let Some((_, root, show_hidden, dirty)) = &chrome_state {
+            egui::Panel::top("fyler-titlebar")
+                .exact_size(theme::TITLEBAR_HEIGHT)
+                .show(ui, |ui| chrome::draw_titlebar(ui, root));
+            egui::Panel::top("fyler-toolbar")
+                .exact_size(theme::TOOLBAR_HEIGHT)
+                .show(ui, |ui| {
+                    chrome_action = chrome::draw_toolbar(ui, *show_hidden, *dirty);
+                });
+            egui::Panel::top("fyler-breadcrumb")
+                .exact_size(theme::BREADCRUMB_HEIGHT)
+                .show(ui, |ui| chrome::draw_breadcrumb(ui, root));
+        }
+        if self.dialog.is_none()
+            && let (Some((pane_id, _, _, _)), Some(action)) = (chrome_state, chrome_action)
+        {
+            if action == chrome::ChromeAction::ShowHelp {
+                self.dialog = Some(DialogState::Help);
+            } else if action == chrome::ChromeAction::ShowSettings {
+                self.dialog = Some(DialogState::Settings);
+            } else if let Some(event) = chrome_editor_event(action, &snapshots[&pane_id])
+                && self
+                    .action_tx
+                    .send(GuiAction::Editor { pane_id, event })
+                    .is_err()
+            {
+                self.fatal_error = Some("Failed to send toolbar action to app".to_owned());
+            }
+        }
         if should_forward_input(
             self.dialog.is_none(),
             self.fatal_error.is_none(),
@@ -774,16 +827,20 @@ impl eframe::App for FylerApp {
             pane.engine_error = Some(format!("Failed to send input to editor engine: {error}"));
         }
 
-        egui::Panel::bottom("global-command-area").show(ui, |ui| {
-            if let Some(state) = &self.popupmenu {
-                cmdline::draw_popupmenu(ui, state);
-            }
-            if let Some(state) = &self.cmdline {
-                cmdline::draw_cmdline(ui, state);
-            } else if let Some(message) = &self.message {
-                cmdline::draw_message(ui, message);
-            }
-        });
+        if self.cmdline.is_some() || self.popupmenu.is_some() {
+            egui::Panel::bottom("global-command-area").show(ui, |ui| {
+                if let Some(state) = &self.popupmenu {
+                    cmdline::draw_popupmenu(ui, state);
+                }
+                if let Some(state) = &self.cmdline {
+                    cmdline::draw_cmdline(ui, state);
+                }
+            });
+        } else if let Some(message) = &self.message {
+            egui::Panel::top("global-message-area")
+                .exact_size(34.0)
+                .show(ui, |ui| cmdline::draw_message(ui, message));
+        }
 
         let layout = self.layout.clone();
         let active = self.active;
@@ -881,6 +938,9 @@ impl eframe::App for FylerApp {
             }) => {
                 cancel_loader =
                     confirm::draw_loader_progress(ui, title, path, *entries, *cancel_requested);
+            }
+            Some(DialogState::Settings) => {
+                dismiss_errors = draw_settings(ui, self.icon_style, self.confirm_detail);
             }
             Some(DialogState::Help) => {
                 dismiss_errors = draw_help(ui, &self.help_lines);
@@ -1007,6 +1067,21 @@ fn should_forward_input(dialog_absent: bool, fatal_absent: bool, engine_healthy:
     dialog_absent && fatal_absent && engine_healthy
 }
 
+fn chrome_editor_event(
+    action: chrome::ChromeAction,
+    snapshot: &fyler_core::editor::EditorSnapshot,
+) -> Option<EditorEvent> {
+    match action {
+        chrome::ChromeAction::NavigateParent => Some(EditorEvent::NavigateParent),
+        chrome::ChromeAction::ToggleHidden => Some(EditorEvent::ToggleHidden),
+        chrome::ChromeAction::ReviewChanges => Some(EditorEvent::CommitRequested {
+            changedtick: snapshot.changedtick,
+            lines: Arc::clone(&snapshot.lines),
+        }),
+        chrome::ChromeAction::ShowHelp | chrome::ChromeAction::ShowSettings => None,
+    }
+}
+
 struct ImeGeometry {
     tree_rect: egui::Rect,
     cursor_rect: egui::Rect,
@@ -1040,15 +1115,16 @@ fn draw_layout_in_rect(
             let pane = panes.get_mut(id)?;
             let snapshot = snapshots.get(id)?;
             let stroke = if *id == active {
-                egui::Stroke::new(2.0, ui.visuals().selection.stroke.color)
+                egui::Stroke::new(1.0, theme::ACCENT)
             } else {
-                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
+                egui::Stroke::new(1.0, theme::BORDER_SUBTLE)
             };
+            ui.painter().rect_filled(rect, 0.0, theme::CANVAS);
             ui.painter()
                 .rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
 
-            let inner = rect.shrink(4.0);
-            let modeline_height = ui.text_style_height(&egui::TextStyle::Monospace) + 8.0;
+            let inner = rect.shrink(1.0);
+            let modeline_height = theme::STATUSBAR_HEIGHT;
             let tree_rect = egui::Rect::from_min_max(
                 inner.min,
                 egui::pos2(
@@ -1450,6 +1526,97 @@ fn draw_feedback(
     result
 }
 
+fn draw_settings(ui: &mut egui::Ui, icon_style: IconStyle, confirm_detail: ConfirmDetail) -> bool {
+    let dismiss_from_keyboard = ui
+        .ctx()
+        .input(|input| input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape));
+    let icon_style = match icon_style {
+        IconStyle::Ascii => "ASCII",
+        IconStyle::Nerd => "Nerd Font",
+    };
+    let confirm_detail = match confirm_detail {
+        ConfirmDetail::Full => "Full operation list",
+        ConfirmDetail::Summary => "Summarize large plans",
+    };
+
+    egui::Modal::new(egui::Id::new("fyler-settings"))
+        .show(ui.ctx(), |ui| {
+            ui.set_min_width(540.0);
+            ui.heading("Settings");
+            ui.label(
+                egui::RichText::new("Loaded from config.toml at startup")
+                    .size(11.0)
+                    .color(theme::TEXT_MUTED),
+            );
+            ui.add_space(8.0);
+            ui.separator();
+            settings_section(ui, "APPEARANCE");
+            egui::Grid::new("fyler-settings-appearance")
+                .num_columns(2)
+                .min_col_width(180.0)
+                .spacing([20.0, 10.0])
+                .show(ui, |ui| {
+                    settings_row(ui, "Theme", "Dark canvas");
+                    settings_row(ui, "Accent", "Orange");
+                    settings_row(ui, "Font", "Monospace · 13 px");
+                    settings_row(ui, "Row height", "28 px");
+                    settings_row(ui, "File icons", icon_style);
+                });
+            ui.add_space(10.0);
+            settings_section(ui, "SAFETY");
+            egui::Grid::new("fyler-settings-safety")
+                .num_columns(2)
+                .min_col_width(180.0)
+                .spacing([20.0, 10.0])
+                .show(ui, |ui| {
+                    settings_row(ui, "Confirmation detail", confirm_detail);
+                    settings_row(ui, "Delete behavior", "Recycle bin");
+                    settings_row(ui, "Apply gate", "Confirmation required");
+                });
+            ui.add_space(10.0);
+            settings_section(ui, "EDITOR ENGINE");
+            ui.label(
+                egui::RichText::new("●  running · one isolated Neovim process per pane")
+                    .monospace()
+                    .size(12.0)
+                    .color(theme::GREEN),
+            );
+            ui.add_space(12.0);
+            ui.separator();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(egui::Button::new("Done  ↵")).clicked() || dismiss_from_keyboard
+            })
+            .inner
+        })
+        .inner
+}
+
+fn settings_section(ui: &mut egui::Ui, title: &str) {
+    ui.label(
+        egui::RichText::new(title)
+            .monospace()
+            .size(10.0)
+            .strong()
+            .color(theme::TEXT_MUTED),
+    );
+    ui.add_space(4.0);
+}
+
+fn settings_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.label(
+        egui::RichText::new(label)
+            .size(12.0)
+            .color(theme::TEXT_SECONDARY),
+    );
+    ui.label(
+        egui::RichText::new(value)
+            .monospace()
+            .size(12.0)
+            .color(theme::TEXT),
+    );
+    ui.end_row();
+}
+
 fn draw_help(ui: &mut egui::Ui, help_lines: &[String]) -> bool {
     let dismiss_from_keyboard = ui
         .ctx()
@@ -1457,13 +1624,42 @@ fn draw_help(ui: &mut egui::Ui, help_lines: &[String]) -> bool {
 
     egui::Modal::new(egui::Id::new("fyler-help"))
         .show(ui.ctx(), |ui| {
-            ui.heading("Help");
-            ui.add_space(8.0);
-            for line in help_lines {
-                ui.monospace(line);
-            }
-            ui.add_space(12.0);
-            ui.button("Dismiss (Enter / Esc)").clicked() || dismiss_from_keyboard
+            ui.set_min_width(420.0);
+            ui.horizontal(|ui| {
+                ui.heading("Keyboard");
+                ui.label(
+                    egui::RichText::new("?  toggle")
+                        .monospace()
+                        .size(11.0)
+                        .color(theme::TEXT_MUTED),
+                );
+            });
+            ui.add_space(6.0);
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(520.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for line in help_lines {
+                        ui.add_sized(
+                            [ui.available_width(), 24.0],
+                            egui::Label::new(
+                                egui::RichText::new(line)
+                                    .monospace()
+                                    .size(12.0)
+                                    .color(theme::TEXT_SECONDARY),
+                            )
+                            .halign(egui::Align::LEFT),
+                        );
+                    }
+                });
+            ui.separator();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(egui::Button::new("Close  esc").frame(false))
+                    .clicked()
+                    || dismiss_from_keyboard
+            })
+            .inner
         })
         .inner
 }
@@ -1495,12 +1691,16 @@ fn initial_window_geometry(monitor_size: Option<egui::Vec2>) -> Option<(egui::Ve
 }
 
 fn native_options(window: Option<WindowGeometry>) -> eframe::NativeOptions {
-    let viewport = window.map_or_else(egui::ViewportBuilder::default, |window| {
-        egui::ViewportBuilder::default()
-            .with_inner_size([window.inner_width, window.inner_height])
-            .with_position([window.outer_x, window.outer_y])
-            .with_maximized(window.maximized)
-    });
+    let viewport = window
+        .map_or_else(egui::ViewportBuilder::default, |window| {
+            egui::ViewportBuilder::default()
+                .with_inner_size([window.inner_width, window.inner_height])
+                .with_position([window.outer_x, window.outer_y])
+                .with_maximized(window.maximized)
+        })
+        .with_decorations(false)
+        .with_min_inner_size([720.0, 480.0])
+        .with_title("fyler");
     eframe::NativeOptions {
         viewport,
         // Geometry is persisted in session.toml so it shares the same normal-shutdown contract
@@ -1537,6 +1737,7 @@ pub fn run(
                 help_lines,
             } = gui_options;
             let resize_to_monitor_on_first_frame = initial_window.is_none();
+            theme::install(&creation_context.egui_ctx);
             install_fallback_font(
                 &creation_context.egui_ctx,
                 font_path.as_deref(),
@@ -1771,6 +1972,7 @@ mod tests {
                         unreadable: 0,
                         file_infos: HashMap::new(),
                         collapsed_dirs: HashSet::new(),
+                        show_hidden: false,
                         engine_error: None,
                         last_cursor_line: 0,
                         tree_viewport: None,
@@ -1787,6 +1989,7 @@ mod tests {
                         unreadable: 0,
                         file_infos: HashMap::new(),
                         collapsed_dirs: HashSet::new(),
+                        show_hidden: false,
                         engine_error: None,
                         last_cursor_line: 0,
                         tree_viewport: None,
@@ -1839,6 +2042,11 @@ mod tests {
             unreadable: 2,
         })
         .unwrap();
+        tx.send(GuiEvent::HiddenVisibility {
+            pane_id: second,
+            shown: true,
+        })
+        .unwrap();
 
         app.receive_events();
 
@@ -1853,6 +2061,39 @@ mod tests {
         assert!(app.panes[&second].offline);
         assert_eq!(app.panes[&second].unreadable, 2);
         assert!(!app.panes[&first].offline);
+        assert!(app.panes[&second].show_hidden);
+        assert!(!app.panes[&first].show_hidden);
+    }
+
+    #[test]
+    fn toolbar_actions_preserve_snapshot_commit_identity() {
+        let mut snapshot = fyler_core::editor::EditorSnapshot::empty();
+        snapshot.changedtick = 42;
+        snapshot.lines = Arc::from([fyler_core::editor::EditorLine::new("file.txt")]);
+
+        assert_eq!(
+            chrome_editor_event(chrome::ChromeAction::NavigateParent, &snapshot),
+            Some(EditorEvent::NavigateParent)
+        );
+        assert_eq!(
+            chrome_editor_event(chrome::ChromeAction::ToggleHidden, &snapshot),
+            Some(EditorEvent::ToggleHidden)
+        );
+        let Some(EditorEvent::CommitRequested { changedtick, lines }) =
+            chrome_editor_event(chrome::ChromeAction::ReviewChanges, &snapshot)
+        else {
+            panic!("expected commit event");
+        };
+        assert_eq!(changedtick, 42);
+        assert!(Arc::ptr_eq(&lines, &snapshot.lines));
+        assert_eq!(
+            chrome_editor_event(chrome::ChromeAction::ShowHelp, &snapshot),
+            None
+        );
+        assert_eq!(
+            chrome_editor_event(chrome::ChromeAction::ShowSettings, &snapshot),
+            None
+        );
     }
 
     #[test]

@@ -10,10 +10,11 @@ use fyler_core::id::EntryId;
 use fyler_core::pane::PaneId;
 
 use crate::confirm::IconStyle;
-use crate::{conceal, icon};
+use crate::{conceal, icon, theme};
 
-/// 1階層ぶんのインデントを空白2文字幅として描画する。
-const INDENT_UNIT_SPACES: &str = "  ";
+/// 1階層ぶんの装飾インデント。文字列のタブ幅とは独立したGUI座標。
+const INDENT_UNIT_PX: f32 = 20.0;
+const TREE_LEFT_PADDING: f32 = 12.0;
 
 /// 前フレームのツリー可視範囲。
 #[derive(Debug, Clone, Copy)]
@@ -57,20 +58,14 @@ pub fn draw(
     pane_id: PaneId,
 ) -> TreeViewOutput {
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
-    let text_color = ui.visuals().text_color();
-    let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-    let row_height_with_spacing = row_height + ui.spacing().item_spacing.y;
-    let indent_unit_px = ui
-        .painter()
-        .layout_no_wrap(INDENT_UNIT_SPACES.to_owned(), font_id.clone(), text_color)
-        .size()
-        .x;
+    let text_color = theme::TEXT;
+    let row_height = theme::TREE_ROW_HEIGHT;
     let selection = display_selection(snapshot);
     let requested_offset = if follow_cursor {
         previous_viewport
             .filter(|_| snapshot.cursor.line < snapshot.lines.len())
             .and_then(|viewport| {
-                let cursor_top = snapshot.cursor.line as f32 * row_height_with_spacing;
+                let cursor_top = snapshot.cursor.line as f32 * row_height;
                 follow_offset(
                     cursor_top,
                     cursor_top + row_height,
@@ -94,8 +89,14 @@ pub fn draw(
         for (line_offset, line) in snapshot.lines[row_range].iter().enumerate() {
             let line_index = first_line + line_offset;
             let concealed = conceal::conceal_line(&line.text);
-            let indent_px = indent_offset(concealed.depth, indent_unit_px);
+            let indent_px = indent_offset(concealed.depth, INDENT_UNIT_PX);
             let painter = ui.painter().clone();
+            let (_, is_dir) = fyler_core::grammar::split_dir_suffix(concealed.display);
+            let icon_color = if is_dir {
+                theme::BLUE
+            } else {
+                theme::TEXT_MUTED
+            };
             let icon_galley = painter.layout_no_wrap(
                 format!(
                     "{} ",
@@ -106,11 +107,11 @@ pub fn draw(
                     )
                 ),
                 font_id.clone(),
-                text_color,
+                icon_color,
             );
             let badge = badge_for_line(&line.text, git_badges);
             let badge_galley = painter.layout_no_wrap(
-                format!("{} ", badge.map(badge_character).unwrap_or(" ")),
+                badge.map(badge_character).unwrap_or(" ").to_owned(),
                 font_id.clone(),
                 badge_color(ui.visuals(), badge),
             );
@@ -124,22 +125,44 @@ pub fn draw(
             let incomplete = incomplete_for_line(&line.text, incomplete_dirs);
             let incomplete_galley = painter.layout_no_wrap(
                 if incomplete {
-                    " [unreadable]".to_owned()
+                    "[unreadable]".to_owned()
                 } else {
                     String::new()
                 },
-                font_id.clone(),
-                ui.visuals().error_fg_color,
+                egui::FontId::monospace(11.0),
+                theme::RED,
             );
             let icon_width = icon_galley.size().x;
-            let badge_width = badge_galley.size().x;
             let text_width = text_galley.size().x;
-            let text_offset = indent_px + icon_width + badge_width;
-            let width = ui
-                .available_width()
-                .max(text_offset + text_width + incomplete_galley.size().x);
-            let (rect, _) =
+            let text_offset = TREE_LEFT_PADDING + indent_px + icon_width;
+            let width = ui.available_width().max(
+                text_offset
+                    + text_width
+                    + incomplete_galley.size().x
+                    + badge_galley.size().x
+                    + 32.0,
+            );
+            let (rect, response) =
                 ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::hover());
+
+            if response.hovered() {
+                painter.rect_filled(rect, 0.0, theme::HOVER);
+            }
+            if snapshot.cursor.line == line_index {
+                painter.rect_filled(rect, 0.0, theme::accent_selection_fill());
+                painter.rect_filled(
+                    egui::Rect::from_min_size(rect.min, egui::vec2(2.0, rect.height())),
+                    0.0,
+                    theme::ACCENT,
+                );
+            }
+            for depth in 0..concealed.depth {
+                let x = rect.left() + TREE_LEFT_PADDING + (depth as f32 + 0.5) * INDENT_UNIT_PX;
+                painter.line_segment(
+                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                    egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
+                );
+            }
 
             if let Some((start, cursor)) = selection {
                 draw_selection(
@@ -154,26 +177,33 @@ pub fn draw(
                     text_offset,
                 );
             }
+            let icon_y = rect.center().y - icon_galley.size().y / 2.0;
             painter.galley(
-                egui::pos2(rect.left() + indent_px, rect.top()),
+                egui::pos2(rect.left() + TREE_LEFT_PADDING + indent_px, icon_y),
                 icon_galley,
-                text_color,
+                icon_color,
             );
+            let text_y = rect.center().y - text_galley.size().y / 2.0;
             painter.galley(
-                egui::pos2(rect.left() + indent_px + icon_width, rect.top()),
-                badge_galley,
-                badge_color(ui.visuals(), badge),
-            );
-            painter.galley(
-                egui::pos2(rect.left() + text_offset, rect.top()),
+                egui::pos2(rect.left() + text_offset, text_y),
                 text_galley,
                 text_color,
             );
-            if incomplete {
+            let mut right = rect.right() - 16.0;
+            if badge.is_some() {
+                right -= badge_galley.size().x;
                 painter.galley(
-                    egui::pos2(rect.left() + text_offset + text_width, rect.top()),
+                    egui::pos2(right, rect.center().y - badge_galley.size().y / 2.0),
+                    badge_galley,
+                    badge_color(ui.visuals(), badge),
+                );
+            }
+            if incomplete {
+                right -= incomplete_galley.size().x + 12.0;
+                painter.galley(
+                    egui::pos2(right, rect.center().y - incomplete_galley.size().y / 2.0),
                     incomplete_galley,
-                    ui.visuals().error_fg_color,
+                    theme::RED,
                 );
             }
 
@@ -419,12 +449,12 @@ fn badge_character(badge: GitBadge) -> &'static str {
     }
 }
 
-fn badge_color(visuals: &egui::Visuals, badge: Option<GitBadge>) -> egui::Color32 {
+fn badge_color(_visuals: &egui::Visuals, badge: Option<GitBadge>) -> egui::Color32 {
     match badge {
-        Some(GitBadge::Modified | GitBadge::Renamed) => egui::Color32::from_rgb(230, 190, 60),
-        Some(GitBadge::Added) => egui::Color32::from_rgb(80, 200, 120),
-        Some(GitBadge::Deleted | GitBadge::Conflicted) => visuals.error_fg_color,
-        Some(GitBadge::Untracked) | None => visuals.weak_text_color(),
+        Some(GitBadge::Modified | GitBadge::Renamed) => theme::YELLOW,
+        Some(GitBadge::Added) => theme::GREEN,
+        Some(GitBadge::Deleted | GitBadge::Conflicted) => theme::RED,
+        Some(GitBadge::Untracked) | None => theme::TEXT_FAINT,
     }
 }
 
@@ -459,27 +489,23 @@ fn draw_cursor(
         )
         .size()
         .x;
-    let cursor_width = painter
-        .layout_no_wrap(
-            cursor_text.clone(),
-            font_id.clone(),
-            ui.visuals().text_color(),
-        )
-        .size()
-        .x
-        .max(1.0);
+    let cursor_size = painter
+        .layout_no_wrap(cursor_text.clone(), font_id.clone(), theme::TEXT)
+        .size();
+    let cursor_width = cursor_size.x.max(1.0);
     let cursor_x = row_rect.left() + text_offset + before_width;
+    let cursor_y = row_rect.center().y - cursor_size.y / 2.0;
     let cursor_rect = egui::Rect::from_min_size(
-        egui::pos2(cursor_x, row_rect.top()),
-        egui::vec2(cursor_width, row_rect.height()),
+        egui::pos2(cursor_x, cursor_y),
+        egui::vec2(cursor_width, cursor_size.y),
     );
 
     match snapshot.mode {
         Mode::Insert | Mode::Cmdline => {
             painter.line_segment(
                 [
-                    egui::pos2(cursor_x, row_rect.top()),
-                    egui::pos2(cursor_x, row_rect.bottom()),
+                    egui::pos2(cursor_x, cursor_rect.top()),
+                    egui::pos2(cursor_x, cursor_rect.bottom()),
                 ],
                 egui::Stroke::new(2.0, ui.visuals().strong_text_color()),
             );
@@ -487,8 +513,8 @@ fn draw_cursor(
         Mode::Replace => {
             painter.line_segment(
                 [
-                    egui::pos2(cursor_x, row_rect.bottom() - 1.0),
-                    egui::pos2(cursor_x + cursor_width, row_rect.bottom() - 1.0),
+                    egui::pos2(cursor_x, cursor_rect.bottom() - 1.0),
+                    egui::pos2(cursor_x + cursor_width, cursor_rect.bottom() - 1.0),
                 ],
                 egui::Stroke::new(2.0, ui.visuals().strong_text_color()),
             );

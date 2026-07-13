@@ -9,7 +9,7 @@ use fyler_core::fileinfo::{FileInfo, human_readable_size};
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::EntryId;
 
-use crate::conceal;
+use crate::{conceal, theme};
 
 /// モード名・dirtyインジケータ・現在ルート・カーソル位置などを描く。
 /// `Mode::Other(s)` は生文字列をそのまま表示する(隠さない)。
@@ -33,7 +33,6 @@ pub fn draw(
         Mode::Cmdline => "CMDLINE",
         Mode::Other(mode) => mode,
     };
-    let dirty = if snapshot.dirty { " [+]" } else { "" };
     let file_info = cursor_file_info(snapshot, file_infos);
 
     let (line, column) = snapshot
@@ -51,24 +50,74 @@ pub fn draw(
         })
         .unwrap_or((snapshot.cursor.line + 1, 1));
 
-    ui.horizontal(|ui| {
-        ui.monospace(format!("{mode}{dirty}"));
-        ui.monospace(root.display().to_string());
+    ui.painter().rect_filled(ui.max_rect(), 0.0, theme::SURFACE);
+    ui.painter().line_segment(
+        [ui.max_rect().left_top(), ui.max_rect().right_top()],
+        egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
+    );
+    ui.horizontal_centered(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        draw_mode_badge(ui, mode);
+        ui.label(
+            egui::RichText::new(root.display().to_string())
+                .monospace()
+                .size(12.0)
+                .color(theme::TEXT_MUTED),
+        );
+        if snapshot.dirty {
+            ui.label(
+                egui::RichText::new("·  pending changes")
+                    .monospace()
+                    .size(12.0)
+                    .color(theme::ACCENT),
+            );
+        }
         if let Some((is_error, label)) = health_label(offline, unreadable, crashed) {
-            let color = if is_error {
-                ui.visuals().error_fg_color
-            } else {
-                egui::Color32::from_rgb(230, 190, 60)
-            };
-            ui.colored_label(color, label);
+            ui.label(
+                egui::RichText::new(label)
+                    .monospace()
+                    .size(12.0)
+                    .color(if is_error { theme::RED } else { theme::YELLOW }),
+            );
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.monospace(format!("{line}:{column}"));
+            ui.add_space(12.0);
+            ui.label(
+                egui::RichText::new(format!("ln {line}, col {column}"))
+                    .monospace()
+                    .size(11.0)
+                    .color(theme::TEXT_FAINT),
+            );
             if let Some(file_info) = &file_info {
-                ui.monospace(file_info);
+                ui.label(
+                    egui::RichText::new(file_info)
+                        .monospace()
+                        .size(11.0)
+                        .color(theme::TEXT_FAINT),
+                );
             }
         });
     });
+}
+
+fn draw_mode_badge(ui: &mut egui::Ui, mode: &str) {
+    let (background, foreground) = match mode {
+        "INSERT" => (theme::ACCENT, theme::CANVAS),
+        "REPLACE" => (theme::YELLOW, theme::CANVAS),
+        "VISUAL" | "VISUAL LINE" | "VISUAL BLOCK" => (theme::BLUE, theme::CANVAS),
+        _ => (theme::SURFACE_RAISED, theme::TEXT),
+    };
+    let text = egui::RichText::new(mode)
+        .monospace()
+        .size(11.0)
+        .strong()
+        .color(foreground);
+    egui::Frame::NONE
+        .fill(background)
+        .inner_margin(egui::Margin::symmetric(12, 5))
+        .show(ui, |ui| {
+            ui.label(text);
+        });
 }
 
 fn health_label(offline: bool, unreadable: usize, crashed: bool) -> Option<(bool, String)> {

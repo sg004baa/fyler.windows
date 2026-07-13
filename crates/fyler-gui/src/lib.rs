@@ -8,12 +8,14 @@
 //! nvim固有概念をここに書いたら絶対ルール2違反。
 
 pub mod app;
+pub mod chrome;
 pub mod cmdline;
 pub mod conceal;
 pub mod confirm;
 pub mod icon;
 pub mod input;
 pub mod modeline;
+pub mod theme;
 pub mod tree_view;
 
 pub use app::FylerApp;
