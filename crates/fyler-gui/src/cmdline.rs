@@ -104,11 +104,7 @@ pub fn visible_window(len: usize, selected: Option<usize>, max: usize) -> Range<
 
 /// エディタメッセージの表示(Errorは目立つ色で)。
 pub fn draw_message(ui: &mut egui::Ui, message: &EditorMessage) {
-    let (icon, color) = match message.kind {
-        MessageKind::Info => ("i", theme::BLUE),
-        MessageKind::Warn => ("!", theme::YELLOW),
-        MessageKind::Error => ("×", theme::RED),
-    };
+    let (icon, color) = message_style(message.kind);
     ui.painter().rect_filled(ui.max_rect(), 0.0, theme::SURFACE);
     ui.painter().line_segment(
         [ui.max_rect().left_top(), ui.max_rect().right_top()],
@@ -116,7 +112,9 @@ pub fn draw_message(ui: &mut egui::Ui, message: &EditorMessage) {
     );
     ui.horizontal_centered(|ui| {
         ui.add_space(8.0);
-        ui.label(egui::RichText::new(icon).monospace().strong().color(color));
+        if let Some(icon) = icon {
+            ui.label(egui::RichText::new(icon).monospace().strong().color(color));
+        }
         ui.label(
             egui::RichText::new(&message.text)
                 .monospace()
@@ -126,9 +124,26 @@ pub fn draw_message(ui: &mut egui::Ui, message: &EditorMessage) {
     });
 }
 
+fn message_style(kind: MessageKind) -> (Option<&'static str>, egui::Color32) {
+    match kind {
+        MessageKind::Search => (None, theme::TEXT_SECONDARY),
+        MessageKind::Info => (Some("i"), theme::BLUE),
+        MessageKind::Warn => (Some("!"), theme::YELLOW),
+        MessageKind::Error => (Some("×"), theme::RED),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_status_has_no_generic_message_icon() {
+        assert_eq!(
+            message_style(MessageKind::Search),
+            (None, theme::TEXT_SECONDARY)
+        );
+    }
 
     #[test]
     fn visible_window_returns_full_range_when_shorter_than_max() {

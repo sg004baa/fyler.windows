@@ -43,6 +43,8 @@ pub enum EditorAction {
     TransferMove,
     /// 選択項目を別paneへコピーする。
     TransferCopy,
+    /// 左ナビゲーションドックへfocusを移す、またはエディタへ戻す。
+    ToggleDockFocus,
     /// ヘルプを表示する。
     Help,
     /// paneを上下に分割する。
@@ -85,6 +87,7 @@ impl EditorAction {
             "open_with" => Self::OpenWith,
             "transfer_move" => Self::TransferMove,
             "transfer_copy" => Self::TransferCopy,
+            "toggle_dock_focus" => Self::ToggleDockFocus,
             "help" => Self::Help,
             "pane_split_horizontal" => Self::PaneSplitHorizontal,
             "pane_split_vertical" => Self::PaneSplitVertical,
@@ -118,6 +121,7 @@ impl EditorAction {
             Self::OpenWith => "open_with",
             Self::TransferMove => "transfer_move",
             Self::TransferCopy => "transfer_copy",
+            Self::ToggleDockFocus => "toggle_dock_focus",
             Self::Help => "help",
             Self::PaneSplitHorizontal => "pane_split_horizontal",
             Self::PaneSplitVertical => "pane_split_vertical",
@@ -150,6 +154,7 @@ impl EditorAction {
             Self::OpenWith => "Open with application",
             Self::TransferMove => "Move to another pane",
             Self::TransferCopy => "Copy to another pane",
+            Self::ToggleDockFocus => "Focus navigation dock / Return to editor",
             Self::Help => "Show help",
             Self::PaneSplitHorizontal => "Split pane horizontally",
             Self::PaneSplitVertical => "Split pane vertically",
@@ -341,8 +346,16 @@ fn write_stroke(formatter: &mut fmt::Formatter<'_>, stroke: &KeyInput) -> fmt::R
     }
 }
 
+/// 組み込みkeymapで使う既定leader。
+pub fn default_leader() -> KeyInput {
+    KeyInput {
+        key: Key::Char(' '),
+        mods: Modifiers::default(),
+    }
+}
+
 /// 現行の組み込みキー操作と順序が一致する既定バインディングを返す。
-pub fn default_bindings() -> Vec<KeyBinding> {
+pub fn default_bindings(leader: KeyInput) -> Vec<KeyBinding> {
     let entries = [
         ("Enter", EditorAction::Activate),
         ("^", EditorAction::NavigateParent),
@@ -360,6 +373,7 @@ pub fn default_bindings() -> Vec<KeyBinding> {
         ("g o", EditorAction::OpenWith),
         ("g m", EditorAction::TransferMove),
         ("g c", EditorAction::TransferCopy),
+        ("Leader e", EditorAction::ToggleDockFocus),
         ("?", EditorAction::Help),
         ("Ctrl+W s", EditorAction::PaneSplitHorizontal),
         ("Ctrl+W S", EditorAction::PaneSplitHorizontal),
@@ -377,7 +391,8 @@ pub fn default_bindings() -> Vec<KeyBinding> {
     entries
         .into_iter()
         .map(|(sequence, action)| KeyBinding {
-            sequence: parse_key_sequence(sequence, None).expect("built-in keymap must be valid"),
+            sequence: parse_key_sequence(sequence, Some(leader))
+                .expect("built-in keymap must be valid"),
             action,
         })
         .collect()
@@ -385,14 +400,14 @@ pub fn default_bindings() -> Vec<KeyBinding> {
 
 /// 既定値へユーザー指定を順に適用し、不正な項目だけを警告して無視する。
 pub fn resolve_bindings(
-    leader: Option<KeyInput>,
+    leader: KeyInput,
     user_entries: &[(String, String)],
 ) -> (Vec<KeyBinding>, Vec<String>) {
-    let mut bindings = default_bindings();
+    let mut bindings = default_bindings(leader);
     let mut warnings = Vec::new();
     let mut seen = Vec::<KeySequence>::new();
     for (source, action_name) in user_entries {
-        let sequence = match parse_key_sequence(source, leader) {
+        let sequence = match parse_key_sequence(source, Some(leader)) {
             Ok(sequence) => sequence,
             Err(error) => {
                 warnings.push(format!("Ignoring key {source:?}: {error}"));
@@ -542,10 +557,18 @@ mod tests {
     }
 
     #[test]
+    fn default_dock_focus_binding_follows_configured_leader() {
+        let leader = parse_leader("x").unwrap();
+        assert!(default_bindings(leader).iter().any(|binding| {
+            binding.sequence.to_string() == "x e" && binding.action == EditorAction::ToggleDockFocus
+        }));
+    }
+
+    #[test]
     fn empty_resolution_preserves_defaults_exactly() {
         assert_eq!(
-            resolve_bindings(Some(space()), &[]),
-            (default_bindings(), Vec::new())
+            resolve_bindings(space(), &[]),
+            (default_bindings(space()), Vec::new())
         );
     }
 
@@ -560,7 +583,7 @@ mod tests {
             ("Ctrl+W".into(), "help".into()),
             ("Ctrl+W v x".into(), "help".into()),
         ];
-        let (bindings, warnings) = resolve_bindings(Some(space()), &entries);
+        let (bindings, warnings) = resolve_bindings(space(), &entries);
         assert!(
             bindings
                 .iter()
@@ -593,7 +616,7 @@ mod tests {
 
     #[test]
     fn action_config_names_round_trip() {
-        for binding in default_bindings() {
+        for binding in default_bindings(space()) {
             let action = binding.action;
             assert_eq!(
                 EditorAction::from_config_name(action.config_name()),

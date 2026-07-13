@@ -59,14 +59,16 @@ pub fn draw(
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
     let text_color = theme::TEXT;
     let row_height = theme::TREE_ROW_HEIGHT;
+    let row_pitch = row_height + ui.spacing().item_spacing.y;
     let selection = display_selection(snapshot);
     let requested_offset = previous_viewport
         .filter(|_| snapshot.cursor.line < snapshot.lines.len())
         .and_then(|viewport| {
-            let cursor_top = snapshot.cursor.line as f32 * row_height;
+            let (cursor_top, cursor_bottom) =
+                row_bounds(snapshot.cursor.line, row_height, row_pitch);
             follow_offset(
                 cursor_top,
-                cursor_top + row_height,
+                cursor_bottom,
                 viewport.scroll_offset,
                 viewport.height,
             )
@@ -534,6 +536,11 @@ fn draw_cursor(
     cursor_rect
 }
 
+fn row_bounds(line: usize, row_height: f32, row_pitch: f32) -> (f32, f32) {
+    let top = line as f32 * row_pitch;
+    (top, top + row_height)
+}
+
 fn follow_offset(
     cursor_top: f32,
     cursor_bottom: f32,
@@ -619,6 +626,11 @@ mod tests {
         assert_eq!(valid_byte_index("新a", 1), 0);
         assert_eq!(valid_byte_index("新a", 3), 3);
         assert_eq!(valid_byte_index("新a", usize::MAX), 4);
+    }
+
+    #[test]
+    fn cursor_row_bounds_include_show_rows_item_spacing() {
+        assert_eq!(row_bounds(20, 24.0, 28.0), (560.0, 584.0));
     }
 
     #[test]

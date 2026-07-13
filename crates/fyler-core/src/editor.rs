@@ -428,6 +428,8 @@ pub enum EditorEvent {
     OpenFilePicker,
     /// 匿名フィードバックモーダルを開くよう要求した。
     FeedbackRequested,
+    /// 左ナビゲーションドックへfocusを移す、またはエディタへ戻すよう要求した。
+    ToggleDockFocus,
     /// ユーザーがヘルプ表示を要求した。
     ShowHelp,
     /// ユーザーがpaneの分割・focus移動・closeを要求した。
@@ -500,6 +502,8 @@ pub struct EditorMessage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageKind {
+    /// `/`検索のパターンと一致数。
+    Search,
     Info,
     Warn,
     Error,

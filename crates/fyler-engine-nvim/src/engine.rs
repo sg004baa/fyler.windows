@@ -446,6 +446,9 @@ impl NvimEngine {
                             "fyler_open_picker" => {
                                 let _ = event_tx.send(EditorEvent::OpenFilePicker);
                             }
+                            "fyler_dock_focus" => {
+                                let _ = event_tx.send(EditorEvent::ToggleDockFocus);
+                            }
                             "fyler_help" => {
                                 let _ = event_tx.send(EditorEvent::ShowHelp);
                             }
@@ -1209,9 +1212,16 @@ fn parse_cmdline(value: &Value) -> Option<CmdlineState> {
 fn parse_message(value: &Value) -> Option<EditorMessage> {
     let fields = value.as_array()?;
     let kind_name = fields.first()?.as_str().unwrap_or_default();
-    let text = chunks_text(fields.get(1)?)?;
+    let mut text = chunks_text(fields.get(1)?)?;
     if text.is_empty() {
         return None;
+    }
+    if kind_name == "search_count" {
+        remove_search_wrap_marker(&mut text);
+        return Some(EditorMessage {
+            kind: MessageKind::Search,
+            text,
+        });
     }
 
     let kind = match kind_name {
@@ -1220,6 +1230,19 @@ fn parse_message(value: &Value) -> Option<EditorMessage> {
         _ => MessageKind::Info,
     };
     Some(EditorMessage { kind, text })
+}
+
+fn remove_search_wrap_marker(text: &mut String) {
+    let Some(count_start) = text.rfind('[') else {
+        return;
+    };
+    let prefix = text[..count_start].trim_end();
+    let Some(without_marker) = prefix.strip_suffix('W') else {
+        return;
+    };
+    if without_marker.ends_with(char::is_whitespace) {
+        text.replace_range(without_marker.len()..count_start, "");
+    }
 }
 
 fn chunks_text(value: &Value) -> Option<String> {
@@ -1519,6 +1542,25 @@ mod tests {
         assert_eq!(parse_popupmenu_select(&[Value::from(2)]), Some(Some(2)));
         assert_eq!(parse_popupmenu_select(&[Value::from(-1)]), Some(None));
         assert_eq!(parse_popupmenu_select(&[]), None);
+    }
+
+    #[test]
+    fn search_count_message_drops_gui_icon_kind_and_wrap_marker() {
+        let value = Value::Array(vec![
+            Value::from("search_count"),
+            Value::Array(vec![Value::Array(vec![
+                Value::from(0),
+                Value::from("/test W [1/3]"),
+            ])]),
+        ]);
+
+        assert_eq!(
+            parse_message(&value),
+            Some(EditorMessage {
+                kind: MessageKind::Search,
+                text: "/test [1/3]".to_owned(),
+            })
+        );
     }
 
     #[test]

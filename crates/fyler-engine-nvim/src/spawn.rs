@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use fyler_core::keymap::{KeyBinding, default_bindings};
+use fyler_core::keymap::{KeyBinding, default_bindings, default_leader};
 
 /// nvim起動引数。**この組み合わせから変えないこと**(DESIGN.md):
 ///
@@ -44,7 +44,7 @@ impl NvimConfig {
         Self {
             nvim_exe,
             root,
-            bindings: default_bindings(),
+            bindings: default_bindings(default_leader()),
         }
     }
 }

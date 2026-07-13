@@ -12,7 +12,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use fyler_core::editor::{Key, KeyInput, Modifiers};
 use fyler_core::keymap;
 use fyler_core::options::{SortKey, SortOrder, TerminalKind};
 use fyler_gui::confirm::{ConfirmDetail, IconStyle};
@@ -71,7 +70,7 @@ impl Default for Config {
             font_y_offset_factor: DEFAULT_FONT_Y_OFFSET_FACTOR,
             icons: IconStyle::Ascii,
             bookmarks: Vec::new(),
-            bindings: keymap::default_bindings(),
+            bindings: keymap::default_bindings(keymap::default_leader()),
         }
     }
 }
@@ -111,10 +110,7 @@ pub fn load() -> (Config, Vec<String>) {
     };
 
     let mut config = Config::default();
-    let default_leader = KeyInput {
-        key: Key::Char(' '),
-        mods: Modifiers::default(),
-    };
+    let default_leader = keymap::default_leader();
     let leader = match table.get("leader") {
         Some(value) => match value.as_str() {
             Some(value) => match keymap::parse_leader(value) {
@@ -131,6 +127,7 @@ pub fn load() -> (Config, Vec<String>) {
         },
         None => default_leader,
     };
+    config.bindings = keymap::default_bindings(leader);
     if let Some(value) = table.get("show_hidden") {
         match value.as_bool() {
             Some(show_hidden) => config.show_hidden = show_hidden,
@@ -276,7 +273,7 @@ pub fn load() -> (Config, Vec<String>) {
                         None => warnings.push("keymap.normal must be a table".to_owned()),
                     }
                 }
-                let (bindings, keymap_warnings) = keymap::resolve_bindings(Some(leader), &entries);
+                let (bindings, keymap_warnings) = keymap::resolve_bindings(leader, &entries);
                 config.bindings = bindings;
                 warnings.extend(
                     keymap_warnings
@@ -562,6 +559,14 @@ mod tests {
         assert_eq!(config, Config::default());
         assert!(warnings.iter().any(|warning| warning.contains("unknown")));
 
+        fs::write(&path, "leader = 'x'\n").unwrap();
+        let (config, warnings) = load();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(config.bindings.iter().any(|binding| {
+            binding.sequence.to_string() == "x e"
+                && binding.action == keymap::EditorAction::ToggleDockFocus
+        }));
+
         fs::write(
             &path,
             "leader = 'Space'\n[keymap.normal]\n'Leader f' = 'file_picker'\n'g d' = 'none'\n",
@@ -586,7 +591,10 @@ mod tests {
         )
         .unwrap();
         let (config, warnings) = load();
-        assert_eq!(config.bindings, keymap::default_bindings());
+        assert_eq!(
+            config.bindings,
+            keymap::default_bindings(keymap::default_leader())
+        );
         assert!(warnings.iter().any(|warning| warning.contains("leader")));
         assert!(
             warnings

@@ -43,6 +43,7 @@ fn binding_payload(action: EditorAction) -> BindingPayload {
         OpenWith => ("open_with", None, &["n"]),
         TransferMove => ("transfer", Some("move"), &["n", "x"]),
         TransferCopy => ("transfer", Some("copy"), &["n", "x"]),
+        ToggleDockFocus => ("dock_focus", None, &["n"]),
         Help => ("help", None, &["n"]),
         PaneSplitHorizontal => ("pane", Some("split_horizontal"), &["n"]),
         PaneSplitVertical => ("pane", Some("split_vertical"), &["n"]),
@@ -283,6 +284,8 @@ local function dispatch(binding)
     vim.rpcnotify(channel, "fyler_open_with", line)
   elseif binding.kind == "transfer" then
     request_transfer(binding.arg, vim.fn.mode():sub(1, 1) ~= "n")
+  elseif binding.kind == "dock_focus" then
+    vim.rpcnotify(channel, "fyler_dock_focus")
   elseif binding.kind == "help" then
     vim.rpcnotify(channel, "fyler_help")
   elseif binding.kind == "pane" then
@@ -479,6 +482,7 @@ mod tests {
             (OpenWith, "open_with", None, &["n"][..]),
             (TransferMove, "transfer", Some("move"), &["n", "x"][..]),
             (TransferCopy, "transfer", Some("copy"), &["n", "x"][..]),
+            (ToggleDockFocus, "dock_focus", None, &["n"][..]),
             (Help, "help", None, &["n"][..]),
             (
                 PaneSplitHorizontal,
@@ -517,9 +521,9 @@ mod tests {
 
     #[test]
     fn defaults_split_into_normal_maps_and_ctrl_w_trie() {
-        let bindings = fyler_core::keymap::default_bindings();
+        let bindings = fyler_core::keymap::default_bindings(fyler_core::keymap::default_leader());
         let (normal, trie) = binding_values(&bindings);
-        assert_eq!(normal.as_array().unwrap().len(), 17);
+        assert_eq!(normal.as_array().unwrap().len(), 18);
         let trie = trie.as_map().unwrap();
         assert_eq!(trie.len(), 12);
         assert!(trie.iter().any(|(key, _)| key.as_str() == Some("<C-w>")));

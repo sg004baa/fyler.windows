@@ -6,7 +6,7 @@ use fyler_core::editor::{
     EditorCommand, EditorEngine, EditorEvent, EditorLine, FoldOp, Key, KeyInput, MessageKind, Mode,
     Modifiers, SearchHighlight,
 };
-use fyler_core::keymap::resolve_bindings;
+use fyler_core::keymap::{default_leader, resolve_bindings};
 use fyler_core::pane::PaneAction;
 use fyler_core::transfer::TransferKind;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
@@ -160,6 +160,27 @@ async fn file_picker_keymap_emits_open_request() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a compatible nvim executable"]
+async fn dock_focus_keymap_emits_toggle_request() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+
+    engine.send(key_command(Key::Char(' ')))?;
+    engine.send(key_command(Key::Char('e')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::ToggleDockFocus)
+    })
+    .await
+    .context("<leader>e did not emit ToggleDockFocus")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
 async fn custom_leader_binding_fires_once_and_unmap_removes_default() -> anyhow::Result<()> {
     let _serial = NVIM_TEST_SERIAL.lock().await;
     let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
@@ -171,7 +192,7 @@ async fn custom_leader_binding_fires_once_and_unmap_removes_default() -> anyhow:
         mods: Modifiers::default(),
     };
     let (bindings, warnings) = resolve_bindings(
-        Some(space),
+        space,
         &[
             ("Leader f".into(), "file_picker".into()),
             ("g .".into(), "none".into()),
@@ -210,8 +231,10 @@ async fn custom_ctrl_w_trie_dispatches_and_blocks_unknown_keys() -> anyhow::Resu
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let root = std::env::current_dir()?;
-    let (bindings, warnings) =
-        resolve_bindings(None, &[("Ctrl+W x".into(), "pane_focus_next".into())]);
+    let (bindings, warnings) = resolve_bindings(
+        default_leader(),
+        &[("Ctrl+W x".into(), "pane_focus_next".into())],
+    );
     assert!(warnings.is_empty(), "{warnings:?}");
     let mut config = NvimConfig::new(nvim_exe, root);
     config.bindings = bindings;

@@ -244,6 +244,7 @@ Rules and limitations:
 | `open_with` | Choose an application and open the entry | `g o` |
 | `transfer_move` | Move entries to another pane | `g m` |
 | `transfer_copy` | Copy entries to another pane | `g c` |
+| `toggle_dock_focus` | Focus the navigation dock or return to the editor | `Leader e` |
 | `help` | Show help | `?` |
 | `pane_split_horizontal` | Split the pane horizontally | `Ctrl+W s`, `Ctrl+W S` |
 | `pane_split_vertical` | Split the pane vertically | `Ctrl+W v` |
@@ -260,3 +261,6 @@ sequence.
 
 The help dialog opened with `?` is generated from the resolved built-in and user bindings. It
 omits actions with no remaining bindings and reflects added or reassigned keys.
+
+While the navigation dock has focus, use `j`/`k` or the arrow keys to move and `Enter` to change
+the active pane's root. Invoke `toggle_dock_focus` again to return keyboard input to the editor.

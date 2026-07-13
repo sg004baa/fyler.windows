@@ -201,13 +201,82 @@ pub fn draw_breadcrumb(ui: &mut egui::Ui, root: &Path) {
         }
     });
 }
-pub fn draw_navigation_rail(
-    ui: &mut egui::Ui,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NavigationSection {
+    Pinned,
+    Recent,
+    Drives,
+}
+
+impl NavigationSection {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Pinned => "PINNED",
+            Self::Recent => "RECENT",
+            Self::Drives => "DRIVES",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NavigationEntry {
+    section: NavigationSection,
+    label: String,
+    pub(crate) path: PathBuf,
+    current: bool,
+}
+
+pub(crate) fn navigation_entries(
     root: &Path,
     bookmarks: &[(String, PathBuf)],
     recent_roots: &[PathBuf],
     drives: &[PathBuf],
-) -> Option<PathBuf> {
+) -> Vec<NavigationEntry> {
+    let mut entries = Vec::with_capacity(1 + bookmarks.len() + recent_roots.len() + drives.len());
+    entries.push(NavigationEntry {
+        section: NavigationSection::Pinned,
+        label: navigation_path_label(root),
+        path: root.to_path_buf(),
+        current: true,
+    });
+    entries.extend(
+        bookmarks
+            .iter()
+            .filter(|(_, path)| path.as_path() != root)
+            .map(|(label, path)| NavigationEntry {
+                section: NavigationSection::Pinned,
+                label: label.clone(),
+                path: path.clone(),
+                current: false,
+            }),
+    );
+    entries.extend(
+        recent_roots
+            .iter()
+            .filter(|path| path.as_path() != root)
+            .filter(|path| !bookmarks.iter().any(|(_, bookmark)| bookmark == *path))
+            .map(|path| NavigationEntry {
+                section: NavigationSection::Recent,
+                label: navigation_path_label(path),
+                path: path.clone(),
+                current: false,
+            }),
+    );
+    entries.extend(drives.iter().map(|path| NavigationEntry {
+        section: NavigationSection::Drives,
+        label: path.display().to_string(),
+        path: path.clone(),
+        current: false,
+    }));
+    entries
+}
+
+pub(crate) fn draw_navigation_rail(
+    ui: &mut egui::Ui,
+    entries: &[NavigationEntry],
+    focused: bool,
+    selected: usize,
+) -> Option<usize> {
     ui.set_clip_rect(ui.max_rect());
     ui.painter().rect_filled(ui.max_rect(), 0.0, theme::SURFACE);
     ui.painter().line_segment(
@@ -215,78 +284,98 @@ pub fn draw_navigation_rail(
         egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
     );
 
-    let mut target = None;
-    ui.add_space(12.0);
-    navigation_section(ui, "PINNED");
-    navigation_row(ui, navigation_path_label(root), true);
-    for (name, path) in bookmarks {
-        if path != root && navigation_row(ui, name, false).clicked() {
-            target = Some(path.clone());
-        }
-    }
-
-    let recent = recent_roots
-        .iter()
-        .filter(|path| path.as_path() != root)
-        .filter(|path| !bookmarks.iter().any(|(_, bookmark)| bookmark == *path))
-        .collect::<Vec<_>>();
-    if !recent.is_empty() {
-        ui.add_space(10.0);
-        navigation_section(ui, "RECENT");
-        for path in recent {
-            if navigation_row(ui, navigation_path_label(path), false).clicked() {
-                target = Some(path.clone());
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let mut clicked = None;
+            let mut previous_section = None;
+            ui.add_space(12.0);
+            for (index, entry) in entries.iter().enumerate() {
+                if previous_section != Some(entry.section) {
+                    if previous_section.is_some() {
+                        ui.add_space(10.0);
+                    }
+                    let count = entries[index..]
+                        .iter()
+                        .take_while(|candidate| candidate.section == entry.section)
+                        .count();
+                    navigation_section(ui, entry.section.title(), count);
+                    previous_section = Some(entry.section);
+                }
+                let response = navigation_row(
+                    ui,
+                    &entry.label,
+                    entry.current,
+                    focused && selected == index,
+                );
+                if focused && selected == index {
+                    response.scroll_to_me(None);
+                }
+                if response.clicked() {
+                    clicked = Some(index);
+                }
             }
-        }
-    }
-
-    if !drives.is_empty() {
-        ui.add_space(10.0);
-        navigation_section(ui, "DRIVES");
-        for path in drives {
-            if navigation_row(ui, path.display().to_string(), false).clicked() {
-                target = Some(path.clone());
-            }
-        }
-    }
-
-    target
+            clicked
+        })
+        .inner
 }
 
-fn navigation_section(ui: &mut egui::Ui, title: &str) {
+fn navigation_section(ui: &mut egui::Ui, title: &str, count: usize) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
-    ui.painter().text(
+    let painter = ui.painter();
+    let font = egui::FontId::monospace(10.0);
+    painter.text(
         egui::pos2(rect.left() + 14.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         title,
-        egui::FontId::monospace(10.0),
+        font.clone(),
+        theme::TEXT_FAINT,
+    );
+    painter.text(
+        egui::pos2(rect.right() - 14.0, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        count,
+        font,
         theme::TEXT_FAINT,
     );
 }
 
-fn navigation_row(ui: &mut egui::Ui, label: impl Into<String>, selected: bool) -> egui::Response {
+fn navigation_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    current: bool,
+    focused_selection: bool,
+) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), theme::TREE_ROW_HEIGHT),
         egui::Sense::click(),
     );
-    if selected {
+    if current || focused_selection {
         ui.painter()
             .rect_filled(rect, 0.0, theme::accent_selection_fill());
         ui.painter().rect_filled(
             egui::Rect::from_min_size(rect.min, egui::vec2(2.0, rect.height())),
             0.0,
-            theme::ACCENT,
+            if current { theme::ACCENT } else { theme::BLUE },
         );
     } else if response.hovered() {
         ui.painter().rect_filled(rect, 0.0, theme::HOVER);
     }
+    if focused_selection {
+        ui.painter().rect_stroke(
+            rect.shrink(1.0),
+            0.0,
+            egui::Stroke::new(1.0, theme::BLUE),
+            egui::StrokeKind::Inside,
+        );
+    }
     ui.painter().text(
         egui::pos2(rect.left() + 14.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
-        format!("D  {}", label.into()),
+        format!("D  {label}"),
         egui::FontId::monospace(12.0),
-        if selected {
+        if current || focused_selection {
             theme::TEXT
         } else {
             theme::TEXT_SECONDARY
@@ -393,5 +482,30 @@ mod tests {
             "project"
         );
         assert_eq!(navigation_path_label(Path::new("/")), "/");
+    }
+    #[test]
+    fn navigation_entries_are_sectioned_countable_and_deduplicated() {
+        let entries = navigation_entries(
+            Path::new("/work"),
+            &[
+                ("current".to_owned(), PathBuf::from("/work")),
+                ("docs".to_owned(), PathBuf::from("/docs")),
+            ],
+            &[PathBuf::from("/recent")],
+            &[PathBuf::from("/")],
+        );
+
+        assert_eq!(entries.len(), 4);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.section == NavigationSection::Pinned)
+                .count(),
+            2
+        );
+        assert_eq!(entries[0].label, "work");
+        assert_eq!(entries[1].label, "docs");
+        assert_eq!(entries[2].section.title(), "RECENT");
+        assert_eq!(entries[3].section.title(), "DRIVES");
     }
 }
