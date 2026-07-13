@@ -22,16 +22,16 @@ pub const TITLEBAR_HEIGHT: f32 = 36.0;
 pub const TOOLBAR_HEIGHT: f32 = 34.0;
 pub const BREADCRUMB_HEIGHT: f32 = 30.0;
 pub const STATUSBAR_HEIGHT: f32 = 26.0;
-pub const TREE_ROW_HEIGHT: f32 = 28.0;
+pub const TREE_ROW_HEIGHT: f32 = 24.0;
 
 /// アプリ全体へ Fyler Screens の near-black palette と compact spacing を適用する。
 pub fn install(context: &egui::Context) {
     context.set_theme(egui::Theme::Dark);
     context.style_mut_of(egui::Theme::Dark, |style| {
         style.visuals = visuals();
-        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.button_padding = egui::vec2(10.0, 5.0);
-        style.spacing.interact_size = egui::vec2(36.0, 28.0);
+        style.spacing.item_spacing = egui::vec2(6.0, 4.0);
+        style.spacing.button_padding = egui::vec2(8.0, 4.0);
+        style.spacing.interact_size = egui::vec2(32.0, 24.0);
         style.spacing.slider_width = 112.0;
         style.text_styles.insert(
             egui::TextStyle::Heading,
@@ -116,6 +116,6 @@ mod tests {
                 > u16::from(TEXT_MUTED.r()) + u16::from(TEXT_MUTED.g()) + u16::from(TEXT_MUTED.b())
         );
         assert_ne!(ACCENT, RED);
-        assert_eq!(TREE_ROW_HEIGHT, 28.0);
+        assert_eq!(TREE_ROW_HEIGHT, 24.0);
     }
 }

@@ -112,6 +112,7 @@ pub fn draw_plan(
     let key_choice = ui.ctx().input(|input| {
         plan_choice_from_keys(
             input.key_pressed(egui::Key::Y),
+            input.key_pressed(egui::Key::Enter),
             input.key_pressed(egui::Key::N),
             input.key_pressed(egui::Key::Escape),
         )
@@ -240,6 +241,7 @@ pub fn draw_transfer_plan(
     let key_choice = ui.ctx().input(|input| {
         plan_choice_from_keys(
             input.key_pressed(egui::Key::Y),
+            input.key_pressed(egui::Key::Enter),
             input.key_pressed(egui::Key::N),
             input.key_pressed(egui::Key::Escape),
         )
@@ -288,6 +290,7 @@ pub fn draw_undo_plan(ui: &mut egui::Ui, lines: &[String]) -> Option<ConfirmChoi
     let key_choice = ui.ctx().input(|input| {
         plan_choice_from_keys(
             input.key_pressed(egui::Key::Y),
+            input.key_pressed(egui::Key::Enter),
             input.key_pressed(egui::Key::N),
             input.key_pressed(egui::Key::Escape),
         )
@@ -491,6 +494,7 @@ pub fn draw_undo_recovery(ui: &mut egui::Ui, descriptions: &[String]) -> Option<
     let key_choice = ui.ctx().input(|input| {
         plan_choice_from_keys(
             input.key_pressed(egui::Key::Y),
+            input.key_pressed(egui::Key::Enter),
             input.key_pressed(egui::Key::N),
             input.key_pressed(egui::Key::Escape),
         )
@@ -748,8 +752,8 @@ pub fn open_with_selection_step(len: usize, selected: usize, delta: i32) -> usiz
 }
 
 /// plan確認キーの押下状態を、エンジン非依存の確認結果へ変換する。
-fn plan_choice_from_keys(y: bool, n: bool, esc: bool) -> Option<ConfirmChoice> {
-    if y {
+fn plan_choice_from_keys(y: bool, enter: bool, n: bool, esc: bool) -> Option<ConfirmChoice> {
+    if y || enter {
         Some(ConfirmChoice::Approve)
     } else if n || esc {
         Some(ConfirmChoice::Cancel)
@@ -902,18 +906,22 @@ mod tests {
     #[test]
     fn plan_keyboard_shortcuts_map_to_choices() {
         assert_eq!(
-            plan_choice_from_keys(true, false, false),
+            plan_choice_from_keys(true, false, false, false),
             Some(ConfirmChoice::Approve)
         );
         assert_eq!(
-            plan_choice_from_keys(false, true, false),
+            plan_choice_from_keys(false, true, false, false),
+            Some(ConfirmChoice::Approve)
+        );
+        assert_eq!(
+            plan_choice_from_keys(false, false, true, false),
             Some(ConfirmChoice::Cancel)
         );
         assert_eq!(
-            plan_choice_from_keys(false, false, true),
+            plan_choice_from_keys(false, false, false, true),
             Some(ConfirmChoice::Cancel)
         );
-        assert_eq!(plan_choice_from_keys(false, false, false), None);
+        assert_eq!(plan_choice_from_keys(false, false, false, false), None);
     }
 
     #[test]

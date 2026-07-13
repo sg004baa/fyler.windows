@@ -1,10 +1,12 @@
 //! Fyler Screens の titlebar / toolbar / breadcrumb。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
 use crate::theme;
+
+pub const NAV_RAIL_WIDTH: f32 = 208.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChromeAction {
@@ -12,7 +14,6 @@ pub enum ChromeAction {
     ToggleHidden,
     ReviewChanges,
     ShowSettings,
-    ShowHelp,
 }
 
 pub fn draw_titlebar(ui: &mut egui::Ui, root: &Path) {
@@ -147,21 +148,6 @@ pub fn draw_toolbar(ui: &mut egui::Ui, show_hidden: bool, dirty: bool) -> Option
             {
                 action = Some(ChromeAction::ShowSettings);
             }
-            if ui
-                .add(
-                    egui::Button::new(
-                        egui::RichText::new("?  keyboard")
-                            .monospace()
-                            .size(12.0)
-                            .color(theme::TEXT_MUTED),
-                    )
-                    .frame(false),
-                )
-                .on_hover_text("Keyboard reference")
-                .clicked()
-            {
-                action = Some(ChromeAction::ShowHelp);
-            }
             let review = if dirty {
                 egui::RichText::new("review changes  ·  pending")
                     .monospace()
@@ -208,22 +194,112 @@ pub fn draw_breadcrumb(ui: &mut egui::Ui, root: &Path) {
                 } else {
                     theme::TEXT_MUTED
                 });
-            let response = ui.add_enabled(false, egui::Button::new(text).frame(current));
+            ui.add_enabled(false, egui::Button::new(text).frame(current));
             if !current {
-                response.on_disabled_hover_text("Use :cd to navigate directly");
                 ui.label(egui::RichText::new("›").color(theme::TEXT_FAINT));
             }
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add_space(12.0);
-            ui.label(
-                egui::RichText::new(":cd  edit path")
-                    .monospace()
-                    .size(11.0)
-                    .color(theme::TEXT_FAINT),
-            );
-        });
     });
+}
+pub fn draw_navigation_rail(
+    ui: &mut egui::Ui,
+    root: &Path,
+    bookmarks: &[(String, PathBuf)],
+    recent_roots: &[PathBuf],
+    drives: &[PathBuf],
+) -> Option<PathBuf> {
+    ui.set_clip_rect(ui.max_rect());
+    ui.painter().rect_filled(ui.max_rect(), 0.0, theme::SURFACE);
+    ui.painter().line_segment(
+        [ui.max_rect().right_top(), ui.max_rect().right_bottom()],
+        egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
+    );
+
+    let mut target = None;
+    ui.add_space(12.0);
+    navigation_section(ui, "PINNED");
+    navigation_row(ui, navigation_path_label(root), true);
+    for (name, path) in bookmarks {
+        if path != root && navigation_row(ui, name, false).clicked() {
+            target = Some(path.clone());
+        }
+    }
+
+    let recent = recent_roots
+        .iter()
+        .filter(|path| path.as_path() != root)
+        .filter(|path| !bookmarks.iter().any(|(_, bookmark)| bookmark == *path))
+        .collect::<Vec<_>>();
+    if !recent.is_empty() {
+        ui.add_space(10.0);
+        navigation_section(ui, "RECENT");
+        for path in recent {
+            if navigation_row(ui, navigation_path_label(path), false).clicked() {
+                target = Some(path.clone());
+            }
+        }
+    }
+
+    if !drives.is_empty() {
+        ui.add_space(10.0);
+        navigation_section(ui, "DRIVES");
+        for path in drives {
+            if navigation_row(ui, path.display().to_string(), false).clicked() {
+                target = Some(path.clone());
+            }
+        }
+    }
+
+    target
+}
+
+fn navigation_section(ui: &mut egui::Ui, title: &str) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
+    ui.painter().text(
+        egui::pos2(rect.left() + 14.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        title,
+        egui::FontId::monospace(10.0),
+        theme::TEXT_FAINT,
+    );
+}
+
+fn navigation_row(ui: &mut egui::Ui, label: impl Into<String>, selected: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), theme::TREE_ROW_HEIGHT),
+        egui::Sense::click(),
+    );
+    if selected {
+        ui.painter()
+            .rect_filled(rect, 0.0, theme::accent_selection_fill());
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(rect.min, egui::vec2(2.0, rect.height())),
+            0.0,
+            theme::ACCENT,
+        );
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, 0.0, theme::HOVER);
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + 14.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!("D  {}", label.into()),
+        egui::FontId::monospace(12.0),
+        if selected {
+            theme::TEXT
+        } else {
+            theme::TEXT_SECONDARY
+        },
+    );
+    response
+}
+
+fn navigation_path_label(path: &Path) -> String {
+    path.file_name()
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn draw_logo(ui: &mut egui::Ui) {
@@ -308,5 +384,14 @@ mod tests {
             breadcrumb_parts(Path::new("project/src")),
             ["project", "src"]
         );
+    }
+
+    #[test]
+    fn navigation_rail_uses_leaf_name_and_keeps_root_visible() {
+        assert_eq!(
+            navigation_path_label(Path::new("/home/user/project")),
+            "project"
+        );
+        assert_eq!(navigation_path_label(Path::new("/")), "/");
     }
 }

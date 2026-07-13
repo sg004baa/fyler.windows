@@ -99,6 +99,21 @@ pub struct GuiOptions {
     pub icon_style: IconStyle,
     /// ヘルプダイアログへ表示する、エンジン非依存表記の行。
     pub help_lines: Vec<String>,
+    /// 左ドックへ表示する設定済みブックマーク。
+    pub bookmarks: Vec<(String, PathBuf)>,
+    /// 左ドックへ表示する最近使ったルート。
+    pub recent_roots: Vec<PathBuf>,
+    /// 左ドックへ表示する利用可能ドライブ。
+    pub drives: Vec<PathBuf>,
+}
+
+struct AppOptions {
+    confirm_detail: ConfirmDetail,
+    icon_style: IconStyle,
+    help_lines: Vec<String>,
+    bookmarks: Vec<(String, PathBuf)>,
+    recent_roots: Vec<PathBuf>,
+    drives: Vec<PathBuf>,
 }
 
 /// app層からGUIへ渡す描画指示。
@@ -330,6 +345,9 @@ pub struct FylerApp {
     confirm_detail: ConfirmDetail,
     icon_style: IconStyle,
     help_lines: Vec<String>,
+    bookmarks: Vec<(String, PathBuf)>,
+    recent_roots: Vec<PathBuf>,
+    drives: Vec<PathBuf>,
     /// native window geometryが未保存の初回起動だけ、monitor比率でサイズを設定する。
     resize_to_monitor_on_first_frame: bool,
     window_geometry: Arc<Mutex<Option<WindowGeometry>>>,
@@ -346,7 +364,6 @@ struct PaneViewState {
     collapsed_dirs: HashSet<EntryId>,
     show_hidden: bool,
     engine_error: Option<String>,
-    last_cursor_line: usize,
     tree_viewport: Option<tree_view::TreeViewport>,
 }
 
@@ -354,12 +371,18 @@ impl FylerApp {
     fn new(
         gui_events: mpsc::Receiver<GuiEvent>,
         action_tx: mpsc::Sender<GuiAction>,
-        confirm_detail: ConfirmDetail,
-        icon_style: IconStyle,
-        help_lines: Vec<String>,
+        options: AppOptions,
         repaint_context: egui::Context,
         event_dequeued: Arc<dyn Fn() + Send + Sync>,
     ) -> anyhow::Result<Self> {
+        let AppOptions {
+            confirm_detail,
+            icon_style,
+            help_lines,
+            bookmarks,
+            recent_roots,
+            drives,
+        } = options;
         let (event_tx, event_rx) = mpsc::channel();
         thread::Builder::new()
             .name("fyler-editor-events".to_owned())
@@ -399,6 +422,9 @@ impl FylerApp {
             confirm_detail,
             icon_style,
             help_lines,
+            bookmarks,
+            recent_roots,
+            drives,
             resize_to_monitor_on_first_frame: false,
             window_geometry: Arc::new(Mutex::new(None)),
         })
@@ -426,7 +452,6 @@ impl FylerApp {
                             collapsed_dirs: HashSet::new(),
                             show_hidden: false,
                             engine_error: None,
-                            last_cursor_line: 0,
                             tree_viewport: None,
                         },
                     );
@@ -512,8 +537,11 @@ impl FylerApp {
                 },
                 GuiEvent::RootChanged { pane_id, root } => {
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
-                        pane.root = root;
+                        pane.root = root.clone();
                     }
+                    self.recent_roots.retain(|recent| recent != &root);
+                    self.recent_roots.insert(0, root);
+                    self.recent_roots.truncate(10);
                 }
                 GuiEvent::GitBadges { pane_id, badges } => {
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
@@ -800,9 +828,7 @@ impl eframe::App for FylerApp {
         if self.dialog.is_none()
             && let (Some((pane_id, _, _, _)), Some(action)) = (chrome_state, chrome_action)
         {
-            if action == chrome::ChromeAction::ShowHelp {
-                self.dialog = Some(DialogState::Help);
-            } else if action == chrome::ChromeAction::ShowSettings {
+            if action == chrome::ChromeAction::ShowSettings {
                 self.dialog = Some(DialogState::Settings);
             } else if let Some(event) = chrome_editor_event(action, &snapshots[&pane_id])
                 && self
@@ -845,11 +871,12 @@ impl eframe::App for FylerApp {
         let layout = self.layout.clone();
         let active = self.active;
         let fatal_error = self.fatal_error.clone();
-        let ime = egui::CentralPanel::default()
+
+        let (ime, navigation_target) = egui::CentralPanel::default()
             .show(ui, |ui| {
                 if let Some(error) = fatal_error {
                     ui.colored_label(ui.visuals().error_fg_color, error);
-                    None
+                    (None, None)
                 } else if let (Some(layout), Some(active)) = (layout.as_ref(), active) {
                     draw_layout(
                         ui,
@@ -858,12 +885,29 @@ impl eframe::App for FylerApp {
                         &mut self.panes,
                         &snapshots,
                         self.icon_style,
+                        &self.bookmarks,
+                        &self.recent_roots,
+                        &self.drives,
                     )
                 } else {
-                    None
+                    (None, None)
                 }
             })
             .inner;
+        if self.dialog.is_none()
+            && let (Some(active), Some(target)) = (active, navigation_target)
+            && self
+                .action_tx
+                .send(GuiAction::Editor {
+                    pane_id: active,
+                    event: EditorEvent::ChangeDirectory {
+                        query: Some(target.display().to_string()),
+                    },
+                })
+                .is_err()
+        {
+            self.fatal_error = Some("Failed to send navigation action to app".to_owned());
+        }
         if self.dialog.is_none()
             && let Some(ime) = ime
         {
@@ -1078,7 +1122,7 @@ fn chrome_editor_event(
             changedtick: snapshot.changedtick,
             lines: Arc::clone(&snapshot.lines),
         }),
-        chrome::ChromeAction::ShowHelp | chrome::ChromeAction::ShowSettings => None,
+        chrome::ChromeAction::ShowSettings => None,
     }
 }
 
@@ -1087,6 +1131,7 @@ struct ImeGeometry {
     cursor_rect: egui::Rect,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_layout(
     ui: &mut egui::Ui,
     layout: &PaneLayout,
@@ -1094,10 +1139,37 @@ fn draw_layout(
     panes: &mut BTreeMap<PaneId, PaneViewState>,
     snapshots: &BTreeMap<PaneId, Arc<fyler_core::editor::EditorSnapshot>>,
     icon_style: IconStyle,
-) -> Option<ImeGeometry> {
+    bookmarks: &[(String, PathBuf)],
+    recent_roots: &[PathBuf],
+    drives: &[PathBuf],
+) -> (Option<ImeGeometry>, Option<PathBuf>) {
     let rect = ui.available_rect_before_wrap();
     ui.allocate_rect(rect, egui::Sense::hover());
-    draw_layout_in_rect(ui, rect, layout, active, panes, snapshots, icon_style)
+    let Some(root) = panes.get(&active).map(|pane| pane.root.clone()) else {
+        return (None, None);
+    };
+    let rail_width = chrome::NAV_RAIL_WIDTH.min(rect.width());
+    let rail_rect = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(rect.left() + rail_width, rect.bottom()),
+    );
+    let content_rect =
+        egui::Rect::from_min_max(egui::pos2(rail_rect.right(), rect.top()), rect.max);
+    let navigation_target = ui
+        .scope_builder(egui::UiBuilder::new().max_rect(rail_rect), |ui| {
+            chrome::draw_navigation_rail(ui, &root, bookmarks, recent_roots, drives)
+        })
+        .inner;
+    let ime = draw_layout_in_rect(
+        ui,
+        content_rect,
+        layout,
+        active,
+        panes,
+        snapshots,
+        icon_style,
+    );
+    (ime, navigation_target)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1134,7 +1206,6 @@ fn draw_layout_in_rect(
             );
             let modeline_rect =
                 egui::Rect::from_min_max(egui::pos2(inner.min.x, tree_rect.max.y), inner.max);
-            let cursor_changed = snapshot.cursor.line != pane.last_cursor_line;
             let output = ui
                 .scope_builder(egui::UiBuilder::new().max_rect(tree_rect), |ui| {
                     if let Some(error) = &pane.engine_error {
@@ -1148,7 +1219,6 @@ fn draw_layout_in_rect(
                             &pane.incomplete_dirs,
                             &pane.collapsed_dirs,
                             icon_style,
-                            cursor_changed,
                             pane.tree_viewport,
                             *id,
                         ))
@@ -1166,7 +1236,6 @@ fn draw_layout_in_rect(
                     pane.engine_error.is_some(),
                 );
             });
-            pane.last_cursor_line = snapshot.cursor.line;
             let output = output?;
             pane.tree_viewport = Some(output.viewport);
             if *id == active
@@ -1559,7 +1628,7 @@ fn draw_settings(ui: &mut egui::Ui, icon_style: IconStyle, confirm_detail: Confi
                     settings_row(ui, "Theme", "Dark canvas");
                     settings_row(ui, "Accent", "Orange");
                     settings_row(ui, "Font", "Monospace · 13 px");
-                    settings_row(ui, "Row height", "28 px");
+                    settings_row(ui, "Row height", "24 px");
                     settings_row(ui, "File icons", icon_style);
                 });
             ui.add_space(10.0);
@@ -1624,40 +1693,37 @@ fn draw_help(ui: &mut egui::Ui, help_lines: &[String]) -> bool {
 
     egui::Modal::new(egui::Id::new("fyler-help"))
         .show(ui.ctx(), |ui| {
-            ui.set_min_width(420.0);
-            ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_min_width(420.0);
                 ui.heading("Keyboard");
-                ui.label(
-                    egui::RichText::new("?  toggle")
-                        .monospace()
-                        .size(11.0)
-                        .color(theme::TEXT_MUTED),
-                );
-            });
-            ui.add_space(6.0);
-            ui.separator();
-            egui::ScrollArea::vertical()
-                .max_height(520.0)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    for line in help_lines {
-                        ui.add_sized(
-                            [ui.available_width(), 24.0],
-                            egui::Label::new(
-                                egui::RichText::new(line)
-                                    .monospace()
-                                    .size(12.0)
-                                    .color(theme::TEXT_SECONDARY),
-                            )
-                            .halign(egui::Align::LEFT),
-                        );
-                    }
-                });
-            ui.separator();
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add(egui::Button::new("Close  esc").frame(false))
-                    .clicked()
-                    || dismiss_from_keyboard
+                ui.add_space(6.0);
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(520.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                            for line in help_lines {
+                                ui.add_sized(
+                                    [ui.available_width(), 22.0],
+                                    egui::Label::new(
+                                        egui::RichText::new(line)
+                                            .monospace()
+                                            .size(12.0)
+                                            .color(theme::TEXT_SECONDARY),
+                                    )
+                                    .halign(egui::Align::LEFT),
+                                );
+                            }
+                        });
+                    });
+                ui.separator();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(egui::Button::new("Close  esc").frame(false))
+                        .clicked()
+                        || dismiss_from_keyboard
+                })
+                .inner
             })
             .inner
         })
@@ -1735,6 +1801,9 @@ pub fn run(
                 font_y_offset_factor,
                 icon_style,
                 help_lines,
+                bookmarks,
+                recent_roots,
+                drives,
             } = gui_options;
             let resize_to_monitor_on_first_frame = initial_window.is_none();
             theme::install(&creation_context.egui_ctx);
@@ -1746,9 +1815,14 @@ pub fn run(
             let mut app = FylerApp::new(
                 event_rx,
                 action_tx,
-                confirm_detail,
-                icon_style,
-                help_lines,
+                AppOptions {
+                    confirm_detail,
+                    icon_style,
+                    help_lines,
+                    bookmarks,
+                    recent_roots,
+                    drives,
+                },
                 creation_context.egui_ctx.clone(),
                 event_dequeued,
             )
@@ -1872,6 +1946,9 @@ mod tests {
                 confirm_detail: ConfirmDetail::Full,
                 icon_style: IconStyle::Ascii,
                 help_lines: Vec::new(),
+                bookmarks: Vec::new(),
+                recent_roots: Vec::new(),
+                drives: Vec::new(),
                 resize_to_monitor_on_first_frame: false,
                 window_geometry: Arc::new(Mutex::new(None)),
             },
@@ -1974,7 +2051,6 @@ mod tests {
                         collapsed_dirs: HashSet::new(),
                         show_hidden: false,
                         engine_error: None,
-                        last_cursor_line: 0,
                         tree_viewport: None,
                     },
                 ),
@@ -1991,7 +2067,6 @@ mod tests {
                         collapsed_dirs: HashSet::new(),
                         show_hidden: false,
                         engine_error: None,
-                        last_cursor_line: 0,
                         tree_viewport: None,
                     },
                 ),
@@ -2016,6 +2091,9 @@ mod tests {
             confirm_detail: ConfirmDetail::Full,
             icon_style: IconStyle::Ascii,
             help_lines: Vec::new(),
+            bookmarks: Vec::new(),
+            recent_roots: Vec::new(),
+            drives: Vec::new(),
             resize_to_monitor_on_first_frame: false,
             window_geometry: Arc::new(Mutex::new(None)),
         };
@@ -2053,6 +2131,7 @@ mod tests {
         assert_eq!(app.panes[&first].root, PathBuf::from("first"));
         assert!(app.panes[&first].git_badges.is_empty());
         assert_eq!(app.panes[&second].root, PathBuf::from("changed"));
+        assert_eq!(app.recent_roots, [PathBuf::from("changed")]);
         assert_eq!(
             app.panes[&second].git_badges.get(&EntryId(9)),
             Some(&GitBadge::Modified)
@@ -2086,10 +2165,6 @@ mod tests {
         };
         assert_eq!(changedtick, 42);
         assert!(Arc::ptr_eq(&lines, &snapshot.lines));
-        assert_eq!(
-            chrome_editor_event(chrome::ChromeAction::ShowHelp, &snapshot),
-            None
-        );
         assert_eq!(
             chrome_editor_event(chrome::ChromeAction::ShowSettings, &snapshot),
             None

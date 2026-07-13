@@ -53,7 +53,6 @@ pub fn draw(
     incomplete_dirs: &HashSet<EntryId>,
     collapsed_dirs: &HashSet<EntryId>,
     icon_style: IconStyle,
-    follow_cursor: bool,
     previous_viewport: Option<TreeViewport>,
     pane_id: PaneId,
 ) -> TreeViewOutput {
@@ -61,21 +60,17 @@ pub fn draw(
     let text_color = theme::TEXT;
     let row_height = theme::TREE_ROW_HEIGHT;
     let selection = display_selection(snapshot);
-    let requested_offset = if follow_cursor {
-        previous_viewport
-            .filter(|_| snapshot.cursor.line < snapshot.lines.len())
-            .and_then(|viewport| {
-                let cursor_top = snapshot.cursor.line as f32 * row_height;
-                follow_offset(
-                    cursor_top,
-                    cursor_top + row_height,
-                    viewport.scroll_offset,
-                    viewport.height,
-                )
-            })
-    } else {
-        None
-    };
+    let requested_offset = previous_viewport
+        .filter(|_| snapshot.cursor.line < snapshot.lines.len())
+        .and_then(|viewport| {
+            let cursor_top = snapshot.cursor.line as f32 * row_height;
+            follow_offset(
+                cursor_top,
+                cursor_top + row_height,
+                viewport.scroll_offset,
+                viewport.height,
+            )
+        });
 
     let mut scroll_area = egui::ScrollArea::vertical()
         .id_salt(pane_id.get())
@@ -502,12 +497,17 @@ fn draw_cursor(
 
     match snapshot.mode {
         Mode::Insert | Mode::Cmdline => {
-            painter.line_segment(
-                [
+            painter.rect_filled(
+                egui::Rect::from_min_max(
                     egui::pos2(cursor_x, cursor_rect.top()),
-                    egui::pos2(cursor_x, cursor_rect.bottom()),
-                ],
-                egui::Stroke::new(2.0, ui.visuals().strong_text_color()),
+                    egui::pos2(cursor_x + 2.0, cursor_rect.bottom()),
+                ),
+                0.0,
+                if snapshot.mode == Mode::Insert {
+                    theme::BLUE
+                } else {
+                    theme::TEXT
+                },
             );
         }
         Mode::Replace => {

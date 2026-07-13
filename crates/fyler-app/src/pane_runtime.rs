@@ -358,6 +358,9 @@ pub(super) fn run() -> anyhow::Result<()> {
         font_y_offset_factor: config.font_y_offset_factor,
         icon_style: config.icons,
         help_lines: help_lines(&bindings),
+        bookmarks: config.bookmarks.clone(),
+        recent_roots: super::config::load_recent_roots(),
+        drives: fyler_fsops::drives::list_drives(),
     };
     let bookmarks = config.bookmarks;
     let resolved_nvim = nvim_locate::resolve();
