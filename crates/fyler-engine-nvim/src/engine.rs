@@ -325,12 +325,20 @@ impl NvimEngine {
                             "redraw" => {
                                 // cmdline系イベントが来たら検索パターンが変わりうるので
                                 // snapshotを再発行する(incsearchプレビュー追従)。
-                                if handle_redraw(
+                                let outcome = handle_redraw(
                                     &notification.args,
                                     &event_tx,
                                     &mut cmdline_state,
-                                ) {
+                                );
+                                if outcome.cmdline_changed {
                                     snapshot_pending = true;
+                                }
+                                // 検索失敗(E486)等でエコー行 + エラーが積み上がると
+                                // nvimがhit-enter待ちに入りfylerがフリーズして見える。
+                                // ext_messagesのreturn_promptは外部UIが表示を持つため、
+                                // 即座に<CR>で解除し、プロンプト自体は表示しない。
+                                if outcome.hit_enter_prompt {
+                                    let _ = nvim.input("<CR>").await;
                                 }
                             }
                             "fyler_commit_requested" => {
@@ -1063,12 +1071,21 @@ fn apply_lines_notification(args: &[Value], lines: &mut Vec<EditorLine>) -> bool
     true
 }
 
+/// [`handle_redraw`] の結果。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RedrawOutcome {
+    /// cmdline系イベントでsnapshot再発行が必要か。
+    cmdline_changed: bool,
+    /// hit-enter(press-enter)プロンプトを受け取ったか。
+    hit_enter_prompt: bool,
+}
+
 fn handle_redraw(
     args: &[Value],
     event_tx: &mpsc::UnboundedSender<EditorEvent>,
     cmdline_state: &mut Option<CmdlineState>,
-) -> bool {
-    let mut cmdline_changed = false;
+) -> RedrawOutcome {
+    let mut outcome = RedrawOutcome::default();
     for batch in args {
         let Some(batch) = batch.as_array() else {
             continue;
@@ -1083,7 +1100,7 @@ fn handle_redraw(
                     if let Some(state) = parse_cmdline(update) {
                         *cmdline_state = Some(state.clone());
                         let _ = event_tx.send(EditorEvent::CmdlineShow(state));
-                        cmdline_changed = true;
+                        outcome.cmdline_changed = true;
                     }
                 }
             }
@@ -1100,14 +1117,14 @@ fn handle_redraw(
                     if let Some(state) = cmdline_state {
                         state.cursor = cursor;
                         let _ = event_tx.send(EditorEvent::CmdlineShow(state.clone()));
-                        cmdline_changed = true;
+                        outcome.cmdline_changed = true;
                     }
                 }
             }
             "cmdline_hide" => {
                 *cmdline_state = None;
                 let _ = event_tx.send(EditorEvent::CmdlineHide);
-                cmdline_changed = true;
+                outcome.cmdline_changed = true;
             }
             "popupmenu_show" => {
                 for update in &batch[1..] {
@@ -1132,6 +1149,12 @@ fn handle_redraw(
             }
             "msg_show" => {
                 for update in &batch[1..] {
+                    // hit-enter(press-enter)プロンプトはfylerが表示を持つため
+                    // 表示せず、呼び出し側が<CR>で即解除する(検索失敗のフリーズ対策)。
+                    if is_return_prompt(update) {
+                        outcome.hit_enter_prompt = true;
+                        continue;
+                    }
                     if let Some(message) = parse_message(update) {
                         let _ = event_tx.send(EditorEvent::Message(message));
                     }
@@ -1142,7 +1165,7 @@ fn handle_redraw(
             }
         }
     }
-    cmdline_changed
+    outcome
 }
 
 fn parse_popupmenu_show(args: &[Value]) -> Option<PopupmenuState> {
@@ -1188,6 +1211,15 @@ fn parse_popupmenu_selected(value: &Value) -> Option<Option<usize>> {
     } else {
         usize::try_from(selected).ok()
     })
+}
+
+/// `msg_show` の更新が hit-enter(press-enter)プロンプトかを返す。
+fn is_return_prompt(value: &Value) -> bool {
+    value
+        .as_array()
+        .and_then(|fields| fields.first())
+        .and_then(Value::as_str)
+        == Some("return_prompt")
 }
 
 fn parse_cmdline(value: &Value) -> Option<CmdlineState> {
@@ -1561,6 +1593,50 @@ mod tests {
                 text: "/test [1/3]".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn hit_enter_prompt_is_detected_and_dismissed_not_shown() {
+        let update = Value::Array(vec![
+            Value::from("return_prompt"),
+            Value::Array(vec![Value::Array(vec![
+                Value::from(0),
+                Value::from("Press ENTER or type command to continue"),
+            ])]),
+        ]);
+        assert!(is_return_prompt(&update));
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut cmdline_state = None;
+        let args = vec![Value::Array(vec![Value::from("msg_show"), update])];
+        let outcome = handle_redraw(&args, &event_tx, &mut cmdline_state);
+        assert!(outcome.hit_enter_prompt);
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn ordinary_error_message_is_shown_without_hit_enter() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut cmdline_state = None;
+        let args = vec![Value::Array(vec![
+            Value::from("msg_show"),
+            Value::Array(vec![
+                Value::from("emsg"),
+                Value::Array(vec![Value::Array(vec![
+                    Value::from(0),
+                    Value::from("E486: Pattern not found: zzz"),
+                ])]),
+            ]),
+        ])];
+        let outcome = handle_redraw(&args, &event_tx, &mut cmdline_state);
+        assert!(!outcome.hit_enter_prompt);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(EditorEvent::Message(EditorMessage {
+                kind: MessageKind::Error,
+                ..
+            }))
+        ));
     }
 
     #[test]

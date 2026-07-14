@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use eframe::egui;
 use fyler_core::editor::{Cursor, EditorSnapshot, Mode, SearchHighlight};
+use fyler_core::fileinfo::FileInfo;
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::EntryId;
@@ -52,6 +53,7 @@ pub fn draw(
     git_badges: &HashMap<EntryId, GitBadge>,
     incomplete_dirs: &HashSet<EntryId>,
     collapsed_dirs: &HashSet<EntryId>,
+    file_infos: &HashMap<EntryId, FileInfo>,
     icon_style: IconStyle,
     previous_viewport: Option<TreeViewport>,
     pane_id: PaneId,
@@ -129,15 +131,24 @@ pub fn draw(
                 egui::FontId::monospace(11.0),
                 theme::RED,
             );
+            let modified_text = file_info_for_line(&line.text, file_infos)
+                .and_then(|info| info.modified.clone())
+                .unwrap_or_default();
+            let modified_galley = painter.layout_no_wrap(
+                modified_text,
+                egui::FontId::monospace(11.0),
+                theme::TEXT_MUTED,
+            );
             let icon_width = icon_galley.size().x;
             let text_width = text_galley.size().x;
             let text_offset = TREE_LEFT_PADDING + indent_px + icon_width;
             let width = ui.available_width().max(
                 text_offset
                     + text_width
+                    + modified_galley.size().x
                     + incomplete_galley.size().x
                     + badge_galley.size().x
-                    + 32.0,
+                    + 44.0,
             );
             let (rect, response) =
                 ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::hover());
@@ -201,6 +212,14 @@ pub fn draw(
                     egui::pos2(right, rect.center().y - incomplete_galley.size().y / 2.0),
                     incomplete_galley,
                     theme::RED,
+                );
+            }
+            if modified_galley.size().x > 0.0 {
+                right -= modified_galley.size().x + 12.0;
+                painter.galley(
+                    egui::pos2(right, rect.center().y - modified_galley.size().y / 2.0),
+                    modified_galley,
+                    theme::TEXT_MUTED,
                 );
             }
 
@@ -426,6 +445,16 @@ fn badge_for_line(raw: &str, git_badges: &HashMap<EntryId, GitBadge>) -> Option<
         return None;
     };
     git_badges.get(&id).copied()
+}
+
+fn file_info_for_line<'a>(
+    raw: &str,
+    file_infos: &'a HashMap<EntryId, FileInfo>,
+) -> Option<&'a FileInfo> {
+    let PrefixParse::WithId { id, .. } = fyler_core::grammar::split_id_prefix(raw) else {
+        return None;
+    };
+    file_infos.get(&id)
 }
 
 fn incomplete_for_line(raw: &str, incomplete_dirs: &HashSet<EntryId>) -> bool {

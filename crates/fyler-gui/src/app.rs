@@ -349,17 +349,19 @@ impl NavigationDockState {
         }
     }
 
+    /// ドックfocusのトグル。閉→開+focus / 開+focus無→focus / 開+focus有→閉(非表示)。
     fn toggle_focus(&mut self) {
+        self.pending_binding.clear();
         if !self.open {
             self.open = true;
             self.focused = true;
             self.selected = 0;
-        } else if self.focused {
-            self.focused = false;
-            self.pending_binding.clear();
-        } else {
+        } else if !self.focused {
             self.focused = true;
             self.selected = 0;
+        } else {
+            self.open = false;
+            self.focused = false;
         }
     }
 }
@@ -859,30 +861,24 @@ impl eframe::App for FylerApp {
         let chrome_state = self.active.and_then(|pane_id| {
             let pane = self.panes.get(&pane_id)?;
             let snapshot = snapshots.get(&pane_id)?;
-            Some((pane_id, pane.root.clone(), pane.show_hidden, snapshot.dirty))
+            Some((pane_id, pane.root.clone(), snapshot.dirty))
         });
         let mut chrome_action = None;
-        if let Some((_, root, show_hidden, dirty)) = &chrome_state {
-            egui::Panel::top("fyler-titlebar")
-                .exact_size(theme::TITLEBAR_HEIGHT)
-                .show(ui, |ui| chrome::draw_titlebar(ui, root));
+        if let Some((_, root, dirty)) = &chrome_state {
             egui::Panel::top("fyler-toolbar")
                 .exact_size(theme::TOOLBAR_HEIGHT)
                 .show(ui, |ui| {
-                    chrome_action = chrome::draw_toolbar(ui, *show_hidden, *dirty);
+                    chrome_action = chrome::draw_toolbar(ui, root, *dirty);
                 });
-            egui::Panel::top("fyler-breadcrumb")
-                .exact_size(theme::BREADCRUMB_HEIGHT)
-                .show(ui, |ui| chrome::draw_breadcrumb(ui, root));
         }
         let navigation_entries = chrome_state
             .as_ref()
-            .map(|(_, root, _, _)| {
+            .map(|(_, root, _)| {
                 chrome::navigation_entries(root, &self.bookmarks, &self.recent_roots, &self.drives)
             })
             .unwrap_or_default();
         if self.dialog.is_none()
-            && let (Some((pane_id, _, _, _)), Some(action)) = (chrome_state.as_ref(), chrome_action)
+            && let (Some((pane_id, _, _)), Some(action)) = (chrome_state.as_ref(), chrome_action)
         {
             if action == chrome::ChromeAction::ShowSettings {
                 self.dialog = Some(DialogState::Settings);
@@ -1302,7 +1298,6 @@ fn chrome_editor_event(
 ) -> Option<EditorEvent> {
     match action {
         chrome::ChromeAction::NavigateParent => Some(EditorEvent::NavigateParent),
-        chrome::ChromeAction::ToggleHidden => Some(EditorEvent::ToggleHidden),
         chrome::ChromeAction::ReviewChanges => Some(EditorEvent::CommitRequested {
             changedtick: snapshot.changedtick,
             lines: Arc::clone(&snapshot.lines),
@@ -1346,6 +1341,7 @@ fn draw_layout(
                     navigation_entries,
                     navigation_focused,
                     navigation_selected,
+                    icon_style,
                 )
             })
             .inner;
@@ -1411,6 +1407,7 @@ fn draw_layout_in_rect(
                             &pane.git_badges,
                             &pane.incomplete_dirs,
                             &pane.collapsed_dirs,
+                            &pane.file_infos,
                             icon_style,
                             pane.tree_viewport,
                             *id,
@@ -2433,7 +2430,10 @@ mod tests {
         assert_eq!(state.selected, 0);
 
         let binding = fyler_core::keymap::parse_key_sequence("x e", None).unwrap();
-        state.focused = true;
+        let mut state = NavigationDockState {
+            focused: true,
+            ..NavigationDockState::visible()
+        };
         let keys = [
             KeyInput {
                 key: Key::Char('q'),
@@ -2472,6 +2472,25 @@ mod tests {
     }
 
     #[test]
+    fn dock_toggle_cycles_closed_focused_and_hidden() {
+        let mut state = NavigationDockState::default();
+        // closed → open + focus
+        state.toggle_focus();
+        assert!(state.open && state.focused);
+        // open + focused → closed (hidden)
+        state.toggle_focus();
+        assert!(!state.open && !state.focused);
+        // closed → open + focus
+        state.toggle_focus();
+        assert!(state.open && state.focused);
+
+        // open + unfocused → focus
+        state.focused = false;
+        state.toggle_focus();
+        assert!(state.open && state.focused);
+    }
+
+    #[test]
     fn toolbar_actions_preserve_snapshot_commit_identity() {
         let mut snapshot = fyler_core::editor::EditorSnapshot::empty();
         snapshot.changedtick = 42;
@@ -2480,10 +2499,6 @@ mod tests {
         assert_eq!(
             chrome_editor_event(chrome::ChromeAction::NavigateParent, &snapshot),
             Some(EditorEvent::NavigateParent)
-        );
-        assert_eq!(
-            chrome_editor_event(chrome::ChromeAction::ToggleHidden, &snapshot),
-            Some(EditorEvent::ToggleHidden)
         );
         let Some(EditorEvent::CommitRequested { changedtick, lines }) =
             chrome_editor_event(chrome::ChromeAction::ReviewChanges, &snapshot)

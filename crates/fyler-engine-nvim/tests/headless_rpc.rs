@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use fyler_core::editor::{
-    EditorCommand, EditorEngine, EditorEvent, EditorLine, FoldOp, Key, KeyInput, MessageKind, Mode,
-    Modifiers, SearchHighlight,
+    EditorCommand, EditorEngine, EditorEvent, EditorLine, EditorMessage, FoldOp, Key, KeyInput,
+    MessageKind, Mode, Modifiers, SearchHighlight,
 };
 use fyler_core::keymap::{default_leader, resolve_bindings};
 use fyler_core::pane::PaneAction;
@@ -1072,6 +1072,45 @@ async fn sort_alias_tab_completes_and_executes() -> anyhow::Result<()> {
     })
     .await
     .context(":sort da<Tab><CR> did not emit ChangeSort(\"date\")")?;
+
+    Ok(())
+}
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn failed_search_keeps_engine_responsive() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+    engine.set_initial_lines(vec![
+        EditorLine::new("/001 alpha"),
+        EditorLine::new("/002 beta"),
+    ])?;
+    wait_for_lines(&engine, |lines| lines.len() == 2).await?;
+
+    engine.send(key_command(Key::Char('/')))?;
+    for ch in ['z', 'z', 'q', 'x'] {
+        engine.send(key_command(Key::Char(ch)))?;
+    }
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            EditorEvent::Message(EditorMessage {
+                kind: MessageKind::Error,
+                ..
+            })
+        )
+    })
+    .await
+    .context("failed search did not report E486")?;
+
+    // フリーズしていなければ後続のカーソル移動がそのまま反映される。
+    engine.send(key_command(Key::Char('j')))?;
+    wait_for_cursor(&engine, |line, _| line == 1).await?;
+    assert_eq!(engine.snapshot().mode, Mode::Normal);
 
     Ok(())
 }
