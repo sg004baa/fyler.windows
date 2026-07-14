@@ -320,7 +320,6 @@ enum DialogState {
         body: String,
         stage: FeedbackStage,
     },
-    Settings,
     Help,
 }
 
@@ -860,36 +859,35 @@ impl eframe::App for FylerApp {
 
         let chrome_state = self.active.and_then(|pane_id| {
             let pane = self.panes.get(&pane_id)?;
-            let snapshot = snapshots.get(&pane_id)?;
-            Some((pane_id, pane.root.clone(), snapshot.dirty))
+            Some((pane_id, pane.root.clone()))
         });
         let mut chrome_action = None;
-        if let Some((_, root, dirty)) = &chrome_state {
+        if let Some((_, root)) = &chrome_state {
             egui::Panel::top("fyler-toolbar")
                 .exact_size(theme::TOOLBAR_HEIGHT)
                 .show(ui, |ui| {
-                    chrome_action = chrome::draw_toolbar(ui, root, *dirty);
+                    chrome_action = chrome::draw_toolbar(ui, root);
                 });
         }
         let navigation_entries = chrome_state
             .as_ref()
-            .map(|(_, root, _)| {
+            .map(|(_, root)| {
                 chrome::navigation_entries(root, &self.bookmarks, &self.recent_roots, &self.drives)
             })
             .unwrap_or_default();
         if self.dialog.is_none()
-            && let (Some((pane_id, _, _)), Some(action)) = (chrome_state.as_ref(), chrome_action)
+            && let (Some((pane_id, _)), Some(action)) = (chrome_state.as_ref(), chrome_action)
         {
-            if action == chrome::ChromeAction::ShowSettings {
-                self.dialog = Some(DialogState::Settings);
-            } else if let Some(event) = chrome_editor_event(action, &snapshots[pane_id])
-                && self
-                    .action_tx
-                    .send(GuiAction::Editor {
-                        pane_id: *pane_id,
-                        event,
-                    })
-                    .is_err()
+            let event = match action {
+                chrome::ChromeAction::NavigateParent => EditorEvent::NavigateParent,
+            };
+            if self
+                .action_tx
+                .send(GuiAction::Editor {
+                    pane_id: *pane_id,
+                    event,
+                })
+                .is_err()
             {
                 self.fatal_error = Some("Failed to send toolbar action to app".to_owned());
             }
@@ -1062,9 +1060,6 @@ impl eframe::App for FylerApp {
             }) => {
                 cancel_loader =
                     confirm::draw_loader_progress(ui, title, path, *entries, *cancel_requested);
-            }
-            Some(DialogState::Settings) => {
-                dismiss_errors = draw_settings(ui, self.icon_style, self.confirm_detail);
             }
             Some(DialogState::Help) => {
                 dismiss_errors = draw_help(ui, &self.help_entries);
@@ -1292,20 +1287,6 @@ fn handle_navigation_movement(
     }
 }
 
-fn chrome_editor_event(
-    action: chrome::ChromeAction,
-    snapshot: &fyler_core::editor::EditorSnapshot,
-) -> Option<EditorEvent> {
-    match action {
-        chrome::ChromeAction::NavigateParent => Some(EditorEvent::NavigateParent),
-        chrome::ChromeAction::ReviewChanges => Some(EditorEvent::CommitRequested {
-            changedtick: snapshot.changedtick,
-            lines: Arc::clone(&snapshot.lines),
-        }),
-        chrome::ChromeAction::ShowSettings => None,
-    }
-}
-
 struct ImeGeometry {
     tree_rect: egui::Rect,
     cursor_rect: egui::Rect,
@@ -1376,7 +1357,7 @@ fn draw_layout_in_rect(
             let pane = panes.get_mut(id)?;
             let snapshot = snapshots.get(id)?;
             let stroke = if *id == active {
-                egui::Stroke::new(1.0, theme::ACCENT)
+                egui::Stroke::new(1.0, theme::ACCENT_DIM)
             } else {
                 egui::Stroke::new(1.0, theme::BORDER_SUBTLE)
             };
@@ -1784,98 +1765,6 @@ fn draw_feedback(
     });
     result
 }
-
-fn draw_settings(ui: &mut egui::Ui, icon_style: IconStyle, confirm_detail: ConfirmDetail) -> bool {
-    let dismiss_from_keyboard = ui
-        .ctx()
-        .input(|input| input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape));
-    let icon_style = match icon_style {
-        IconStyle::Ascii => "ASCII",
-        IconStyle::Nerd => "Nerd Font",
-    };
-    let confirm_detail = match confirm_detail {
-        ConfirmDetail::Full => "Full operation list",
-        ConfirmDetail::Summary => "Summarize large plans",
-    };
-
-    egui::Modal::new(egui::Id::new("fyler-settings"))
-        .show(ui.ctx(), |ui| {
-            ui.set_min_width(540.0);
-            ui.heading("Settings");
-            ui.label(
-                egui::RichText::new("Loaded from config.toml at startup")
-                    .size(11.0)
-                    .color(theme::TEXT_MUTED),
-            );
-            ui.add_space(8.0);
-            ui.separator();
-            settings_section(ui, "APPEARANCE");
-            egui::Grid::new("fyler-settings-appearance")
-                .num_columns(2)
-                .min_col_width(180.0)
-                .spacing([20.0, 10.0])
-                .show(ui, |ui| {
-                    settings_row(ui, "Theme", "Dark canvas");
-                    settings_row(ui, "Accent", "Orange");
-                    settings_row(ui, "Font", "Monospace · 13 px");
-                    settings_row(ui, "Row height", "24 px");
-                    settings_row(ui, "File icons", icon_style);
-                });
-            ui.add_space(10.0);
-            settings_section(ui, "SAFETY");
-            egui::Grid::new("fyler-settings-safety")
-                .num_columns(2)
-                .min_col_width(180.0)
-                .spacing([20.0, 10.0])
-                .show(ui, |ui| {
-                    settings_row(ui, "Confirmation detail", confirm_detail);
-                    settings_row(ui, "Delete behavior", "Recycle bin");
-                    settings_row(ui, "Apply gate", "Confirmation required");
-                });
-            ui.add_space(10.0);
-            settings_section(ui, "EDITOR ENGINE");
-            ui.label(
-                egui::RichText::new("●  running · one isolated Neovim process per pane")
-                    .monospace()
-                    .size(12.0)
-                    .color(theme::GREEN),
-            );
-            ui.add_space(12.0);
-            ui.separator();
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add(egui::Button::new("Done  ↵")).clicked() || dismiss_from_keyboard
-            })
-            .inner
-        })
-        .inner
-}
-
-fn settings_section(ui: &mut egui::Ui, title: &str) {
-    ui.label(
-        egui::RichText::new(title)
-            .monospace()
-            .size(10.0)
-            .strong()
-            .color(theme::TEXT_MUTED),
-    );
-    ui.add_space(4.0);
-}
-
-fn settings_row(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.label(
-        egui::RichText::new(label)
-            .size(12.0)
-            .color(theme::TEXT_SECONDARY),
-    );
-    ui.label(
-        egui::RichText::new(value)
-            .monospace()
-            .size(12.0)
-            .color(theme::TEXT),
-    );
-    ui.end_row();
-}
-
 fn draw_help(ui: &mut egui::Ui, help_entries: &[HelpEntry]) -> bool {
     let dismiss_from_keyboard = ui.ctx().input(|input| {
         input.key_pressed(egui::Key::Escape)
@@ -2488,29 +2377,6 @@ mod tests {
         state.focused = false;
         state.toggle_focus();
         assert!(state.open && state.focused);
-    }
-
-    #[test]
-    fn toolbar_actions_preserve_snapshot_commit_identity() {
-        let mut snapshot = fyler_core::editor::EditorSnapshot::empty();
-        snapshot.changedtick = 42;
-        snapshot.lines = Arc::from([fyler_core::editor::EditorLine::new("file.txt")]);
-
-        assert_eq!(
-            chrome_editor_event(chrome::ChromeAction::NavigateParent, &snapshot),
-            Some(EditorEvent::NavigateParent)
-        );
-        let Some(EditorEvent::CommitRequested { changedtick, lines }) =
-            chrome_editor_event(chrome::ChromeAction::ReviewChanges, &snapshot)
-        else {
-            panic!("expected commit event");
-        };
-        assert_eq!(changedtick, 42);
-        assert!(Arc::ptr_eq(&lines, &snapshot.lines));
-        assert_eq!(
-            chrome_editor_event(chrome::ChromeAction::ShowSettings, &snapshot),
-            None
-        );
     }
 
     #[test]

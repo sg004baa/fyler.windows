@@ -61,6 +61,8 @@ pub fn draw(
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
     let text_color = theme::TEXT;
     let row_height = theme::TREE_ROW_HEIGHT;
+    // 行間の余白をゼロにして item を詰める(pitch = 行高 24px)。
+    ui.spacing_mut().item_spacing.y = 0.0;
     let row_pitch = row_height + ui.spacing().item_spacing.y;
     let selection = display_selection(snapshot);
     let requested_offset = previous_viewport
@@ -161,7 +163,7 @@ pub fn draw(
                 painter.rect_filled(
                     egui::Rect::from_min_size(rect.min, egui::vec2(2.0, rect.height())),
                     0.0,
-                    theme::ACCENT,
+                    theme::ACCENT_DIM,
                 );
             }
             for depth in 0..concealed.depth {
@@ -527,20 +529,6 @@ fn draw_cursor(
     );
 
     match snapshot.mode {
-        Mode::Insert | Mode::Cmdline => {
-            painter.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(cursor_x, cursor_rect.top()),
-                    egui::pos2(cursor_x + 2.0, cursor_rect.bottom()),
-                ),
-                0.0,
-                if snapshot.mode == Mode::Insert {
-                    theme::BLUE
-                } else {
-                    theme::TEXT
-                },
-            );
-        }
         Mode::Replace => {
             painter.line_segment(
                 [
@@ -551,14 +539,25 @@ fn draw_cursor(
             );
         }
         _ => {
-            painter.rect_filled(cursor_rect, 0.0, ui.visuals().selection.bg_fill);
-            painter.text(
-                cursor_rect.min,
-                egui::Align2::LEFT_TOP,
-                cursor_text,
-                font_id.clone(),
-                ui.visuals().selection.stroke.color,
-            );
+            // 点滅する縦バー。カーソル下の文字色は変えない。
+            let blink_on = ui.ctx().input(|input| input.time).rem_euclid(1.2) < 0.6;
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(600));
+            if blink_on {
+                let color = if snapshot.mode == Mode::Insert {
+                    theme::BLUE
+                } else {
+                    theme::TEXT
+                };
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(cursor_x, cursor_rect.top()),
+                        egui::pos2(cursor_x + 2.0, cursor_rect.bottom()),
+                    ),
+                    0.0,
+                    color,
+                );
+            }
         }
     }
 

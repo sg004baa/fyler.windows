@@ -12,15 +12,13 @@ pub const NAV_RAIL_WIDTH: f32 = 208.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChromeAction {
     NavigateParent,
-    ReviewChanges,
-    ShowSettings,
 }
 
 /// タイトルバー・ツールバー・ぱんくずを1行へ統合したトップchrome。
 ///
 /// フレームレスウィンドウのため、空き領域をドラッグ/ダブルクリックで
 /// ウィンドウ移動・最大化に使う。ウィンドウ操作ボタンもこの行に置く。
-pub fn draw_toolbar(ui: &mut egui::Ui, root: &Path, dirty: bool) -> Option<ChromeAction> {
+pub fn draw_toolbar(ui: &mut egui::Ui, root: &Path) -> Option<ChromeAction> {
     ui.painter().rect_filled(ui.max_rect(), 0.0, theme::SURFACE);
     ui.painter().line_segment(
         [ui.max_rect().left_bottom(), ui.max_rect().right_bottom()],
@@ -81,43 +79,6 @@ pub fn draw_toolbar(ui: &mut egui::Ui, root: &Path, dirty: bool) -> Option<Chrom
             if window_button(ui, "—", false).clicked() {
                 ui.ctx()
                     .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            }
-            ui.add_space(8.0);
-            if ui
-                .add(
-                    egui::Button::new(
-                        egui::RichText::new("settings")
-                            .monospace()
-                            .size(12.0)
-                            .color(theme::TEXT_MUTED),
-                    )
-                    .frame(false),
-                )
-                .on_hover_text("Appearance and safety settings")
-                .clicked()
-            {
-                action = Some(ChromeAction::ShowSettings);
-            }
-            let review = if dirty {
-                egui::RichText::new("review changes  ·  pending")
-                    .monospace()
-                    .size(12.0)
-                    .color(theme::ACCENT)
-            } else {
-                egui::RichText::new("review changes  ·  0")
-                    .monospace()
-                    .size(12.0)
-                    .color(theme::TEXT_MUTED)
-            };
-            if ui
-                .add_enabled(
-                    dirty,
-                    egui::Button::new(review).min_size(egui::vec2(150.0, 24.0)),
-                )
-                .on_hover_text("Review pending changes before applying")
-                .clicked()
-            {
-                action = Some(ChromeAction::ReviewChanges);
             }
         });
     });

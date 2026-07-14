@@ -2204,6 +2204,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     if finish.is_err() {
                                         return;
                                     }
+                                    git.request(pane_id, session.root.clone());
                                 }
                                 LoaderResult::Cancelled => {
                                     if showed_dialog
