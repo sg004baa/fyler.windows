@@ -348,6 +348,7 @@ struct NavigationDockState {
 }
 
 impl NavigationDockState {
+    #[cfg(test)]
     fn visible() -> Self {
         Self {
             open: true,
@@ -482,7 +483,7 @@ impl FylerApp {
             icon_style,
             help_entries,
             dock_focus_bindings,
-            navigation_dock: NavigationDockState::visible(),
+            navigation_dock: NavigationDockState::default(),
             bookmarks,
             recent_roots,
             drives,
@@ -1419,6 +1420,7 @@ fn draw_layout_in_rect(
                             icon_style,
                             pane.tree_viewport,
                             *id,
+                            *id == active,
                         ))
                     }
                 })

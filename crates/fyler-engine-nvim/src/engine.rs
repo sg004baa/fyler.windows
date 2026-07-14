@@ -1155,6 +1155,11 @@ fn handle_redraw(
                         outcome.hit_enter_prompt = true;
                         continue;
                     }
+                    // undo/redoの状態報告("N changes; before #M ...")はファイラーには
+                    // ノイズなので表示しない。
+                    if is_muted_kind(update) {
+                        continue;
+                    }
                     if let Some(message) = parse_message(update) {
                         let _ = event_tx.send(EditorEvent::Message(message));
                     }
@@ -1220,6 +1225,19 @@ fn is_return_prompt(value: &Value) -> bool {
         .and_then(|fields| fields.first())
         .and_then(Value::as_str)
         == Some("return_prompt")
+}
+
+/// `msg_show` の更新が、ファイラーで表示不要なノイズ種別かを返す。
+///
+/// 現状は undo/redo の状態報告(`kind == "undo"`)を抑制する。
+fn is_muted_kind(value: &Value) -> bool {
+    matches!(
+        value
+            .as_array()
+            .and_then(|fields| fields.first())
+            .and_then(Value::as_str),
+        Some("undo")
+    )
 }
 
 fn parse_cmdline(value: &Value) -> Option<CmdlineState> {
@@ -1637,6 +1655,25 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn undo_report_message_is_muted() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut cmdline_state = None;
+        let args = vec![Value::Array(vec![
+            Value::from("msg_show"),
+            Value::Array(vec![
+                Value::from("undo"),
+                Value::Array(vec![Value::Array(vec![
+                    Value::from(0),
+                    Value::from("3 changes; before #4  69 seconds ago"),
+                ])]),
+            ]),
+        ])];
+        let outcome = handle_redraw(&args, &event_tx, &mut cmdline_state);
+        assert!(!outcome.hit_enter_prompt);
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[test]

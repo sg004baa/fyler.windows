@@ -1114,6 +1114,41 @@ async fn failed_search_keeps_engine_responsive() -> anyhow::Result<()> {
 
     Ok(())
 }
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn buffer_undo_report_is_not_surfaced_as_a_message() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+    engine.set_initial_lines(vec![EditorLine::new("/001 alpha")])?;
+    wait_for_lines(&engine, |lines| lines.len() == 1).await?;
+
+    // 行を追加してから undo すると nvim は "N changes; before #M ..." を返す。
+    engine.send(key_command(Key::Char('o')))?;
+    engine.send(EditorCommand::Text("x".to_owned()))?;
+    engine.send(key_command(Key::Esc))?;
+    engine.send(key_command(Key::Char('u')))?;
+
+    // undo報告(kind "undo")はメッセージとしてGUIへ送られない。
+    let surfaced = tokio::time::timeout(Duration::from_millis(1200), async {
+        while let Some(event) = events.recv().await {
+            if let EditorEvent::Message(message) = event
+                && message.text.contains("changes")
+            {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    assert!(!surfaced, "undo report should be muted");
+
+    Ok(())
+}
 
 async fn wait_for_lines(
     engine: &NvimEngine,

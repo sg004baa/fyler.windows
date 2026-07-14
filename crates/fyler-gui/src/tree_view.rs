@@ -57,6 +57,7 @@ pub fn draw(
     icon_style: IconStyle,
     previous_viewport: Option<TreeViewport>,
     pane_id: PaneId,
+    is_active: bool,
 ) -> TreeViewOutput {
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
     let text_color = theme::TEXT;
@@ -225,7 +226,7 @@ pub fn draw(
                 );
             }
 
-            if snapshot.cursor.line == line_index {
+            if is_active && snapshot.cursor.line == line_index {
                 cursor_rect = Some(draw_cursor(
                     ui,
                     rect,
@@ -341,7 +342,7 @@ fn draw_selection(
     else {
         return;
     };
-    let fill = translucent_selection_fill(ui.visuals());
+    let fill = translucent_selection_fill();
     let painter = ui.painter();
 
     if matches!(mode, Mode::VisualLine) {
@@ -437,9 +438,9 @@ fn byte_after_character(text: &str, requested: usize) -> usize {
         .map_or(index, |character| index + character.len_utf8())
 }
 
-fn translucent_selection_fill(visuals: &egui::Visuals) -> egui::Color32 {
-    let color = visuals.selection.bg_fill;
-    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), color.a().min(96))
+fn translucent_selection_fill() -> egui::Color32 {
+    // Visual選択が確実に視認できるよう、Visualモードバッジと同系のBLUEで塗る。
+    egui::Color32::from_rgba_unmultiplied(theme::BLUE.r(), theme::BLUE.g(), theme::BLUE.b(), 72)
 }
 
 fn badge_for_line(raw: &str, git_badges: &HashMap<EntryId, GitBadge>) -> Option<GitBadge> {
@@ -528,23 +529,18 @@ fn draw_cursor(
         egui::vec2(cursor_width, cursor_size.y),
     );
 
-    // vim準拠のカーソル形状。点滅は共通(約600ms周期)。
-    let blink_on = ui.ctx().input(|input| input.time).rem_euclid(1.2) < 0.6;
-    ui.ctx()
-        .request_repaint_after(std::time::Duration::from_millis(600));
+    // vim準拠のカーソル形状(点滅なし)。
     match snapshot.mode {
         Mode::Insert => {
             // 縦バー(細)。文字色は変えない。
-            if blink_on {
-                painter.rect_filled(
-                    egui::Rect::from_min_max(
-                        egui::pos2(cursor_x, cursor_rect.top()),
-                        egui::pos2(cursor_x + 2.0, cursor_rect.bottom()),
-                    ),
-                    0.0,
-                    theme::BLUE,
-                );
-            }
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(cursor_x, cursor_rect.top()),
+                    egui::pos2(cursor_x + 2.0, cursor_rect.bottom()),
+                ),
+                0.0,
+                theme::BLUE,
+            );
         }
         Mode::Replace => {
             // 下線。
@@ -558,16 +554,14 @@ fn draw_cursor(
         }
         _ => {
             // ブロック(reverse video)。セルをTEXT色で塗り、文字を背景色で描き直す。
-            if blink_on {
-                painter.rect_filled(cursor_rect, 0.0, theme::TEXT);
-                painter.text(
-                    cursor_rect.left_top(),
-                    egui::Align2::LEFT_TOP,
-                    &cursor_text,
-                    font_id.clone(),
-                    theme::CANVAS,
-                );
-            }
+            painter.rect_filled(cursor_rect, 0.0, theme::TEXT);
+            painter.text(
+                cursor_rect.left_top(),
+                egui::Align2::LEFT_TOP,
+                &cursor_text,
+                font_id.clone(),
+                theme::CANVAS,
+            );
         }
     }
 
