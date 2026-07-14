@@ -17,6 +17,7 @@ use fyler_core::fileinfo::FileInfo;
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::id::EntryId;
 use fyler_core::keymap::KeySequence;
+use fyler_core::options::StatusItem;
 use fyler_core::pane::{PaneId, PaneLayout, SplitDirection};
 use fyler_core::path::TreePath;
 use fyler_core::plan::OperationPlan;
@@ -114,8 +115,11 @@ pub struct GuiOptions {
     pub bookmarks: Vec<(String, PathBuf)>,
     /// 左ドックへ表示する最近使ったルート。
     pub recent_roots: Vec<PathBuf>,
-    /// 左ドックへ表示する利用可能ドライブ。
     pub drives: Vec<PathBuf>,
+    /// ステータスラインの左クラスタ表示項目(順序どおり)。
+    pub statusline_left: Vec<StatusItem>,
+    /// ステータスラインの右クラスタ表示項目(順序どおり)。
+    pub statusline_right: Vec<StatusItem>,
 }
 
 struct AppOptions {
@@ -126,6 +130,8 @@ struct AppOptions {
     bookmarks: Vec<(String, PathBuf)>,
     recent_roots: Vec<PathBuf>,
     drives: Vec<PathBuf>,
+    statusline_left: Vec<StatusItem>,
+    statusline_right: Vec<StatusItem>,
 }
 
 /// app層からGUIへ渡す描画指示。
@@ -154,6 +160,7 @@ pub enum GuiEvent {
     /// baselineのエントリIDに対応するGit装飾を全件差し替える。
     GitBadges {
         pane_id: PaneId,
+        branch: Option<String>,
         badges: HashMap<EntryId, GitBadge>,
     },
     /// 読み取り不能なディレクトリの行末装飾を全件差し替える。
@@ -394,6 +401,8 @@ pub struct FylerApp {
     bookmarks: Vec<(String, PathBuf)>,
     recent_roots: Vec<PathBuf>,
     drives: Vec<PathBuf>,
+    statusline_left: Vec<StatusItem>,
+    statusline_right: Vec<StatusItem>,
     /// native window geometryが未保存の初回起動だけ、monitor比率でサイズを設定する。
     resize_to_monitor_on_first_frame: bool,
     window_geometry: Arc<Mutex<Option<WindowGeometry>>>,
@@ -403,6 +412,7 @@ struct PaneViewState {
     engine: Arc<dyn EditorEngine>,
     root: PathBuf,
     git_badges: HashMap<EntryId, GitBadge>,
+    branch: Option<String>,
     incomplete_dirs: HashSet<EntryId>,
     offline: bool,
     unreadable: usize,
@@ -429,6 +439,8 @@ impl FylerApp {
             bookmarks,
             recent_roots,
             drives,
+            statusline_left,
+            statusline_right,
         } = options;
         let (event_tx, event_rx) = mpsc::channel();
         thread::Builder::new()
@@ -474,6 +486,8 @@ impl FylerApp {
             bookmarks,
             recent_roots,
             drives,
+            statusline_left,
+            statusline_right,
             resize_to_monitor_on_first_frame: false,
             window_geometry: Arc::new(Mutex::new(None)),
         })
@@ -494,6 +508,7 @@ impl FylerApp {
                             engine,
                             root,
                             git_badges: HashMap::new(),
+                            branch: None,
                             incomplete_dirs: HashSet::new(),
                             offline: false,
                             unreadable: 0,
@@ -594,8 +609,13 @@ impl FylerApp {
                     self.recent_roots.insert(0, root);
                     self.recent_roots.truncate(10);
                 }
-                GuiEvent::GitBadges { pane_id, badges } => {
+                GuiEvent::GitBadges {
+                    pane_id,
+                    branch,
+                    badges,
+                } => {
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
+                        pane.branch = branch;
                         pane.git_badges = badges;
                     }
                 }
@@ -862,11 +882,11 @@ impl eframe::App for FylerApp {
             Some((pane_id, pane.root.clone()))
         });
         let mut chrome_action = None;
-        if let Some((_, root)) = &chrome_state {
+        if chrome_state.is_some() {
             egui::Panel::top("fyler-toolbar")
                 .exact_size(theme::TOOLBAR_HEIGHT)
                 .show(ui, |ui| {
-                    chrome_action = chrome::draw_toolbar(ui, root);
+                    chrome_action = chrome::draw_toolbar(ui);
                 });
         }
         let navigation_entries = chrome_state
@@ -945,6 +965,8 @@ impl eframe::App for FylerApp {
                         self.navigation_dock.open,
                         self.navigation_dock.focused,
                         self.navigation_dock.selected,
+                        &self.statusline_left,
+                        &self.statusline_right,
                     )
                 } else {
                     (None, None)
@@ -1304,6 +1326,8 @@ fn draw_layout(
     navigation_open: bool,
     navigation_focused: bool,
     navigation_selected: usize,
+    statusline_left: &[StatusItem],
+    statusline_right: &[StatusItem],
 ) -> (Option<ImeGeometry>, Option<usize>) {
     let rect = ui.available_rect_before_wrap();
     ui.allocate_rect(rect, egui::Sense::hover());
@@ -1338,6 +1362,8 @@ fn draw_layout(
         panes,
         snapshots,
         icon_style,
+        statusline_left,
+        statusline_right,
     );
     (ime, navigation_clicked)
 }
@@ -1351,19 +1377,20 @@ fn draw_layout_in_rect(
     panes: &mut BTreeMap<PaneId, PaneViewState>,
     snapshots: &BTreeMap<PaneId, Arc<fyler_core::editor::EditorSnapshot>>,
     icon_style: IconStyle,
+    statusline_left: &[StatusItem],
+    statusline_right: &[StatusItem],
 ) -> Option<ImeGeometry> {
     match layout {
         PaneLayout::Leaf(id) => {
             let pane = panes.get_mut(id)?;
             let snapshot = snapshots.get(id)?;
-            let stroke = if *id == active {
-                egui::Stroke::new(1.0, theme::ACCENT_DIM)
-            } else {
-                egui::Stroke::new(1.0, theme::BORDER_SUBTLE)
-            };
             ui.painter().rect_filled(rect, 0.0, theme::CANVAS);
-            ui.painter()
-                .rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
+            ui.painter().rect_stroke(
+                rect,
+                0.0,
+                egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
+                egui::StrokeKind::Inside,
+            );
 
             let inner = rect.shrink(1.0);
             let modeline_height = theme::STATUSBAR_HEIGHT;
@@ -1401,12 +1428,19 @@ fn draw_layout_in_rect(
                     ui,
                     snapshot,
                     &pane.root,
+                    pane.branch.as_deref(),
                     &pane.file_infos,
+                    statusline_left,
+                    statusline_right,
                     pane.offline,
                     pane.unreadable,
                     pane.engine_error.is_some(),
                 );
             });
+            if *id != active {
+                ui.painter()
+                    .rect_filled(rect, 0.0, theme::inactive_pane_veil());
+            }
             let output = output?;
             pane.tree_viewport = Some(output.viewport);
             if *id == active
@@ -1444,8 +1478,17 @@ fn draw_layout_in_rect(
                     )
                 }
             };
-            let first_ime =
-                draw_layout_in_rect(ui, first_rect, first, active, panes, snapshots, icon_style);
+            let first_ime = draw_layout_in_rect(
+                ui,
+                first_rect,
+                first,
+                active,
+                panes,
+                snapshots,
+                icon_style,
+                statusline_left,
+                statusline_right,
+            );
             let second_ime = draw_layout_in_rect(
                 ui,
                 second_rect,
@@ -1454,6 +1497,8 @@ fn draw_layout_in_rect(
                 panes,
                 snapshots,
                 icon_style,
+                statusline_left,
+                statusline_right,
             );
             first_ime.or(second_ime)
         }
@@ -1918,6 +1963,8 @@ pub fn run(
                 bookmarks,
                 recent_roots,
                 drives,
+                statusline_left,
+                statusline_right,
             } = gui_options;
             let resize_to_monitor_on_first_frame = initial_window.is_none();
             theme::install(&creation_context.egui_ctx);
@@ -1937,6 +1984,8 @@ pub fn run(
                     bookmarks,
                     recent_roots,
                     drives,
+                    statusline_left,
+                    statusline_right,
                 },
                 creation_context.egui_ctx.clone(),
                 event_dequeued,
@@ -2066,6 +2115,8 @@ mod tests {
                 bookmarks: Vec::new(),
                 recent_roots: Vec::new(),
                 drives: Vec::new(),
+                statusline_left: Vec::new(),
+                statusline_right: Vec::new(),
                 resize_to_monitor_on_first_frame: false,
                 window_geometry: Arc::new(Mutex::new(None)),
             },
@@ -2161,6 +2212,7 @@ mod tests {
                         engine: recording_engine(),
                         root: PathBuf::from("first"),
                         git_badges: HashMap::new(),
+                        branch: None,
                         incomplete_dirs: HashSet::new(),
                         offline: false,
                         unreadable: 0,
@@ -2177,6 +2229,7 @@ mod tests {
                         engine: recording_engine(),
                         root: PathBuf::from("second"),
                         git_badges: HashMap::new(),
+                        branch: None,
                         incomplete_dirs: HashSet::new(),
                         offline: false,
                         unreadable: 0,
@@ -2213,6 +2266,8 @@ mod tests {
             bookmarks: Vec::new(),
             recent_roots: Vec::new(),
             drives: Vec::new(),
+            statusline_left: Vec::new(),
+            statusline_right: Vec::new(),
             resize_to_monitor_on_first_frame: false,
             window_geometry: Arc::new(Mutex::new(None)),
         };
@@ -2225,6 +2280,7 @@ mod tests {
         .unwrap();
         tx.send(GuiEvent::GitBadges {
             pane_id: second,
+            branch: Some("main".to_owned()),
             badges: HashMap::from([(EntryId(9), GitBadge::Modified)]),
         })
         .unwrap();

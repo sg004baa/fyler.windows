@@ -386,6 +386,8 @@ pub(super) fn run() -> anyhow::Result<()> {
         bookmarks: config.bookmarks.clone(),
         recent_roots: super::config::load_recent_roots(),
         drives: fyler_fsops::drives::list_drives(),
+        statusline_left: config.statusline_left,
+        statusline_right: config.statusline_right,
     };
     let bookmarks = config.bookmarks;
     let resolved_nvim = nvim_locate::resolve();
@@ -2803,6 +2805,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                     AppEvent::GitStatus {
                         pane_id,
                         root,
+                        branch,
                         statuses,
                     } => {
                         if let Some(next_root) = git.on_finished(pane_id) {
@@ -2818,6 +2821,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                         if gui_event_tx
                             .send(GuiEvent::GitBadges {
                                 pane_id,
+                                branch,
                                 badges: session.git_badges.clone(),
                             })
                             .is_err()

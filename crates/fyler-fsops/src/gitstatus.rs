@@ -35,6 +35,32 @@ pub fn status_badges(root: &Path) -> anyhow::Result<HashMap<PathBuf, GitBadge>> 
     Ok(parse_porcelain(&status_output.stdout, prefix))
 }
 
+/// 表示ルートが属するGitブランチ名を返す。
+///
+/// `git`が無い/リポジトリ外/コマンド失敗時は`None`。detached HEADでは短縮SHAを返す。
+pub fn branch(root: &Path) -> Option<String> {
+    // symbolic-refはコミットが無い(unborn)ブランチでも名前を返す。
+    if let Ok(output) = git_output(root, &["symbolic-ref", "--short", "HEAD"])
+        && output.status.success()
+    {
+        let name = String::from_utf8_lossy(trim_line_ending(&output.stdout))
+            .trim()
+            .to_owned();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    // detached HEAD: 短縮SHAで代替する。
+    let short = git_output(root, &["rev-parse", "--short", "HEAD"]).ok()?;
+    if !short.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(trim_line_ending(&short.stdout))
+        .trim()
+        .to_owned();
+    (!sha.is_empty()).then_some(sha)
+}
+
 fn git_output(root: &Path, arguments: &[&str]) -> std::io::Result<Output> {
     let mut command = Command::new("git");
     command
@@ -246,5 +272,31 @@ mod tests {
             badges.get(Path::new("untracked.txt")),
             Some(&GitBadge::Untracked)
         );
+    }
+
+    #[test]
+    fn branch_reads_current_branch_of_initialized_repository() {
+        let root = tempdir().unwrap();
+        let version = git_output(root.path(), &["--version"]);
+        if !version.is_ok_and(|output| output.status.success()) {
+            return;
+        }
+
+        assert!(
+            git_output(root.path(), &["init", "--quiet"])
+                .unwrap()
+                .status
+                .success()
+        );
+        // ブランチ名を固定してデフォルト名(main/master)差を避ける。
+        assert!(
+            git_output(root.path(), &["checkout", "-q", "-b", "trunk"])
+                .unwrap()
+                .status
+                .success()
+        );
+
+        assert_eq!(branch(root.path()).as_deref(), Some("trunk"));
+        assert_eq!(branch(&root.path().join("missing")), None);
     }
 }

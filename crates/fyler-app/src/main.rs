@@ -76,6 +76,7 @@ enum AppEvent {
     GitStatus {
         pane_id: PaneId,
         root: PathBuf,
+        branch: Option<String>,
         statuses: HashMap<PathBuf, GitBadge>,
     },
     LoaderProgress(PaneId, usize),
@@ -136,9 +137,11 @@ impl GitRefresher {
                 .stack_size(256 * 1024)
                 .spawn(move || {
                     let statuses = fyler_fsops::gitstatus::status_badges(&root).unwrap_or_default();
+                    let branch = fyler_fsops::gitstatus::branch(&root);
                     let _ = event_tx.send(AppEvent::GitStatus {
                         pane_id,
                         root,
+                        branch,
                         statuses,
                     });
                 }),
@@ -255,6 +258,7 @@ fn after_root_change(
     })?;
     gui_event_tx.send(GuiEvent::GitBadges {
         pane_id,
+        branch: None,
         badges: HashMap::new(),
     })?;
     send_view_state(gui_event_tx, pane_id, save_controller)?;

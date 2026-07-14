@@ -15,6 +15,10 @@ pub const TEXT_FAINT: egui::Color32 = egui::Color32::from_rgb(74, 72, 68);
 pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(255, 107, 26);
 /// active pane枠やカーソル行バーに使う、主張を抑えた暗いオレンジ。
 pub const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(138, 66, 30);
+/// 非アクティブpaneへ重ねて暗くする半透明ベール。
+pub fn inactive_pane_veil() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(11, 11, 12, 130)
+}
 pub const BLUE: egui::Color32 = egui::Color32::from_rgb(90, 143, 174);
 pub const GREEN: egui::Color32 = egui::Color32::from_rgb(111, 174, 90);
 pub const YELLOW: egui::Color32 = egui::Color32::from_rgb(217, 169, 58);

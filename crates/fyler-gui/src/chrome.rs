@@ -18,7 +18,7 @@ pub enum ChromeAction {
 ///
 /// フレームレスウィンドウのため、空き領域をドラッグ/ダブルクリックで
 /// ウィンドウ移動・最大化に使う。ウィンドウ操作ボタンもこの行に置く。
-pub fn draw_toolbar(ui: &mut egui::Ui, root: &Path) -> Option<ChromeAction> {
+pub fn draw_toolbar(ui: &mut egui::Ui) -> Option<ChromeAction> {
     ui.painter().rect_filled(ui.max_rect(), 0.0, theme::SURFACE);
     ui.painter().line_segment(
         [ui.max_rect().left_bottom(), ui.max_rect().right_bottom()],
@@ -59,10 +59,6 @@ pub fn draw_toolbar(ui: &mut egui::Ui, root: &Path) -> Option<ChromeAction> {
         }
         ui.add_enabled(false, chrome_button("↻"))
             .on_disabled_hover_text("Filesystem changes refresh automatically");
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(6.0);
-        draw_breadcrumb(ui, root);
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
@@ -85,27 +81,6 @@ pub fn draw_toolbar(ui: &mut egui::Ui, root: &Path) -> Option<ChromeAction> {
     action
 }
 
-/// ぱんくずをツールバー行へインラインで描く(currentの囲みなし)。
-fn draw_breadcrumb(ui: &mut egui::Ui, root: &Path) {
-    let parts = breadcrumb_parts(root);
-    ui.spacing_mut().item_spacing.x = 1.0;
-    for (index, part) in parts.iter().enumerate() {
-        let current = index + 1 == parts.len();
-        ui.label(
-            egui::RichText::new(part)
-                .monospace()
-                .size(12.0)
-                .color(if current {
-                    theme::TEXT
-                } else {
-                    theme::TEXT_MUTED
-                }),
-        );
-        if !current {
-            ui.label(egui::RichText::new("›").color(theme::TEXT_FAINT));
-        }
-    }
-}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NavigationSection {
     Pinned,
@@ -334,35 +309,9 @@ fn chrome_button(label: &'static str) -> egui::Button<'static> {
     .min_size(egui::vec2(26.0, 26.0))
 }
 
-fn breadcrumb_parts(root: &Path) -> Vec<String> {
-    let mut parts = root
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .filter(|part| !part.is_empty() && part != "\\")
-        .collect::<Vec<_>>();
-    if parts.is_empty() {
-        parts.push(root.display().to_string());
-    }
-    parts
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn breadcrumb_preserves_path_order() {
-        let parts = breadcrumb_parts(Path::new("/home/user/project"));
-        assert_eq!(parts, ["/", "home", "user", "project"]);
-    }
-
-    #[test]
-    fn relative_root_is_still_visible() {
-        assert_eq!(
-            breadcrumb_parts(Path::new("project/src")),
-            ["project", "src"]
-        );
-    }
 
     #[test]
     fn navigation_rail_uses_leaf_name_and_keeps_root_visible() {

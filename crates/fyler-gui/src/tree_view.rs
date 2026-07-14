@@ -528,34 +528,44 @@ fn draw_cursor(
         egui::vec2(cursor_width, cursor_size.y),
     );
 
+    // vim準拠のカーソル形状。点滅は共通(約600ms周期)。
+    let blink_on = ui.ctx().input(|input| input.time).rem_euclid(1.2) < 0.6;
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(600));
     match snapshot.mode {
-        Mode::Replace => {
-            painter.line_segment(
-                [
-                    egui::pos2(cursor_x, cursor_rect.bottom() - 1.0),
-                    egui::pos2(cursor_x + cursor_width, cursor_rect.bottom() - 1.0),
-                ],
-                egui::Stroke::new(2.0, ui.visuals().strong_text_color()),
-            );
-        }
-        _ => {
-            // 点滅する縦バー。カーソル下の文字色は変えない。
-            let blink_on = ui.ctx().input(|input| input.time).rem_euclid(1.2) < 0.6;
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(600));
+        Mode::Insert => {
+            // 縦バー(細)。文字色は変えない。
             if blink_on {
-                let color = if snapshot.mode == Mode::Insert {
-                    theme::BLUE
-                } else {
-                    theme::TEXT
-                };
                 painter.rect_filled(
                     egui::Rect::from_min_max(
                         egui::pos2(cursor_x, cursor_rect.top()),
                         egui::pos2(cursor_x + 2.0, cursor_rect.bottom()),
                     ),
                     0.0,
-                    color,
+                    theme::BLUE,
+                );
+            }
+        }
+        Mode::Replace => {
+            // 下線。
+            painter.line_segment(
+                [
+                    egui::pos2(cursor_x, cursor_rect.bottom() - 1.0),
+                    egui::pos2(cursor_x + cursor_width, cursor_rect.bottom() - 1.0),
+                ],
+                egui::Stroke::new(2.0, theme::TEXT),
+            );
+        }
+        _ => {
+            // ブロック(reverse video)。セルをTEXT色で塗り、文字を背景色で描き直す。
+            if blink_on {
+                painter.rect_filled(cursor_rect, 0.0, theme::TEXT);
+                painter.text(
+                    cursor_rect.left_top(),
+                    egui::Align2::LEFT_TOP,
+                    &cursor_text,
+                    font_id.clone(),
+                    theme::CANVAS,
                 );
             }
         }

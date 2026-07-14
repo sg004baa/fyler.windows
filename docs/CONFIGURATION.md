@@ -79,6 +79,7 @@ projects = 'D:\projects'
 | `leader` | string | `"Space"` | One unmodified key used to expand `Leader` bindings |
 | `[bookmarks]` | table | empty | Bookmark names mapped to absolute paths |
 | `[keymap.normal]` | table | built-in keymap | Key sequences mapped to action names |
+| `[statusline]` | table | see below | `left`/`right` arrays of status item names |
 
 ### Display and sorting
 
@@ -99,6 +100,23 @@ startup. The `toggle_hidden` action (`g .` by default) can also change this whil
 
 `sort_reverse = true` reverses the selected key. Directory grouping remains controlled separately
 by `sort`. At runtime, use `:sort name|date|size|ext`; add `!` to the command for descending order.
+### Statusline
+
+The bottom statusline is built from two ordered clusters. `[statusline].left` fills from the left
+and `[statusline].right` fills from the right, each listing item names in display order:
+
+```toml
+[statusline]
+left = ["mode", "branch", "path"]
+right = ["line", "column", "percent"]
+```
+
+Available items: `mode`, `branch` (only shown inside a Git repository), `path`, `line`, `column`,
+`percent` (cursor position through the file), `size`, and `modified` (cursor entry size and
+modified time). The defaults are the two arrays shown above. Unknown item names and non-array
+values are ignored with a warning. Pending-change and health indicators (`[offline]`,
+`[! N unreadable]`) always appear regardless of configuration.
+
 ### Session and window restoration
 
 With `restore_session = true`, a normally closed fyler window writes `session.toml` beside
