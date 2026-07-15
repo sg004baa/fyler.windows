@@ -12,6 +12,8 @@ use fyler_core::report::{CommitReport, OpOutcome, OpResult};
 use fyler_core::transfer::{TransferKind, TransferOp, TransferPlan};
 use fyler_core::validate::ValidateError;
 
+use crate::theme;
+
 /// ユーザーの選択。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmChoice {
@@ -40,6 +42,55 @@ pub enum IconStyle {
     Nerd,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PlanCounts {
+    create: usize,
+    rename: usize,
+    move_count: usize,
+    copy: usize,
+    delete: usize,
+}
+
+impl From<&OperationPlan> for PlanCounts {
+    fn from(plan: &OperationPlan) -> Self {
+        let mut counts = Self::default();
+        for operation in &plan.ops {
+            match operation {
+                FsOperation::Create { .. } => counts.create += 1,
+                FsOperation::Move { from, to, .. } if from.parent() == to.parent() => {
+                    counts.rename += 1;
+                }
+                FsOperation::Move { .. } => counts.move_count += 1,
+                FsOperation::Copy { .. } => counts.copy += 1,
+                FsOperation::Delete { .. } => counts.delete += 1,
+            }
+        }
+        counts
+    }
+}
+
+fn count_badge(ui: &mut egui::Ui, count: usize, noun: &str, color: egui::Color32) {
+    egui::Frame::NONE
+        .fill(theme::SURFACE_RAISED)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(7, 3))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format!("{count} {noun}"))
+                    .monospace()
+                    .size(11.0)
+                    .color(color),
+            );
+        });
+}
+
+fn summary_badge(ui: &mut egui::Ui, count: usize, noun: &str, color: egui::Color32) {
+    if count > 0 {
+        count_badge(ui, count, noun, color);
+    }
+}
+
 /// OperationPlanをモーダルで表示し、選択があれば返す。
 ///
 /// 実装契約:
@@ -61,52 +112,137 @@ pub fn draw_plan(
     let key_choice = ui.ctx().input(|input| {
         plan_choice_from_keys(
             input.key_pressed(egui::Key::Y),
+            input.key_pressed(egui::Key::Enter),
             input.key_pressed(egui::Key::N),
             input.key_pressed(egui::Key::Escape),
         )
     });
+    let counts = PlanCounts::from(plan);
 
     egui::Modal::new(egui::Id::new("save-plan-confirmation"))
         .show(ui.ctx(), |ui| {
-            ui.heading("Confirm changes");
-            ui.add_space(8.0);
-
-            for label in plan_labels(plan, detail) {
-                ui.monospace(label);
-            }
-            if !overwrites.is_empty() {
-                ui.add_space(8.0);
-                ui.colored_label(
-                    ui.visuals().warn_fg_color,
-                    "These existing files will be moved to the recycle bin before overwrite:",
-                );
-                for path in overwrites {
-                    ui.colored_label(ui.visuals().warn_fg_color, path.to_string());
-                }
-            }
-            if !warnings.is_empty() {
-                ui.add_space(8.0);
-                for warning in warnings {
-                    ui.colored_label(ui.visuals().warn_fg_color, warning);
-                }
-            }
-
-            ui.add_space(12.0);
+            ui.set_min_width(520.0);
             ui.horizontal(|ui| {
-                let approve_label = if overwrites.is_empty() {
-                    "Approve (y)"
-                } else {
-                    "Overwrite and apply (y)"
-                };
-                let approve_clicked = ui.button(approve_label).clicked();
-                let cancel_clicked = ui.button("Cancel (n / Esc)").clicked();
-                if approve_clicked || key_choice == Some(ConfirmChoice::Approve) {
-                    Some(ConfirmChoice::Approve)
-                } else if cancel_clicked || key_choice == Some(ConfirmChoice::Cancel) {
-                    Some(ConfirmChoice::Cancel)
-                } else {
-                    None
-                }
+                ui.heading("Review changes");
+                count_badge(ui, plan.ops.len(), "operations", theme::TEXT_SECONDARY);
+            });
+            ui.label(
+                egui::RichText::new(
+                    "These will be applied to disk. Deletions go to the recycle bin.",
+                )
+                .size(11.0)
+                .color(theme::TEXT_MUTED),
+            );
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                summary_badge(ui, counts.create, "create", theme::GREEN);
+                summary_badge(ui, counts.rename, "rename", theme::BLUE);
+                summary_badge(ui, counts.copy, "copy", theme::BLUE);
+                summary_badge(ui, counts.move_count, "move", theme::BLUE);
+                summary_badge(ui, counts.delete, "delete", theme::RED);
+            });
+            ui.add_space(8.0);
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.add_space(4.0);
+                    for (group_index, group) in plan_groups(plan, detail).iter().enumerate() {
+                        if group_index > 0 {
+                            ui.add_space(8.0);
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(group.kind.heading())
+                                    .monospace()
+                                    .size(10.0)
+                                    .strong()
+                                    .color(group.kind.color()),
+                            );
+                            if group.kind == OpKind::Delete {
+                                ui.label(
+                                    egui::RichText::new("·  recoverable from recycle bin")
+                                        .size(10.0)
+                                        .color(theme::TEXT_FAINT),
+                                );
+                            }
+                        });
+                        ui.add_space(2.0);
+                        for entry in &group.entries {
+                            ui.horizontal(|ui| {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new(group.kind.marker())
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(group.kind.color()),
+                                );
+                                ui.label(
+                                    egui::RichText::new(entry)
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(theme::TEXT_SECONDARY),
+                                );
+                            });
+                        }
+                    }
+                    if !overwrites.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("OVERWRITE")
+                                .monospace()
+                                .size(11.0)
+                                .strong()
+                                .color(theme::YELLOW),
+                        );
+                        for path in overwrites {
+                            ui.label(
+                                egui::RichText::new(path.to_string())
+                                    .monospace()
+                                    .size(12.0)
+                                    .color(theme::YELLOW),
+                            );
+                        }
+                    }
+                    for warning in warnings {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(warning).size(12.0).color(theme::YELLOW));
+                    }
+                });
+
+            ui.separator();
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let approve_label = if overwrites.is_empty() {
+                        format!("Apply {} changes  ↵", plan.ops.len())
+                    } else {
+                        format!("Overwrite + apply {}  ↵", plan.ops.len())
+                    };
+                    let approve_clicked = ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(approve_label)
+                                    .strong()
+                                    .color(theme::CANVAS),
+                            )
+                            .fill(theme::ACCENT)
+                            .stroke(egui::Stroke::new(1.0, theme::ACCENT)),
+                        )
+                        .clicked();
+                    let cancel_clicked = ui
+                        .add(egui::Button::new("Cancel  esc").frame(false))
+                        .clicked();
+                    if approve_clicked || key_choice == Some(ConfirmChoice::Approve) {
+                        Some(ConfirmChoice::Approve)
+                    } else if cancel_clicked || key_choice == Some(ConfirmChoice::Cancel) {
+                        Some(ConfirmChoice::Cancel)
+                    } else {
+                        None
+                    }
+                })
+                .inner
             })
             .inner
         })
@@ -123,6 +259,7 @@ pub fn draw_transfer_plan(
     let key_choice = ui.ctx().input(|input| {
         plan_choice_from_keys(
             input.key_pressed(egui::Key::Y),
+            input.key_pressed(egui::Key::Enter),
             input.key_pressed(egui::Key::N),
             input.key_pressed(egui::Key::Escape),
         )
@@ -171,6 +308,7 @@ pub fn draw_undo_plan(ui: &mut egui::Ui, lines: &[String]) -> Option<ConfirmChoi
     let key_choice = ui.ctx().input(|input| {
         plan_choice_from_keys(
             input.key_pressed(egui::Key::Y),
+            input.key_pressed(egui::Key::Enter),
             input.key_pressed(egui::Key::N),
             input.key_pressed(egui::Key::Escape),
         )
@@ -204,38 +342,98 @@ pub fn draw_undo_plan(ui: &mut egui::Ui, lines: &[String]) -> Option<ConfirmChoi
         .inner
 }
 
-fn plan_labels(plan: &OperationPlan, detail: ConfirmDetail) -> Vec<String> {
-    if detail == ConfirmDetail::Full || plan.ops.len() <= 5 {
-        return plan.ops.iter().map(operation_label).collect();
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpKind {
+    Create,
+    Rename,
+    Move,
+    Copy,
+    Delete,
+}
 
-    let mut create = 0;
-    let mut rename = 0;
-    let mut move_count = 0;
-    let mut copy = 0;
-    let mut delete = 0;
-    for operation in &plan.ops {
+impl OpKind {
+    fn of(operation: &FsOperation) -> Self {
         match operation {
-            FsOperation::Create { .. } => create += 1,
-            FsOperation::Move { from, to, .. } if from.parent() == to.parent() => rename += 1,
-            FsOperation::Move { .. } => move_count += 1,
-            FsOperation::Copy { .. } => copy += 1,
-            FsOperation::Delete { .. } => delete += 1,
+            FsOperation::Create { .. } => Self::Create,
+            FsOperation::Move { from, to, .. } if from.parent() == to.parent() => Self::Rename,
+            FsOperation::Move { .. } => Self::Move,
+            FsOperation::Copy { .. } => Self::Copy,
+            FsOperation::Delete { .. } => Self::Delete,
         }
     }
 
-    let summaries = [
-        (create, "CREATE", ""),
-        (rename, "RENAME", ""),
-        (move_count, "MOVE", ""),
-        (copy, "COPY", ""),
-        (delete, "DELETE", "(to recycle bin)"),
-    ]
-    .into_iter()
-    .filter(|(count, _, _)| *count > 0)
-    .map(|(count, kind, suffix)| format!("{kind} {count}{suffix}"))
-    .collect::<Vec<_>>();
-    vec![summaries.join(" / ")]
+    fn heading(self) -> &'static str {
+        match self {
+            Self::Create => "CREATE",
+            Self::Rename => "RENAME",
+            Self::Move => "MOVE",
+            Self::Copy => "COPY",
+            Self::Delete => "DELETE",
+        }
+    }
+
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Create => "+",
+            Self::Rename => "~",
+            Self::Move | Self::Copy => "→",
+            Self::Delete => "-",
+        }
+    }
+
+    fn color(self) -> egui::Color32 {
+        match self {
+            Self::Create => theme::GREEN,
+            Self::Rename | Self::Move | Self::Copy => theme::BLUE,
+            Self::Delete => theme::RED,
+        }
+    }
+}
+
+struct OpGroup {
+    kind: OpKind,
+    entries: Vec<String>,
+}
+
+/// 操作を種別ごとにまとめ、見出し(種別)配下へ表示する内容を返す。
+/// Full か 5件以下なら各操作を1行ずつ、それ以外は種別ごとの件数へ畳む。
+fn plan_groups(plan: &OperationPlan, detail: ConfirmDetail) -> Vec<OpGroup> {
+    let expanded = detail == ConfirmDetail::Full || plan.ops.len() <= 5;
+    let mut groups: Vec<OpGroup> = Vec::new();
+    for kind in [
+        OpKind::Create,
+        OpKind::Rename,
+        OpKind::Move,
+        OpKind::Copy,
+        OpKind::Delete,
+    ] {
+        let matching: Vec<&FsOperation> = plan
+            .ops
+            .iter()
+            .filter(|op| OpKind::of(op) == kind)
+            .collect();
+        if matching.is_empty() {
+            continue;
+        }
+        let entries = if expanded {
+            matching.iter().map(|op| operation_entry(op)).collect()
+        } else {
+            let count = matching.len();
+            vec![format!("{count} item{}", if count == 1 { "" } else { "s" })]
+        };
+        groups.push(OpGroup { kind, entries });
+    }
+    groups
+}
+
+/// 操作の変更内容(種別語を除いたパス表現)。
+fn operation_entry(operation: &FsOperation) -> String {
+    match operation {
+        FsOperation::Create { path, .. } | FsOperation::Delete { path, .. } => path.to_string(),
+        FsOperation::Move { from, to, .. } | FsOperation::Copy { from, to, .. } => {
+            format!("{from} → {to}")
+        }
+    }
 }
 
 /// validateエラーの表示(保存は中断済み)。行番号は0始まりなので表示時に+1する。
@@ -252,29 +450,63 @@ pub fn draw_report(ui: &mut egui::Ui, report: &CommitReport) -> bool {
     let dismiss_from_keyboard = ui
         .ctx()
         .input(|input| input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape));
+    let succeeded = report
+        .results
+        .iter()
+        .filter(|result| matches!(result.outcome, OpOutcome::Success))
+        .count();
+    let failed = report
+        .results
+        .iter()
+        .filter(|result| matches!(result.outcome, OpOutcome::Failed { .. }))
+        .count();
+    let skipped = report.results.len().saturating_sub(succeeded + failed);
 
     egui::Modal::new(egui::Id::new("save-commit-report"))
         .show(ui.ctx(), |ui| {
-            ui.heading("Apply result");
+            ui.set_min_width(460.0);
+            ui.heading(if failed == 0 {
+                "Changes applied"
+            } else {
+                "Applied with errors"
+            });
             ui.add_space(8.0);
-
-            for result in &report.results {
-                let label = report_label(result);
-                match &result.outcome {
-                    OpOutcome::Success => {
-                        ui.monospace(label);
+            ui.horizontal_wrapped(|ui| {
+                summary_badge(ui, succeeded, "done", theme::GREEN);
+                summary_badge(ui, failed, "failed", theme::RED);
+                summary_badge(ui, skipped, "skipped", theme::YELLOW);
+            });
+            ui.add_space(8.0);
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(300.0)
+                .show(ui, |ui| {
+                    for result in &report.results {
+                        let (prefix, color) = match &result.outcome {
+                            OpOutcome::Success => ("✓", theme::GREEN),
+                            OpOutcome::Failed { .. } => ("×", theme::RED),
+                            OpOutcome::Skipped { .. } => ("·", theme::YELLOW),
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("{prefix}  {}", report_label(result)))
+                                .monospace()
+                                .size(12.0)
+                                .color(color),
+                        );
                     }
-                    OpOutcome::Failed { .. } => {
-                        ui.colored_label(ui.visuals().error_fg_color, label);
-                    }
-                    OpOutcome::Skipped { .. } => {
-                        ui.monospace(label);
-                    }
-                }
-            }
-
-            ui.add_space(12.0);
-            ui.button("Close (Enter / Esc)").clicked() || dismiss_from_keyboard
+                });
+            ui.separator();
+            ui.add_space(6.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(
+                    egui::Button::new(egui::RichText::new("Done  ↵").strong().color(theme::CANVAS))
+                        .fill(theme::ACCENT)
+                        .stroke(egui::Stroke::new(1.0, theme::ACCENT)),
+                )
+                .clicked()
+                    || dismiss_from_keyboard
+            })
+            .inner
         })
         .inner
 }
@@ -340,6 +572,7 @@ pub fn draw_undo_recovery(ui: &mut egui::Ui, descriptions: &[String]) -> Option<
     let key_choice = ui.ctx().input(|input| {
         plan_choice_from_keys(
             input.key_pressed(egui::Key::Y),
+            input.key_pressed(egui::Key::Enter),
             input.key_pressed(egui::Key::N),
             input.key_pressed(egui::Key::Escape),
         )
@@ -390,29 +623,92 @@ pub fn draw_apply_progress(
             .ctx()
             .input(|input| input.key_pressed(egui::Key::N) || input.key_pressed(egui::Key::Escape));
     let fraction = completed as f32 / total.max(1) as f32;
+    let queued = total
+        .saturating_sub(completed)
+        .saturating_sub(usize::from(current.is_some()));
 
     egui::Modal::new(egui::Id::new("save-apply-progress"))
         .show(ui.ctx(), |ui| {
-            ui.heading("Applying changes");
-            ui.add_space(8.0);
-            ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)));
-            ui.label(format!("{completed} / {total}"));
+            ui.set_min_width(480.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.heading("Applying changes");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{completed} / {total}"))
+                            .monospace()
+                            .size(12.0)
+                            .color(theme::TEXT_MUTED),
+                    );
+                });
+            });
             if let Some(current) = current {
-                ui.add_space(4.0);
-                ui.monospace(current);
-            }
-
-            ui.add_space(12.0);
-            if cancel_requested {
-                ui.colored_label(
-                    ui.visuals().warn_fg_color,
-                    "Cancel requested; stopping after the current operation finishes",
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new(current)
+                        .monospace()
+                        .size(12.0)
+                        .color(theme::TEXT_SECONDARY),
                 );
             }
-            let cancel_clicked = ui
-                .add_enabled(!cancel_requested, egui::Button::new("Cancel (n / Esc)"))
-                .clicked();
-            cancel_clicked || cancel_from_keyboard
+            ui.add_space(10.0);
+            ui.add(
+                egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
+                    .fill(theme::BLUE)
+                    .desired_width(480.0)
+                    .show_percentage(),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("{completed} done"))
+                        .monospace()
+                        .size(11.0)
+                        .color(theme::GREEN),
+                );
+                if current.is_some() {
+                    ui.label(
+                        egui::RichText::new("·  1 in progress")
+                            .monospace()
+                            .size(11.0)
+                            .color(theme::TEXT_MUTED),
+                    );
+                }
+                ui.label(
+                    egui::RichText::new(format!("·  {queued} queued"))
+                        .monospace()
+                        .size(11.0)
+                        .color(theme::TEXT_MUTED),
+                );
+            });
+            ui.add_space(10.0);
+            ui.separator();
+            if cancel_requested {
+                ui.label(
+                    egui::RichText::new(
+                        "Cancel requested; stopping after the current operation finishes",
+                    )
+                    .size(11.0)
+                    .color(theme::YELLOW),
+                );
+            }
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Do not close the window until this finishes")
+                        .size(11.0)
+                        .color(theme::TEXT_FAINT),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_enabled(
+                        !cancel_requested,
+                        egui::Button::new("Cancel remaining  esc"),
+                    )
+                    .clicked()
+                })
+                .inner
+            })
+            .inner
+                || cancel_from_keyboard
         })
         .inner
 }
@@ -534,8 +830,8 @@ pub fn open_with_selection_step(len: usize, selected: usize, delta: i32) -> usiz
 }
 
 /// plan確認キーの押下状態を、エンジン非依存の確認結果へ変換する。
-fn plan_choice_from_keys(y: bool, n: bool, esc: bool) -> Option<ConfirmChoice> {
-    if y {
+fn plan_choice_from_keys(y: bool, enter: bool, n: bool, esc: bool) -> Option<ConfirmChoice> {
+    if y || enter {
         Some(ConfirmChoice::Approve)
     } else if n || esc {
         Some(ConfirmChoice::Cancel)
@@ -688,18 +984,22 @@ mod tests {
     #[test]
     fn plan_keyboard_shortcuts_map_to_choices() {
         assert_eq!(
-            plan_choice_from_keys(true, false, false),
+            plan_choice_from_keys(true, false, false, false),
             Some(ConfirmChoice::Approve)
         );
         assert_eq!(
-            plan_choice_from_keys(false, true, false),
+            plan_choice_from_keys(false, true, false, false),
+            Some(ConfirmChoice::Approve)
+        );
+        assert_eq!(
+            plan_choice_from_keys(false, false, true, false),
             Some(ConfirmChoice::Cancel)
         );
         assert_eq!(
-            plan_choice_from_keys(false, false, true),
+            plan_choice_from_keys(false, false, false, true),
             Some(ConfirmChoice::Cancel)
         );
-        assert_eq!(plan_choice_from_keys(false, false, false), None);
+        assert_eq!(plan_choice_from_keys(false, false, false, false), None);
     }
 
     #[test]
@@ -749,22 +1049,40 @@ mod tests {
         };
 
         assert_eq!(
-            plan_labels(&plan, ConfirmDetail::Summary),
-            ["RENAME 2 / COPY 3 / DELETE 1(to recycle bin)"]
+            PlanCounts::from(&plan),
+            PlanCounts {
+                rename: 2,
+                copy: 3,
+                delete: 1,
+                ..PlanCounts::default()
+            }
+        );
+
+        let groups = plan_groups(&plan, ConfirmDetail::Summary)
+            .into_iter()
+            .map(|group| (group.kind, group.entries))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            groups,
+            vec![
+                (OpKind::Rename, vec!["2 items".to_owned()]),
+                (OpKind::Copy, vec!["3 items".to_owned()]),
+                (OpKind::Delete, vec!["1 item".to_owned()]),
+            ]
         );
     }
 
     #[test]
-    fn summary_detail_keeps_short_plans_expanded() {
+    fn short_plans_list_each_operation_under_its_kind() {
         let plan = OperationPlan {
             ops: vec![FsOperation::Delete {
                 id: EntryId(1),
                 path: TreePath::parse("old.txt"),
             }],
         };
-        assert_eq!(
-            plan_labels(&plan, ConfirmDetail::Summary),
-            ["DELETE old.txt (to recycle bin)"]
-        );
+        let groups = plan_groups(&plan, ConfirmDetail::Summary);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].kind, OpKind::Delete);
+        assert_eq!(groups[0].entries, vec!["old.txt".to_owned()]);
     }
 }

@@ -9,12 +9,15 @@ use std::thread;
 use eframe::egui;
 use fyler_core::WindowGeometry;
 use fyler_core::editor::{
-    CmdlineState, EditorEngine, EditorEvent, EditorMessage, Mode, PopupmenuState,
+    CmdlineState, EditorEngine, EditorEvent, EditorMessage, Key, KeyInput, Mode, Modifiers,
+    PopupmenuState,
 };
 use fyler_core::feedback::{FeedbackKind, MAX_BODY_CHARS, validate_body};
 use fyler_core::fileinfo::FileInfo;
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::id::EntryId;
+use fyler_core::keymap::{HelpEntry, KeySequence};
+use fyler_core::options::StatusItem;
 use fyler_core::pane::{PaneId, PaneLayout, SplitDirection};
 use fyler_core::path::TreePath;
 use fyler_core::plan::OperationPlan;
@@ -23,7 +26,7 @@ use fyler_core::transfer::{TransferOp, TransferPlan};
 use fyler_core::validate::ValidateError;
 
 use crate::confirm::{ConfirmChoice, ConfirmDetail, IconStyle};
-use crate::{cmdline, confirm, input, modeline, tree_view};
+use crate::{chrome, cmdline, confirm, input, modeline, theme, tree_view};
 
 const CJK_FONT_NAME: &str = "fyler-cjk";
 const INITIAL_WINDOW_SCALE: f32 = 0.7;
@@ -48,6 +51,10 @@ pub struct PickerHit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuiAction {
     Confirm(ConfirmChoice),
+    Editor {
+        pane_id: PaneId,
+        event: EditorEvent,
+    },
     LoaderCancel,
     PickerSelect {
         pane_id: PaneId,
@@ -93,8 +100,31 @@ pub struct GuiOptions {
     pub font_y_offset_factor: f32,
     /// ツリーへ描画するファイルアイコンのスタイル。
     pub icon_style: IconStyle,
-    /// ヘルプダイアログへ表示する、エンジン非依存表記の行。
-    pub help_lines: Vec<String>,
+    /// ヘルプダイアログへ表示する、エンジン非依存の操作一覧。
+    pub help_entries: Vec<HelpEntry>,
+    /// ドックfocus操作へ割り当てられた解決済みキーシーケンス。
+    pub dock_focus_bindings: Vec<KeySequence>,
+    /// 左ドックへ表示する設定済みブックマーク。
+    pub bookmarks: Vec<(String, PathBuf)>,
+    /// 左ドックへ表示する最近使ったルート。
+    pub recent_roots: Vec<PathBuf>,
+    pub drives: Vec<PathBuf>,
+    /// ステータスラインの左クラスタ表示項目(順序どおり)。
+    pub statusline_left: Vec<StatusItem>,
+    /// ステータスラインの右クラスタ表示項目(順序どおり)。
+    pub statusline_right: Vec<StatusItem>,
+}
+
+struct AppOptions {
+    confirm_detail: ConfirmDetail,
+    icon_style: IconStyle,
+    help_entries: Vec<HelpEntry>,
+    dock_focus_bindings: Vec<KeySequence>,
+    bookmarks: Vec<(String, PathBuf)>,
+    recent_roots: Vec<PathBuf>,
+    drives: Vec<PathBuf>,
+    statusline_left: Vec<StatusItem>,
+    statusline_right: Vec<StatusItem>,
 }
 
 /// app層からGUIへ渡す描画指示。
@@ -123,6 +153,7 @@ pub enum GuiEvent {
     /// baselineのエントリIDに対応するGit装飾を全件差し替える。
     GitBadges {
         pane_id: PaneId,
+        branch: Option<String>,
         badges: HashMap<EntryId, GitBadge>,
     },
     /// 読み取り不能なディレクトリの行末装飾を全件差し替える。
@@ -296,6 +327,40 @@ enum FeedbackStage {
     Failed(FeedbackResultKind, &'static str),
 }
 
+#[derive(Debug, Default)]
+struct NavigationDockState {
+    open: bool,
+    focused: bool,
+    selected: usize,
+    pending_binding: Vec<KeyInput>,
+}
+
+impl NavigationDockState {
+    #[cfg(test)]
+    fn visible() -> Self {
+        Self {
+            open: true,
+            ..Self::default()
+        }
+    }
+
+    /// ドックfocusのトグル。閉→開+focus / 開+focus無→focus / 開+focus有→閉(非表示)。
+    fn toggle_focus(&mut self) {
+        self.pending_binding.clear();
+        if !self.open {
+            self.open = true;
+            self.focused = true;
+            self.selected = 0;
+        } else if !self.focused {
+            self.focused = true;
+            self.selected = 0;
+        } else {
+            self.open = false;
+            self.focused = false;
+        }
+    }
+}
+
 /// fylerのGUIアプリケーション。
 ///
 /// 描画契約:
@@ -319,7 +384,14 @@ pub struct FylerApp {
     feedback_needs_focus: bool,
     confirm_detail: ConfirmDetail,
     icon_style: IconStyle,
-    help_lines: Vec<String>,
+    help_entries: Vec<HelpEntry>,
+    dock_focus_bindings: Vec<KeySequence>,
+    navigation_dock: NavigationDockState,
+    bookmarks: Vec<(String, PathBuf)>,
+    recent_roots: Vec<PathBuf>,
+    drives: Vec<PathBuf>,
+    statusline_left: Vec<StatusItem>,
+    statusline_right: Vec<StatusItem>,
     /// native window geometryが未保存の初回起動だけ、monitor比率でサイズを設定する。
     resize_to_monitor_on_first_frame: bool,
     window_geometry: Arc<Mutex<Option<WindowGeometry>>>,
@@ -329,13 +401,13 @@ struct PaneViewState {
     engine: Arc<dyn EditorEngine>,
     root: PathBuf,
     git_badges: HashMap<EntryId, GitBadge>,
+    branch: Option<String>,
     incomplete_dirs: HashSet<EntryId>,
     offline: bool,
     unreadable: usize,
     file_infos: HashMap<EntryId, FileInfo>,
     collapsed_dirs: HashSet<EntryId>,
     engine_error: Option<String>,
-    last_cursor_line: usize,
     tree_viewport: Option<tree_view::TreeViewport>,
 }
 
@@ -343,12 +415,21 @@ impl FylerApp {
     fn new(
         gui_events: mpsc::Receiver<GuiEvent>,
         action_tx: mpsc::Sender<GuiAction>,
-        confirm_detail: ConfirmDetail,
-        icon_style: IconStyle,
-        help_lines: Vec<String>,
+        options: AppOptions,
         repaint_context: egui::Context,
         event_dequeued: Arc<dyn Fn() + Send + Sync>,
     ) -> anyhow::Result<Self> {
+        let AppOptions {
+            confirm_detail,
+            icon_style,
+            help_entries,
+            dock_focus_bindings,
+            bookmarks,
+            recent_roots,
+            drives,
+            statusline_left,
+            statusline_right,
+        } = options;
         let (event_tx, event_rx) = mpsc::channel();
         thread::Builder::new()
             .name("fyler-editor-events".to_owned())
@@ -387,7 +468,14 @@ impl FylerApp {
             feedback_needs_focus: false,
             confirm_detail,
             icon_style,
-            help_lines,
+            help_entries,
+            dock_focus_bindings,
+            navigation_dock: NavigationDockState::default(),
+            bookmarks,
+            recent_roots,
+            drives,
+            statusline_left,
+            statusline_right,
             resize_to_monitor_on_first_frame: false,
             window_geometry: Arc::new(Mutex::new(None)),
         })
@@ -408,13 +496,13 @@ impl FylerApp {
                             engine,
                             root,
                             git_badges: HashMap::new(),
+                            branch: None,
                             incomplete_dirs: HashSet::new(),
                             offline: false,
                             unreadable: 0,
                             file_infos: HashMap::new(),
                             collapsed_dirs: HashSet::new(),
                             engine_error: None,
-                            last_cursor_line: 0,
                             tree_viewport: None,
                         },
                     );
@@ -450,6 +538,7 @@ impl FylerApp {
                     EditorEvent::ChangeDirectory { .. } => {}
                     EditorEvent::ChangeSort { .. } => {}
                     EditorEvent::ToggleHidden => {}
+                    EditorEvent::ToggleDockFocus => self.navigation_dock.toggle_focus(),
                     EditorEvent::Fold { .. } => {}
                     EditorEvent::JumpBookmark { .. } => {}
                     EditorEvent::OpenFilePicker => {}
@@ -499,12 +588,21 @@ impl FylerApp {
                     }
                 },
                 GuiEvent::RootChanged { pane_id, root } => {
+                    self.navigation_dock.selected = 0;
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
-                        pane.root = root;
+                        pane.root = root.clone();
                     }
+                    self.recent_roots.retain(|recent| recent != &root);
+                    self.recent_roots.insert(0, root);
+                    self.recent_roots.truncate(10);
                 }
-                GuiEvent::GitBadges { pane_id, badges } => {
+                GuiEvent::GitBadges {
+                    pane_id,
+                    branch,
+                    badges,
+                } => {
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
+                        pane.branch = branch;
                         pane.git_badges = badges;
                     }
                 }
@@ -760,13 +858,50 @@ impl eframe::App for FylerApp {
             .iter()
             .map(|(id, pane)| (*id, pane.engine.snapshot()))
             .collect::<BTreeMap<_, _>>();
-        if should_forward_input(
-            self.dialog.is_none(),
-            self.fatal_error.is_none(),
-            self.active
-                .and_then(|active| self.panes.get(&active))
-                .is_some_and(|pane| pane.engine_error.is_none()),
-        ) && let Some(active) = self.active
+
+        let chrome_state = self.active.and_then(|pane_id| {
+            let pane = self.panes.get(&pane_id)?;
+            Some((pane_id, pane.root.clone()))
+        });
+        let mut chrome_action = None;
+        egui::Panel::top("fyler-toolbar")
+            .exact_size(theme::TOOLBAR_HEIGHT)
+            .show(ui, |ui| {
+                chrome_action = chrome::draw_toolbar(ui);
+            });
+        let navigation_entries = chrome_state
+            .as_ref()
+            .map(|(_, root)| {
+                chrome::navigation_entries(root, &self.bookmarks, &self.recent_roots, &self.drives)
+            })
+            .unwrap_or_default();
+        if self.dialog.is_none()
+            && let (Some((pane_id, _)), Some(action)) = (chrome_state.as_ref(), chrome_action)
+        {
+            let event = match action {
+                chrome::ChromeAction::NavigateParent => EditorEvent::NavigateParent,
+            };
+            if self
+                .action_tx
+                .send(GuiAction::Editor {
+                    pane_id: *pane_id,
+                    event,
+                })
+                .is_err()
+            {
+                self.fatal_error = Some("Failed to send toolbar action to app".to_owned());
+            }
+        }
+        let navigation_focused = self.navigation_dock.focused;
+        if !navigation_focused
+            && should_forward_input(
+                self.dialog.is_none(),
+                self.fatal_error.is_none(),
+                self.active
+                    .and_then(|active| self.panes.get(&active))
+                    .is_some_and(|pane| pane.engine_error.is_none()),
+            )
+            && let Some(active) = self.active
             && let (Some(pane), Some(snapshot)) =
                 (self.panes.get_mut(&active), snapshots.get(&active))
             && let Err(error) = input::forward_input(ui.ctx(), pane.engine.as_ref(), &snapshot.mode)
@@ -774,25 +909,30 @@ impl eframe::App for FylerApp {
             pane.engine_error = Some(format!("Failed to send input to editor engine: {error}"));
         }
 
-        egui::Panel::bottom("global-command-area").show(ui, |ui| {
-            if let Some(state) = &self.popupmenu {
-                cmdline::draw_popupmenu(ui, state);
-            }
-            if let Some(state) = &self.cmdline {
-                cmdline::draw_cmdline(ui, state);
-            } else if let Some(message) = &self.message {
-                cmdline::draw_message(ui, message);
-            }
-        });
+        if self.cmdline.is_some() || self.popupmenu.is_some() {
+            egui::Panel::bottom("global-command-area").show(ui, |ui| {
+                if let Some(state) = &self.popupmenu {
+                    cmdline::draw_popupmenu(ui, state);
+                }
+                if let Some(state) = &self.cmdline {
+                    cmdline::draw_cmdline(ui, state);
+                }
+            });
+        } else if let Some(message) = &self.message {
+            egui::Panel::top("global-message-area")
+                .exact_size(34.0)
+                .show(ui, |ui| cmdline::draw_message(ui, message));
+        }
 
         let layout = self.layout.clone();
         let active = self.active;
         let fatal_error = self.fatal_error.clone();
-        let ime = egui::CentralPanel::default()
+
+        let (ime, navigation_clicked) = egui::CentralPanel::default()
             .show(ui, |ui| {
                 if let Some(error) = fatal_error {
                     ui.colored_label(ui.visuals().error_fg_color, error);
-                    None
+                    (None, None)
                 } else if let (Some(layout), Some(active)) = (layout.as_ref(), active) {
                     draw_layout(
                         ui,
@@ -801,12 +941,53 @@ impl eframe::App for FylerApp {
                         &mut self.panes,
                         &snapshots,
                         self.icon_style,
+                        &navigation_entries,
+                        self.navigation_dock.open,
+                        self.navigation_dock.focused,
+                        self.navigation_dock.selected,
+                        &self.statusline_left,
+                        &self.statusline_right,
                     )
                 } else {
-                    None
+                    (None, None)
                 }
             })
             .inner;
+        let mut navigation_target = None;
+        if self.dialog.is_none() {
+            if let Some(index) = navigation_clicked {
+                self.navigation_dock.focused = true;
+                self.navigation_dock.selected = index;
+                navigation_target = navigation_entries
+                    .get(index)
+                    .map(|entry| entry.path.clone());
+            }
+            if self.navigation_dock.focused {
+                navigation_target = handle_navigation_keys(
+                    &mut self.navigation_dock,
+                    input::normalized_keys(ui.ctx()),
+                    &self.dock_focus_bindings,
+                    &navigation_entries,
+                )
+                .or(navigation_target);
+            }
+        } else {
+            self.navigation_dock.pending_binding.clear();
+        }
+        if self.dialog.is_none()
+            && let (Some(active), Some(target)) = (active, navigation_target)
+            && self
+                .action_tx
+                .send(GuiAction::Editor {
+                    pane_id: active,
+                    event: EditorEvent::ChangeDirectory {
+                        query: Some(target.display().to_string()),
+                    },
+                })
+                .is_err()
+        {
+            self.fatal_error = Some("Failed to send navigation action to app".to_owned());
+        }
         if self.dialog.is_none()
             && let Some(ime) = ime
         {
@@ -883,7 +1064,7 @@ impl eframe::App for FylerApp {
                     confirm::draw_loader_progress(ui, title, path, *entries, *cancel_requested);
             }
             Some(DialogState::Help) => {
-                dismiss_errors = draw_help(ui, &self.help_lines);
+                dismiss_errors = draw_help(ui, &self.help_entries);
             }
             Some(DialogState::ValidationErrors(errors)) => {
                 let dismiss_from_keyboard = ui.ctx().input(|input| {
@@ -1007,11 +1188,113 @@ fn should_forward_input(dialog_absent: bool, fatal_absent: bool, engine_healthy:
     dialog_absent && fatal_absent && engine_healthy
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockBindingMatch {
+    Activated,
+    Pending,
+    Unmatched,
+}
+
+fn advance_dock_binding(
+    pending: &mut Vec<KeyInput>,
+    key: KeyInput,
+    bindings: &[KeySequence],
+) -> DockBindingMatch {
+    pending.push(key);
+    if bindings
+        .iter()
+        .any(|binding| binding.0.as_slice() == pending.as_slice())
+    {
+        pending.clear();
+        return DockBindingMatch::Activated;
+    }
+    if bindings
+        .iter()
+        .any(|binding| binding.0.starts_with(pending))
+    {
+        return DockBindingMatch::Pending;
+    }
+
+    pending.clear();
+    pending.push(key);
+    if bindings
+        .iter()
+        .any(|binding| binding.0.as_slice() == pending.as_slice())
+    {
+        pending.clear();
+        DockBindingMatch::Activated
+    } else if bindings
+        .iter()
+        .any(|binding| binding.0.starts_with(pending))
+    {
+        DockBindingMatch::Pending
+    } else {
+        pending.clear();
+        DockBindingMatch::Unmatched
+    }
+}
+
+fn handle_navigation_keys(
+    state: &mut NavigationDockState,
+    keys: impl IntoIterator<Item = KeyInput>,
+    bindings: &[KeySequence],
+    entries: &[chrome::NavigationEntry],
+) -> Option<PathBuf> {
+    let mut target = None;
+    for key in keys {
+        let starts_binding = bindings
+            .iter()
+            .any(|binding| binding.0.first() == Some(&key));
+        if state.pending_binding.is_empty()
+            && !starts_binding
+            && handle_navigation_movement(state, key, entries, &mut target)
+        {
+            continue;
+        }
+        match advance_dock_binding(&mut state.pending_binding, key, bindings) {
+            DockBindingMatch::Activated => state.toggle_focus(),
+            DockBindingMatch::Pending => {}
+            DockBindingMatch::Unmatched => {
+                let _ = handle_navigation_movement(state, key, entries, &mut target);
+            }
+        }
+    }
+    target
+}
+
+fn handle_navigation_movement(
+    state: &mut NavigationDockState,
+    key: KeyInput,
+    entries: &[chrome::NavigationEntry],
+    target: &mut Option<PathBuf>,
+) -> bool {
+    if key.mods != Modifiers::default() || entries.is_empty() {
+        return false;
+    }
+    match key.key {
+        Key::Char('j') | Key::Down => {
+            state.selected = (state.selected + 1).min(entries.len() - 1);
+            true
+        }
+        Key::Char('k') | Key::Up => {
+            state.selected = state.selected.saturating_sub(1);
+            true
+        }
+        Key::Enter => {
+            state.selected = state.selected.min(entries.len() - 1);
+            *target = Some(entries[state.selected].path.clone());
+            true
+        }
+        _ => false,
+    }
+}
+
 struct ImeGeometry {
     tree_rect: egui::Rect,
     cursor_rect: egui::Rect,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_layout(
     ui: &mut egui::Ui,
     layout: &PaneLayout,
@@ -1019,10 +1302,50 @@ fn draw_layout(
     panes: &mut BTreeMap<PaneId, PaneViewState>,
     snapshots: &BTreeMap<PaneId, Arc<fyler_core::editor::EditorSnapshot>>,
     icon_style: IconStyle,
-) -> Option<ImeGeometry> {
+    navigation_entries: &[chrome::NavigationEntry],
+    navigation_open: bool,
+    navigation_focused: bool,
+    navigation_selected: usize,
+    statusline_left: &[StatusItem],
+    statusline_right: &[StatusItem],
+) -> (Option<ImeGeometry>, Option<usize>) {
     let rect = ui.available_rect_before_wrap();
     ui.allocate_rect(rect, egui::Sense::hover());
-    draw_layout_in_rect(ui, rect, layout, active, panes, snapshots, icon_style)
+    let (content_rect, navigation_clicked) = if navigation_open {
+        let rail_width = chrome::NAV_RAIL_WIDTH.min(rect.width());
+        let rail_rect = egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2(rect.left() + rail_width, rect.bottom()),
+        );
+        let content_rect =
+            egui::Rect::from_min_max(egui::pos2(rail_rect.right(), rect.top()), rect.max);
+        let clicked = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(rail_rect), |ui| {
+                chrome::draw_navigation_rail(
+                    ui,
+                    navigation_entries,
+                    navigation_focused,
+                    navigation_selected,
+                    icon_style,
+                )
+            })
+            .inner;
+        (content_rect, clicked)
+    } else {
+        (rect, None)
+    };
+    let ime = draw_layout_in_rect(
+        ui,
+        content_rect,
+        layout,
+        active,
+        panes,
+        snapshots,
+        icon_style,
+        statusline_left,
+        statusline_right,
+    );
+    (ime, navigation_clicked)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1034,21 +1357,23 @@ fn draw_layout_in_rect(
     panes: &mut BTreeMap<PaneId, PaneViewState>,
     snapshots: &BTreeMap<PaneId, Arc<fyler_core::editor::EditorSnapshot>>,
     icon_style: IconStyle,
+    statusline_left: &[StatusItem],
+    statusline_right: &[StatusItem],
 ) -> Option<ImeGeometry> {
     match layout {
         PaneLayout::Leaf(id) => {
             let pane = panes.get_mut(id)?;
             let snapshot = snapshots.get(id)?;
-            let stroke = if *id == active {
-                egui::Stroke::new(2.0, ui.visuals().selection.stroke.color)
-            } else {
-                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
-            };
-            ui.painter()
-                .rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
+            ui.painter().rect_filled(rect, 0.0, theme::CANVAS);
+            ui.painter().rect_stroke(
+                rect,
+                0.0,
+                egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
+                egui::StrokeKind::Inside,
+            );
 
-            let inner = rect.shrink(4.0);
-            let modeline_height = ui.text_style_height(&egui::TextStyle::Monospace) + 8.0;
+            let inner = rect.shrink(1.0);
+            let modeline_height = theme::STATUSBAR_HEIGHT;
             let tree_rect = egui::Rect::from_min_max(
                 inner.min,
                 egui::pos2(
@@ -1058,7 +1383,6 @@ fn draw_layout_in_rect(
             );
             let modeline_rect =
                 egui::Rect::from_min_max(egui::pos2(inner.min.x, tree_rect.max.y), inner.max);
-            let cursor_changed = snapshot.cursor.line != pane.last_cursor_line;
             let output = ui
                 .scope_builder(egui::UiBuilder::new().max_rect(tree_rect), |ui| {
                     if let Some(error) = &pane.engine_error {
@@ -1071,10 +1395,11 @@ fn draw_layout_in_rect(
                             &pane.git_badges,
                             &pane.incomplete_dirs,
                             &pane.collapsed_dirs,
+                            &pane.file_infos,
                             icon_style,
-                            cursor_changed,
                             pane.tree_viewport,
                             *id,
+                            *id == active,
                         ))
                     }
                 })
@@ -1084,13 +1409,19 @@ fn draw_layout_in_rect(
                     ui,
                     snapshot,
                     &pane.root,
+                    pane.branch.as_deref(),
                     &pane.file_infos,
+                    statusline_left,
+                    statusline_right,
                     pane.offline,
                     pane.unreadable,
                     pane.engine_error.is_some(),
                 );
             });
-            pane.last_cursor_line = snapshot.cursor.line;
+            if *id != active {
+                ui.painter()
+                    .rect_filled(rect, 0.0, theme::inactive_pane_veil());
+            }
             let output = output?;
             pane.tree_viewport = Some(output.viewport);
             if *id == active
@@ -1128,8 +1459,17 @@ fn draw_layout_in_rect(
                     )
                 }
             };
-            let first_ime =
-                draw_layout_in_rect(ui, first_rect, first, active, panes, snapshots, icon_style);
+            let first_ime = draw_layout_in_rect(
+                ui,
+                first_rect,
+                first,
+                active,
+                panes,
+                snapshots,
+                icon_style,
+                statusline_left,
+                statusline_right,
+            );
             let second_ime = draw_layout_in_rect(
                 ui,
                 second_rect,
@@ -1138,6 +1478,8 @@ fn draw_layout_in_rect(
                 panes,
                 snapshots,
                 icon_style,
+                statusline_left,
+                statusline_right,
             );
             first_ime.or(second_ime)
         }
@@ -1449,23 +1791,82 @@ fn draw_feedback(
     });
     result
 }
+fn draw_help(ui: &mut egui::Ui, help_entries: &[HelpEntry]) -> bool {
+    let dismiss_from_keyboard = ui.ctx().input(|input| {
+        input.key_pressed(egui::Key::Escape)
+            || input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Text(text) if text == "?"))
+    });
 
-fn draw_help(ui: &mut egui::Ui, help_lines: &[String]) -> bool {
-    let dismiss_from_keyboard = ui
-        .ctx()
-        .input(|input| input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape));
-
-    egui::Modal::new(egui::Id::new("fyler-help"))
-        .show(ui.ctx(), |ui| {
-            ui.heading("Help");
-            ui.add_space(8.0);
-            for line in help_lines {
-                ui.monospace(line);
-            }
-            ui.add_space(12.0);
-            ui.button("Dismiss (Enter / Esc)").clicked() || dismiss_from_keyboard
-        })
-        .inner
+    egui::Modal::new(egui::Id::new("fyler-help")).show(ui.ctx(), |ui| {
+        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_min_width(540.0);
+            let (header_rect, _) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
+            ui.painter().text(
+                header_rect.left_center(),
+                egui::Align2::LEFT_CENTER,
+                "Keyboard",
+                egui::TextStyle::Heading.resolve(ui.style()),
+                theme::TEXT,
+            );
+            ui.painter().text(
+                header_rect.right_center(),
+                egui::Align2::RIGHT_CENTER,
+                "? / esc",
+                egui::FontId::monospace(11.0),
+                theme::TEXT_MUTED,
+            );
+            ui.add_space(6.0);
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(520.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    egui::Grid::new("fyler-help-commands")
+                        .num_columns(2)
+                        .min_col_width(150.0)
+                        .spacing([24.0, 8.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("KEY")
+                                    .monospace()
+                                    .strong()
+                                    .size(10.0)
+                                    .color(theme::TEXT_MUTED),
+                            );
+                            ui.label(
+                                egui::RichText::new("COMMAND")
+                                    .monospace()
+                                    .strong()
+                                    .size(10.0)
+                                    .color(theme::TEXT_MUTED),
+                            );
+                            ui.end_row();
+                            for entry in help_entries {
+                                ui.label(
+                                    egui::RichText::new(&entry.command)
+                                        .monospace()
+                                        .strong()
+                                        .size(12.0)
+                                        .color(theme::BLUE),
+                                );
+                                ui.label(
+                                    egui::RichText::new(&entry.description)
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(theme::TEXT_SECONDARY),
+                                );
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
+    });
+    dismiss_from_keyboard
 }
 
 fn current_window_geometry(context: &egui::Context) -> Option<WindowGeometry> {
@@ -1495,12 +1896,16 @@ fn initial_window_geometry(monitor_size: Option<egui::Vec2>) -> Option<(egui::Ve
 }
 
 fn native_options(window: Option<WindowGeometry>) -> eframe::NativeOptions {
-    let viewport = window.map_or_else(egui::ViewportBuilder::default, |window| {
-        egui::ViewportBuilder::default()
-            .with_inner_size([window.inner_width, window.inner_height])
-            .with_position([window.outer_x, window.outer_y])
-            .with_maximized(window.maximized)
-    });
+    let viewport = window
+        .map_or_else(egui::ViewportBuilder::default, |window| {
+            egui::ViewportBuilder::default()
+                .with_inner_size([window.inner_width, window.inner_height])
+                .with_position([window.outer_x, window.outer_y])
+                .with_maximized(window.maximized)
+        })
+        .with_decorations(false)
+        .with_min_inner_size([720.0, 480.0])
+        .with_title("fyler");
     eframe::NativeOptions {
         viewport,
         // Geometry is persisted in session.toml so it shares the same normal-shutdown contract
@@ -1534,9 +1939,16 @@ pub fn run(
                 font_path,
                 font_y_offset_factor,
                 icon_style,
-                help_lines,
+                help_entries,
+                dock_focus_bindings,
+                bookmarks,
+                recent_roots,
+                drives,
+                statusline_left,
+                statusline_right,
             } = gui_options;
             let resize_to_monitor_on_first_frame = initial_window.is_none();
+            theme::install(&creation_context.egui_ctx);
             install_fallback_font(
                 &creation_context.egui_ctx,
                 font_path.as_deref(),
@@ -1545,9 +1957,17 @@ pub fn run(
             let mut app = FylerApp::new(
                 event_rx,
                 action_tx,
-                confirm_detail,
-                icon_style,
-                help_lines,
+                AppOptions {
+                    confirm_detail,
+                    icon_style,
+                    help_entries,
+                    dock_focus_bindings,
+                    bookmarks,
+                    recent_roots,
+                    drives,
+                    statusline_left,
+                    statusline_right,
+                },
                 creation_context.egui_ctx.clone(),
                 event_dequeued,
             )
@@ -1670,7 +2090,14 @@ mod tests {
                 feedback_needs_focus: false,
                 confirm_detail: ConfirmDetail::Full,
                 icon_style: IconStyle::Ascii,
-                help_lines: Vec::new(),
+                help_entries: Vec::new(),
+                dock_focus_bindings: Vec::new(),
+                navigation_dock: NavigationDockState::visible(),
+                bookmarks: Vec::new(),
+                recent_roots: Vec::new(),
+                drives: Vec::new(),
+                statusline_left: Vec::new(),
+                statusline_right: Vec::new(),
                 resize_to_monitor_on_first_frame: false,
                 window_geometry: Arc::new(Mutex::new(None)),
             },
@@ -1766,13 +2193,13 @@ mod tests {
                         engine: recording_engine(),
                         root: PathBuf::from("first"),
                         git_badges: HashMap::new(),
+                        branch: None,
                         incomplete_dirs: HashSet::new(),
                         offline: false,
                         unreadable: 0,
                         file_infos: HashMap::new(),
                         collapsed_dirs: HashSet::new(),
                         engine_error: None,
-                        last_cursor_line: 0,
                         tree_viewport: None,
                     },
                 ),
@@ -1782,13 +2209,13 @@ mod tests {
                         engine: recording_engine(),
                         root: PathBuf::from("second"),
                         git_badges: HashMap::new(),
+                        branch: None,
                         incomplete_dirs: HashSet::new(),
                         offline: false,
                         unreadable: 0,
                         file_infos: HashMap::new(),
                         collapsed_dirs: HashSet::new(),
                         engine_error: None,
-                        last_cursor_line: 0,
                         tree_viewport: None,
                     },
                 ),
@@ -1812,7 +2239,14 @@ mod tests {
             feedback_needs_focus: false,
             confirm_detail: ConfirmDetail::Full,
             icon_style: IconStyle::Ascii,
-            help_lines: Vec::new(),
+            help_entries: Vec::new(),
+            dock_focus_bindings: Vec::new(),
+            navigation_dock: NavigationDockState::visible(),
+            bookmarks: Vec::new(),
+            recent_roots: Vec::new(),
+            drives: Vec::new(),
+            statusline_left: Vec::new(),
+            statusline_right: Vec::new(),
             resize_to_monitor_on_first_frame: false,
             window_geometry: Arc::new(Mutex::new(None)),
         };
@@ -1825,6 +2259,7 @@ mod tests {
         .unwrap();
         tx.send(GuiEvent::GitBadges {
             pane_id: second,
+            branch: Some("main".to_owned()),
             badges: HashMap::from([(EntryId(9), GitBadge::Modified)]),
         })
         .unwrap();
@@ -1839,12 +2274,12 @@ mod tests {
             unreadable: 2,
         })
         .unwrap();
-
         app.receive_events();
 
         assert_eq!(app.panes[&first].root, PathBuf::from("first"));
         assert!(app.panes[&first].git_badges.is_empty());
         assert_eq!(app.panes[&second].root, PathBuf::from("changed"));
+        assert_eq!(app.recent_roots, [PathBuf::from("changed")]);
         assert_eq!(
             app.panes[&second].git_badges.get(&EntryId(9)),
             Some(&GitBadge::Modified)
@@ -1853,6 +2288,125 @@ mod tests {
         assert!(app.panes[&second].offline);
         assert_eq!(app.panes[&second].unreadable, 2);
         assert!(!app.panes[&first].offline);
+    }
+
+    #[test]
+    fn navigation_dock_uses_j_k_enter_and_returns_focus_with_configured_binding() {
+        let entries = chrome::navigation_entries(
+            Path::new("/current"),
+            &[
+                ("docs".to_owned(), PathBuf::from("/docs")),
+                ("src".to_owned(), PathBuf::from("/src")),
+            ],
+            &[],
+            &[],
+        );
+        let mut state = NavigationDockState {
+            focused: true,
+            ..NavigationDockState::visible()
+        };
+        let target = handle_navigation_keys(
+            &mut state,
+            [
+                KeyInput {
+                    key: Key::Char('j'),
+                    mods: Modifiers::default(),
+                },
+                KeyInput {
+                    key: Key::Enter,
+                    mods: Modifiers::default(),
+                },
+            ],
+            &[],
+            &entries,
+        );
+        assert_eq!(state.selected, 1);
+        assert_eq!(target, Some(PathBuf::from("/src")));
+
+        let binding = fyler_core::keymap::parse_key_sequence("x e", None).unwrap();
+        assert_eq!(
+            handle_navigation_keys(&mut state, binding.0.clone(), &[binding], &entries),
+            None
+        );
+        assert!(!state.focused);
+    }
+
+    #[test]
+    fn configured_dock_binding_wins_over_navigation_and_recovers_after_mismatch() {
+        let entries = chrome::navigation_entries(Path::new("/current"), &[], &[], &[]);
+        let binding = fyler_core::keymap::parse_key_sequence("j", None).unwrap();
+        let mut state = NavigationDockState {
+            focused: true,
+            ..NavigationDockState::visible()
+        };
+        handle_navigation_keys(
+            &mut state,
+            binding.0.clone(),
+            std::slice::from_ref(&binding),
+            &entries,
+        );
+        assert!(!state.focused);
+        assert_eq!(state.selected, 0);
+
+        let binding = fyler_core::keymap::parse_key_sequence("x e", None).unwrap();
+        let mut state = NavigationDockState {
+            focused: true,
+            ..NavigationDockState::visible()
+        };
+        let keys = [
+            KeyInput {
+                key: Key::Char('q'),
+                mods: Modifiers::default(),
+            },
+            KeyInput {
+                key: Key::Char('x'),
+                mods: Modifiers::default(),
+            },
+            KeyInput {
+                key: Key::Char('e'),
+                mods: Modifiers::default(),
+            },
+        ];
+        handle_navigation_keys(&mut state, keys, &[binding], &entries);
+        assert!(!state.focused);
+        assert!(state.pending_binding.is_empty());
+    }
+
+    #[test]
+    fn dock_focus_event_opens_and_focuses_a_closed_navigation_dock() {
+        let (mut app, event_tx, _action_rx) = empty_test_app();
+        app.navigation_dock = NavigationDockState::default();
+        event_tx
+            .send(GuiEvent::Editor {
+                pane_id: PaneId::new(1),
+                event: EditorEvent::ToggleDockFocus,
+            })
+            .unwrap();
+
+        app.receive_events();
+
+        assert!(app.navigation_dock.open);
+        assert!(app.navigation_dock.focused);
+        assert_eq!(app.navigation_dock.selected, 0);
+    }
+
+    #[test]
+    fn dock_toggle_cycles_closed_focused_and_hidden() {
+        let mut state = NavigationDockState::default();
+        // closed → open + focus
+        state.toggle_focus();
+        assert!(state.open && state.focused);
+        // open + focused → closed (hidden)
+        state.toggle_focus();
+        assert!(!state.open && !state.focused);
+        // closed → open + focus
+        state.toggle_focus();
+        assert!(state.open && state.focused);
+
+        // open + unfocused → focus
+        state.focused = false;
+        state.toggle_focus();
+        assert!(state.open && state.focused);
     }
 
     #[test]

@@ -4,16 +4,18 @@ use std::collections::{HashMap, HashSet};
 
 use eframe::egui;
 use fyler_core::editor::{Cursor, EditorSnapshot, Mode, SearchHighlight};
+use fyler_core::fileinfo::FileInfo;
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::EntryId;
 use fyler_core::pane::PaneId;
 
 use crate::confirm::IconStyle;
-use crate::{conceal, icon};
+use crate::{conceal, icon, theme};
 
-/// 1階層ぶんのインデントを空白2文字幅として描画する。
-const INDENT_UNIT_SPACES: &str = "  ";
+/// 1階層ぶんの装飾インデント。文字列のタブ幅とは独立したGUI座標。
+const INDENT_UNIT_PX: f32 = 20.0;
+const TREE_LEFT_PADDING: f32 = 12.0;
 
 /// 前フレームのツリー可視範囲。
 #[derive(Debug, Clone, Copy)]
@@ -22,6 +24,8 @@ pub struct TreeViewport {
     pub scroll_offset: f32,
     /// スクロール領域の表示高。
     pub height: f32,
+    /// この可視範囲を記録した時点のカーソル行。
+    pub cursor_line: usize,
 }
 
 /// ツリー描画後にapp層へ返す表示情報。
@@ -51,36 +55,32 @@ pub fn draw(
     git_badges: &HashMap<EntryId, GitBadge>,
     incomplete_dirs: &HashSet<EntryId>,
     collapsed_dirs: &HashSet<EntryId>,
+    file_infos: &HashMap<EntryId, FileInfo>,
     icon_style: IconStyle,
-    follow_cursor: bool,
     previous_viewport: Option<TreeViewport>,
     pane_id: PaneId,
+    is_active: bool,
 ) -> TreeViewOutput {
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
-    let text_color = ui.visuals().text_color();
-    let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-    let row_height_with_spacing = row_height + ui.spacing().item_spacing.y;
-    let indent_unit_px = ui
-        .painter()
-        .layout_no_wrap(INDENT_UNIT_SPACES.to_owned(), font_id.clone(), text_color)
-        .size()
-        .x;
+    let text_color = theme::TEXT;
+    let row_height = theme::TREE_ROW_HEIGHT;
+    // 行間の余白をゼロにして item を詰める(pitch = 行高 24px)。
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let row_pitch = row_height + ui.spacing().item_spacing.y;
     let selection = display_selection(snapshot);
-    let requested_offset = if follow_cursor {
-        previous_viewport
-            .filter(|_| snapshot.cursor.line < snapshot.lines.len())
-            .and_then(|viewport| {
-                let cursor_top = snapshot.cursor.line as f32 * row_height_with_spacing;
-                follow_offset(
-                    cursor_top,
-                    cursor_top + row_height,
-                    viewport.scroll_offset,
-                    viewport.height,
-                )
-            })
-    } else {
-        None
-    };
+    let requested_offset = previous_viewport
+        .filter(|viewport| viewport.cursor_line != snapshot.cursor.line)
+        .filter(|_| snapshot.cursor.line < snapshot.lines.len())
+        .and_then(|viewport| {
+            let (cursor_top, cursor_bottom) =
+                row_bounds(snapshot.cursor.line, row_height, row_pitch);
+            follow_offset(
+                cursor_top,
+                cursor_bottom,
+                viewport.scroll_offset,
+                viewport.height,
+            )
+        });
 
     let mut scroll_area = egui::ScrollArea::vertical()
         .id_salt(pane_id.get())
@@ -94,8 +94,14 @@ pub fn draw(
         for (line_offset, line) in snapshot.lines[row_range].iter().enumerate() {
             let line_index = first_line + line_offset;
             let concealed = conceal::conceal_line(&line.text);
-            let indent_px = indent_offset(concealed.depth, indent_unit_px);
+            let indent_px = indent_offset(concealed.depth, INDENT_UNIT_PX);
             let painter = ui.painter().clone();
+            let (_, is_dir) = fyler_core::grammar::split_dir_suffix(concealed.display);
+            let icon_color = if is_dir {
+                theme::BLUE
+            } else {
+                theme::TEXT_MUTED
+            };
             let icon_galley = painter.layout_no_wrap(
                 format!(
                     "{} ",
@@ -106,11 +112,11 @@ pub fn draw(
                     )
                 ),
                 font_id.clone(),
-                text_color,
+                icon_color,
             );
             let badge = badge_for_line(&line.text, git_badges);
             let badge_galley = painter.layout_no_wrap(
-                format!("{} ", badge.map(badge_character).unwrap_or(" ")),
+                badge.map(badge_character).unwrap_or(" ").to_owned(),
                 font_id.clone(),
                 badge_color(ui.visuals(), badge),
             );
@@ -124,22 +130,53 @@ pub fn draw(
             let incomplete = incomplete_for_line(&line.text, incomplete_dirs);
             let incomplete_galley = painter.layout_no_wrap(
                 if incomplete {
-                    " [unreadable]".to_owned()
+                    "[unreadable]".to_owned()
                 } else {
                     String::new()
                 },
-                font_id.clone(),
-                ui.visuals().error_fg_color,
+                egui::FontId::monospace(11.0),
+                theme::RED,
+            );
+            let modified_text = file_info_for_line(&line.text, file_infos)
+                .and_then(|info| info.modified.clone())
+                .unwrap_or_default();
+            let modified_galley = painter.layout_no_wrap(
+                modified_text,
+                egui::FontId::monospace(11.0),
+                theme::TEXT_MUTED,
             );
             let icon_width = icon_galley.size().x;
-            let badge_width = badge_galley.size().x;
             let text_width = text_galley.size().x;
-            let text_offset = indent_px + icon_width + badge_width;
-            let width = ui
-                .available_width()
-                .max(text_offset + text_width + incomplete_galley.size().x);
-            let (rect, _) =
+            let text_offset = TREE_LEFT_PADDING + indent_px + icon_width;
+            let width = ui.available_width().max(
+                text_offset
+                    + text_width
+                    + modified_galley.size().x
+                    + incomplete_galley.size().x
+                    + badge_galley.size().x
+                    + 44.0,
+            );
+            let (rect, response) =
                 ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::hover());
+
+            if response.hovered() {
+                painter.rect_filled(rect, 0.0, theme::HOVER);
+            }
+            if snapshot.cursor.line == line_index {
+                painter.rect_filled(rect, 0.0, theme::accent_selection_fill());
+                painter.rect_filled(
+                    egui::Rect::from_min_size(rect.min, egui::vec2(2.0, rect.height())),
+                    0.0,
+                    theme::ACCENT_DIM,
+                );
+            }
+            for depth in 0..concealed.depth {
+                let x = rect.left() + TREE_LEFT_PADDING + (depth as f32 + 0.5) * INDENT_UNIT_PX;
+                painter.line_segment(
+                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                    egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
+                );
+            }
 
             if let Some((start, cursor)) = selection {
                 draw_selection(
@@ -154,30 +191,45 @@ pub fn draw(
                     text_offset,
                 );
             }
+            let icon_y = rect.center().y - icon_galley.size().y / 2.0;
             painter.galley(
-                egui::pos2(rect.left() + indent_px, rect.top()),
+                egui::pos2(rect.left() + TREE_LEFT_PADDING + indent_px, icon_y),
                 icon_galley,
-                text_color,
+                icon_color,
             );
+            let text_y = rect.center().y - text_galley.size().y / 2.0;
             painter.galley(
-                egui::pos2(rect.left() + indent_px + icon_width, rect.top()),
-                badge_galley,
-                badge_color(ui.visuals(), badge),
-            );
-            painter.galley(
-                egui::pos2(rect.left() + text_offset, rect.top()),
+                egui::pos2(rect.left() + text_offset, text_y),
                 text_galley,
                 text_color,
             );
-            if incomplete {
+            let mut right = rect.right() - 16.0;
+            if badge.is_some() {
+                right -= badge_galley.size().x;
                 painter.galley(
-                    egui::pos2(rect.left() + text_offset + text_width, rect.top()),
+                    egui::pos2(right, rect.center().y - badge_galley.size().y / 2.0),
+                    badge_galley,
+                    badge_color(ui.visuals(), badge),
+                );
+            }
+            if incomplete {
+                right -= incomplete_galley.size().x + 12.0;
+                painter.galley(
+                    egui::pos2(right, rect.center().y - incomplete_galley.size().y / 2.0),
                     incomplete_galley,
-                    ui.visuals().error_fg_color,
+                    theme::RED,
+                );
+            }
+            if modified_galley.size().x > 0.0 {
+                right -= modified_galley.size().x + 12.0;
+                painter.galley(
+                    egui::pos2(right, rect.center().y - modified_galley.size().y / 2.0),
+                    modified_galley,
+                    theme::TEXT_MUTED,
                 );
             }
 
-            if snapshot.cursor.line == line_index {
+            if is_active && snapshot.cursor.line == line_index {
                 cursor_rect = Some(draw_cursor(
                     ui,
                     rect,
@@ -201,6 +253,7 @@ pub fn draw(
         viewport: TreeViewport {
             scroll_offset: output.state.offset.y,
             height: output.inner_rect.height(),
+            cursor_line: snapshot.cursor.line,
         },
     }
 }
@@ -293,7 +346,7 @@ fn draw_selection(
     else {
         return;
     };
-    let fill = translucent_selection_fill(ui.visuals());
+    let fill = translucent_selection_fill();
     let painter = ui.painter();
 
     if matches!(mode, Mode::VisualLine) {
@@ -389,9 +442,9 @@ fn byte_after_character(text: &str, requested: usize) -> usize {
         .map_or(index, |character| index + character.len_utf8())
 }
 
-fn translucent_selection_fill(visuals: &egui::Visuals) -> egui::Color32 {
-    let color = visuals.selection.bg_fill;
-    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), color.a().min(96))
+fn translucent_selection_fill() -> egui::Color32 {
+    // Visual選択が確実に視認できるよう、Visualモードバッジと同系のBLUEで塗る。
+    egui::Color32::from_rgba_unmultiplied(theme::BLUE.r(), theme::BLUE.g(), theme::BLUE.b(), 72)
 }
 
 fn badge_for_line(raw: &str, git_badges: &HashMap<EntryId, GitBadge>) -> Option<GitBadge> {
@@ -399,6 +452,16 @@ fn badge_for_line(raw: &str, git_badges: &HashMap<EntryId, GitBadge>) -> Option<
         return None;
     };
     git_badges.get(&id).copied()
+}
+
+fn file_info_for_line<'a>(
+    raw: &str,
+    file_infos: &'a HashMap<EntryId, FileInfo>,
+) -> Option<&'a FileInfo> {
+    let PrefixParse::WithId { id, .. } = fyler_core::grammar::split_id_prefix(raw) else {
+        return None;
+    };
+    file_infos.get(&id)
 }
 
 fn incomplete_for_line(raw: &str, incomplete_dirs: &HashSet<EntryId>) -> bool {
@@ -419,12 +482,12 @@ fn badge_character(badge: GitBadge) -> &'static str {
     }
 }
 
-fn badge_color(visuals: &egui::Visuals, badge: Option<GitBadge>) -> egui::Color32 {
+fn badge_color(_visuals: &egui::Visuals, badge: Option<GitBadge>) -> egui::Color32 {
     match badge {
-        Some(GitBadge::Modified | GitBadge::Renamed) => egui::Color32::from_rgb(230, 190, 60),
-        Some(GitBadge::Added) => egui::Color32::from_rgb(80, 200, 120),
-        Some(GitBadge::Deleted | GitBadge::Conflicted) => visuals.error_fg_color,
-        Some(GitBadge::Untracked) | None => visuals.weak_text_color(),
+        Some(GitBadge::Modified | GitBadge::Renamed) => theme::YELLOW,
+        Some(GitBadge::Added) => theme::GREEN,
+        Some(GitBadge::Deleted | GitBadge::Conflicted) => theme::RED,
+        Some(GitBadge::Untracked) | None => theme::TEXT_FAINT,
     }
 }
 
@@ -459,53 +522,59 @@ fn draw_cursor(
         )
         .size()
         .x;
-    let cursor_width = painter
-        .layout_no_wrap(
-            cursor_text.clone(),
-            font_id.clone(),
-            ui.visuals().text_color(),
-        )
-        .size()
-        .x
-        .max(1.0);
+    let cursor_size = painter
+        .layout_no_wrap(cursor_text.clone(), font_id.clone(), theme::TEXT)
+        .size();
+    let cursor_width = cursor_size.x.max(1.0);
     let cursor_x = row_rect.left() + text_offset + before_width;
+    let cursor_y = row_rect.center().y - cursor_size.y / 2.0;
     let cursor_rect = egui::Rect::from_min_size(
-        egui::pos2(cursor_x, row_rect.top()),
-        egui::vec2(cursor_width, row_rect.height()),
+        egui::pos2(cursor_x, cursor_y),
+        egui::vec2(cursor_width, cursor_size.y),
     );
 
+    // vim準拠のカーソル形状(点滅なし)。
     match snapshot.mode {
-        Mode::Insert | Mode::Cmdline => {
-            painter.line_segment(
-                [
-                    egui::pos2(cursor_x, row_rect.top()),
-                    egui::pos2(cursor_x, row_rect.bottom()),
-                ],
-                egui::Stroke::new(2.0, ui.visuals().strong_text_color()),
+        Mode::Insert => {
+            // 縦バー(細)。文字色は変えない。
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(cursor_x, cursor_rect.top()),
+                    egui::pos2(cursor_x + 2.0, cursor_rect.bottom()),
+                ),
+                0.0,
+                theme::BLUE,
             );
         }
         Mode::Replace => {
+            // 下線。
             painter.line_segment(
                 [
-                    egui::pos2(cursor_x, row_rect.bottom() - 1.0),
-                    egui::pos2(cursor_x + cursor_width, row_rect.bottom() - 1.0),
+                    egui::pos2(cursor_x, cursor_rect.bottom() - 1.0),
+                    egui::pos2(cursor_x + cursor_width, cursor_rect.bottom() - 1.0),
                 ],
-                egui::Stroke::new(2.0, ui.visuals().strong_text_color()),
+                egui::Stroke::new(2.0, theme::TEXT),
             );
         }
         _ => {
-            painter.rect_filled(cursor_rect, 0.0, ui.visuals().selection.bg_fill);
+            // ブロック(reverse video)。セルをTEXT色で塗り、文字を背景色で描き直す。
+            painter.rect_filled(cursor_rect, 0.0, theme::TEXT);
             painter.text(
-                cursor_rect.min,
+                cursor_rect.left_top(),
                 egui::Align2::LEFT_TOP,
-                cursor_text,
+                &cursor_text,
                 font_id.clone(),
-                ui.visuals().selection.stroke.color,
+                theme::CANVAS,
             );
         }
     }
 
     cursor_rect
+}
+
+fn row_bounds(line: usize, row_height: f32, row_pitch: f32) -> (f32, f32) {
+    let top = line as f32 * row_pitch;
+    (top, top + row_height)
 }
 
 fn follow_offset(
@@ -593,6 +662,11 @@ mod tests {
         assert_eq!(valid_byte_index("新a", 1), 0);
         assert_eq!(valid_byte_index("新a", 3), 3);
         assert_eq!(valid_byte_index("新a", usize::MAX), 4);
+    }
+
+    #[test]
+    fn cursor_row_bounds_include_show_rows_item_spacing() {
+        assert_eq!(row_bounds(20, 24.0, 28.0), (560.0, 584.0));
     }
 
     #[test]

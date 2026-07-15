@@ -29,6 +29,18 @@ pub fn forward_input(
 
     Ok(())
 }
+/// GUI内のキーボード操作向けに、このフレームの入力をNormal mode相当の
+/// エンジン非依存キー列へ正規化する。
+pub(crate) fn normalized_keys(ctx: &egui::Context) -> Vec<KeyInput> {
+    let events = ctx.input(|input| input.events.clone());
+    translate_events(&events, &Mode::Normal)
+        .into_iter()
+        .filter_map(|command| match command {
+            EditorCommand::Key(key) => Some(key),
+            _ => None,
+        })
+        .collect()
+}
 
 fn translate_events(events: &[egui::Event], mode: &Mode) -> Vec<EditorCommand> {
     let text_mode = matches!(mode, Mode::Insert | Mode::Replace | Mode::Cmdline);

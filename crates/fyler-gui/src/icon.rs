@@ -43,6 +43,14 @@ pub fn for_display_name(display_name: &str) -> &'static str {
     }
 }
 
+/// 指定スタイルのディレクトリアイコン(左ドックのブックマーク・ドライブ用)。
+pub fn directory(style: IconStyle) -> &'static str {
+    match style {
+        IconStyle::Ascii => DIRECTORY,
+        IconStyle::Nerd => NERD_DIRECTORY,
+    }
+}
+
 /// conceal済みの表示名と指定スタイルに対応するアイコンを返す。
 ///
 /// Nerd Font非対応フォントではNerdアイコンがtofuになる。既定は

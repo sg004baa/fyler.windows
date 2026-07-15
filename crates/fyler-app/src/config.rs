@@ -12,9 +12,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use fyler_core::editor::{Key, KeyInput, Modifiers};
 use fyler_core::keymap;
-use fyler_core::options::{SortKey, SortOrder, TerminalKind};
+use fyler_core::options::{SortKey, SortOrder, StatusItem, TerminalKind};
 use fyler_gui::confirm::{ConfirmDetail, IconStyle};
 
 const CONFIG_FILE: &str = "config.toml";
@@ -54,6 +53,10 @@ pub struct Config {
     pub bookmarks: Vec<(String, PathBuf)>,
     /// 解決済みkeymapバインディング(デフォルト+ユーザー上書き適用済み)。
     pub bindings: Vec<keymap::KeyBinding>,
+    /// ステータスライン左クラスタの表示項目。
+    pub statusline_left: Vec<StatusItem>,
+    /// ステータスライン右クラスタの表示項目。
+    pub statusline_right: Vec<StatusItem>,
 }
 
 impl Default for Config {
@@ -71,7 +74,9 @@ impl Default for Config {
             font_y_offset_factor: DEFAULT_FONT_Y_OFFSET_FACTOR,
             icons: IconStyle::Ascii,
             bookmarks: Vec::new(),
-            bindings: keymap::default_bindings(),
+            bindings: keymap::default_bindings(keymap::default_leader()),
+            statusline_left: fyler_core::options::default_statusline_left(),
+            statusline_right: fyler_core::options::default_statusline_right(),
         }
     }
 }
@@ -111,10 +116,7 @@ pub fn load() -> (Config, Vec<String>) {
     };
 
     let mut config = Config::default();
-    let default_leader = KeyInput {
-        key: Key::Char(' '),
-        mods: Modifiers::default(),
-    };
+    let default_leader = keymap::default_leader();
     let leader = match table.get("leader") {
         Some(value) => match value.as_str() {
             Some(value) => match keymap::parse_leader(value) {
@@ -131,6 +133,7 @@ pub fn load() -> (Config, Vec<String>) {
         },
         None => default_leader,
     };
+    config.bindings = keymap::default_bindings(leader);
     if let Some(value) = table.get("show_hidden") {
         match value.as_bool() {
             Some(show_hidden) => config.show_hidden = show_hidden,
@@ -182,6 +185,25 @@ pub fn load() -> (Config, Vec<String>) {
         match value.as_str() {
             Some(url) => config.feedback_url = Some(url.to_owned()),
             None => warnings.push("feedback_url must be a string".to_owned()),
+        }
+    }
+    if let Some(value) = table.get("statusline") {
+        match value.as_table() {
+            Some(statusline) => {
+                for key in statusline.keys() {
+                    if key != "left" && key != "right" {
+                        warnings.push(format!("Ignoring unknown statusline key: {key}"));
+                    }
+                }
+                if let Some(items) = parse_statusline_items(statusline.get("left"), &mut warnings) {
+                    config.statusline_left = items;
+                }
+                if let Some(items) = parse_statusline_items(statusline.get("right"), &mut warnings)
+                {
+                    config.statusline_right = items;
+                }
+            }
+            None => warnings.push("statusline must be a table".to_owned()),
         }
     }
     if let Some(value) = table.get("confirm_detail") {
@@ -276,7 +298,7 @@ pub fn load() -> (Config, Vec<String>) {
                         None => warnings.push("keymap.normal must be a table".to_owned()),
                     }
                 }
-                let (bindings, keymap_warnings) = keymap::resolve_bindings(Some(leader), &entries);
+                let (bindings, keymap_warnings) = keymap::resolve_bindings(leader, &entries);
                 config.bindings = bindings;
                 warnings.extend(
                     keymap_warnings
@@ -305,6 +327,7 @@ pub fn load() -> (Config, Vec<String>) {
                 | "bookmarks"
                 | "leader"
                 | "keymap"
+                | "statusline"
         ) {
             warnings.push(format!("Ignoring unknown configuration key: {key}"));
         }
@@ -320,6 +343,28 @@ fn numeric_f32(value: &toml::Value) -> Option<f32> {
         _ => return None,
     };
     value.is_finite().then_some(value)
+}
+
+/// `[statusline]`の`left`/`right`配列を項目列へ変換する。値が無ければ`None`。
+///
+/// 配列でない場合と不正な項目名は警告して該当項目を無視する。
+fn parse_statusline_items(
+    value: Option<&toml::Value>,
+    warnings: &mut Vec<String>,
+) -> Option<Vec<StatusItem>> {
+    let value = value?;
+    let Some(array) = value.as_array() else {
+        warnings.push("statusline entries must be an array of item names".to_owned());
+        return None;
+    };
+    let mut items = Vec::with_capacity(array.len());
+    for entry in array {
+        match entry.as_str().and_then(StatusItem::from_config_name) {
+            Some(item) => items.push(item),
+            None => warnings.push(format!("Ignoring unknown statusline item: {entry}")),
+        }
+    }
+    Some(items)
 }
 
 /// `recent.toml`から最近使ったルートを新しい順で読む。
@@ -562,6 +607,14 @@ mod tests {
         assert_eq!(config, Config::default());
         assert!(warnings.iter().any(|warning| warning.contains("unknown")));
 
+        fs::write(&path, "leader = 'x'\n").unwrap();
+        let (config, warnings) = load();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(config.bindings.iter().any(|binding| {
+            binding.sequence.to_string() == "x e"
+                && binding.action == keymap::EditorAction::ToggleDockFocus
+        }));
+
         fs::write(
             &path,
             "leader = 'Space'\n[keymap.normal]\n'Leader f' = 'file_picker'\n'g d' = 'none'\n",
@@ -586,7 +639,10 @@ mod tests {
         )
         .unwrap();
         let (config, warnings) = load();
-        assert_eq!(config.bindings, keymap::default_bindings());
+        assert_eq!(
+            config.bindings,
+            keymap::default_bindings(keymap::default_leader())
+        );
         assert!(warnings.iter().any(|warning| warning.contains("leader")));
         assert!(
             warnings
@@ -638,6 +694,43 @@ mod tests {
             warnings
                 .iter()
                 .any(|warning| warning.contains("not an absolute path"))
+        );
+
+        fs::write(
+            &path,
+            "[statusline]\nleft = ['mode', 'path']\nright = ['percent']\n",
+        )
+        .unwrap();
+        let (config, warnings) = load();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(config.statusline_left, [StatusItem::Mode, StatusItem::Path]);
+        assert_eq!(config.statusline_right, [StatusItem::Percent]);
+
+        fs::write(
+            &path,
+            "[statusline]\nleft = ['mode', 'bogus']\nright = 'percent'\ntop = ['mode']\n",
+        )
+        .unwrap();
+        let (config, warnings) = load();
+        assert_eq!(config.statusline_left, [StatusItem::Mode]);
+        assert_eq!(
+            config.statusline_right,
+            fyler_core::options::default_statusline_right()
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("unknown statusline item"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("must be an array"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("unknown statusline key"))
         );
 
         let first = directory.path().join("z-first");

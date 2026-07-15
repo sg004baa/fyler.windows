@@ -3,10 +3,10 @@ use std::time::Duration;
 
 use anyhow::Context;
 use fyler_core::editor::{
-    EditorCommand, EditorEngine, EditorEvent, EditorLine, FoldOp, Key, KeyInput, MessageKind, Mode,
-    Modifiers, SearchHighlight,
+    EditorCommand, EditorEngine, EditorEvent, EditorLine, EditorMessage, FoldOp, Key, KeyInput,
+    MessageKind, Mode, Modifiers, SearchHighlight,
 };
-use fyler_core::keymap::resolve_bindings;
+use fyler_core::keymap::{default_leader, resolve_bindings};
 use fyler_core::pane::PaneAction;
 use fyler_core::transfer::TransferKind;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
@@ -43,7 +43,7 @@ async fn spawn_attach_and_edit_updates_snapshot() -> anyhow::Result<()> {
         matches!(event, EditorEvent::ActivateLine { line: 0 })
     })
     .await?;
-    engine.send(key_command(Key::Char('^')))?;
+    engine.send(key_command(Key::Backspace))?;
     wait_for_event(&mut events, |event| {
         matches!(event, EditorEvent::NavigateParent)
     })
@@ -160,6 +160,27 @@ async fn file_picker_keymap_emits_open_request() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a compatible nvim executable"]
+async fn dock_focus_keymap_emits_toggle_request() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+
+    engine.send(key_command(Key::Char(' ')))?;
+    engine.send(key_command(Key::Char('e')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::ToggleDockFocus)
+    })
+    .await
+    .context("<leader>e did not emit ToggleDockFocus")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
 async fn custom_leader_binding_fires_once_and_unmap_removes_default() -> anyhow::Result<()> {
     let _serial = NVIM_TEST_SERIAL.lock().await;
     let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
@@ -171,7 +192,7 @@ async fn custom_leader_binding_fires_once_and_unmap_removes_default() -> anyhow:
         mods: Modifiers::default(),
     };
     let (bindings, warnings) = resolve_bindings(
-        Some(space),
+        space,
         &[
             ("Leader f".into(), "file_picker".into()),
             ("g .".into(), "none".into()),
@@ -210,8 +231,10 @@ async fn custom_ctrl_w_trie_dispatches_and_blocks_unknown_keys() -> anyhow::Resu
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nvim"));
     let root = std::env::current_dir()?;
-    let (bindings, warnings) =
-        resolve_bindings(None, &[("Ctrl+W x".into(), "pane_focus_next".into())]);
+    let (bindings, warnings) = resolve_bindings(
+        default_leader(),
+        &[("Ctrl+W x".into(), "pane_focus_next".into())],
+    );
     assert!(warnings.is_empty(), "{warnings:?}");
     let mut config = NvimConfig::new(nvim_exe, root);
     config.bindings = bindings;
@@ -1049,6 +1072,155 @@ async fn sort_alias_tab_completes_and_executes() -> anyhow::Result<()> {
     })
     .await
     .context(":sort da<Tab><CR> did not emit ChangeSort(\"date\")")?;
+
+    Ok(())
+}
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn failed_search_keeps_engine_responsive() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+    engine.set_initial_lines(vec![
+        EditorLine::new("/001 alpha"),
+        EditorLine::new("/002 beta"),
+    ])?;
+    wait_for_lines(&engine, |lines| lines.len() == 2).await?;
+
+    engine.send(key_command(Key::Char('/')))?;
+    for ch in ['z', 'z', 'q', 'x'] {
+        engine.send(key_command(Key::Char(ch)))?;
+    }
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            EditorEvent::Message(EditorMessage {
+                kind: MessageKind::Error,
+                ..
+            })
+        )
+    })
+    .await
+    .context("failed search did not report E486")?;
+
+    // フリーズしていなければ後続のカーソル移動がそのまま反映される。
+    engine.send(key_command(Key::Char('j')))?;
+    wait_for_cursor(&engine, |line, _| line == 1).await?;
+    assert_eq!(engine.snapshot().mode, Mode::Normal);
+
+    Ok(())
+}
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn buffer_undo_report_is_not_surfaced_as_a_message() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+    engine.set_initial_lines(vec![EditorLine::new("/001 alpha")])?;
+    wait_for_lines(&engine, |lines| lines.len() == 1).await?;
+
+    // 行を追加してから undo すると nvim は "N changes; before #M ..." を返す。
+    engine.send(key_command(Key::Char('o')))?;
+    engine.send(EditorCommand::Text("x".to_owned()))?;
+    engine.send(key_command(Key::Esc))?;
+    engine.send(key_command(Key::Char('u')))?;
+
+    // undo報告(kind "undo")はメッセージとしてGUIへ送られない。
+    let surfaced = tokio::time::timeout(Duration::from_millis(1200), async {
+        while let Some(event) = events.recv().await {
+            if let EditorEvent::Message(message) = event
+                && message.text.contains("changes")
+            {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    assert!(!surfaced, "undo report should be muted");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn opening_a_line_preserves_the_current_indent() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, _events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+    // 深さ2相当(先頭タブ2つ)の行。
+    engine.set_initial_lines(vec![EditorLine::new("\t\tchild")])?;
+    wait_for_lines(&engine, |lines| lines.len() == 1).await?;
+
+    // `o` で改行し、内容を入力してからNormalへ戻す(空行だと autoindent は破棄される)。
+    engine.send(key_command(Key::Char('o')))?;
+    engine.send(EditorCommand::Text("x".to_owned()))?;
+    engine.send(key_command(Key::Esc))?;
+
+    // 新しい行は現在行の先頭タブを引き継ぐ(二重インデントしない)。
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 2 && lines[1].text.as_ref() == "\t\tx"
+    })
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn opening_a_line_preserves_id_prefixed_depth() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, _events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+    engine.set_initial_lines(vec![EditorLine::new("/002 \tchild")])?;
+    wait_for_lines(&engine, |lines| lines.len() == 1).await?;
+
+    engine.send(key_command(Key::Char('o')))?;
+    engine.send(EditorCommand::Text("x".to_owned()))?;
+    engine.send(key_command(Key::Esc))?;
+
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 2
+            && lines[1].text.starts_with('\t')
+            && !lines[1].text.starts_with("\t\t")
+            && !lines[1].text.starts_with('/')
+    })
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn cursor_snaps_past_the_id_prefix_and_indent() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, _events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+    // `/002 ` (5) + タブ1つ = name_start_col 6。
+    engine.set_initial_lines(vec![EditorLine::new("/002 \tchild")])?;
+    wait_for_lines(&engine, |lines| lines.len() == 1).await?;
+
+    // 行頭(プレフィックス/インデント領域)へ移動すると name_start_col まで戻される。
+    // name_start_col が例外を投げるとスナップが働かず col=0 のまま止まる。
+    engine.send(key_command(Key::Char('0')))?;
+    wait_for_cursor(&engine, |_line, col| col == 6).await?;
 
     Ok(())
 }

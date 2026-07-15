@@ -43,6 +43,7 @@ fn binding_payload(action: EditorAction) -> BindingPayload {
         OpenWith => ("open_with", None, &["n"]),
         TransferMove => ("transfer", Some("move"), &["n", "x"]),
         TransferCopy => ("transfer", Some("copy"), &["n", "x"]),
+        ToggleDockFocus => ("dock_focus", None, &["n"]),
         Help => ("help", None, &["n"]),
         PaneSplitHorizontal => ("pane", Some("split_horizontal"), &["n"]),
         PaneSplitVertical => ("pane", Some("split_vertical"), &["n"]),
@@ -189,15 +190,40 @@ vim.bo[buffer].buftype = "acwrite"
 vim.bo[buffer].bufhidden = "hide"
 vim.bo[buffer].swapfile = false
 vim.bo[buffer].expandtab = false
+-- インデントは o/O remap が明示的に管理するため、自動インデントは全て無効化する
+-- (でないと現在行の先頭タブを autoindent がコピーし、remap分と二重になる)。
+vim.bo[buffer].autoindent = false
+vim.bo[buffer].smartindent = false
+vim.bo[buffer].cindent = false
+vim.bo[buffer].indentexpr = ""
 
 local group = vim.api.nvim_create_augroup("fyler_guards", { clear = true })
 
-local function name_start_col(line)
+local function line_depth(line)
   local prefix = line:match("^/%d+ ") or ""
   local rest = line:sub(#prefix + 1)
   local tabs = rest:match("^\t*")
-  return #prefix + #tabs
+  return #tabs
 end
+
+local function name_start_col(line)
+  local prefix = line:match("^/%d+ ") or ""
+  return #prefix + line_depth(line)
+end
+
+local function open_line_with_current_depth(command)
+  local row = vim.api.nvim_win_get_cursor(0)[1] - 1
+  local line = vim.api.nvim_buf_get_lines(buffer, row, row + 1, false)[1] or ""
+  return command .. string.rep("\t", line_depth(line))
+end
+
+vim.keymap.set("n", "o", function()
+  return open_line_with_current_depth("o")
+end, { buffer = buffer, expr = true, silent = true })
+
+vim.keymap.set("n", "O", function()
+  return open_line_with_current_depth("O")
+end, { buffer = buffer, expr = true, silent = true })
 
 local function shift_lines(first, last, delta)
   local lines = vim.api.nvim_buf_get_lines(buffer, first, last + 1, false)
@@ -283,6 +309,8 @@ local function dispatch(binding)
     vim.rpcnotify(channel, "fyler_open_with", line)
   elseif binding.kind == "transfer" then
     request_transfer(binding.arg, vim.fn.mode():sub(1, 1) ~= "n")
+  elseif binding.kind == "dock_focus" then
+    vim.rpcnotify(channel, "fyler_dock_focus")
   elseif binding.kind == "help" then
     vim.rpcnotify(channel, "fyler_help")
   elseif binding.kind == "pane" then
@@ -479,6 +507,7 @@ mod tests {
             (OpenWith, "open_with", None, &["n"][..]),
             (TransferMove, "transfer", Some("move"), &["n", "x"][..]),
             (TransferCopy, "transfer", Some("copy"), &["n", "x"][..]),
+            (ToggleDockFocus, "dock_focus", None, &["n"][..]),
             (Help, "help", None, &["n"][..]),
             (
                 PaneSplitHorizontal,
@@ -517,9 +546,9 @@ mod tests {
 
     #[test]
     fn defaults_split_into_normal_maps_and_ctrl_w_trie() {
-        let bindings = fyler_core::keymap::default_bindings();
+        let bindings = fyler_core::keymap::default_bindings(fyler_core::keymap::default_leader());
         let (normal, trie) = binding_values(&bindings);
-        assert_eq!(normal.as_array().unwrap().len(), 17);
+        assert_eq!(normal.as_array().unwrap().len(), 18);
         let trie = trie.as_map().unwrap();
         assert_eq!(trie.len(), 12);
         assert!(trie.iter().any(|(key, _)| key.as_str() == Some("<C-w>")));

@@ -604,23 +604,42 @@ impl SaveController {
         (self.scan_options.key, self.scan_options.reverse)
     }
 
-    /// 表示ルート相対のGit状態を、現在のbaselineのエントリIDへ対応付けて返す。
+    /// 表示ルート相対のGit状態を、現在表示中のエントリIDへ対応付けて返す。
     ///
-    /// Gitがディレクトリ単位で報告した状態は同じパスのエントリだけへ付け、子孫や
-    /// 親ディレクトリへ伝播しない。対応するエントリがない状態は無視する。
+    /// 表示中の行に一致するパスはその行へ付ける。未ロード/折りたたみで表示行に
+    /// 現れない子孫の状態は、最も近い表示中の祖先ディレクトリへ巻き上げる
+    /// (フォルダに変更が含まれることを示す)。同じ祖先へ複数の状態が集まる場合は
+    /// [`git_badge_rank`] の高い方を残す。ルート外・対応する表示行がない状態は無視する。
     pub fn map_git_badges(
         &self,
         statuses: &HashMap<PathBuf, GitBadge>,
     ) -> HashMap<EntryId, GitBadge> {
-        statuses
+        let visible: HashMap<TreePath, EntryId> = visible_entries(&self.baseline, &self.context)
             .iter()
-            .filter_map(|(path, badge)| {
-                let tree_path = tree_path_from_relative(path)?;
-                self.baseline
-                    .get_by_path(&tree_path)
-                    .map(|entry| (entry.id, *badge))
-            })
-            .collect()
+            .map(|entry| (entry.path.clone(), entry.id))
+            .collect();
+        let mut result: HashMap<EntryId, GitBadge> = HashMap::new();
+        for (path, badge) in statuses {
+            let Some(tree_path) = tree_path_from_relative(path) else {
+                continue;
+            };
+            let mut candidate = Some(tree_path);
+            while let Some(current) = candidate {
+                if let Some(&id) = visible.get(&current) {
+                    result
+                        .entry(id)
+                        .and_modify(|existing| {
+                            if git_badge_rank(*badge) > git_badge_rank(*existing) {
+                                *existing = *badge;
+                            }
+                        })
+                        .or_insert(*badge);
+                    break;
+                }
+                candidate = current.parent();
+            }
+        }
+        result
     }
 
     /// 現在表示中の行に対応するエントリの表示用メタデータをIDへ対応付けて返す。
@@ -1550,6 +1569,18 @@ fn tree_path_from_relative(path: &Path) -> Option<TreePath> {
         })
         .collect::<Option<Vec<_>>>()
         .map(TreePath::from_components)
+}
+
+/// ディレクトリへ巻き上げる際に残す状態を決める優先度。値が大きいほど優先。
+fn git_badge_rank(badge: GitBadge) -> u8 {
+    match badge {
+        GitBadge::Conflicted => 5,
+        GitBadge::Modified => 4,
+        GitBadge::Renamed => 3,
+        GitBadge::Added => 2,
+        GitBadge::Deleted => 1,
+        GitBadge::Untracked => 0,
+    }
 }
 
 /// planの読み取り元を属性だけで検査し、クラウド取得を伴い得る操作の警告を返す。
@@ -3872,7 +3903,7 @@ mod tests {
     }
 
     #[test]
-    fn shallow_baseline_consumers_ignore_unloaded_descendants_without_health_errors() {
+    fn shallow_baseline_rolls_unloaded_descendant_git_status_to_visible_ancestor() {
         let root = tempdir().unwrap();
         fs::create_dir(root.path().join("lazy")).unwrap();
         fs::write(root.path().join("lazy").join("child.txt"), b"child").unwrap();
@@ -3889,12 +3920,18 @@ mod tests {
             baseline,
             Arc::new(RecordingEngine::default()),
         );
-        let statuses = HashMap::from([
-            (PathBuf::from("lazy"), GitBadge::Modified),
-            (PathBuf::from("lazy/child.txt"), GitBadge::Added),
-        ]);
+        let statuses = HashMap::from([(PathBuf::from("lazy/child.txt"), GitBadge::Added)]);
 
-        assert_eq!(controller.map_git_badges(&statuses).len(), 1);
+        // 未ロードの子孫の状態は、表示中の祖先ディレクトリ lazy へ巻き上がる。
+        let lazy_id = controller
+            .baseline
+            .get_by_path(&TreePath::parse("lazy"))
+            .unwrap()
+            .id;
+        assert_eq!(
+            controller.map_git_badges(&statuses),
+            HashMap::from([(lazy_id, GitBadge::Added)])
+        );
         assert_eq!(controller.visible_file_infos().len(), 1);
         assert_eq!(controller.unreadable_count(), 0);
     }

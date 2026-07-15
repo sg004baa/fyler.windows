@@ -10,8 +10,15 @@ use std::ops::Range;
 
 use fyler_core::editor::{CmdlineState, EditorMessage, MessageKind, PopupmenuState};
 
+use crate::theme;
+
 /// cmdline入力中の表示。プロンプト文字 + 内容 + カーソル。
 pub fn draw_cmdline(ui: &mut egui::Ui, state: &CmdlineState) {
+    ui.painter().rect_filled(ui.max_rect(), 0.0, theme::SURFACE);
+    ui.painter().line_segment(
+        [ui.max_rect().left_top(), ui.max_rect().right_top()],
+        egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
+    );
     let mut cursor = state.cursor.min(state.content.len());
     while !state.content.is_char_boundary(cursor) {
         cursor -= 1;
@@ -40,7 +47,14 @@ pub fn draw_cmdline(ui: &mut egui::Ui, state: &CmdlineState) {
         ..Default::default()
     };
     let mut job = egui::text::LayoutJob::default();
-    job.append(&state.prompt.to_string(), 0.0, normal.clone());
+    job.append(
+        &state.prompt.to_string(),
+        0.0,
+        egui::TextFormat {
+            color: theme::ACCENT,
+            ..normal.clone()
+        },
+    );
     job.append(before, 0.0, normal.clone());
     job.append(under_cursor, 0.0, cursor_format);
     job.append(after_cursor, 0.0, normal);
@@ -90,17 +104,46 @@ pub fn visible_window(len: usize, selected: Option<usize>, max: usize) -> Range<
 
 /// エディタメッセージの表示(Errorは目立つ色で)。
 pub fn draw_message(ui: &mut egui::Ui, message: &EditorMessage) {
-    let color = match message.kind {
-        MessageKind::Info => ui.visuals().text_color(),
-        MessageKind::Warn => ui.visuals().warn_fg_color,
-        MessageKind::Error => ui.visuals().error_fg_color,
-    };
-    ui.colored_label(color, &message.text);
+    let (icon, color) = message_style(message.kind);
+    ui.painter().rect_filled(ui.max_rect(), 0.0, theme::SURFACE);
+    ui.painter().line_segment(
+        [ui.max_rect().left_top(), ui.max_rect().right_top()],
+        egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
+    );
+    ui.horizontal_centered(|ui| {
+        ui.add_space(8.0);
+        if let Some(icon) = icon {
+            ui.label(egui::RichText::new(icon).monospace().strong().color(color));
+        }
+        ui.label(
+            egui::RichText::new(&message.text)
+                .monospace()
+                .size(12.0)
+                .color(color),
+        );
+    });
+}
+
+fn message_style(kind: MessageKind) -> (Option<&'static str>, egui::Color32) {
+    match kind {
+        MessageKind::Search => (None, theme::TEXT_SECONDARY),
+        MessageKind::Info => (Some("i"), theme::BLUE),
+        MessageKind::Warn => (Some("!"), theme::YELLOW),
+        MessageKind::Error => (Some("×"), theme::RED),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_status_has_no_generic_message_icon() {
+        assert_eq!(
+            message_style(MessageKind::Search),
+            (None, theme::TEXT_SECONDARY)
+        );
+    }
 
     #[test]
     fn visible_window_returns_full_range_when_shorter_than_max() {

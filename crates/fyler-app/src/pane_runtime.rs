@@ -14,7 +14,7 @@ use fyler_core::feedback::{FeedbackPayload, validate_body};
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::{EntryId, IdAllocator};
-use fyler_core::keymap::{EditorAction, KeyBinding};
+use fyler_core::keymap::{EditorAction, HelpEntry, KeyBinding, KeySequence};
 use fyler_core::pane::{FocusDirection, PaneAction, PaneId, PaneLayout, SplitDirection};
 use fyler_core::path::TreePath;
 use fyler_core::report::{ApplyProgress, CommitReport, OpOutcome, OpResult};
@@ -241,7 +241,7 @@ fn create_pane(
     })
 }
 
-fn help_lines(bindings: &[KeyBinding]) -> Vec<String> {
+fn help_entries(bindings: &[KeyBinding]) -> Vec<HelpEntry> {
     let mut actions = Vec::<(EditorAction, Vec<String>)>::new();
     for binding in bindings {
         if let Some((_, sequences)) = actions
@@ -253,18 +253,36 @@ fn help_lines(bindings: &[KeyBinding]) -> Vec<String> {
             actions.push((binding.action, vec![binding.sequence.to_string()]));
         }
     }
-    let mut lines = actions
+    let mut entries = actions
         .into_iter()
-        .map(|(action, sequences)| format!("{}  {}", sequences.join(", "), action.description()))
+        .map(|(action, sequences)| HelpEntry {
+            command: sequences.join(" / "),
+            description: action.description().to_owned(),
+        })
         .collect::<Vec<_>>();
-    lines.extend([
-        ":w  Save changes".to_owned(),
-        ":cd  Change root".to_owned(),
-        ":b  Bookmarks / Recent roots".to_owned(),
-        ":terminal  Open terminal here".to_owned(),
-        ":feedback  Send anonymous feedback".to_owned(),
+    entries.extend([
+        HelpEntry {
+            command: ":w".to_owned(),
+            description: "Save changes".to_owned(),
+        },
+        HelpEntry {
+            command: ":cd".to_owned(),
+            description: "Change root".to_owned(),
+        },
+        HelpEntry {
+            command: ":b".to_owned(),
+            description: "Bookmarks / Recent roots".to_owned(),
+        },
+        HelpEntry {
+            command: ":terminal".to_owned(),
+            description: "Open terminal here".to_owned(),
+        },
+        HelpEntry {
+            command: ":feedback".to_owned(),
+            description: "Send anonymous feedback".to_owned(),
+        },
     ]);
-    lines
+    entries
 }
 
 fn should_restore_session(explicit_root: bool, restore_session: bool) -> bool {
@@ -357,7 +375,17 @@ pub(super) fn run() -> anyhow::Result<()> {
         font_path: config.font,
         font_y_offset_factor: config.font_y_offset_factor,
         icon_style: config.icons,
-        help_lines: help_lines(&bindings),
+        help_entries: help_entries(&bindings),
+        dock_focus_bindings: bindings
+            .iter()
+            .filter(|binding| binding.action == EditorAction::ToggleDockFocus)
+            .map(|binding| KeySequence(binding.sequence.0.clone()))
+            .collect(),
+        bookmarks: config.bookmarks.clone(),
+        recent_roots: super::config::load_recent_roots(),
+        drives: fyler_fsops::drives::list_drives(),
+        statusline_left: config.statusline_left,
+        statusline_right: config.statusline_right,
     };
     let bookmarks = config.bookmarks;
     let resolved_nvim = nvim_locate::resolve();
@@ -518,6 +546,7 @@ pub(super) fn run() -> anyhow::Result<()> {
             while let Ok(action) = action_rx.recv() {
                 let event = match action {
                     GuiAction::Confirm(choice) => AppEvent::Confirm(choice),
+                    GuiAction::Editor { pane_id, event } => AppEvent::Editor(pane_id, event),
                     GuiAction::LoaderCancel => AppEvent::LoaderCancel,
                     GuiAction::PickerSelect {
                         pane_id,
@@ -2175,6 +2204,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     if finish.is_err() {
                                         return;
                                     }
+                                    git.request(pane_id, session.root.clone());
                                 }
                                 LoaderResult::Cancelled => {
                                     if showed_dialog
@@ -2773,6 +2803,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                     AppEvent::GitStatus {
                         pane_id,
                         root,
+                        branch,
                         statuses,
                     } => {
                         if let Some(next_root) = git.on_finished(pane_id) {
@@ -2788,6 +2819,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                         if gui_event_tx
                             .send(GuiEvent::GitBadges {
                                 pane_id,
+                                branch,
                                 badges: session.git_badges.clone(),
                             })
                             .is_err()
@@ -3861,10 +3893,10 @@ mod tests {
 
     #[test]
     fn help_reflects_default_custom_and_unmapped_bindings() {
-        let defaults = fyler_core::keymap::default_bindings();
-        let default_lines = help_lines(&defaults);
-        assert!(default_lines.iter().any(|line| {
-            line.starts_with("Enter  ") && line.contains(EditorAction::Activate.description())
+        let defaults = fyler_core::keymap::default_bindings(fyler_core::keymap::default_leader());
+        let default_entries = help_entries(&defaults);
+        assert!(default_entries.iter().any(|entry| {
+            entry.command == "Enter" && entry.description == EditorAction::Activate.description()
         }));
 
         let mut customized = defaults
@@ -3875,14 +3907,15 @@ mod tests {
             sequence: fyler_core::keymap::parse_key_sequence("x", None).unwrap(),
             action: EditorAction::FilePicker,
         });
-        let custom_lines = help_lines(&customized);
+        let custom_entries = help_entries(&customized);
         assert!(
-            !custom_lines
+            !custom_entries
                 .iter()
-                .any(|line| line.contains(EditorAction::ToggleHidden.description()))
+                .any(|entry| { entry.description == EditorAction::ToggleHidden.description() })
         );
-        assert!(custom_lines.iter().any(|line| {
-            line.starts_with("g /, x  ") && line.contains(EditorAction::FilePicker.description())
+        assert!(custom_entries.iter().any(|entry| {
+            entry.command == "g / / x"
+                && entry.description == EditorAction::FilePicker.description()
         }));
     }
 
