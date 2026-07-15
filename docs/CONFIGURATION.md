@@ -247,7 +247,7 @@ Rules and limitations:
 | Action | Description | Default key |
 |---|---|---|
 | `activate` | Toggle a directory or open a file | `Enter` |
-| `navigate_parent` | Go to the parent directory | `^` |
+| `navigate_parent` | Go to the parent directory | `Backspace` |
 | `navigate_into` | Enter the selected directory | `g d` |
 | `toggle_hidden` | Toggle hidden files | `g .` |
 | `fold_close` | Collapse a directory | `z c` |

@@ -158,7 +158,7 @@ pub fn draw_plan(
                                     .monospace()
                                     .size(10.0)
                                     .strong()
-                                    .color(theme::TEXT_MUTED),
+                                    .color(group.kind.color()),
                             );
                             if group.kind == OpKind::Delete {
                                 ui.label(

@@ -43,7 +43,7 @@ async fn spawn_attach_and_edit_updates_snapshot() -> anyhow::Result<()> {
         matches!(event, EditorEvent::ActivateLine { line: 0 })
     })
     .await?;
-    engine.send(key_command(Key::Char('^')))?;
+    engine.send(key_command(Key::Backspace))?;
     wait_for_event(&mut events, |event| {
         matches!(event, EditorEvent::NavigateParent)
     })
@@ -1171,6 +1171,33 @@ async fn opening_a_line_preserves_the_current_indent() -> anyhow::Result<()> {
     // 新しい行は現在行の先頭タブを引き継ぐ。
     wait_for_lines(&engine, |lines| {
         lines.len() == 2 && lines[1].text.starts_with("\t\t")
+    })
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn opening_a_line_preserves_id_prefixed_depth() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, _events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+    engine.set_initial_lines(vec![EditorLine::new("/002 \tchild")])?;
+    wait_for_lines(&engine, |lines| lines.len() == 1).await?;
+
+    engine.send(key_command(Key::Char('o')))?;
+    engine.send(EditorCommand::Text("x".to_owned()))?;
+    engine.send(key_command(Key::Esc))?;
+
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 2
+            && lines[1].text.starts_with('\t')
+            && !lines[1].text.starts_with("\t\t")
+            && !lines[1].text.starts_with('/')
     })
     .await?;
 

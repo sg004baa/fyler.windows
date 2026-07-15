@@ -190,17 +190,35 @@ vim.bo[buffer].buftype = "acwrite"
 vim.bo[buffer].bufhidden = "hide"
 vim.bo[buffer].swapfile = false
 vim.bo[buffer].expandtab = false
--- 改行(o/O/<CR>)時に現在行の先頭タブ(=ツリー深さ)を引き継ぐ。
-vim.bo[buffer].autoindent = true
 
 local group = vim.api.nvim_create_augroup("fyler_guards", { clear = true })
 
-local function name_start_col(line)
+local function line_depth(line)
   local prefix = line:match("^/%d+ ") or ""
   local rest = line:sub(#prefix + 1)
   local tabs = rest:match("^\t*")
+  return #tabs
+end
+
+local function name_start_col(line)
+  local prefix = line:match("^/%d+ ") or ""
+  local tabs = line_depth(line)
   return #prefix + #tabs
 end
+
+local function open_line_with_current_depth(command)
+  local row = vim.api.nvim_win_get_cursor(0)[1] - 1
+  local line = vim.api.nvim_buf_get_lines(buffer, row, row + 1, false)[1] or ""
+  return command .. string.rep("\t", line_depth(line))
+end
+
+vim.keymap.set("n", "o", function()
+  return open_line_with_current_depth("o")
+end, { buffer = buffer, expr = true, silent = true })
+
+vim.keymap.set("n", "O", function()
+  return open_line_with_current_depth("O")
+end, { buffer = buffer, expr = true, silent = true })
 
 local function shift_lines(first, last, delta)
   local lines = vim.api.nvim_buf_get_lines(buffer, first, last + 1, false)
