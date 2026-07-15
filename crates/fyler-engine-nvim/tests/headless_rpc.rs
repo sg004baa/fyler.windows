@@ -1150,6 +1150,33 @@ async fn buffer_undo_report_is_not_surfaced_as_a_message() -> anyhow::Result<()>
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn opening_a_line_preserves_the_current_indent() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, _events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+    // 深さ2相当(先頭タブ2つ)の行。
+    engine.set_initial_lines(vec![EditorLine::new("\t\tchild")])?;
+    wait_for_lines(&engine, |lines| lines.len() == 1).await?;
+
+    // `o` で改行し、内容を入力してからNormalへ戻す(空行だと autoindent は破棄される)。
+    engine.send(key_command(Key::Char('o')))?;
+    engine.send(EditorCommand::Text("x".to_owned()))?;
+    engine.send(key_command(Key::Esc))?;
+
+    // 新しい行は現在行の先頭タブを引き継ぐ。
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 2 && lines[1].text.starts_with("\t\t")
+    })
+    .await?;
+
+    Ok(())
+}
+
 async fn wait_for_lines(
     engine: &NvimEngine,
     predicate: impl Fn(&[EditorLine]) -> bool,

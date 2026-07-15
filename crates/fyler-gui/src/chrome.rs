@@ -112,24 +112,13 @@ pub(crate) fn navigation_entries(
     recent_roots: &[PathBuf],
     drives: &[PathBuf],
 ) -> Vec<NavigationEntry> {
-    let mut entries = Vec::with_capacity(1 + bookmarks.len() + recent_roots.len() + drives.len());
-    entries.push(NavigationEntry {
+    let mut entries = Vec::with_capacity(bookmarks.len() + recent_roots.len() + drives.len());
+    entries.extend(bookmarks.iter().map(|(label, path)| NavigationEntry {
         section: NavigationSection::Pinned,
-        label: navigation_path_label(root),
-        path: root.to_path_buf(),
-        current: true,
-    });
-    entries.extend(
-        bookmarks
-            .iter()
-            .filter(|(_, path)| path.as_path() != root)
-            .map(|(label, path)| NavigationEntry {
-                section: NavigationSection::Pinned,
-                label: label.clone(),
-                path: path.clone(),
-                current: false,
-            }),
-    );
+        label: label.clone(),
+        path: path.clone(),
+        current: path.as_path() == root,
+    }));
     entries.extend(
         recent_roots
             .iter()
@@ -146,7 +135,7 @@ pub(crate) fn navigation_entries(
         section: NavigationSection::Drives,
         label: path.display().to_string(),
         path: path.clone(),
-        current: false,
+        current: path.as_path() == root,
     }));
     entries
 }
@@ -234,16 +223,23 @@ fn navigation_row(
         egui::vec2(ui.available_width(), theme::TREE_ROW_HEIGHT),
         egui::Sense::click(),
     );
-    if current || focused_selection {
+    if focused_selection {
         ui.painter()
             .rect_filled(rect, 0.0, theme::accent_selection_fill());
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, 0.0, theme::HOVER);
+    }
+    // 左端バー: カーソル(選択)はBLUEで追従、現在rootは控えめなACCENTマーカー。
+    if focused_selection || current {
         ui.painter().rect_filled(
             egui::Rect::from_min_size(rect.min, egui::vec2(2.0, rect.height())),
             0.0,
-            if current { theme::ACCENT } else { theme::BLUE },
+            if focused_selection {
+                theme::BLUE
+            } else {
+                theme::ACCENT
+            },
         );
-    } else if response.hovered() {
-        ui.painter().rect_filled(rect, 0.0, theme::HOVER);
     }
     if focused_selection {
         ui.painter().rect_stroke(
@@ -258,7 +254,7 @@ fn navigation_row(
         egui::Align2::LEFT_CENTER,
         format!("{}  {label}", icon::directory(icon_style)),
         egui::FontId::monospace(12.0),
-        if current || focused_selection {
+        if focused_selection || current {
             theme::TEXT
         } else {
             theme::TEXT_SECONDARY
@@ -341,8 +337,10 @@ mod tests {
                 .count(),
             2
         );
-        assert_eq!(entries[0].label, "work");
+        assert_eq!(entries[0].label, "current");
+        assert!(entries[0].current);
         assert_eq!(entries[1].label, "docs");
+        assert!(!entries[1].current);
         assert_eq!(entries[2].section.title(), "RECENT");
         assert_eq!(entries[3].section.title(), "DRIVES");
     }

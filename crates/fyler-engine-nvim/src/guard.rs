@@ -190,6 +190,8 @@ vim.bo[buffer].buftype = "acwrite"
 vim.bo[buffer].bufhidden = "hide"
 vim.bo[buffer].swapfile = false
 vim.bo[buffer].expandtab = false
+-- 改行(o/O/<CR>)時に現在行の先頭タブ(=ツリー深さ)を引き継ぐ。
+vim.bo[buffer].autoindent = true
 
 local group = vim.api.nvim_create_augroup("fyler_guards", { clear = true })
 

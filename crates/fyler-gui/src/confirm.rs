@@ -148,20 +148,44 @@ pub fn draw_plan(
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     ui.add_space(4.0);
-                    for label in plan_labels(plan, detail) {
-                        let color = if label.starts_with("DELETE") {
-                            theme::RED
-                        } else if label.starts_with("CREATE") {
-                            theme::GREEN
-                        } else {
-                            theme::TEXT_SECONDARY
-                        };
-                        ui.label(
-                            egui::RichText::new(label)
-                                .monospace()
-                                .size(12.0)
-                                .color(color),
-                        );
+                    for (group_index, group) in plan_groups(plan, detail).iter().enumerate() {
+                        if group_index > 0 {
+                            ui.add_space(8.0);
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(group.kind.heading())
+                                    .monospace()
+                                    .size(10.0)
+                                    .strong()
+                                    .color(theme::TEXT_MUTED),
+                            );
+                            if group.kind == OpKind::Delete {
+                                ui.label(
+                                    egui::RichText::new("·  recoverable from recycle bin")
+                                        .size(10.0)
+                                        .color(theme::TEXT_FAINT),
+                                );
+                            }
+                        });
+                        ui.add_space(2.0);
+                        for entry in &group.entries {
+                            ui.horizontal(|ui| {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new(group.kind.marker())
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(group.kind.color()),
+                                );
+                                ui.label(
+                                    egui::RichText::new(entry)
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(theme::TEXT_SECONDARY),
+                                );
+                            });
+                        }
                     }
                     if !overwrites.is_empty() {
                         ui.add_space(8.0);
@@ -190,12 +214,6 @@ pub fn draw_plan(
             ui.separator();
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("recycle bin  ·  undoable on Windows")
-                        .monospace()
-                        .size(11.0)
-                        .color(theme::TEXT_FAINT),
-                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let approve_label = if overwrites.is_empty() {
                         format!("Apply {} changes  ↵", plan.ops.len())
@@ -324,38 +342,98 @@ pub fn draw_undo_plan(ui: &mut egui::Ui, lines: &[String]) -> Option<ConfirmChoi
         .inner
 }
 
-fn plan_labels(plan: &OperationPlan, detail: ConfirmDetail) -> Vec<String> {
-    if detail == ConfirmDetail::Full || plan.ops.len() <= 5 {
-        return plan.ops.iter().map(operation_label).collect();
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpKind {
+    Create,
+    Rename,
+    Move,
+    Copy,
+    Delete,
+}
 
-    let mut create = 0;
-    let mut rename = 0;
-    let mut move_count = 0;
-    let mut copy = 0;
-    let mut delete = 0;
-    for operation in &plan.ops {
+impl OpKind {
+    fn of(operation: &FsOperation) -> Self {
         match operation {
-            FsOperation::Create { .. } => create += 1,
-            FsOperation::Move { from, to, .. } if from.parent() == to.parent() => rename += 1,
-            FsOperation::Move { .. } => move_count += 1,
-            FsOperation::Copy { .. } => copy += 1,
-            FsOperation::Delete { .. } => delete += 1,
+            FsOperation::Create { .. } => Self::Create,
+            FsOperation::Move { from, to, .. } if from.parent() == to.parent() => Self::Rename,
+            FsOperation::Move { .. } => Self::Move,
+            FsOperation::Copy { .. } => Self::Copy,
+            FsOperation::Delete { .. } => Self::Delete,
         }
     }
 
-    let summaries = [
-        (create, "CREATE", ""),
-        (rename, "RENAME", ""),
-        (move_count, "MOVE", ""),
-        (copy, "COPY", ""),
-        (delete, "DELETE", "(to recycle bin)"),
-    ]
-    .into_iter()
-    .filter(|(count, _, _)| *count > 0)
-    .map(|(count, kind, suffix)| format!("{kind} {count}{suffix}"))
-    .collect::<Vec<_>>();
-    vec![summaries.join(" / ")]
+    fn heading(self) -> &'static str {
+        match self {
+            Self::Create => "CREATE",
+            Self::Rename => "RENAME",
+            Self::Move => "MOVE",
+            Self::Copy => "COPY",
+            Self::Delete => "DELETE",
+        }
+    }
+
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Create => "+",
+            Self::Rename => "~",
+            Self::Move | Self::Copy => "→",
+            Self::Delete => "-",
+        }
+    }
+
+    fn color(self) -> egui::Color32 {
+        match self {
+            Self::Create => theme::GREEN,
+            Self::Rename | Self::Move | Self::Copy => theme::BLUE,
+            Self::Delete => theme::RED,
+        }
+    }
+}
+
+struct OpGroup {
+    kind: OpKind,
+    entries: Vec<String>,
+}
+
+/// 操作を種別ごとにまとめ、見出し(種別)配下へ表示する内容を返す。
+/// Full か 5件以下なら各操作を1行ずつ、それ以外は種別ごとの件数へ畳む。
+fn plan_groups(plan: &OperationPlan, detail: ConfirmDetail) -> Vec<OpGroup> {
+    let expanded = detail == ConfirmDetail::Full || plan.ops.len() <= 5;
+    let mut groups: Vec<OpGroup> = Vec::new();
+    for kind in [
+        OpKind::Create,
+        OpKind::Rename,
+        OpKind::Move,
+        OpKind::Copy,
+        OpKind::Delete,
+    ] {
+        let matching: Vec<&FsOperation> = plan
+            .ops
+            .iter()
+            .filter(|op| OpKind::of(op) == kind)
+            .collect();
+        if matching.is_empty() {
+            continue;
+        }
+        let entries = if expanded {
+            matching.iter().map(|op| operation_entry(op)).collect()
+        } else {
+            let count = matching.len();
+            vec![format!("{count} item{}", if count == 1 { "" } else { "s" })]
+        };
+        groups.push(OpGroup { kind, entries });
+    }
+    groups
+}
+
+/// 操作の変更内容(種別語を除いたパス表現)。
+fn operation_entry(operation: &FsOperation) -> String {
+    match operation {
+        FsOperation::Create { path, .. } | FsOperation::Delete { path, .. } => path.to_string(),
+        FsOperation::Move { from, to, .. } | FsOperation::Copy { from, to, .. } => {
+            format!("{from} → {to}")
+        }
+    }
 }
 
 /// validateエラーの表示(保存は中断済み)。行番号は0始まりなので表示時に+1する。
@@ -980,23 +1058,31 @@ mod tests {
             }
         );
 
+        let groups = plan_groups(&plan, ConfirmDetail::Summary)
+            .into_iter()
+            .map(|group| (group.kind, group.entries))
+            .collect::<Vec<_>>();
         assert_eq!(
-            plan_labels(&plan, ConfirmDetail::Summary),
-            ["RENAME 2 / COPY 3 / DELETE 1(to recycle bin)"]
+            groups,
+            vec![
+                (OpKind::Rename, vec!["2 items".to_owned()]),
+                (OpKind::Copy, vec!["3 items".to_owned()]),
+                (OpKind::Delete, vec!["1 item".to_owned()]),
+            ]
         );
     }
 
     #[test]
-    fn summary_detail_keeps_short_plans_expanded() {
+    fn short_plans_list_each_operation_under_its_kind() {
         let plan = OperationPlan {
             ops: vec![FsOperation::Delete {
                 id: EntryId(1),
                 path: TreePath::parse("old.txt"),
             }],
         };
-        assert_eq!(
-            plan_labels(&plan, ConfirmDetail::Summary),
-            ["DELETE old.txt (to recycle bin)"]
-        );
+        let groups = plan_groups(&plan, ConfirmDetail::Summary);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].kind, OpKind::Delete);
+        assert_eq!(groups[0].entries, vec!["old.txt".to_owned()]);
     }
 }

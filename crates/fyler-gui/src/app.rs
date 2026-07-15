@@ -2325,7 +2325,10 @@ mod tests {
     fn navigation_dock_uses_j_k_enter_and_returns_focus_with_configured_binding() {
         let entries = chrome::navigation_entries(
             Path::new("/current"),
-            &[("docs".to_owned(), PathBuf::from("/docs"))],
+            &[
+                ("docs".to_owned(), PathBuf::from("/docs")),
+                ("src".to_owned(), PathBuf::from("/src")),
+            ],
             &[],
             &[],
         );
@@ -2349,7 +2352,7 @@ mod tests {
             &entries,
         );
         assert_eq!(state.selected, 1);
-        assert_eq!(target, Some(PathBuf::from("/docs")));
+        assert_eq!(target, Some(PathBuf::from("/src")));
 
         let binding = fyler_core::keymap::parse_key_sequence("x e", None).unwrap();
         assert_eq!(
