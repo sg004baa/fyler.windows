@@ -24,6 +24,8 @@ pub struct TreeViewport {
     pub scroll_offset: f32,
     /// スクロール領域の表示高。
     pub height: f32,
+    /// この可視範囲を記録した時点のカーソル行。
+    pub cursor_line: usize,
 }
 
 /// ツリー描画後にapp層へ返す表示情報。
@@ -67,6 +69,7 @@ pub fn draw(
     let row_pitch = row_height + ui.spacing().item_spacing.y;
     let selection = display_selection(snapshot);
     let requested_offset = previous_viewport
+        .filter(|viewport| viewport.cursor_line != snapshot.cursor.line)
         .filter(|_| snapshot.cursor.line < snapshot.lines.len())
         .and_then(|viewport| {
             let (cursor_top, cursor_bottom) =
@@ -250,6 +253,7 @@ pub fn draw(
         viewport: TreeViewport {
             scroll_offset: output.state.offset.y,
             height: output.inner_rect.height(),
+            cursor_line: snapshot.cursor.line,
         },
     }
 }

@@ -984,10 +984,6 @@ fn send_view_state(
         pane_id,
         dirs: save_controller.collapsed_dirs(),
     })?;
-    gui_event_tx.send(GuiEvent::HiddenVisibility {
-        pane_id,
-        shown: save_controller.scan_options().show_hidden,
-    })?;
     gui_event_tx.send(GuiEvent::IncompleteDirs {
         pane_id,
         dirs: save_controller.incomplete_dir_ids(),

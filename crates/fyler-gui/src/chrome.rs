@@ -1,5 +1,6 @@
 //! Fyler Screens の titlebar / toolbar / breadcrumb。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
@@ -113,30 +114,37 @@ pub(crate) fn navigation_entries(
     drives: &[PathBuf],
 ) -> Vec<NavigationEntry> {
     let mut entries = Vec::with_capacity(bookmarks.len() + recent_roots.len() + drives.len());
-    entries.extend(bookmarks.iter().map(|(label, path)| NavigationEntry {
-        section: NavigationSection::Pinned,
-        label: label.clone(),
-        path: path.clone(),
-        current: path.as_path() == root,
-    }));
-    entries.extend(
-        recent_roots
-            .iter()
-            .filter(|path| path.as_path() != root)
-            .filter(|path| !bookmarks.iter().any(|(_, bookmark)| bookmark == *path))
-            .map(|path| NavigationEntry {
+    let mut seen = HashSet::new();
+    for (label, path) in bookmarks {
+        if seen.insert(path.clone()) {
+            entries.push(NavigationEntry {
+                section: NavigationSection::Pinned,
+                label: label.clone(),
+                path: path.clone(),
+                current: path.as_path() == root,
+            });
+        }
+    }
+    for path in recent_roots {
+        if path.as_path() != root && seen.insert(path.clone()) {
+            entries.push(NavigationEntry {
                 section: NavigationSection::Recent,
                 label: navigation_path_label(path),
                 path: path.clone(),
                 current: false,
-            }),
-    );
-    entries.extend(drives.iter().map(|path| NavigationEntry {
-        section: NavigationSection::Drives,
-        label: path.display().to_string(),
-        path: path.clone(),
-        current: path.as_path() == root,
-    }));
+            });
+        }
+    }
+    for path in drives {
+        if seen.insert(path.clone()) {
+            entries.push(NavigationEntry {
+                section: NavigationSection::Drives,
+                label: path.display().to_string(),
+                path: path.clone(),
+                current: path.as_path() == root,
+            });
+        }
+    }
     entries
 }
 
@@ -324,9 +332,10 @@ mod tests {
             &[
                 ("current".to_owned(), PathBuf::from("/work")),
                 ("docs".to_owned(), PathBuf::from("/docs")),
+                ("docs-duplicate".to_owned(), PathBuf::from("/docs")),
             ],
-            &[PathBuf::from("/recent")],
-            &[PathBuf::from("/")],
+            &[PathBuf::from("/recent"), PathBuf::from("/docs")],
+            &[PathBuf::from("/"), PathBuf::from("/recent")],
         );
 
         assert_eq!(entries.len(), 4);
@@ -343,5 +352,19 @@ mod tests {
         assert!(!entries[1].current);
         assert_eq!(entries[2].section.title(), "RECENT");
         assert_eq!(entries[3].section.title(), "DRIVES");
+    }
+
+    #[test]
+    fn navigation_entries_skip_drive_when_bookmark_already_uses_path() {
+        let entries = navigation_entries(
+            Path::new("/other"),
+            &[("root".to_owned(), PathBuf::from("/"))],
+            &[],
+            &[PathBuf::from("/")],
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].section, NavigationSection::Pinned);
+        assert_eq!(entries[0].path, PathBuf::from("/"));
     }
 }

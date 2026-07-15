@@ -14,7 +14,7 @@ use fyler_core::feedback::{FeedbackPayload, validate_body};
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::{EntryId, IdAllocator};
-use fyler_core::keymap::{EditorAction, KeyBinding, KeySequence};
+use fyler_core::keymap::{EditorAction, HelpEntry, KeyBinding, KeySequence};
 use fyler_core::pane::{FocusDirection, PaneAction, PaneId, PaneLayout, SplitDirection};
 use fyler_core::path::TreePath;
 use fyler_core::report::{ApplyProgress, CommitReport, OpOutcome, OpResult};
@@ -24,9 +24,7 @@ use fyler_core::undo::UndoTransaction;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
 use fyler_fsops::scan::ScanOptions;
 use fyler_fsops::watch::{FsWatcher, WatchEvent};
-use fyler_gui::app::{
-    FeedbackResultKind, GuiAction, GuiEvent, GuiOptions, HelpEntry, PickerAction,
-};
+use fyler_gui::app::{FeedbackResultKind, GuiAction, GuiEvent, GuiOptions, PickerAction};
 use fyler_gui::confirm::ConfirmChoice;
 
 use super::feedback::{FeedbackOutcome, resolve_endpoint, send_feedback};

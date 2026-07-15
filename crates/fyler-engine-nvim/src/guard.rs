@@ -190,6 +190,12 @@ vim.bo[buffer].buftype = "acwrite"
 vim.bo[buffer].bufhidden = "hide"
 vim.bo[buffer].swapfile = false
 vim.bo[buffer].expandtab = false
+-- インデントは o/O remap が明示的に管理するため、自動インデントは全て無効化する
+-- (でないと現在行の先頭タブを autoindent がコピーし、remap分と二重になる)。
+vim.bo[buffer].autoindent = false
+vim.bo[buffer].smartindent = false
+vim.bo[buffer].cindent = false
+vim.bo[buffer].indentexpr = ""
 
 local group = vim.api.nvim_create_augroup("fyler_guards", { clear = true })
 

@@ -16,7 +16,7 @@ use fyler_core::feedback::{FeedbackKind, MAX_BODY_CHARS, validate_body};
 use fyler_core::fileinfo::FileInfo;
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::id::EntryId;
-use fyler_core::keymap::KeySequence;
+use fyler_core::keymap::{HelpEntry, KeySequence};
 use fyler_core::options::StatusItem;
 use fyler_core::pane::{PaneId, PaneLayout, SplitDirection};
 use fyler_core::path::TreePath;
@@ -84,13 +84,6 @@ pub enum FeedbackResultKind {
     ServerError,
     Network,
     Timeout,
-}
-
-/// Helpモーダルへ表示する、解決済みkeymapの1操作。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HelpEntry {
-    pub command: String,
-    pub description: String,
 }
 
 /// app層からGUI起動時に渡す表示設定。
@@ -184,11 +177,6 @@ pub enum GuiEvent {
     CollapsedDirs {
         pane_id: PaneId,
         dirs: HashSet<EntryId>,
-    },
-    /// 隠しファイル表示状態をtoolbarへ反映する。
-    HiddenVisibility {
-        pane_id: PaneId,
-        shown: bool,
     },
     /// 指定paneのファイルpickerを候補待ち状態で即座に開く。
     ShowFilePicker {
@@ -419,7 +407,6 @@ struct PaneViewState {
     unreadable: usize,
     file_infos: HashMap<EntryId, FileInfo>,
     collapsed_dirs: HashSet<EntryId>,
-    show_hidden: bool,
     engine_error: Option<String>,
     tree_viewport: Option<tree_view::TreeViewport>,
 }
@@ -515,7 +502,6 @@ impl FylerApp {
                             unreadable: 0,
                             file_infos: HashMap::new(),
                             collapsed_dirs: HashSet::new(),
-                            show_hidden: false,
                             engine_error: None,
                             tree_viewport: None,
                         },
@@ -643,11 +629,6 @@ impl FylerApp {
                 GuiEvent::CollapsedDirs { pane_id, dirs } => {
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
                         pane.collapsed_dirs = dirs;
-                    }
-                }
-                GuiEvent::HiddenVisibility { pane_id, shown } => {
-                    if let Some(pane) = self.panes.get_mut(&pane_id) {
-                        pane.show_hidden = shown;
                     }
                 }
                 GuiEvent::ShowFilePicker { pane_id } => {
@@ -883,13 +864,11 @@ impl eframe::App for FylerApp {
             Some((pane_id, pane.root.clone()))
         });
         let mut chrome_action = None;
-        if chrome_state.is_some() {
-            egui::Panel::top("fyler-toolbar")
-                .exact_size(theme::TOOLBAR_HEIGHT)
-                .show(ui, |ui| {
-                    chrome_action = chrome::draw_toolbar(ui);
-                });
-        }
+        egui::Panel::top("fyler-toolbar")
+            .exact_size(theme::TOOLBAR_HEIGHT)
+            .show(ui, |ui| {
+                chrome_action = chrome::draw_toolbar(ui);
+            });
         let navigation_entries = chrome_state
             .as_ref()
             .map(|(_, root)| {
@@ -2220,7 +2199,6 @@ mod tests {
                         unreadable: 0,
                         file_infos: HashMap::new(),
                         collapsed_dirs: HashSet::new(),
-                        show_hidden: false,
                         engine_error: None,
                         tree_viewport: None,
                     },
@@ -2237,7 +2215,6 @@ mod tests {
                         unreadable: 0,
                         file_infos: HashMap::new(),
                         collapsed_dirs: HashSet::new(),
-                        show_hidden: false,
                         engine_error: None,
                         tree_viewport: None,
                     },
@@ -2297,12 +2274,6 @@ mod tests {
             unreadable: 2,
         })
         .unwrap();
-        tx.send(GuiEvent::HiddenVisibility {
-            pane_id: second,
-            shown: true,
-        })
-        .unwrap();
-
         app.receive_events();
 
         assert_eq!(app.panes[&first].root, PathBuf::from("first"));
@@ -2317,8 +2288,6 @@ mod tests {
         assert!(app.panes[&second].offline);
         assert_eq!(app.panes[&second].unreadable, 2);
         assert!(!app.panes[&first].offline);
-        assert!(app.panes[&second].show_hidden);
-        assert!(!app.panes[&first].show_hidden);
     }
 
     #[test]

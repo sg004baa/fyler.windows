@@ -128,7 +128,7 @@ pub fn draw_plan(
             });
             ui.label(
                 egui::RichText::new(
-                    "These will be applied to disk in order. Deletions go to the recycle bin.",
+                    "These will be applied to disk. Deletions go to the recycle bin.",
                 )
                 .size(11.0)
                 .color(theme::TEXT_MUTED),

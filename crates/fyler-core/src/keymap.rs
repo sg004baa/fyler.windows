@@ -8,6 +8,13 @@ use crate::editor::{Key, KeyInput, Modifiers};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeySequence(pub Vec<KeyInput>);
 
+/// Helpモーダルへ表示する、解決済みkeymapの1操作。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelpEntry {
+    pub command: String,
+    pub description: String,
+}
+
 /// ユーザーがキーに割り当てられる操作(エンジン非依存の語彙)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorAction {

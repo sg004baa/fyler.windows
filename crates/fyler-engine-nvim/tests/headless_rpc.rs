@@ -1168,9 +1168,9 @@ async fn opening_a_line_preserves_the_current_indent() -> anyhow::Result<()> {
     engine.send(EditorCommand::Text("x".to_owned()))?;
     engine.send(key_command(Key::Esc))?;
 
-    // 新しい行は現在行の先頭タブを引き継ぐ。
+    // 新しい行は現在行の先頭タブを引き継ぐ(二重インデントしない)。
     wait_for_lines(&engine, |lines| {
-        lines.len() == 2 && lines[1].text.starts_with("\t\t")
+        lines.len() == 2 && lines[1].text.as_ref() == "\t\tx"
     })
     .await?;
 
