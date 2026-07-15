@@ -202,8 +202,7 @@ end
 
 local function name_start_col(line)
   local prefix = line:match("^/%d+ ") or ""
-  local tabs = line_depth(line)
-  return #prefix + #tabs
+  return #prefix + line_depth(line)
 end
 
 local function open_line_with_current_depth(command)

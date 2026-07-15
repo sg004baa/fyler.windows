@@ -1204,6 +1204,27 @@ async fn opening_a_line_preserves_id_prefixed_depth() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn cursor_snaps_past_the_id_prefix_and_indent() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, _events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+    // `/002 ` (5) + タブ1つ = name_start_col 6。
+    engine.set_initial_lines(vec![EditorLine::new("/002 \tchild")])?;
+    wait_for_lines(&engine, |lines| lines.len() == 1).await?;
+
+    // 行頭(プレフィックス/インデント領域)へ移動すると name_start_col まで戻される。
+    // name_start_col が例外を投げるとスナップが働かず col=0 のまま止まる。
+    engine.send(key_command(Key::Char('0')))?;
+    wait_for_cursor(&engine, |_line, col| col == 6).await?;
+
+    Ok(())
+}
+
 async fn wait_for_lines(
     engine: &NvimEngine,
     predicate: impl Fn(&[EditorLine]) -> bool,
