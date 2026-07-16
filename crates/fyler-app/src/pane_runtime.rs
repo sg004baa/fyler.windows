@@ -18,7 +18,7 @@ use fyler_core::keymap::{EditorAction, HelpEntry, KeyBinding, KeySequence};
 use fyler_core::pane::{FocusDirection, PaneAction, PaneId, PaneLayout, SplitDirection};
 use fyler_core::path::TreePath;
 use fyler_core::report::{ApplyProgress, CommitReport, OpOutcome, OpResult};
-use fyler_core::transfer::TransferKind;
+use fyler_core::transfer::{DropEffect, ImportPlan, TransferKind};
 use fyler_core::tree::{BaselineTree, EntryKind};
 use fyler_core::undo::UndoTransaction;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
@@ -28,6 +28,7 @@ use fyler_gui::app::{FeedbackResultKind, GuiAction, GuiEvent, GuiOptions, Picker
 use fyler_gui::confirm::ConfirmChoice;
 
 use super::feedback::{FeedbackOutcome, resolve_endpoint, send_feedback};
+use super::import_flow::{self, ImportController, ImportFlowResult};
 use super::nvim_locate;
 use super::picker::{ActivePicker, CatalogService, PickerSearchWorker};
 use super::save_flow::{FoldResult, SaveController, SaveFlowResult};
@@ -39,10 +40,10 @@ use super::transfer_flow::{
 use super::{
     ActivateOutcome, AppEvent, BookmarkResolution, GitRefresher, after_root_change,
     bookmark_list_message, default_root, format_drive_paths, handle_activate_line,
-    handle_external_change, handle_open_file_picker, handle_open_terminal, handle_open_with,
-    handle_picker_select, handle_yank_path, normalize_root, parse_sort_query,
-    resolve_bookmark_query, resolve_cd_target, send_gui_message, send_save_result, send_view_state,
-    sort_state_message,
+    handle_clipboard_copy_or_cut, handle_external_change, handle_open_file_picker,
+    handle_open_terminal, handle_open_with, handle_picker_select, handle_yank_path, normalize_root,
+    parse_sort_query, resolve_bookmark_query, resolve_cd_target, send_gui_message,
+    send_save_result, send_view_state, sort_state_message,
 };
 use super::{undo_format, undo_journal};
 use crate::queue_stats::{CountingSender, QueueGauge};
@@ -568,6 +569,17 @@ pub(super) fn run() -> anyhow::Result<()> {
                         AppEvent::FeedbackSubmit { kind, body }
                     }
                     GuiAction::FeedbackClosed => AppEvent::FeedbackClosed,
+                    GuiAction::FilesDropped {
+                        pane_id,
+                        line,
+                        paths,
+                        effect,
+                    } => AppEvent::FilesDropped {
+                        pane_id,
+                        line,
+                        paths,
+                        effect,
+                    },
                 };
                 if action_event_tx.send(event).is_err() {
                     return;
@@ -619,6 +631,7 @@ pub(super) fn run() -> anyhow::Result<()> {
             let mut apply_owner = None;
             let mut loader_owner: Option<LoaderOwner> = None;
             let mut transfer = TransferController::new();
+            let mut import = ImportController::new();
             let mut pending_recovery = pending_recovery;
             let mut pending_open_with: Option<(
                 PathBuf,
@@ -722,6 +735,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                             apply_owner.is_some()
                                 || transfer.is_awaiting()
                                 || transfer.is_running()
+                                || import.is_awaiting()
+                                || import.is_running()
                                 || loader_owner.is_some(),
                         )
                         .is_err()
@@ -777,6 +792,11 @@ pub(super) fn run() -> anyhow::Result<()> {
                         {
                             return;
                         }
+                        if import.invalidate_if_involves(pane_id)
+                            && gui_event_tx.send(GuiEvent::CloseDialog).is_err()
+                        {
+                            return;
+                        }
                         if gui_event_tx
                             .send(GuiEvent::Editor {
                                 pane_id,
@@ -812,8 +832,147 @@ pub(super) fn run() -> anyhow::Result<()> {
                             apply_owner.is_some()
                                 || dialog_owner.is_some()
                                 || transfer.is_awaiting()
-                                || transfer.is_running(),
+                                || transfer.is_running()
+                                || import.is_awaiting()
+                                || import.is_running(),
                             &mut transfer,
+                            &gui_event_tx,
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    AppEvent::Editor(pane_id, EditorEvent::ClipboardCopyRequested { lines }) => {
+                        if pane_id != active {
+                            continue;
+                        }
+                        let Some(session) = panes.get(&pane_id) else {
+                            continue;
+                        };
+                        let snapshot = session.engine.snapshot();
+                        let pane_state = TransferPaneState {
+                            dirty: snapshot.dirty,
+                            idle: session.save_controller.is_idle(),
+                            crashed: session.crashed,
+                            offline: session.save_controller.is_offline(),
+                        };
+                        let globally_busy = apply_owner.is_some()
+                            || dialog_owner.is_some()
+                            || transfer.is_awaiting()
+                            || transfer.is_running()
+                            || import.is_awaiting()
+                            || import.is_running();
+                        if let Some(reason) =
+                            import_flow::start_rejection(pane_state, globally_busy)
+                        {
+                            if send_gui_message(&gui_event_tx, pane_id, MessageKind::Info, reason)
+                                .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        if handle_clipboard_copy_or_cut(
+                            pane_id,
+                            &session.save_controller,
+                            session.engine.as_ref(),
+                            &session.root,
+                            DropEffect::Copy,
+                            &lines,
+                            &gui_event_tx,
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    AppEvent::Editor(pane_id, EditorEvent::ClipboardCutRequested { lines }) => {
+                        if pane_id != active {
+                            continue;
+                        }
+                        let Some(session) = panes.get(&pane_id) else {
+                            continue;
+                        };
+                        let snapshot = session.engine.snapshot();
+                        let pane_state = TransferPaneState {
+                            dirty: snapshot.dirty,
+                            idle: session.save_controller.is_idle(),
+                            crashed: session.crashed,
+                            offline: session.save_controller.is_offline(),
+                        };
+                        let globally_busy = apply_owner.is_some()
+                            || dialog_owner.is_some()
+                            || transfer.is_awaiting()
+                            || transfer.is_running()
+                            || import.is_awaiting()
+                            || import.is_running();
+                        if let Some(reason) =
+                            import_flow::start_rejection(pane_state, globally_busy)
+                        {
+                            if send_gui_message(&gui_event_tx, pane_id, MessageKind::Info, reason)
+                                .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        if handle_clipboard_copy_or_cut(
+                            pane_id,
+                            &session.save_controller,
+                            session.engine.as_ref(),
+                            &session.root,
+                            DropEffect::Move,
+                            &lines,
+                            &gui_event_tx,
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    AppEvent::Editor(pane_id, EditorEvent::ClipboardPasteRequested { line }) => {
+                        if pane_id != active {
+                            continue;
+                        }
+                        if handle_clipboard_paste_request(
+                            pane_id,
+                            line,
+                            &panes,
+                            apply_owner.is_some()
+                                || dialog_owner.is_some()
+                                || transfer.is_awaiting()
+                                || transfer.is_running()
+                                || import.is_awaiting()
+                                || import.is_running(),
+                            &mut import,
+                            &gui_event_tx,
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    AppEvent::FilesDropped {
+                        pane_id,
+                        line,
+                        paths,
+                        effect,
+                    } => {
+                        if handle_files_dropped(
+                            pane_id,
+                            line,
+                            paths,
+                            effect,
+                            &panes,
+                            apply_owner.is_some()
+                                || dialog_owner.is_some()
+                                || transfer.is_awaiting()
+                                || transfer.is_running()
+                                || import.is_awaiting()
+                                || import.is_running(),
+                            active_picker.is_some(),
+                            &mut import,
                             &gui_event_tx,
                         )
                         .is_err()
@@ -875,8 +1034,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     session.crashed,
                                     dialog_owner.is_some(),
                                     apply_owner.is_some(),
-                                    transfer.is_awaiting(),
-                                    transfer.is_running(),
+                                    transfer.is_awaiting() || import.is_awaiting(),
+                                    transfer.is_running() || import.is_running(),
                                     &gui_event_tx,
                                 ) {
                                     Ok(opened) => opened,
@@ -906,6 +1065,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     || dialog_owner.is_some()
                                     || transfer.is_awaiting()
                                     || transfer.is_running()
+                                    || import.is_awaiting()
+                                    || import.is_running()
                                 {
                                     if send_gui_message(
                                         &gui_event_tx,
@@ -935,7 +1096,9 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     apply_owner.is_some()
                                         || dialog_owner.is_some()
                                         || transfer.is_awaiting()
-                                        || transfer.is_running(),
+                                        || transfer.is_running()
+                                        || import.is_awaiting()
+                                        || import.is_running(),
                                 ) {
                                     if send_gui_message(
                                         &gui_event_tx,
@@ -1083,7 +1246,9 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     feedback_open
                                         || apply_owner.is_some()
                                         || transfer.is_awaiting()
-                                        || transfer.is_running(),
+                                        || transfer.is_running()
+                                        || import.is_awaiting()
+                                        || import.is_running(),
                                 )
                                 .is_err()
                                 {
@@ -1102,8 +1267,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     session.crashed,
                                     dialog_owner.is_some(),
                                     apply_owner.is_some(),
-                                    transfer.is_awaiting(),
-                                    transfer.is_running(),
+                                    transfer.is_awaiting() || import.is_awaiting(),
+                                    transfer.is_running() || import.is_running(),
                                     &gui_event_tx,
                                 )
                                 .is_err()
@@ -1163,7 +1328,9 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     feedback_open
                                         || apply_owner.is_some()
                                         || transfer.is_awaiting()
-                                        || transfer.is_running(),
+                                        || transfer.is_running()
+                                        || import.is_awaiting()
+                                        || import.is_running(),
                                 )
                                 .is_err()
                                 {
@@ -1223,7 +1390,9 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     feedback_open
                                         || apply_owner.is_some()
                                         || transfer.is_awaiting()
-                                        || transfer.is_running(),
+                                        || transfer.is_running()
+                                        || import.is_awaiting()
+                                        || import.is_running(),
                                 )
                                 .is_err()
                                 {
@@ -1260,7 +1429,9 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             feedback_open
                                                 || apply_owner.is_some()
                                                 || transfer.is_awaiting()
-                                                || transfer.is_running(),
+                                                || transfer.is_running()
+                                                || import.is_awaiting()
+                                                || import.is_running(),
                                         )
                                         .is_err()
                                         {
@@ -1600,6 +1771,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     || apply_owner.is_some()
                                     || transfer.is_awaiting()
                                     || transfer.is_running()
+                                    || import.is_awaiting()
+                                    || import.is_running()
                                 {
                                     continue;
                                 }
@@ -1651,7 +1824,9 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     || dialog_owner.is_some()
                                     || apply_owner.is_some()
                                     || transfer.is_awaiting()
-                                    || transfer.is_running(),
+                                    || transfer.is_running()
+                                    || import.is_awaiting()
+                                    || import.is_running(),
                                 session.crashed,
                                 session.save_controller.is_idle(),
                             ) {
@@ -1882,6 +2057,89 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 }
                                 TransferFlowResult::Finished { .. }
                                 | TransferFlowResult::Ignored => {}
+                            }
+                            continue;
+                        }
+                        if import.is_awaiting() || import.is_running() {
+                            match import.on_choice(choice) {
+                                ImportFlowResult::StartApply {
+                                    pane,
+                                    plan,
+                                    overwrites,
+                                    cancel,
+                                } => {
+                                    discard_all_undo_slots(&mut panes, journal.as_ref());
+                                    if let Some(session) = panes.get(&pane) {
+                                        let _ = session
+                                            .engine
+                                            .send(EditorCommand::SetModifiable(false));
+                                    }
+                                    if gui_event_tx
+                                        .send(GuiEvent::ShowApplyProgress {
+                                            total: plan.ops.len(),
+                                        })
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    let worker_plan = plan.clone();
+                                    let worker_event_tx = event_tx.clone();
+                                    // copy/moveは再帰深度が読めないため既定stackを維持する。
+                                    let spawn_result = thread::Builder::new()
+                                        .name("fyler-import".to_owned())
+                                        .spawn(move || {
+                                            let report = fyler_fsops::apply::apply_import_plan_cancellable(
+                                                &worker_plan,
+                                                &overwrites,
+                                                &cancel,
+                                                &mut |progress| {
+                                                    let _ = worker_event_tx.send(
+                                                        AppEvent::ImportProgress(progress),
+                                                    );
+                                                },
+                                            );
+                                            let _ = worker_event_tx
+                                                .send(AppEvent::ImportFinished(report));
+                                        });
+                                    if let Err(error) = spawn_result {
+                                        let error =
+                                            format!("Failed to start import worker: {error}");
+                                        let report = CommitReport {
+                                            results: plan
+                                                .ops
+                                                .into_iter()
+                                                .map(|op| OpResult {
+                                                    op,
+                                                    outcome: OpOutcome::Failed {
+                                                        error: error.clone(),
+                                                        progress: None,
+                                                    },
+                                                })
+                                                .collect(),
+                                        };
+                                        if event_tx
+                                            .send(AppEvent::ImportFinished(report))
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                                ImportFlowResult::Cancelled => {
+                                    if gui_event_tx.send(GuiEvent::CloseDialog).is_err() {
+                                        return;
+                                    }
+                                }
+                                ImportFlowResult::CancelRequested => {
+                                    if gui_event_tx
+                                        .send(GuiEvent::ApplyCancelRequested)
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                ImportFlowResult::Finished { .. }
+                                | ImportFlowResult::Ignored => {}
                             }
                             continue;
                         }
@@ -2171,6 +2429,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                         let other_busy = apply_owner.is_some()
                             || transfer.is_awaiting()
                             || transfer.is_running()
+                            || import.is_awaiting()
+                            || import.is_running()
                             || if showed_dialog {
                                 dialog_owner != Some(pane_id)
                             } else {
@@ -2301,6 +2561,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                             && !session.deferred_changes.is_empty()
                             && apply_owner.is_none()
                             && !transfer.is_running()
+                            && !import.is_running()
                         {
                             let changed_paths = std::mem::take(&mut session.deferred_changes);
                             if handle_external_change(
@@ -2635,6 +2896,83 @@ pub(super) fn run() -> anyhow::Result<()> {
                             }
                         }
                     }
+                    AppEvent::ImportProgress(progress) => {
+                        if import.is_running()
+                            && gui_event_tx
+                                .send(GuiEvent::ImportProgress(progress))
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    AppEvent::ImportFinished(report) => {
+                        let ImportFlowResult::Finished {
+                            pane,
+                            effect,
+                            report,
+                        } = import.on_finished(report)
+                        else {
+                            continue;
+                        };
+                        let mut reconcile_error = None;
+                        if let Some(session) = panes.get_mut(&pane) {
+                            if let Err(error) = session.save_controller.reconcile_after_transfer()
+                            {
+                                reconcile_error = Some(format!("pane {pane}: {error:#}"));
+                            }
+                            if !session.save_controller.is_offline() {
+                                let _ =
+                                    session.engine.send(EditorCommand::SetModifiable(true));
+                            }
+                            if send_view_state(&gui_event_tx, pane, &mut session.save_controller)
+                                .is_err()
+                            {
+                                return;
+                            }
+                            git.request(pane, session.root.clone());
+                        }
+                        if gui_event_tx
+                            .send(GuiEvent::ShowImportReport { report, effect })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        if let Some(error) = reconcile_error
+                            && send_gui_message(
+                                &gui_event_tx,
+                                pane,
+                                MessageKind::Error,
+                                format!(
+                                    "A folder became offline or unreachable after import and will retry automatically: {error}"
+                                ),
+                            )
+                            .is_err()
+                        {
+                            return;
+                        }
+                        let pane_ids = panes.keys().copied().collect::<Vec<_>>();
+                        for deferred_id in pane_ids {
+                            let Some(deferred) = panes.get_mut(&deferred_id) else {
+                                continue;
+                            };
+                            if deferred.deferred_changes.is_empty() {
+                                continue;
+                            }
+                            let changed_paths = std::mem::take(&mut deferred.deferred_changes);
+                            if handle_external_change(
+                                deferred_id,
+                                &changed_paths,
+                                &mut deferred.save_controller,
+                                &gui_event_tx,
+                                &mut git,
+                                &deferred.root,
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
                     AppEvent::ExternalChange(pane_id, change) => {
                         let mut by_pane = BTreeMap::<PaneId, BTreeSet<PathBuf>>::new();
                         by_pane.entry(pane_id).or_default().extend(change.paths);
@@ -2676,7 +3014,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                             };
                             if should_defer_external_change(
                                 apply_owner.is_some(),
-                                transfer.is_running(),
+                                transfer.is_running() || import.is_running(),
                                 loader_owner.as_ref().is_some_and(|owner| {
                                     owner.pane_id == changed_id && owner.loads_directory()
                                 }),
@@ -2697,6 +3035,24 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         changed_id,
                                         MessageKind::Warn,
                                         "Transfer was cancelled because files changed externally. Review the changes and try again.",
+                                    )
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                let import_invalidated =
+                                    import.invalidate_if_involves(changed_id);
+                                if import_invalidated
+                                    && gui_event_tx.send(GuiEvent::CloseDialog).is_err()
+                                {
+                                    return;
+                                }
+                                if import_invalidated
+                                    && send_gui_message(
+                                        &gui_event_tx,
+                                        changed_id,
+                                        MessageKind::Warn,
+                                        "Paste was cancelled because files changed externally. Review the changes and try again.",
                                     )
                                     .is_err()
                                 {
@@ -2757,7 +3113,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                         }
                     }
                     AppEvent::OfflineRetryTick => {
-                        if apply_owner.is_some() || transfer.is_running() {
+                        if apply_owner.is_some() || transfer.is_running() || import.is_running() {
                             continue;
                         }
                         let pane_ids = panes.keys().copied().collect::<Vec<_>>();
@@ -3207,6 +3563,156 @@ fn handle_transfer_request(
     gui_event_tx.send(GuiEvent::ShowTransferPlan {
         plan,
         target,
+        overwrites: preflight.overwritable,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_clipboard_paste_request(
+    pane_id: PaneId,
+    line: usize,
+    panes: &BTreeMap<PaneId, PaneSession>,
+    globally_busy: bool,
+    import: &mut ImportController,
+    gui_event_tx: &CountingSender<GuiEvent>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    let Some(session) = panes.get(&pane_id) else {
+        return Ok(());
+    };
+    let snapshot = session.engine.snapshot();
+    let pane_state = TransferPaneState {
+        dirty: snapshot.dirty,
+        idle: session.save_controller.is_idle(),
+        crashed: session.crashed,
+        offline: session.save_controller.is_offline(),
+    };
+    if let Some(reason) = import_flow::start_rejection(pane_state, globally_busy) {
+        return send_gui_message(gui_event_tx, pane_id, MessageKind::Info, reason);
+    }
+    let clipboard = match fyler_fsops::clipboard::read() {
+        Ok(Some(files)) => files,
+        Ok(None) => {
+            return send_gui_message(gui_event_tx, pane_id, MessageKind::Info, "Nothing to paste");
+        }
+        Err(error) => {
+            return send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Error,
+                format!("Failed to read the clipboard: {error:#}"),
+            );
+        }
+    };
+    let target_is_empty = session.save_controller.visible_lines().is_empty();
+    let resolved = session.save_controller.resolve_line(&snapshot.lines, line);
+    start_import(
+        pane_id,
+        clipboard.paths,
+        clipboard.effect,
+        target_is_empty,
+        resolved,
+        &session.root,
+        import,
+        gui_event_tx,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_files_dropped(
+    pane_id: PaneId,
+    line: Option<usize>,
+    paths: Vec<PathBuf>,
+    effect: DropEffect,
+    panes: &BTreeMap<PaneId, PaneSession>,
+    globally_busy: bool,
+    picker_open: bool,
+    import: &mut ImportController,
+    gui_event_tx: &CountingSender<GuiEvent>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let Some(session) = panes.get(&pane_id) else {
+        return Ok(());
+    };
+    if picker_open {
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Info,
+            "Close the open dialog before dropping files",
+        );
+    }
+    let snapshot = session.engine.snapshot();
+    let pane_state = TransferPaneState {
+        dirty: snapshot.dirty,
+        idle: session.save_controller.is_idle(),
+        crashed: session.crashed,
+        offline: session.save_controller.is_offline(),
+    };
+    if let Some(reason) = import_flow::start_rejection(pane_state, globally_busy) {
+        return send_gui_message(gui_event_tx, pane_id, MessageKind::Info, reason);
+    }
+    let target_is_empty = line.is_none();
+    let resolved =
+        line.and_then(|line| session.save_controller.resolve_line(&snapshot.lines, line));
+    start_import(
+        pane_id,
+        paths,
+        effect,
+        target_is_empty,
+        resolved,
+        &session.root,
+        import,
+        gui_event_tx,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_import(
+    pane_id: PaneId,
+    sources: Vec<PathBuf>,
+    effect: DropEffect,
+    target_is_empty: bool,
+    resolved: Option<(TreePath, EntryKind)>,
+    root: &Path,
+    import: &mut ImportController,
+    gui_event_tx: &CountingSender<GuiEvent>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    let Some(destination_tp) = destination_directory(target_is_empty, resolved) else {
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            "Failed to resolve cursor position for paste",
+        );
+    };
+    let destination = destination_tp.to_fs_path(root);
+    let plan = ImportPlan::build(sources, destination, effect);
+    if plan.is_empty() {
+        return send_gui_message(gui_event_tx, pane_id, MessageKind::Info, "Nothing to paste");
+    }
+    let preflight = fyler_fsops::preflight_import(&plan);
+    if !preflight.blocked.is_empty() {
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            format!(
+                "Some paths cannot be pasted: {}",
+                preflight
+                    .blocked
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
+    import.begin(pane_id, plan.clone(), preflight.overwritable.clone());
+    gui_event_tx.send(GuiEvent::ShowImportPlan {
+        pane_id,
+        plan,
         overwrites: preflight.overwritable,
     })
 }
