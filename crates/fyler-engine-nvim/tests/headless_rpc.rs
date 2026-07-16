@@ -318,6 +318,90 @@ async fn transfer_keymaps_emit_normal_and_visual_requests() -> anyhow::Result<()
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a compatible nvim executable"]
+async fn clipboard_copy_and_cut_keymaps_emit_normal_and_visual_requests() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+    engine.set_initial_lines(vec![
+        EditorLine::new("/001 a.txt"),
+        EditorLine::new("/002 b.txt"),
+        EditorLine::new("/003 c.txt"),
+    ])?;
+    wait_for(&engine, |line| line == "/001 a.txt").await?;
+
+    engine.send(EditorCommand::Key(KeyInput {
+        key: Key::Char('c'),
+        mods: Modifiers {
+            ctrl: true,
+            alt: false,
+            shift: false,
+        },
+    }))?;
+    wait_for_event(
+        &mut events,
+        |event| matches!(event, EditorEvent::ClipboardCopyRequested { lines } if lines == &[0]),
+    )
+    .await
+    .context("Ctrl+C did not emit ClipboardCopyRequested")?;
+
+    engine.send(key_command(Key::Char('V')))?;
+    engine.send(key_command(Key::Down))?;
+    engine.send(EditorCommand::Key(KeyInput {
+        key: Key::Char('x'),
+        mods: Modifiers {
+            ctrl: true,
+            alt: false,
+            shift: false,
+        },
+    }))?;
+    wait_for_event(
+        &mut events,
+        |event| matches!(event, EditorEvent::ClipboardCutRequested { lines } if lines == &[0, 1]),
+    )
+    .await
+    .context("visual Ctrl+X did not emit a ranged ClipboardCutRequested")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn clipboard_paste_keymap_emits_request_at_cursor_line() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+    engine.set_initial_lines(vec![
+        EditorLine::new("/001 a.txt"),
+        EditorLine::new("/002 b.txt"),
+    ])?;
+    wait_for(&engine, |line| line == "/001 a.txt").await?;
+
+    engine.send(key_command(Key::Down))?;
+    engine.send(EditorCommand::Key(KeyInput {
+        key: Key::Char('v'),
+        mods: Modifiers {
+            ctrl: true,
+            alt: false,
+            shift: false,
+        },
+    }))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::ClipboardPasteRequested { line: 1 })
+    })
+    .await
+    .context("Ctrl+V did not emit ClipboardPasteRequested at the cursor line")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
 async fn character_waiting_commands_do_not_block_following_input() -> anyhow::Result<()> {
     let _serial = NVIM_TEST_SERIAL.lock().await;
     let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")

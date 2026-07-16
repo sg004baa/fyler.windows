@@ -43,6 +43,9 @@ fn binding_payload(action: EditorAction) -> BindingPayload {
         OpenWith => ("open_with", None, &["n"]),
         TransferMove => ("transfer", Some("move"), &["n", "x"]),
         TransferCopy => ("transfer", Some("copy"), &["n", "x"]),
+        ClipboardCopy => ("clipboard", Some("copy"), &["n", "x"]),
+        ClipboardCut => ("clipboard", Some("cut"), &["n", "x"]),
+        ClipboardPaste => ("clipboard", Some("paste"), &["n", "x"]),
         ToggleDockFocus => ("dock_focus", None, &["n"]),
         Help => ("help", None, &["n"]),
         PaneSplitHorizontal => ("pane", Some("split_horizontal"), &["n"]),
@@ -301,6 +304,21 @@ local function request_transfer(kind, visual)
   vim.rpcnotify(channel, "fyler_transfer", kind, first, last)
 end
 
+local function request_clipboard(kind, visual)
+  local cursor = vim.api.nvim_win_get_cursor(0)[1] - 1
+  if kind == "paste" then
+    vim.rpcnotify(channel, "fyler_clipboard_paste", cursor)
+    return
+  end
+  local first, last = cursor, cursor
+  if visual then
+    local anchor = vim.fn.line("v") - 1
+    first = math.min(anchor, cursor)
+    last = math.max(anchor, cursor)
+  end
+  vim.rpcnotify(channel, "fyler_clipboard", kind, first, last)
+end
+
 local function dispatch(binding)
   local line = vim.api.nvim_win_get_cursor(0)[1] - 1
   if binding.kind == "activate" then
@@ -321,6 +339,8 @@ local function dispatch(binding)
     vim.rpcnotify(channel, "fyler_open_with", line)
   elseif binding.kind == "transfer" then
     request_transfer(binding.arg, vim.fn.mode():sub(1, 1) ~= "n")
+  elseif binding.kind == "clipboard" then
+    request_clipboard(binding.arg, vim.fn.mode():sub(1, 1) ~= "n")
   elseif binding.kind == "dock_focus" then
     vim.rpcnotify(channel, "fyler_dock_focus")
   elseif binding.kind == "help" then
@@ -519,6 +539,9 @@ mod tests {
             (OpenWith, "open_with", None, &["n"][..]),
             (TransferMove, "transfer", Some("move"), &["n", "x"][..]),
             (TransferCopy, "transfer", Some("copy"), &["n", "x"][..]),
+            (ClipboardCopy, "clipboard", Some("copy"), &["n", "x"][..]),
+            (ClipboardCut, "clipboard", Some("cut"), &["n", "x"][..]),
+            (ClipboardPaste, "clipboard", Some("paste"), &["n", "x"][..]),
             (ToggleDockFocus, "dock_focus", None, &["n"][..]),
             (Help, "help", None, &["n"][..]),
             (
@@ -560,7 +583,7 @@ mod tests {
     fn defaults_split_into_normal_maps_and_ctrl_w_trie() {
         let bindings = fyler_core::keymap::default_bindings(fyler_core::keymap::default_leader());
         let (normal, trie) = binding_values(&bindings);
-        assert_eq!(normal.as_array().unwrap().len(), 18);
+        assert_eq!(normal.as_array().unwrap().len(), 21);
         let trie = trie.as_map().unwrap();
         assert_eq!(trie.len(), 12);
         assert!(trie.iter().any(|(key, _)| key.as_str() == Some("<C-w>")));
