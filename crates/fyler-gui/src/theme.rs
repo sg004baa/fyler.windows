@@ -11,7 +11,7 @@ pub const BORDER_SUBTLE: egui::Color32 = egui::Color32::from_rgb(31, 31, 35);
 pub const TEXT: egui::Color32 = egui::Color32::from_rgb(232, 230, 227);
 pub const TEXT_SECONDARY: egui::Color32 = egui::Color32::from_rgb(181, 178, 172);
 pub const TEXT_MUTED: egui::Color32 = egui::Color32::from_rgb(117, 114, 108);
-pub const TEXT_FAINT: egui::Color32 = egui::Color32::from_rgb(74, 72, 68);
+pub const TEXT_FAINT: egui::Color32 = egui::Color32::from_rgb(126, 122, 114);
 pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(255, 107, 26);
 /// active pane枠やカーソル行バーに使う、主張を抑えた暗いオレンジ。
 pub const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(138, 66, 30);
@@ -119,7 +119,29 @@ mod tests {
             u16::from(TEXT.r()) + u16::from(TEXT.g()) + u16::from(TEXT.b())
                 > u16::from(TEXT_MUTED.r()) + u16::from(TEXT_MUTED.g()) + u16::from(TEXT_MUTED.b())
         );
+        assert!(contrast_ratio(TEXT_FAINT, CANVAS) >= 3.0);
         assert_ne!(ACCENT, RED);
         assert_eq!(TREE_ROW_HEIGHT, 24.0);
+    }
+
+    fn contrast_ratio(foreground: egui::Color32, background: egui::Color32) -> f32 {
+        let lighter = relative_luminance(foreground).max(relative_luminance(background));
+        let darker = relative_luminance(foreground).min(relative_luminance(background));
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    fn relative_luminance(color: egui::Color32) -> f32 {
+        0.2126 * linearize(color.r())
+            + 0.7152 * linearize(color.g())
+            + 0.0722 * linearize(color.b())
+    }
+
+    fn linearize(component: u8) -> f32 {
+        let channel = f32::from(component) / 255.0;
+        if channel <= 0.03928 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
     }
 }
