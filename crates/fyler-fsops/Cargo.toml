@@ -14,6 +14,7 @@ fyler-core.workspace = true
 anyhow.workspace = true
 trash.workspace = true
 notify.workspace = true
+ignore = "0.4.29"
 
 # windowsクレートに依存してよいのはこのクレートだけ(AGENTS.md 絶対ルール3の周辺)
 [target.'cfg(windows)'.dependencies]

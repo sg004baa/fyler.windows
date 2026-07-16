@@ -1573,6 +1573,11 @@ fn draw_file_picker(
             *needs_focus = false;
         }
         query_changed = response.changed();
+        if query_changed {
+            // 入力が変わったら選択を先頭へ戻す。workerの新結果を待たず、この
+            // フレームの描画から先頭ハイライトにする。
+            *selected = 0;
+        }
 
         ui.add_space(6.0);
         if indexing {
