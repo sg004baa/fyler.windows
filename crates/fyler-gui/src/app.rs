@@ -159,6 +159,12 @@ pub enum GuiEvent {
         offline: bool,
         unreadable: usize,
     },
+    /// paneのnavigation historyのback/forward可用性をtoolbarへ反映する。
+    HistoryState {
+        pane_id: PaneId,
+        can_go_back: bool,
+        can_go_forward: bool,
+    },
     /// 表示中のエントリIDに対応する表示用メタデータを全件差し替える。
     FileInfos {
         pane_id: PaneId,
@@ -400,6 +406,8 @@ struct PaneViewState {
     collapsed_dirs: HashSet<EntryId>,
     engine_error: Option<String>,
     tree_viewport: Option<tree_view::TreeViewport>,
+    can_go_back: bool,
+    can_go_forward: bool,
 }
 
 impl FylerApp {
@@ -493,6 +501,8 @@ impl FylerApp {
                             collapsed_dirs: HashSet::new(),
                             engine_error: None,
                             tree_viewport: None,
+                            can_go_back: false,
+                            can_go_forward: false,
                         },
                     );
                 }
@@ -524,6 +534,9 @@ impl FylerApp {
                     EditorEvent::NavigateInto { .. } => {}
                     EditorEvent::OpenTerminal { .. } => {}
                     EditorEvent::NavigateParent => {}
+                    EditorEvent::HistoryBack => {}
+                    EditorEvent::HistoryForward => {}
+                    EditorEvent::RefreshRequested => {}
                     EditorEvent::ChangeDirectory { .. } => {}
                     EditorEvent::ChangeSort { .. } => {}
                     EditorEvent::ToggleHidden => {}
@@ -608,6 +621,16 @@ impl FylerApp {
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
                         pane.offline = offline;
                         pane.unreadable = unreadable;
+                    }
+                }
+                GuiEvent::HistoryState {
+                    pane_id,
+                    can_go_back,
+                    can_go_forward,
+                } => {
+                    if let Some(pane) = self.panes.get_mut(&pane_id) {
+                        pane.can_go_back = can_go_back;
+                        pane.can_go_forward = can_go_forward;
                     }
                 }
                 GuiEvent::FileInfos { pane_id, infos } => {
@@ -850,25 +873,37 @@ impl eframe::App for FylerApp {
 
         let chrome_state = self.active.and_then(|pane_id| {
             let pane = self.panes.get(&pane_id)?;
-            Some((pane_id, pane.root.clone()))
+            Some((
+                pane_id,
+                pane.root.clone(),
+                pane.can_go_back,
+                pane.can_go_forward,
+            ))
         });
         let mut chrome_action = None;
         egui::Panel::top("fyler-toolbar")
             .exact_size(theme::TOOLBAR_HEIGHT)
             .show(ui, |ui| {
-                chrome_action = chrome::draw_toolbar(ui);
+                let (can_go_back, can_go_forward) = chrome_state
+                    .as_ref()
+                    .map(|(_, _, back, forward)| (*back, *forward))
+                    .unwrap_or((false, false));
+                chrome_action = chrome::draw_toolbar(ui, can_go_back, can_go_forward);
             });
         let navigation_entries = chrome_state
             .as_ref()
-            .map(|(_, root)| {
+            .map(|(_, root, ..)| {
                 chrome::navigation_entries(root, &self.bookmarks, &self.recent_roots, &self.drives)
             })
             .unwrap_or_default();
         if self.dialog.is_none()
-            && let (Some((pane_id, _)), Some(action)) = (chrome_state.as_ref(), chrome_action)
+            && let (Some((pane_id, ..)), Some(action)) = (chrome_state.as_ref(), chrome_action)
         {
             let event = match action {
                 chrome::ChromeAction::NavigateParent => EditorEvent::NavigateParent,
+                chrome::ChromeAction::HistoryBack => EditorEvent::HistoryBack,
+                chrome::ChromeAction::HistoryForward => EditorEvent::HistoryForward,
+                chrome::ChromeAction::Refresh => EditorEvent::RefreshRequested,
             };
             if self
                 .action_tx
@@ -2105,6 +2140,8 @@ mod tests {
                         collapsed_dirs: HashSet::new(),
                         engine_error: None,
                         tree_viewport: None,
+                        can_go_back: false,
+                        can_go_forward: false,
                     },
                 ),
                 (
@@ -2121,6 +2158,8 @@ mod tests {
                         collapsed_dirs: HashSet::new(),
                         engine_error: None,
                         tree_viewport: None,
+                        can_go_back: false,
+                        can_go_forward: false,
                     },
                 ),
             ]),
