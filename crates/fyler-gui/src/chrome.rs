@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
-use crate::confirm::IconStyle;
 use crate::{icon, theme};
 
 pub const NAV_RAIL_WIDTH: f32 = 208.0;
@@ -153,7 +152,6 @@ pub(crate) fn draw_navigation_rail(
     entries: &[NavigationEntry],
     focused: bool,
     selected: usize,
-    icon_style: IconStyle,
 ) -> Option<usize> {
     ui.set_clip_rect(ui.max_rect());
     ui.painter().rect_filled(ui.max_rect(), 0.0, theme::SURFACE);
@@ -185,7 +183,6 @@ pub(crate) fn draw_navigation_rail(
                     &entry.label,
                     entry.current,
                     focused && selected == index,
-                    icon_style,
                 );
                 if focused && selected == index {
                     response.scroll_to_me(None);
@@ -225,7 +222,6 @@ fn navigation_row(
     label: &str,
     current: bool,
     focused_selection: bool,
-    icon_style: IconStyle,
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), theme::TREE_ROW_HEIGHT),
@@ -257,16 +253,34 @@ fn navigation_row(
             egui::StrokeKind::Inside,
         );
     }
-    ui.painter().text(
-        egui::pos2(rect.left() + 14.0, rect.center().y),
+    let color = if focused_selection || current {
+        theme::TEXT
+    } else {
+        theme::TEXT_SECONDARY
+    };
+    let painter = ui.painter();
+    let label_font = egui::FontId::monospace(12.0);
+    let icon_galley = painter.layout_no_wrap(
+        icon::directory().to_owned(),
+        egui::FontId::new(12.0, icon::font_family()),
+        color,
+    );
+    let icon_x = rect.left() + 14.0;
+    painter.galley(
+        egui::pos2(icon_x, rect.center().y - icon_galley.size().y / 2.0),
+        icon_galley.clone(),
+        color,
+    );
+    let gap = painter
+        .layout_no_wrap("  ".to_owned(), label_font.clone(), color)
+        .size()
+        .x;
+    painter.text(
+        egui::pos2(icon_x + icon_galley.size().x + gap, rect.center().y),
         egui::Align2::LEFT_CENTER,
-        format!("{}  {label}", icon::directory(icon_style)),
-        egui::FontId::monospace(12.0),
-        if focused_selection || current {
-            theme::TEXT
-        } else {
-            theme::TEXT_SECONDARY
-        },
+        label,
+        label_font,
+        color,
     );
     response
 }

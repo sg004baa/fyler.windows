@@ -1,34 +1,43 @@
 //! バッファ文字列に含めないツリーアイコン装飾。
+//!
+//! アイコンは常に組み込みNerd Fontグリフを使う。`config.font`の指定に
+//! 左右されないよう、専用フォントファミリ([`font_family`])で描画する。
 
 use std::path::Path;
 
+use eframe::egui;
 use fyler_core::grammar;
 
-use crate::confirm::IconStyle;
+const DIRECTORY: &str = " ";
+const DIRECTORY_OPEN: &str = " ";
+const FILE: &str = " ";
+const RUST: &str = " ";
+const MARKDOWN: &str = " ";
+const TEXT: &str = " ";
+const TOML: &str = " ";
 
-pub const DIRECTORY: &str = "D";
-pub const DIRECTORY_OPEN: &str = "O";
-pub const FILE: &str = "F";
-pub const RUST: &str = "R";
-pub const MARKDOWN: &str = "M";
-pub const TEXT: &str = "T";
-pub const CONFIG: &str = "C";
+/// アイコン描画専用のフォントファミリ名。組み込みフォントだけを含み、
+/// `config.font`に影響されずアイコンが同一に描画されることを保証する。
+pub const FONT_FAMILY_NAME: &str = "fyler-icons";
 
-const NERD_DIRECTORY: &str = " ";
-const NERD_DIRECTORY_OPEN: &str = " ";
-const NERD_FILE: &str = " ";
-const NERD_RUST: &str = " ";
-const NERD_MARKDOWN: &str = " ";
-const NERD_TEXT: &str = " ";
-const NERD_TOML: &str = " ";
+/// アイコン描画専用のフォントファミリを返す。
+pub fn font_family() -> egui::FontFamily {
+    egui::FontFamily::Name(FONT_FAMILY_NAME.into())
+}
 
-/// conceal済みの表示名に対応するASCIIアイコンを返す。
+/// 左ドック(ブックマーク・ドライブ)用のディレクトリアイコン。
+pub fn directory() -> &'static str {
+    DIRECTORY
+}
+
+/// conceal済みの表示名と展開状態に対応するNerd Fontアイコンを返す。
 ///
-/// ASCIIだけを使い、eguiの既定フォントでも欠けないようにする。
-pub fn for_display_name(display_name: &str) -> &'static str {
+/// ディレクトリは展開状態でグリフを切り替える。拡張子判定は大文字小文字を
+/// 区別しない。
+pub fn for_display_name(display_name: &str, expanded: bool) -> &'static str {
     let (name, is_dir) = grammar::split_dir_suffix(display_name);
     if is_dir {
-        return DIRECTORY;
+        return if expanded { DIRECTORY_OPEN } else { DIRECTORY };
     }
 
     match Path::new(name)
@@ -38,60 +47,8 @@ pub fn for_display_name(display_name: &str) -> &'static str {
         Some(extension) if extension.eq_ignore_ascii_case("rs") => RUST,
         Some(extension) if extension.eq_ignore_ascii_case("md") => MARKDOWN,
         Some(extension) if extension.eq_ignore_ascii_case("txt") => TEXT,
-        Some(extension) if extension.eq_ignore_ascii_case("toml") => CONFIG,
+        Some(extension) if extension.eq_ignore_ascii_case("toml") => TOML,
         _ => FILE,
-    }
-}
-
-/// 指定スタイルのディレクトリアイコン(左ドックのブックマーク・ドライブ用)。
-pub fn directory(style: IconStyle) -> &'static str {
-    match style {
-        IconStyle::Ascii => DIRECTORY,
-        IconStyle::Nerd => NERD_DIRECTORY,
-    }
-}
-
-/// conceal済みの表示名と指定スタイルに対応するアイコンを返す。
-///
-/// Nerd Font非対応フォントではNerdアイコンがtofuになる。既定は
-/// [`IconStyle::Ascii`]で、ユーザーが`config.toml`で明示的に有効化する。
-pub fn for_display_name_styled(display_name: &str, style: IconStyle) -> &'static str {
-    if style == IconStyle::Ascii {
-        return for_display_name(display_name);
-    }
-
-    let (name, is_dir) = grammar::split_dir_suffix(display_name);
-    if is_dir {
-        return NERD_DIRECTORY;
-    }
-
-    match Path::new(name)
-        .extension()
-        .and_then(|extension| extension.to_str())
-    {
-        Some(extension) if extension.eq_ignore_ascii_case("rs") => NERD_RUST,
-        Some(extension) if extension.eq_ignore_ascii_case("md") => NERD_MARKDOWN,
-        Some(extension) if extension.eq_ignore_ascii_case("txt") => NERD_TEXT,
-        Some(extension) if extension.eq_ignore_ascii_case("toml") => NERD_TOML,
-        _ => NERD_FILE,
-    }
-}
-
-/// conceal済みの表示名と展開状態、指定スタイルに対応するアイコンを返す。
-pub fn for_display_name_styled_with_expanded(
-    display_name: &str,
-    style: IconStyle,
-    expanded: bool,
-) -> &'static str {
-    let (_, is_dir) = grammar::split_dir_suffix(display_name);
-    if !is_dir {
-        return for_display_name_styled(display_name, style);
-    }
-    match (style, expanded) {
-        (IconStyle::Ascii, true) => DIRECTORY_OPEN,
-        (IconStyle::Ascii, false) => DIRECTORY,
-        (IconStyle::Nerd, true) => NERD_DIRECTORY_OPEN,
-        (IconStyle::Nerd, false) => NERD_DIRECTORY,
     }
 }
 
@@ -101,81 +58,29 @@ mod tests {
 
     #[test]
     fn selects_directory_icon_from_grammar_suffix() {
-        assert_eq!(for_display_name("  src/"), DIRECTORY);
+        assert_eq!(for_display_name("  src/", false), DIRECTORY);
+    }
+
+    #[test]
+    fn directory_icon_changes_by_expanded_state() {
+        assert_eq!(for_display_name("src/", false), DIRECTORY);
+        assert_eq!(for_display_name("src/", true), DIRECTORY_OPEN);
+        // ファイルは展開状態に影響されない。
+        assert_eq!(for_display_name("main.rs", true), RUST);
+        assert_eq!(for_display_name("main.rs", false), RUST);
     }
 
     #[test]
     fn selects_icons_for_supported_extensions_case_insensitively() {
-        assert_eq!(for_display_name("main.rs"), RUST);
-        assert_eq!(for_display_name("README.MD"), MARKDOWN);
-        assert_eq!(for_display_name("notes.txt"), TEXT);
-        assert_eq!(for_display_name("Cargo.toml"), CONFIG);
+        assert_eq!(for_display_name("main.rs", false), RUST);
+        assert_eq!(for_display_name("README.MD", false), MARKDOWN);
+        assert_eq!(for_display_name("notes.TXT", false), TEXT);
+        assert_eq!(for_display_name("Cargo.TOML", false), TOML);
     }
 
     #[test]
     fn selects_general_file_icon_for_other_files() {
-        assert_eq!(for_display_name("archive.zip"), FILE);
-        assert_eq!(for_display_name("LICENSE"), FILE);
-    }
-
-    #[test]
-    fn expanded_directory_icon_changes_by_state() {
-        assert_eq!(
-            for_display_name_styled_with_expanded("src/", IconStyle::Ascii, false),
-            DIRECTORY
-        );
-        assert_eq!(
-            for_display_name_styled_with_expanded("src/", IconStyle::Ascii, true),
-            DIRECTORY_OPEN
-        );
-        assert_eq!(
-            for_display_name_styled_with_expanded("main.rs", IconStyle::Ascii, true),
-            RUST
-        );
-    }
-
-    #[test]
-    fn styled_ascii_icons_match_existing_mapping() {
-        for name in [
-            "src/",
-            "main.rs",
-            "README.md",
-            "notes.txt",
-            "Cargo.toml",
-            "archive.zip",
-        ] {
-            assert_eq!(
-                for_display_name_styled(name, IconStyle::Ascii),
-                for_display_name(name)
-            );
-        }
-    }
-
-    #[test]
-    fn styled_nerd_icons_cover_directories_and_supported_extensions() {
-        assert_eq!(
-            for_display_name_styled("src/", IconStyle::Nerd),
-            NERD_DIRECTORY
-        );
-        assert_eq!(
-            for_display_name_styled("main.rs", IconStyle::Nerd),
-            NERD_RUST
-        );
-        assert_eq!(
-            for_display_name_styled("README.MD", IconStyle::Nerd),
-            NERD_MARKDOWN
-        );
-        assert_eq!(
-            for_display_name_styled("notes.txt", IconStyle::Nerd),
-            NERD_TEXT
-        );
-        assert_eq!(
-            for_display_name_styled("Cargo.toml", IconStyle::Nerd),
-            NERD_TOML
-        );
-        assert_eq!(
-            for_display_name_styled("archive.zip", IconStyle::Nerd),
-            NERD_FILE
-        );
+        assert_eq!(for_display_name("archive.zip", false), FILE);
+        assert_eq!(for_display_name("LICENSE", false), FILE);
     }
 }
