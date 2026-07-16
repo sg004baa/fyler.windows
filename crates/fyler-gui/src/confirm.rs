@@ -234,13 +234,7 @@ pub fn draw_plan(
                     let cancel_clicked = ui
                         .add(egui::Button::new("Cancel  esc").frame(false))
                         .clicked();
-                    if approve_clicked || key_choice == Some(ConfirmChoice::Approve) {
-                        Some(ConfirmChoice::Approve)
-                    } else if cancel_clicked || key_choice == Some(ConfirmChoice::Cancel) {
-                        Some(ConfirmChoice::Cancel)
-                    } else {
-                        None
-                    }
+                    confirm_choice_from_buttons(approve_clicked, cancel_clicked, key_choice)
                 })
                 .inner
             })
@@ -290,13 +284,7 @@ pub fn draw_transfer_plan(
                 };
                 let approve_clicked = ui.button(approve_label).clicked();
                 let cancel_clicked = ui.button("Cancel (n / Esc)").clicked();
-                if approve_clicked || key_choice == Some(ConfirmChoice::Approve) {
-                    Some(ConfirmChoice::Approve)
-                } else if cancel_clicked || key_choice == Some(ConfirmChoice::Cancel) {
-                    Some(ConfirmChoice::Cancel)
-                } else {
-                    None
-                }
+                confirm_choice_from_buttons(approve_clicked, cancel_clicked, key_choice)
             })
             .inner
         })
@@ -329,13 +317,7 @@ pub fn draw_undo_plan(ui: &mut egui::Ui, lines: &[String]) -> Option<ConfirmChoi
             ui.horizontal(|ui| {
                 let approve_clicked = ui.button("Undo (y)").clicked();
                 let cancel_clicked = ui.button("Cancel (n / Esc)").clicked();
-                if approve_clicked || key_choice == Some(ConfirmChoice::Approve) {
-                    Some(ConfirmChoice::Approve)
-                } else if cancel_clicked || key_choice == Some(ConfirmChoice::Cancel) {
-                    Some(ConfirmChoice::Cancel)
-                } else {
-                    None
-                }
+                confirm_choice_from_buttons(approve_clicked, cancel_clicked, key_choice)
             })
             .inner
         })
@@ -594,13 +576,7 @@ pub fn draw_undo_recovery(ui: &mut egui::Ui, descriptions: &[String]) -> Option<
             ui.horizontal(|ui| {
                 let discard_clicked = ui.button("Discard (y)").clicked();
                 let keep_clicked = ui.button("Keep and close (n / Esc)").clicked();
-                if discard_clicked || key_choice == Some(ConfirmChoice::Approve) {
-                    Some(ConfirmChoice::Approve)
-                } else if keep_clicked || key_choice == Some(ConfirmChoice::Cancel) {
-                    Some(ConfirmChoice::Cancel)
-                } else {
-                    None
-                }
+                confirm_choice_from_buttons(discard_clicked, keep_clicked, key_choice)
             })
             .inner
         })
@@ -840,6 +816,20 @@ fn plan_choice_from_keys(y: bool, enter: bool, n: bool, esc: bool) -> Option<Con
     }
 }
 
+fn confirm_choice_from_buttons(
+    approve_clicked: bool,
+    cancel_clicked: bool,
+    key_choice: Option<ConfirmChoice>,
+) -> Option<ConfirmChoice> {
+    if approve_clicked {
+        Some(ConfirmChoice::Approve)
+    } else if cancel_clicked {
+        Some(ConfirmChoice::Cancel)
+    } else {
+        key_choice
+    }
+}
+
 fn report_label(result: &OpResult) -> String {
     let operation = operation_label(&result.op);
     outcome_label(operation, &result.outcome)
@@ -1000,6 +990,22 @@ mod tests {
             Some(ConfirmChoice::Cancel)
         );
         assert_eq!(plan_choice_from_keys(false, false, false, false), None);
+    }
+
+    #[test]
+    fn confirm_buttons_take_priority_over_keyboard_choice() {
+        assert_eq!(
+            confirm_choice_from_buttons(false, true, Some(ConfirmChoice::Approve)),
+            Some(ConfirmChoice::Cancel)
+        );
+        assert_eq!(
+            confirm_choice_from_buttons(true, false, Some(ConfirmChoice::Cancel)),
+            Some(ConfirmChoice::Approve)
+        );
+        assert_eq!(
+            confirm_choice_from_buttons(false, false, Some(ConfirmChoice::Approve)),
+            Some(ConfirmChoice::Approve)
+        );
     }
 
     #[test]
