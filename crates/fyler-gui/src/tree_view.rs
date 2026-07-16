@@ -10,7 +10,6 @@ use fyler_core::grammar::PrefixParse;
 use fyler_core::id::EntryId;
 use fyler_core::pane::PaneId;
 
-use crate::confirm::IconStyle;
 use crate::{conceal, icon, theme};
 
 /// 1階層ぶんの装飾インデント。文字列のタブ幅とは独立したGUI座標。
@@ -56,12 +55,12 @@ pub fn draw(
     incomplete_dirs: &HashSet<EntryId>,
     collapsed_dirs: &HashSet<EntryId>,
     file_infos: &HashMap<EntryId, FileInfo>,
-    icon_style: IconStyle,
     previous_viewport: Option<TreeViewport>,
     pane_id: PaneId,
     is_active: bool,
 ) -> TreeViewOutput {
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+    let icon_font_id = egui::FontId::new(font_id.size, icon::font_family());
     let text_color = theme::TEXT;
     let row_height = theme::TREE_ROW_HEIGHT;
     // 行間の余白をゼロにして item を詰める(pitch = 行高 24px)。
@@ -105,13 +104,12 @@ pub fn draw(
             let icon_galley = painter.layout_no_wrap(
                 format!(
                     "{} ",
-                    icon::for_display_name_styled_with_expanded(
+                    icon::for_display_name(
                         concealed.display,
-                        icon_style,
                         line_is_expanded_dir(&line.text, collapsed_dirs),
                     )
                 ),
-                font_id.clone(),
+                icon_font_id.clone(),
                 icon_color,
             );
             let badge = badge_for_line(&line.text, git_badges);

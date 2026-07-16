@@ -89,6 +89,7 @@ jobs:
           Copy-Item "LICENSE-APACHE" "stage/fyler/LICENSE-APACHE"
           Copy-Item "THIRD_PARTY_LICENSES.yml" "stage/fyler/THIRD_PARTY_LICENSES.yml"
           Copy-Item "README.md" "stage/fyler/README.md"
+          Copy-Item "crates/fyler-gui/assets/fonts/LICENSE-Moralerspace.txt" "stage/fyler/LICENSE-Moralerspace.txt"
 
           $requiredPaths = @(
             "stage/fyler/fyler.exe",
@@ -96,6 +97,7 @@ jobs:
             "stage/fyler/LICENSE-APACHE",
             "stage/fyler/THIRD_PARTY_LICENSES.yml",
             "stage/fyler/README.md",
+            "stage/fyler/LICENSE-Moralerspace.txt",
             "stage/fyler/nvim/LICENSE.txt",
             "stage/fyler/nvim/bin/nvim.exe",
             "stage/fyler/nvim/lib",
