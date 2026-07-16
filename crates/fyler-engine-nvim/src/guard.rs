@@ -217,6 +217,16 @@ local function open_line_with_current_depth(command)
   return command .. string.rep("\t", line_depth(line))
 end
 
+local function continue_line_with_current_depth()
+  local row = vim.api.nvim_win_get_cursor(0)[1] - 1
+  local line = vim.api.nvim_buf_get_lines(buffer, row, row + 1, false)[1] or ""
+  local cr = vim.api.nvim_replace_termcodes("<CR>", true, false, true)
+  return cr .. string.rep("\t", line_depth(line))
+end
+
+-- o/O の dot-repeat は expr map の展開結果が再生されるため、別depthの行では
+-- 初回実行時のタブ数が残る。現状は複雑な operator 化を避け、直接操作と
+-- insert中<CR>のdepth維持を優先する。
 vim.keymap.set("n", "o", function()
   return open_line_with_current_depth("o")
 end, { buffer = buffer, expr = true, silent = true })
@@ -224,6 +234,8 @@ end, { buffer = buffer, expr = true, silent = true })
 vim.keymap.set("n", "O", function()
   return open_line_with_current_depth("O")
 end, { buffer = buffer, expr = true, silent = true })
+
+vim.keymap.set("i", "<CR>", continue_line_with_current_depth, { buffer = buffer, expr = true, silent = true })
 
 local function shift_lines(first, last, delta)
   local lines = vim.api.nvim_buf_get_lines(buffer, first, last + 1, false)

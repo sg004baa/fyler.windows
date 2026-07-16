@@ -281,4 +281,5 @@ The help dialog opened with `?` is generated from the resolved built-in and user
 omits actions with no remaining bindings and reflects added or reassigned keys.
 
 While the navigation dock has focus, use `j`/`k` or the arrow keys to move and `Enter` to change
-the active pane's root. Invoke `toggle_dock_focus` again to return keyboard input to the editor.
+the active pane's root. `Esc` returns keyboard input to the editor without closing the dock.
+Invoke `toggle_dock_focus` again to hide the dock.

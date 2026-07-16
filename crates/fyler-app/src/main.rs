@@ -398,6 +398,16 @@ fn bookmark_list_message(bookmarks: &[(String, PathBuf)], recent: &[PathBuf]) ->
     }
 }
 
+/// `handle_activate_line` の結果。呼び出し側(pane_runtime)が後続処理を分岐する。
+enum ActivateOutcome {
+    /// ファイルを開いた・エラー通知済み等、追加処理なし。
+    Done,
+    /// ディレクトリの折りたたみ/展開を適用した(git badgeの再マップが必要)。
+    Toggled,
+    /// 未ロードディレクトリの展開にはロードが必要。
+    Load(TreePath),
+}
+
 fn handle_activate_line(
     pane_id: PaneId,
     save_controller: &mut SaveController,
@@ -405,7 +415,7 @@ fn handle_activate_line(
     root: &Path,
     line: usize,
     gui_event_tx: &CountingSender<GuiEvent>,
-) -> Result<Option<TreePath>, mpsc::SendError<GuiEvent>> {
+) -> Result<ActivateOutcome, mpsc::SendError<GuiEvent>> {
     let snapshot = engine.snapshot();
     let Some(editor_line) = snapshot.lines.get(line) else {
         send_gui_message(
@@ -414,7 +424,7 @@ fn handle_activate_line(
             MessageKind::Error,
             "Line to open was not found",
         )?;
-        return Ok(None);
+        return Ok(ActivateOutcome::Done);
     };
 
     match fyler_core::grammar::split_id_prefix(&editor_line.text) {
@@ -425,7 +435,7 @@ fn handle_activate_line(
                 MessageKind::Info,
                 "This line has not been saved",
             )?;
-            return Ok(None);
+            return Ok(ActivateOutcome::Done);
         }
         PrefixParse::Broken => {
             send_gui_message(
@@ -434,7 +444,7 @@ fn handle_activate_line(
                 MessageKind::Error,
                 "Cannot open a line with a broken ID prefix",
             )?;
-            return Ok(None);
+            return Ok(ActivateOutcome::Done);
         }
         PrefixParse::WithId { .. } => {}
     }
@@ -446,7 +456,7 @@ fn handle_activate_line(
             MessageKind::Error,
             "File for this line was not found in the current tree",
         )?;
-        return Ok(None);
+        return Ok(ActivateOutcome::Done);
     };
 
     match kind {
@@ -469,7 +479,7 @@ fn handle_activate_line(
                     MessageKind::Info,
                     "Cannot change folds while editing. Save or discard changes.",
                 )?;
-                return Ok(None);
+                return Ok(ActivateOutcome::Done);
             }
 
             match save_controller.toggle_collapse(&snapshot.lines, line) {
@@ -488,6 +498,7 @@ fn handle_activate_line(
                         )?;
                     }
                     send_view_state(gui_event_tx, pane_id, save_controller)?;
+                    return Ok(ActivateOutcome::Toggled);
                 }
                 ToggleCollapseResult::NotADirectory => {
                     send_gui_message(
@@ -505,7 +516,7 @@ fn handle_activate_line(
                         "Cannot expand: directory could not be read (access denied or unavailable)",
                     )?;
                 }
-                ToggleCollapseResult::NeedsLoad { dir } => return Ok(Some(dir)),
+                ToggleCollapseResult::NeedsLoad { dir } => return Ok(ActivateOutcome::Load(dir)),
                 ToggleCollapseResult::NotFound => {
                     send_gui_message(
                         gui_event_tx,
@@ -518,7 +529,7 @@ fn handle_activate_line(
             }
         }
     }
-    Ok(None)
+    Ok(ActivateOutcome::Done)
 }
 
 fn handle_open_with(

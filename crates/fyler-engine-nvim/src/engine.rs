@@ -230,6 +230,10 @@ impl NvimEngine {
         tokio::spawn(async move {
             let mut cmdline_state = None;
             let mut snapshot_pending = false;
+            // ミラーが反映済みのbuffer changedtick。全再同期(get_lines)が
+            // 処理中に進んだ後続編集を先取りした場合、キューに残った古い
+            // buf_lines_eventを二重適用しないためのゲート(0 = 未確定)。
+            let mut mirror_tick: u64 = 0;
             let mut commit_pending = false;
             let crash_reason = loop {
                 tokio::select! {
@@ -296,24 +300,36 @@ impl NvimEngine {
 
                         match notification.name.as_str() {
                             "nvim_buf_lines_event" => {
-                                if apply_lines_notification(&notification.args, &mut lines) {
-                                    lines_arc = lines_to_arc(&lines);
-                                } else {
-                                    match buffer.get_lines(0, -1, false).await {
-                                        Ok(current_lines) => {
-                                            lines = current_lines
-                                                .into_iter()
-                                                .map(EditorLine::new)
-                                                .collect();
-                                            lines_arc = lines_to_arc(&lines);
-                                        }
-                                        Err(error) => {
-                                            send_message(
-                                                &event_tx,
-                                                MessageKind::Error,
-                                                format!("Failed to resynchronize buffer lines: {error}"),
-                                            );
-                                            continue;
+                                match apply_lines_notification(
+                                    &notification.args,
+                                    &mut lines,
+                                    &mut mirror_tick,
+                                ) {
+                                    ApplyLinesResult::Applied => {
+                                        lines_arc = lines_to_arc(&lines);
+                                    }
+                                    ApplyLinesResult::Stale => {
+                                        // 全再同期が既に反映済みの編集。二重適用しない。
+                                        continue;
+                                    }
+                                    ApplyLinesResult::Resync => {
+                                        // changedtickと行内容を同一メインループステップで
+                                        // 原子取得する。get_lines単独では後続編集を先取りし、
+                                        // キュー内の古いイベントが二重適用される。
+                                        match fetch_buffer_lines_with_tick(&nvim).await {
+                                            Ok((tick, current_lines)) => {
+                                                lines = current_lines;
+                                                mirror_tick = tick;
+                                                lines_arc = lines_to_arc(&lines);
+                                            }
+                                            Err(error) => {
+                                                send_message(
+                                                    &event_tx,
+                                                    MessageKind::Error,
+                                                    format!("Failed to resynchronize buffer lines: {error}"),
+                                                );
+                                                continue;
+                                            }
                                         }
                                     }
                                 }
@@ -337,7 +353,12 @@ impl NvimEngine {
                                 // nvimがhit-enter待ちに入りfylerがフリーズして見える。
                                 // ext_messagesのreturn_promptは外部UIが表示を持つため、
                                 // 即座に<CR>で解除し、プロンプト自体は表示しない。
-                                if outcome.hit_enter_prompt {
+                                // ただしユーザー入力が先にプロンプトを解除していた場合、
+                                // この<CR>はNormalモードでActivateLine(ファイルを開く)に
+                                // 化けるため、実際にblocking中のときだけ送る。
+                                if outcome.hit_enter_prompt
+                                    && input_is_blocking(&nvim).await.unwrap_or(false)
+                                {
                                     let _ = nvim.input("<CR>").await;
                                 }
                             }
@@ -1038,37 +1059,120 @@ async fn input_is_blocking(nvim: &Nvim) -> anyhow::Result<bool> {
         .ok_or_else(|| anyhow::anyhow!("Invalid pending input state format"))
 }
 
-fn apply_lines_notification(args: &[Value], lines: &mut Vec<EditorLine>) -> bool {
-    let Some(first) = args
-        .get(2)
-        .and_then(value_as_u64)
-        .map(|value| value as usize)
-    else {
-        return false;
-    };
-    let Some(last) = args
-        .get(3)
-        .and_then(value_as_u64)
-        .map(|value| value as usize)
-    else {
-        return false;
-    };
-    let Some(replacement_values) = args.get(4).and_then(Value::as_array) else {
-        return false;
-    };
-    if first > last || last > lines.len() {
-        return false;
-    }
+/// [`apply_lines_notification`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyLinesResult {
+    /// イベントをミラーへ適用した。
+    Applied,
+    /// ミラーが既に(全再同期で)反映済みの古いイベント。捨てる。
+    Stale,
+    /// 解釈不能または境界不整合。全再同期が必要。
+    Resync,
+}
 
+/// `nvim_buf_lines_event` をミラーへ適用する。
+///
+/// - `changedtick`(args[1])が `mirror_tick` 以下なら全再同期で反映済みのStale。
+/// - `lastline == -1` は全バッファ差し替え(attach時のsend_buffer等)。
+/// - 適用に成功したら `mirror_tick` をイベントのtickへ進める(tick不明時は据え置き)。
+fn apply_lines_notification(
+    args: &[Value],
+    lines: &mut Vec<EditorLine>,
+    mirror_tick: &mut u64,
+) -> ApplyLinesResult {
+    let tick = args.get(1).and_then(value_as_u64);
+    if let Some(tick) = tick
+        && tick <= *mirror_tick
+    {
+        return ApplyLinesResult::Stale;
+    }
+    let Some(replacement_values) = args.get(4).and_then(Value::as_array) else {
+        return ApplyLinesResult::Resync;
+    };
     let mut replacement = Vec::with_capacity(replacement_values.len());
     for value in replacement_values {
         let Some(line) = value.as_str() else {
-            return false;
+            return ApplyLinesResult::Resync;
         };
         replacement.push(EditorLine::new(line));
     }
-    lines.splice(first..last, replacement);
-    true
+
+    let whole_buffer = args.get(3).and_then(Value::as_i64) == Some(-1);
+    if whole_buffer {
+        *lines = replacement;
+    } else {
+        let Some(first) = args
+            .get(2)
+            .and_then(value_as_u64)
+            .map(|value| value as usize)
+        else {
+            return ApplyLinesResult::Resync;
+        };
+        let Some(last) = args
+            .get(3)
+            .and_then(value_as_u64)
+            .map(|value| value as usize)
+        else {
+            return ApplyLinesResult::Resync;
+        };
+        if first > last || last > lines.len() {
+            return ApplyLinesResult::Resync;
+        }
+        lines.splice(first..last, replacement);
+    }
+    if let Some(tick) = tick {
+        *mirror_tick = tick;
+    }
+    ApplyLinesResult::Applied
+}
+
+/// バッファのchangedtickと全行を、nvimの同一メインループステップで原子取得する。
+///
+/// `get_lines` 単独の再同期は、要求処理時点までに進んだ後続編集を先取りして返すため、
+/// 通知キューに残った古い `nvim_buf_lines_event` がその上へ二重適用される
+/// (行の重複・欠落としてsnapshotへ現れる)。tickを同時に取り、以後 `tick` 以下の
+/// イベントをStaleとして捨てることで整合を保つ。
+async fn fetch_buffer_lines_with_tick(nvim: &Nvim) -> anyhow::Result<(u64, Vec<EditorLine>)> {
+    let calls = vec![
+        atomic_call("nvim_buf_get_changedtick", vec![Value::from(0)]),
+        atomic_call(
+            "nvim_buf_get_lines",
+            vec![
+                Value::from(0),
+                Value::from(0),
+                Value::from(-1),
+                Value::from(false),
+            ],
+        ),
+    ];
+    let response = nvim
+        .call_atomic(calls)
+        .await
+        .map_err(|error| anyhow::anyhow!("nvim_call_atomic failed: {error}"))?;
+    let results = response
+        .first()
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Invalid results format from nvim_call_atomic"))?;
+    if let Some(error) = response.get(1).filter(|value| !value.is_nil()) {
+        anyhow::bail!("A call inside nvim_call_atomic failed: {error:?}");
+    }
+    let tick = results
+        .first()
+        .and_then(value_as_u64)
+        .ok_or_else(|| anyhow::anyhow!("Invalid changedtick result format"))?;
+    let lines = results
+        .get(1)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Invalid lines result format"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(EditorLine::new)
+                .ok_or_else(|| anyhow::anyhow!("Invalid line format"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((tick, lines))
 }
 
 /// [`handle_redraw`] の結果。
@@ -1467,7 +1571,12 @@ mod tests {
             Value::Array(vec![Value::from("B"), Value::from("B2")]),
             Value::from(false),
         ];
-        assert!(apply_lines_notification(&args, &mut lines));
+        let mut mirror_tick = 0;
+        assert_eq!(
+            apply_lines_notification(&args, &mut lines, &mut mirror_tick),
+            ApplyLinesResult::Applied
+        );
+        assert_eq!(mirror_tick, 2);
         assert_eq!(
             lines,
             [
@@ -1477,6 +1586,72 @@ mod tests {
                 EditorLine::new("c"),
             ]
         );
+    }
+
+    #[test]
+    fn line_notification_at_or_below_mirror_tick_is_stale() {
+        // 全再同期がtick=5まで反映済みのミラーに、キュー滞留していた
+        // tick=5以下のイベントが届いても二重適用しない(行重複の回帰テスト)。
+        let mut lines = vec![EditorLine::new("a"), EditorLine::new("b")];
+        let args = vec![
+            Value::Nil,
+            Value::from(5),
+            Value::from(1),
+            Value::from(1),
+            Value::Array(vec![Value::from("b")]),
+            Value::from(false),
+        ];
+        let mut mirror_tick = 5;
+        assert_eq!(
+            apply_lines_notification(&args, &mut lines, &mut mirror_tick),
+            ApplyLinesResult::Stale
+        );
+        assert_eq!(lines, [EditorLine::new("a"), EditorLine::new("b")]);
+        assert_eq!(mirror_tick, 5);
+    }
+
+    #[test]
+    fn line_notification_with_negative_lastline_replaces_the_whole_buffer() {
+        // attach(send_buffer=true)等の lastline == -1 は全バッファ差し替え。
+        // 以前はu64パース失敗でget_lines再同期へ落ち、後続編集の先取りと
+        // キュー内イベントの二重適用を引き起こしていた。
+        let mut lines = vec![EditorLine::new("stale")];
+        let args = vec![
+            Value::Nil,
+            Value::from(2),
+            Value::from(0),
+            Value::from(-1),
+            Value::Array(vec![Value::from("a"), Value::from("b")]),
+            Value::from(false),
+        ];
+        let mut mirror_tick = 0;
+        assert_eq!(
+            apply_lines_notification(&args, &mut lines, &mut mirror_tick),
+            ApplyLinesResult::Applied
+        );
+        assert_eq!(lines, [EditorLine::new("a"), EditorLine::new("b")]);
+        assert_eq!(mirror_tick, 2);
+    }
+
+    #[test]
+    fn malformed_line_notification_requests_resync() {
+        let mut lines = vec![EditorLine::new("a")];
+        // 範囲がミラー長を超える(ミラーが既に不整合)。
+        let args = vec![
+            Value::Nil,
+            Value::from(3),
+            Value::from(5),
+            Value::from(6),
+            Value::Array(vec![Value::from("x")]),
+            Value::from(false),
+        ];
+        let mut mirror_tick = 0;
+        assert_eq!(
+            apply_lines_notification(&args, &mut lines, &mut mirror_tick),
+            ApplyLinesResult::Resync
+        );
+        // 適用失敗時はtickを進めない(再同期側で確定する)。
+        assert_eq!(mirror_tick, 0);
     }
 
     #[test]
@@ -1494,7 +1669,11 @@ mod tests {
             Value::from(false),
         ];
 
-        assert!(apply_lines_notification(&args, &mut lines));
+        let mut mirror_tick = 0;
+        assert_eq!(
+            apply_lines_notification(&args, &mut lines, &mut mirror_tick),
+            ApplyLinesResult::Applied
+        );
         let after = lines_to_arc(&lines);
 
         for index in 0..50 {
@@ -1523,7 +1702,11 @@ mod tests {
         let started = std::time::Instant::now();
 
         for _ in 0..100 {
-            assert!(apply_lines_notification(&args, &mut lines));
+            let mut mirror_tick = 0;
+            assert_eq!(
+                apply_lines_notification(&args, &mut lines, &mut mirror_tick),
+                ApplyLinesResult::Applied
+            );
             std::hint::black_box(lines_to_arc(&lines));
         }
 

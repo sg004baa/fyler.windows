@@ -1268,7 +1268,15 @@ fn handle_navigation_movement(
     entries: &[chrome::NavigationEntry],
     target: &mut Option<PathBuf>,
 ) -> bool {
-    if key.mods != Modifiers::default() || entries.is_empty() {
+    if key.mods != Modifiers::default() {
+        return false;
+    }
+    if key.key == Key::Esc {
+        state.focused = false;
+        state.pending_binding.clear();
+        return true;
+    }
+    if entries.is_empty() {
         return false;
     }
     match key.key {
@@ -1283,6 +1291,8 @@ fn handle_navigation_movement(
         Key::Enter => {
             state.selected = state.selected.min(entries.len() - 1);
             *target = Some(entries[state.selected].path.clone());
+            state.focused = false;
+            state.pending_binding.clear();
             true
         }
         _ => false,
@@ -2322,12 +2332,41 @@ mod tests {
         );
         assert_eq!(state.selected, 1);
         assert_eq!(target, Some(PathBuf::from("/src")));
+        assert!(!state.focused);
 
+        state.focused = true;
         let binding = fyler_core::keymap::parse_key_sequence("x e", None).unwrap();
         assert_eq!(
             handle_navigation_keys(&mut state, binding.0.clone(), &[binding], &entries),
             None
         );
+        assert!(!state.focused);
+    }
+
+    #[test]
+    fn navigation_dock_escape_returns_focus_without_closing() {
+        let entries = chrome::navigation_entries(
+            Path::new("/current"),
+            &[("src".to_owned(), PathBuf::from("/src"))],
+            &[],
+            &[],
+        );
+        let mut state = NavigationDockState {
+            focused: true,
+            ..NavigationDockState::visible()
+        };
+        let target = handle_navigation_keys(
+            &mut state,
+            [KeyInput {
+                key: Key::Esc,
+                mods: Modifiers::default(),
+            }],
+            &[],
+            &entries,
+        );
+
+        assert_eq!(target, None);
+        assert!(state.open);
         assert!(!state.focused);
     }
 

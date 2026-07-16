@@ -1206,6 +1206,32 @@ async fn opening_a_line_preserves_id_prefixed_depth() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a compatible nvim executable"]
+async fn insert_enter_preserves_id_prefixed_depth() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, _events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+    engine.set_initial_lines(vec![EditorLine::new("/002 \tchild")])?;
+    wait_for_lines(&engine, |lines| lines.len() == 1).await?;
+
+    engine.send(key_command(Key::End))?;
+    engine.send(key_command(Key::Char('a')))?;
+    engine.send(key_command(Key::Enter))?;
+    engine.send(EditorCommand::Text("x".to_owned()))?;
+    engine.send(key_command(Key::Esc))?;
+
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 2 && lines[1].text.as_ref() == "\tx" && !lines[1].text.starts_with('/')
+    })
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
 async fn cursor_snaps_past_the_id_prefix_and_indent() -> anyhow::Result<()> {
     let _serial = NVIM_TEST_SERIAL.lock().await;
     let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
@@ -1239,7 +1265,15 @@ async fn wait_for_lines(
         }
     })
     .await
-    .map_err(|_| anyhow::anyhow!("snapshot lines did not match predicate"))
+    .map_err(|_| {
+        let snapshot = engine.snapshot();
+        let lines: Vec<&str> = snapshot
+            .lines
+            .iter()
+            .map(|line| line.text.as_ref())
+            .collect();
+        anyhow::anyhow!("snapshot lines did not match predicate; last snapshot: {lines:?}")
+    })
 }
 
 async fn wait_for_cursor(
