@@ -496,6 +496,24 @@ impl NvimEngine {
                                     ),
                                 }
                             }
+                            "fyler_history" => {
+                                match notification.args.first().and_then(Value::as_str) {
+                                    Some("back") => {
+                                        let _ = event_tx.send(EditorEvent::HistoryBack);
+                                    }
+                                    Some("forward") => {
+                                        let _ = event_tx.send(EditorEvent::HistoryForward);
+                                    }
+                                    _ => send_message(
+                                        &event_tx,
+                                        MessageKind::Error,
+                                        "Failed to get history direction".to_owned(),
+                                    ),
+                                }
+                            }
+                            "fyler_refresh" => {
+                                let _ = event_tx.send(EditorEvent::RefreshRequested);
+                            }
                             "fyler_transfer" => {
                                 let kind = notification.args.first()
                                     .and_then(Value::as_str)

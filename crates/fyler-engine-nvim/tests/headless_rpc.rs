@@ -532,6 +532,105 @@ async fn navigate_into_and_cd_commands_emit_root_change_requests() -> anyhow::Re
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a compatible nvim executable"]
+async fn history_and_refresh_keymaps_and_commands_emit_expected_events() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+
+    let ctrl_key = |character: char| {
+        EditorCommand::Key(KeyInput {
+            key: Key::Char(character),
+            mods: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        })
+    };
+
+    engine.send(ctrl_key('p'))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::HistoryBack)
+    })
+    .await
+    .context("Ctrl+P did not emit HistoryBack")?;
+
+    engine.send(ctrl_key('n'))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::HistoryForward)
+    })
+    .await
+    .context("Ctrl+N did not emit HistoryForward")?;
+
+    engine.send(ctrl_key('r'))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::RefreshRequested)
+    })
+    .await
+    .context("Ctrl+R did not emit RefreshRequested")?;
+
+    engine.send(key_command(Key::Char(':')))?;
+    engine.send(EditorCommand::Text("FylerBack".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::HistoryBack)
+    })
+    .await
+    .context(":FylerBack did not emit HistoryBack")?;
+
+    engine.send(key_command(Key::Char(':')))?;
+    engine.send(EditorCommand::Text("FylerForward".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::HistoryForward)
+    })
+    .await
+    .context(":FylerForward did not emit HistoryForward")?;
+
+    engine.send(key_command(Key::Char(':')))?;
+    engine.send(EditorCommand::Text("FylerReload".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::RefreshRequested)
+    })
+    .await
+    .context(":FylerReload did not emit RefreshRequested")?;
+
+    // command_aliases: :back / :forward / :reload の書き換え(<CR>直前のrewrite_command_alias)。
+    engine.send(key_command(Key::Char(':')))?;
+    engine.send(EditorCommand::Text("back".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::HistoryBack)
+    })
+    .await
+    .context(":back alias did not emit HistoryBack")?;
+
+    engine.send(key_command(Key::Char(':')))?;
+    engine.send(EditorCommand::Text("forward".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::HistoryForward)
+    })
+    .await
+    .context(":forward alias did not emit HistoryForward")?;
+
+    engine.send(key_command(Key::Char(':')))?;
+    engine.send(EditorCommand::Text("reload".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::RefreshRequested)
+    })
+    .await
+    .context(":reload alias did not emit RefreshRequested")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
 async fn search_state_surfaces_smartcase_and_hlsearch() -> anyhow::Result<()> {
     let _serial = NVIM_TEST_SERIAL.lock().await;
     let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
