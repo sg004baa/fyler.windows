@@ -61,6 +61,25 @@ pub enum EditorCommand {
     RequestCommit,
     Undo,
     Redo,
+    /// Shift+click等でlinewise Visual選択を行う。`anchor`はclick前のカーソル行、
+    /// `head`はclick対象行(共に0始まり)。行数を超える指定は最終行へクランプする。
+    /// 前方(anchor < head)・後方(anchor > head)どちらの選択方向にも対応する。
+    SelectLines {
+        anchor: usize,
+        head: usize,
+    },
+    /// 対象行の名前部分(IDプレフィックス・インデントの直後)にカーソルを置き、
+    /// Insert modeで編集を開始する。IDプレフィックス・インデントは変更しない。
+    /// 実FSへは一切触れない(バッファ編集のみ)。`line`は0始まり。
+    BeginNameEdit {
+        line: usize,
+    },
+    /// バッファから該当表示行を1行除去する。実FSへは一切触れず、通常の
+    /// dirty → `:w` → 確認 → apply経路に乗せる(collapsed dirの行削除は
+    /// 配下ごとDELETE planになる、既存文法どおり)。`line`は0始まり。
+    DeleteLine {
+        line: usize,
+    },
 }
 
 /// エンジン状態の整合スナップショット。GUIはこれだけを描画する。

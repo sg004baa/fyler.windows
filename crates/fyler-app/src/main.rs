@@ -41,7 +41,7 @@ use fyler_core::tree::EntryKind;
 use fyler_core::undo::{UndoStep, UndoTransaction};
 use fyler_fsops::openwith::OpenWithHandler;
 use fyler_fsops::watch::ExternalChange;
-use fyler_gui::app::{GuiEvent, PickerAction};
+use fyler_gui::app::{GuiEvent, PickerAction, TreeContextItem, TreeRowClickKind};
 use fyler_gui::confirm::ConfirmChoice;
 
 use crate::queue_stats::CountingSender;
@@ -95,6 +95,20 @@ enum AppEvent {
     Shutdown {
         save_session: bool,
         window: Option<fyler_core::WindowGeometry>,
+    },
+    /// ユーザーがpaneのツリー領域(行または空白部分)をクリックしてfocusを要求した。
+    RequestPaneFocus(PaneId),
+    /// ツリー行のクリック(single/double/shift)。
+    TreeRowClicked {
+        pane_id: PaneId,
+        line: usize,
+        kind: TreeRowClickKind,
+    },
+    /// ツリーのcontext menu項目実行要求。
+    TreeContextAction {
+        pane_id: PaneId,
+        line: usize,
+        item: TreeContextItem,
     },
 }
 
@@ -770,6 +784,115 @@ fn handle_open_terminal(
             pane_id,
             MessageKind::Error,
             format!("Failed to start terminal: {error:#}"),
+        );
+    }
+    Ok(())
+}
+
+/// Rename / Mark for deletion(バッファ編集のみのcontext menu項目)の権威判定。
+/// `open_terminal_rejection` と同じ形((dialog/apply/transfer/crashed/save)。
+fn tree_edit_rejection(
+    dialog_open: bool,
+    apply_running: bool,
+    transfer_awaiting: bool,
+    transfer_running: bool,
+    crashed: bool,
+    save_idle: bool,
+) -> Option<&'static str> {
+    if dialog_open || apply_running || transfer_awaiting || transfer_running {
+        Some("Cannot edit the tree while another dialog or file operation is active")
+    } else if crashed {
+        Some("Cannot edit the tree because the editor engine has stopped")
+    } else if !save_idle {
+        Some("Cannot edit the tree while saving")
+    } else {
+        None
+    }
+}
+
+/// Rename(`EditorCommand::BeginNameEdit`)の実行。実FSへは一切触れない。
+fn handle_begin_name_edit(
+    pane_id: PaneId,
+    engine: &dyn EditorEngine,
+    line: usize,
+    rejection: Option<&'static str>,
+    gui_event_tx: &CountingSender<GuiEvent>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    if let Some(message) = rejection {
+        return send_gui_message(gui_event_tx, pane_id, MessageKind::Info, message);
+    }
+
+    let snapshot = engine.snapshot();
+    let Some(editor_line) = snapshot.lines.get(line) else {
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            "Line to rename was not found",
+        );
+    };
+
+    match fyler_core::grammar::split_id_prefix(&editor_line.text) {
+        PrefixParse::NoId { .. } => {
+            return send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Info,
+                "This line has not been saved",
+            );
+        }
+        PrefixParse::Broken => {
+            return send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Error,
+                "Cannot rename a line with a broken ID prefix",
+            );
+        }
+        PrefixParse::WithId { .. } => {}
+    }
+
+    if let Err(error) = engine.send(EditorCommand::BeginNameEdit { line }) {
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            format!("Failed to start rename: {error:#}"),
+        );
+    }
+    Ok(())
+}
+
+/// Mark for deletion(`EditorCommand::DeleteLine`)の実行。バッファから行を
+/// 除去するだけで、実FSへは一切触れない(通常のdirty→`:w`→確認→apply経路に乗る)。
+/// IDなし(unsaved)行も対象にできる。
+fn handle_mark_for_deletion(
+    pane_id: PaneId,
+    engine: &dyn EditorEngine,
+    line: usize,
+    rejection: Option<&'static str>,
+    gui_event_tx: &CountingSender<GuiEvent>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    if let Some(message) = rejection {
+        return send_gui_message(gui_event_tx, pane_id, MessageKind::Info, message);
+    }
+
+    let snapshot = engine.snapshot();
+    if snapshot.lines.get(line).is_none() {
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            "Line to remove was not found",
+        );
+    }
+
+    if let Err(error) = engine.send(EditorCommand::DeleteLine { line }) {
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            format!("Failed to remove line: {error:#}"),
         );
     }
     Ok(())
