@@ -1457,7 +1457,7 @@ impl SaveController {
     }
 
     fn reconcile_from_fs(&mut self) -> anyhow::Result<()> {
-        let result = self.reconcile_from_fs_preserving_state();
+        let result = self.reconcile_from_fs_preserving_state(None);
         let effects = self.apply_event(SaveEvent::ReconcileFinished);
         debug_assert!(matches!(self.state, SaveState::Idle));
         debug_assert!(
@@ -1477,10 +1477,26 @@ impl SaveController {
     /// pane間transfer完了後に、保存状態機械を変更せず実FSから再同期する。
     pub fn reconcile_after_transfer(&mut self) -> anyhow::Result<()> {
         debug_assert!(self.is_idle());
-        self.reconcile_from_fs_preserving_state()
+        self.reconcile_from_fs_preserving_state(None)
     }
 
-    fn reconcile_from_fs_preserving_state(&mut self) -> anyhow::Result<()> {
+    /// `:reload`(manual refresh)向けに、rootを再スキャンして表示を更新する。
+    ///
+    /// 呼び出し元app層は、クリーン(dirtyでない)かつIdle・オフラインでないことを
+    /// 事前に保証すること(refresh gateの契約。[`refresh_gate`](super::pane_runtime)相当)。
+    /// 折りたたみ状態は既存のID保持機構(`carry_collapsed_dirs`)で維持し、カーソルは
+    /// `cursor_hint`のpathを新baselineへ解決できた場合のみ復元する。再スキャンが
+    /// 失敗した場合は既存のreconcile失敗時と同じ経路でofflineへ遷移する。
+    pub fn refresh(&mut self, cursor_hint: Option<&TreePath>) -> anyhow::Result<()> {
+        debug_assert!(self.is_idle());
+        debug_assert!(!self.is_offline());
+        self.reconcile_from_fs_preserving_state(cursor_hint)
+    }
+
+    fn reconcile_from_fs_preserving_state(
+        &mut self,
+        cursor_hint: Option<&TreePath>,
+    ) -> anyhow::Result<()> {
         let mut ids = self
             .ids
             .lock()
@@ -1501,12 +1517,15 @@ impl SaveController {
             }
         };
         let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
+        let cursor_line = cursor_hint.and_then(|path| {
+            let id = baseline.get_by_path(path)?.id;
+            visible_entries(&baseline, &context)
+                .iter()
+                .position(|entry| entry.id == id)
+        });
         let lines = baseline_to_lines(&baseline, &context);
         self.engine
-            .send(EditorCommand::SetLines {
-                lines,
-                cursor_line: None,
-            })
+            .send(EditorCommand::SetLines { lines, cursor_line })
             .context("Failed to send buffer lines to the engine after reconcile")?;
 
         self.baseline = baseline;
@@ -4875,5 +4894,78 @@ mod tests {
             ]
         );
         assert_eq!(controller.baseline().unloaded_dirs().len(), 12);
+    }
+
+    #[test]
+    fn refresh_rescans_root_preserves_collapsed_state_and_restores_cursor_by_path() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("dir")).unwrap();
+        fs::write(root.path().join("dir/inner.txt"), b"x").unwrap();
+        fs::write(root.path().join("top.txt"), b"y").unwrap();
+
+        let (mut controller, engine) = scanned_controller(root.path(), ScanOptions::default());
+        let lines = controller.visible_lines();
+        let dir_line = (0..lines.len())
+            .find(|&line| {
+                controller.resolve_line(&lines, line)
+                    == Some((TreePath::parse("dir"), EntryKind::Dir))
+            })
+            .expect("dir line present");
+        assert!(matches!(
+            controller.toggle_collapse(&lines, dir_line),
+            ToggleCollapseResult::Toggled(_)
+        ));
+        assert!(!controller.collapsed_dirs().is_empty());
+
+        // 外部でtop-level entryを1件追加してから refresh する(unloaded subtreeへは潜らない
+        // ことの確認も兼ねて、collapsed dir配下は変更しない)。
+        fs::write(root.path().join("new.txt"), b"z").unwrap();
+
+        let cursor_target = TreePath::parse("top.txt");
+        assert!(controller.is_idle());
+        assert!(!controller.is_offline());
+        controller.refresh(Some(&cursor_target)).unwrap();
+
+        let updated_lines = controller.visible_lines();
+        assert!(
+            (0..updated_lines.len()).any(|line| controller.resolve_line(&updated_lines, line)
+                == Some((TreePath::parse("new.txt"), EntryKind::File)))
+        );
+        // collapsed dirの子は再scan後も非表示のまま(collapsed状態がID保持で維持される)。
+        assert!(
+            !(0..updated_lines.len()).any(|line| controller.resolve_line(&updated_lines, line)
+                == Some((TreePath::parse("dir/inner.txt"), EntryKind::File)))
+        );
+
+        let expected_cursor_line = (0..updated_lines.len())
+            .find(|&line| {
+                controller.resolve_line(&updated_lines, line)
+                    == Some((cursor_target.clone(), EntryKind::File))
+            })
+            .expect("top.txt line present after refresh");
+        let sent_cursor_line = engine
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|command| match command {
+                EditorCommand::SetLines { cursor_line, .. } => Some(*cursor_line),
+                _ => None,
+            })
+            .flatten();
+        assert_eq!(sent_cursor_line, Some(expected_cursor_line));
+    }
+
+    #[test]
+    fn refresh_enters_offline_when_rescan_fails() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("a.txt"), b"a").unwrap();
+        let (mut controller, _) = scanned_controller(root.path(), ScanOptions::default());
+        assert!(!controller.is_offline());
+
+        fs::remove_dir_all(root.path()).unwrap();
+        assert!(controller.refresh(None).is_err());
+        assert!(controller.is_offline());
     }
 }

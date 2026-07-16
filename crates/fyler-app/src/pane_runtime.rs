@@ -68,6 +68,89 @@ struct PaneSession {
     undo_slot: Option<UndoTransaction>,
     crashed: bool,
     restoration_warnings: Vec<String>,
+    history: NavigationHistory,
+}
+
+/// pane別navigation historyの1エントリ。root変更前の地点を表す。
+///
+/// sort/hiddenはpane state側に属し、entry毎に複製しない(session全体で共有)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HistoryEntry {
+    /// 離れる時点の表示ルート絶対path。
+    root: PathBuf,
+    /// このrootへ戻った時にカーソルを合わせるトップレベルエントリ名。
+    /// `NavigateParent`の子復元と同じ機構(`SaveController::find_top_level_line`)で使う。
+    cursor_target: Option<OsString>,
+    /// このrootへ戻った時に復元するcollapsed dir(root相対path基準)。
+    collapsed: Vec<TreePath>,
+}
+
+/// pane毎のback/forward navigation history(純粋ロジック)。
+///
+/// 上限pane毎100件。back/forwardスタックの隣接末尾が同一rootならpushしない
+/// (連続重複除去)。
+#[derive(Debug, Default)]
+struct NavigationHistory {
+    back: VecDeque<HistoryEntry>,
+    forward: VecDeque<HistoryEntry>,
+}
+
+const NAVIGATION_HISTORY_CAP: usize = 100;
+
+impl NavigationHistory {
+    fn can_go_back(&self) -> bool {
+        !self.back.is_empty()
+    }
+
+    fn can_go_forward(&self) -> bool {
+        !self.forward.is_empty()
+    }
+
+    /// 通常のroot変更(NavigateInto/NavigateParent/:cd/bookmark/recent/drive)成功時、
+    /// 遷移前の地点をbackへ積みforwardをclearする。backの末尾と同一rootなら積まない。
+    fn record_normal(&mut self, from: HistoryEntry) {
+        if self.back.back().is_none_or(|top| top.root != from.root) {
+            push_capped(&mut self.back, from);
+        }
+        self.forward.clear();
+    }
+
+    /// back navigation成功時、遷移前の地点をforwardへ積む。popは呼び出し元が先に行う。
+    fn record_history_back(&mut self, from: HistoryEntry) {
+        push_capped(&mut self.forward, from);
+    }
+
+    /// forward navigation成功時、遷移前の地点をbackへ積む。popは呼び出し元が先に行う。
+    fn record_history_forward(&mut self, from: HistoryEntry) {
+        push_capped(&mut self.back, from);
+    }
+
+    /// backスタックから直近のentryを取り出す。無効なentryは呼び出し元が
+    /// 通知して捨てるだけでよく、このスタックへ戻さない。
+    fn pop_back(&mut self) -> Option<HistoryEntry> {
+        self.back.pop_back()
+    }
+
+    fn pop_forward(&mut self) -> Option<HistoryEntry> {
+        self.forward.pop_back()
+    }
+
+    /// gateで拒否された等、実際には移動しなかった場合にpopしたentryを戻す。
+    /// popとの対で使う。capは既にpop前に満たしていたので再チェック不要。
+    fn restore_back(&mut self, entry: HistoryEntry) {
+        self.back.push_back(entry);
+    }
+
+    fn restore_forward(&mut self, entry: HistoryEntry) {
+        self.forward.push_back(entry);
+    }
+}
+
+fn push_capped(stack: &mut VecDeque<HistoryEntry>, entry: HistoryEntry) {
+    stack.push_back(entry);
+    if stack.len() > NAVIGATION_HISTORY_CAP {
+        stack.pop_front();
+    }
 }
 
 /// app全体で同時に1本だけ実行する列挙workerの所有状態。
@@ -78,9 +161,23 @@ struct LoaderOwner {
     cancel: Arc<AtomicBool>,
 }
 
+/// root変更要求の意図。History Back/Forwardは通常navigateと異なるhistory更新と
+/// collapsed復元を行うため、loader経由の2相(request→gate→worker→再ゲート→swap)を
+/// 跨いでLoaderKindへ保持し、完了時(finish_session_root_change)に参照する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RootChangeIntent {
+    /// gd/^/:cd/bookmark/recent/drive等の通常のroot変更。
+    Normal,
+    /// `:back` / `Ctrl+P`によるhistory back navigation。
+    HistoryBack { collapsed: Vec<TreePath> },
+    /// `:forward` / `Ctrl+N`によるhistory forward navigation。
+    HistoryForward { collapsed: Vec<TreePath> },
+}
+
 enum LoaderKind {
     Root {
         cursor_target: Option<OsString>,
+        intent: RootChangeIntent,
     },
     Directory {
         dir: TreePath,
@@ -246,6 +343,7 @@ fn create_pane(
         undo_slot: None,
         crashed: false,
         restoration_warnings,
+        history: NavigationHistory::default(),
     })
 }
 
@@ -1096,6 +1194,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     pane_id,
                                     new_root,
                                     None,
+                                    RootChangeIntent::Normal,
                                     session,
                                     &shared_ids,
                                     &event_tx,
@@ -1176,6 +1275,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     pane_id,
                                     new_root,
                                     cursor_target,
+                                    RootChangeIntent::Normal,
                                     session,
                                     &shared_ids,
                                     &event_tx,
@@ -1189,6 +1289,99 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 )
                                 .is_err()
                                 {
+                                    return;
+                                }
+                            }
+                            EditorEvent::HistoryBack => {
+                                if !session.history.can_go_back() {
+                                    if send_gui_message(
+                                        &gui_event_tx,
+                                        pane_id,
+                                        MessageKind::Info,
+                                        "No earlier location in history",
+                                    )
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                let entry = session.history.pop_back().expect("checked can_go_back");
+                                let restore = entry.clone();
+                                let outcome = request_session_root_change(
+                                    pane_id,
+                                    entry.root,
+                                    entry.cursor_target,
+                                    RootChangeIntent::HistoryBack {
+                                        collapsed: entry.collapsed,
+                                    },
+                                    session,
+                                    &shared_ids,
+                                    &event_tx,
+                                    &gui_event_tx,
+                                    &mut loader_owner,
+                                    &mut dialog_owner,
+                                    feedback_open
+                                        || apply_owner.is_some()
+                                        || transfer.is_awaiting()
+                                        || transfer.is_running(),
+                                );
+                                match outcome {
+                                    Ok(RootChangeRequestOutcome::Started) => {}
+                                    Ok(RootChangeRequestOutcome::Rejected) => {
+                                        session.history.restore_back(restore);
+                                    }
+                                    Err(_) => return,
+                                }
+                                if send_history_state(&gui_event_tx, pane_id, session).is_err() {
+                                    return;
+                                }
+                            }
+                            EditorEvent::HistoryForward => {
+                                if !session.history.can_go_forward() {
+                                    if send_gui_message(
+                                        &gui_event_tx,
+                                        pane_id,
+                                        MessageKind::Info,
+                                        "No later location in history",
+                                    )
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                let entry = session
+                                    .history
+                                    .pop_forward()
+                                    .expect("checked can_go_forward");
+                                let restore = entry.clone();
+                                let outcome = request_session_root_change(
+                                    pane_id,
+                                    entry.root,
+                                    entry.cursor_target,
+                                    RootChangeIntent::HistoryForward {
+                                        collapsed: entry.collapsed,
+                                    },
+                                    session,
+                                    &shared_ids,
+                                    &event_tx,
+                                    &gui_event_tx,
+                                    &mut loader_owner,
+                                    &mut dialog_owner,
+                                    feedback_open
+                                        || apply_owner.is_some()
+                                        || transfer.is_awaiting()
+                                        || transfer.is_running(),
+                                );
+                                match outcome {
+                                    Ok(RootChangeRequestOutcome::Started) => {}
+                                    Ok(RootChangeRequestOutcome::Rejected) => {
+                                        session.history.restore_forward(restore);
+                                    }
+                                    Err(_) => return,
+                                }
+                                if send_history_state(&gui_event_tx, pane_id, session).is_err() {
                                     return;
                                 }
                             }
@@ -1236,6 +1429,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     pane_id,
                                     new_root,
                                     None,
+                                    RootChangeIntent::Normal,
                                     session,
                                     &shared_ids,
                                     &event_tx,
@@ -1273,6 +1467,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             pane_id,
                                             new_root,
                                             None,
+                                            RootChangeIntent::Normal,
                                             session,
                                             &shared_ids,
                                             &event_tx,
@@ -1385,6 +1580,135 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     return;
                                 }
                                 git.request(pane_id, session.root.clone());
+                            }
+                            EditorEvent::RefreshRequested => {
+                                let snapshot = session.engine.snapshot();
+                                let cursor_target = session
+                                    .save_controller
+                                    .resolve_line(&snapshot.lines, snapshot.cursor.line)
+                                    .map(|(path, _)| path);
+                                let globally_busy = feedback_open
+                                    || apply_owner.is_some()
+                                    || transfer.is_awaiting()
+                                    || transfer.is_running()
+                                    || loader_owner.is_some()
+                                    || dialog_owner.is_some();
+                                match refresh_gate(
+                                    session.crashed,
+                                    session.save_controller.is_offline(),
+                                    snapshot.dirty,
+                                    session.save_controller.is_idle(),
+                                    globally_busy,
+                                ) {
+                                    RefreshGate::Reject(message) => {
+                                        if send_gui_message(
+                                            &gui_event_tx,
+                                            pane_id,
+                                            MessageKind::Info,
+                                            message,
+                                        )
+                                        .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    RefreshGate::RetryOffline => {
+                                        let result = session.save_controller.retry_offline();
+                                        let reconnected =
+                                            matches!(result, SaveFlowResult::Reconnected(_));
+                                        if send_save_result(&gui_event_tx, pane_id, result)
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                        if reconnected {
+                                            if session.watch_degraded {
+                                                match fyler_fsops::watch::watch(
+                                                    &session.root,
+                                                    session.watch_tx.clone(),
+                                                ) {
+                                                    Ok(watcher) => {
+                                                        session.watcher = watcher;
+                                                        session.watch_degraded = false;
+                                                    }
+                                                    Err(_) => session.watch_degraded = true,
+                                                }
+                                            }
+                                            if send_view_state(
+                                                &gui_event_tx,
+                                                pane_id,
+                                                &mut session.save_controller,
+                                            )
+                                            .is_err()
+                                            {
+                                                return;
+                                            }
+                                            git.request(pane_id, session.root.clone());
+                                        }
+                                    }
+                                    RefreshGate::Allow => {
+                                        match session.save_controller.refresh(cursor_target.as_ref())
+                                        {
+                                            Ok(()) => {
+                                                if session.watch_degraded {
+                                                    match fyler_fsops::watch::watch(
+                                                        &session.root,
+                                                        session.watch_tx.clone(),
+                                                    ) {
+                                                        Ok(watcher) => {
+                                                            session.watcher = watcher;
+                                                            session.watch_degraded = false;
+                                                        }
+                                                        Err(error) => {
+                                                            if send_gui_message(
+                                                                &gui_event_tx,
+                                                                pane_id,
+                                                                MessageKind::Warn,
+                                                                format!(
+                                                                    "Failed to restart the file watcher: {error:#}"
+                                                                ),
+                                                            )
+                                                            .is_err()
+                                                            {
+                                                                return;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if send_view_state(
+                                                    &gui_event_tx,
+                                                    pane_id,
+                                                    &mut session.save_controller,
+                                                )
+                                                .is_err()
+                                                {
+                                                    return;
+                                                }
+                                                git.request(pane_id, session.root.clone());
+                                            }
+                                            Err(error) => {
+                                                if send_save_result(
+                                                    &gui_event_tx,
+                                                    pane_id,
+                                                    SaveFlowResult::WentOffline(error.to_string()),
+                                                )
+                                                .is_err()
+                                                {
+                                                    return;
+                                                }
+                                                if send_view_state(
+                                                    &gui_event_tx,
+                                                    pane_id,
+                                                    &mut session.save_controller,
+                                                )
+                                                .is_err()
+                                                {
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             EditorEvent::Fold { op, line } => {
                                 let snapshot = session.engine.snapshot();
@@ -2384,11 +2708,15 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 LoaderResult::Ready(baseline) => {
                                     let session = panes.get_mut(&pane_id).expect("checked pane");
                                     let finish = match owner.kind {
-                                        LoaderKind::Root { cursor_target } => {
+                                        LoaderKind::Root {
+                                            cursor_target,
+                                            intent,
+                                        } => {
                                             finish_session_root_change(
                                                 pane_id,
                                                 root,
                                                 cursor_target.as_deref(),
+                                                intent,
                                                 baseline,
                                                 session,
                                                 &gui_event_tx,
@@ -3513,11 +3841,21 @@ fn discard_undo_slot(session: &mut PaneSession, journal: Option<&undo_journal::U
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootChangeRequestOutcome {
+    /// gateを通過し、非同期loaderを起動した。
+    Started,
+    /// gateで拒否された(dirty/busy/offline等)。呼び出し元は消費済みのhistory
+    /// entryを戻す必要がある操作(pop等)を行っていないことを保証すること。
+    Rejected,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn request_session_root_change(
     pane_id: PaneId,
     new_root: PathBuf,
     cursor_target: Option<OsString>,
+    intent: RootChangeIntent,
     session: &PaneSession,
     shared_ids: &Arc<Mutex<IdAllocator>>,
     app_event_tx: &CountingSender<AppEvent>,
@@ -3525,7 +3863,7 @@ fn request_session_root_change(
     loader_owner: &mut Option<LoaderOwner>,
     dialog_owner: &mut Option<PaneId>,
     globally_busy: bool,
-) -> Result<(), mpsc::SendError<GuiEvent>> {
+) -> Result<RootChangeRequestOutcome, mpsc::SendError<GuiEvent>> {
     let new_root = match normalize_root(&new_root) {
         Ok(root) => root,
         Err(error) => {
@@ -3535,7 +3873,7 @@ fn request_session_root_change(
                 MessageKind::Error,
                 format!("Failed to normalize root ({}): {error}", new_root.display()),
             )?;
-            return Ok(());
+            return Ok(RootChangeRequestOutcome::Rejected);
         }
     };
     match loader_start_gate(
@@ -3546,10 +3884,10 @@ fn request_session_root_change(
         loader_owner.is_some(),
     ) {
         LoaderStartGate::Allow => {}
-        LoaderStartGate::RejectSilently => return Ok(()),
+        LoaderStartGate::RejectSilently => return Ok(RootChangeRequestOutcome::Rejected),
         LoaderStartGate::Reject(message) => {
             send_gui_message(gui_event_tx, pane_id, MessageKind::Info, message)?;
-            return Ok(());
+            return Ok(RootChangeRequestOutcome::Rejected);
         }
     }
 
@@ -3562,7 +3900,10 @@ fn request_session_root_change(
     *loader_owner = Some(LoaderOwner {
         pane_id,
         root: new_root.clone(),
-        kind: LoaderKind::Root { cursor_target },
+        kind: LoaderKind::Root {
+            cursor_target,
+            intent,
+        },
         cancel: Arc::clone(&cancel),
     });
 
@@ -3602,7 +3943,7 @@ fn request_session_root_change(
             result: Err(anyhow::anyhow!("Failed to start loader worker: {error}")),
         });
     }
-    Ok(())
+    Ok(RootChangeRequestOutcome::Started)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3860,6 +4201,39 @@ fn loader_start_gate(
     LoaderStartGate::Allow
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshGate {
+    Allow,
+    /// offlineから即座にretry_offline済み(5秒tickを待たせない)。
+    RetryOffline,
+    Reject(&'static str),
+}
+
+/// `:reload` / `Ctrl+R`(manual refresh)の実行可否を判定する。既存のroot変更gate
+/// (`loader_start_gate`)と違い、busy/apply/undo/transfer/loader中の拒否はcoalesce
+/// せず必ずMessageを出す(設計決定済み)。
+fn refresh_gate(
+    crashed: bool,
+    offline: bool,
+    dirty: bool,
+    idle: bool,
+    globally_busy: bool,
+) -> RefreshGate {
+    if crashed {
+        return RefreshGate::Reject("Cannot refresh a crashed pane");
+    }
+    if offline {
+        return RefreshGate::RetryOffline;
+    }
+    if dirty {
+        return RefreshGate::Reject("Buffer has unsaved changes; save or discard before refresh");
+    }
+    if !idle || globally_busy {
+        return RefreshGate::Reject("Another operation is in progress");
+    }
+    RefreshGate::Allow
+}
+
 enum LoaderResult<T, E> {
     Ready(T),
     Cancelled,
@@ -3879,6 +4253,7 @@ fn finish_session_root_change(
     pane_id: PaneId,
     new_root: PathBuf,
     cursor_target: Option<&OsStr>,
+    intent: RootChangeIntent,
     new_baseline: BaselineTree,
     session: &mut PaneSession,
     gui_event_tx: &CountingSender<GuiEvent>,
@@ -3897,6 +4272,10 @@ fn finish_session_root_change(
             return Ok(());
         }
     };
+    // rootが実際に切り替わる直前の地点をhistory用に捕捉する。以降の
+    // change_root_preserving_allocatorでsession.root/save_controllerが
+    // 新rootのものへ差し替わるため、必ずこれより前に取ること。
+    let from = capture_history_entry(session);
     if let Err(error) = session
         .save_controller
         .change_root_preserving_allocator(new_root.clone(), new_baseline)
@@ -3909,7 +4288,20 @@ fn finish_session_root_change(
         )?;
         return Ok(());
     }
-    session.save_controller.collapse_all_dirs();
+    match intent {
+        RootChangeIntent::Normal => {
+            session.save_controller.collapse_all_dirs();
+            session.history.record_normal(from);
+        }
+        RootChangeIntent::HistoryBack { collapsed } => {
+            session.save_controller.restore_collapsed_paths(&collapsed);
+            session.history.record_history_back(from);
+        }
+        RootChangeIntent::HistoryForward { collapsed } => {
+            session.save_controller.restore_collapsed_paths(&collapsed);
+            session.history.record_history_forward(from);
+        }
+    }
     let cursor_line =
         cursor_target.and_then(|name| session.save_controller.find_top_level_line(name));
     let new_lines = session.save_controller.visible_lines();
@@ -3939,6 +4331,7 @@ fn finish_session_root_change(
             format!("Failed to record recent root: {error:#}"),
         )?;
     }
+    send_history_state(gui_event_tx, pane_id, session)?;
     after_root_change(
         pane_id,
         gui_event_tx,
@@ -3946,6 +4339,39 @@ fn finish_session_root_change(
         git,
         &session.root,
     )
+}
+
+/// history entry用に、現在のpane state(root/cursor/collapsed)をpath基準で捕捉する。
+/// root変更を確定させる直前(sessionが新rootへ差し替わる前)に呼ぶこと。
+fn capture_history_entry(session: &PaneSession) -> HistoryEntry {
+    let snapshot = session.engine.snapshot();
+    let cursor_target = session
+        .save_controller
+        .resolve_line(&snapshot.lines, snapshot.cursor.line)
+        .and_then(|(path, _)| {
+            path.components()
+                .first()
+                .map(|name| OsString::from(name.clone()))
+        });
+    let (collapsed, _expanded) = session.save_controller.session_directory_state();
+    HistoryEntry {
+        root: session.root.clone(),
+        cursor_target,
+        collapsed,
+    }
+}
+
+/// paneのnavigation history状態(back/forward可用性)をGUIのtoolbarへ反映する。
+fn send_history_state(
+    gui_event_tx: &CountingSender<GuiEvent>,
+    pane_id: PaneId,
+    session: &PaneSession,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    gui_event_tx.send(GuiEvent::HistoryState {
+        pane_id,
+        can_go_back: session.history.can_go_back(),
+        can_go_forward: session.history.can_go_forward(),
+    })
 }
 
 fn send_git_badges_from_cache(
@@ -4392,5 +4818,120 @@ mod tests {
             .unwrap();
         assert_eq!(cycle_focus(&layout, second, true), Some(first));
         assert_eq!(cycle_focus(&layout, first, false), Some(second));
+    }
+
+    fn history_entry(root: &str) -> HistoryEntry {
+        HistoryEntry {
+            root: PathBuf::from(root),
+            cursor_target: None,
+            collapsed: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn history_dedupes_consecutive_same_root_pushes() {
+        let mut history = NavigationHistory::default();
+        history.record_normal(history_entry("a"));
+        history.record_normal(history_entry("a"));
+        assert_eq!(history.back.len(), 1);
+        history.record_normal(history_entry("b"));
+        assert_eq!(history.back.len(), 2);
+    }
+
+    #[test]
+    fn history_back_stack_is_capped_and_evicts_oldest() {
+        let mut history = NavigationHistory::default();
+        for index in 0..(NAVIGATION_HISTORY_CAP + 5) {
+            history.record_normal(history_entry(&format!("root-{index}")));
+        }
+        assert_eq!(history.back.len(), NAVIGATION_HISTORY_CAP);
+        assert_eq!(
+            history.back.back().unwrap().root,
+            PathBuf::from(format!("root-{}", NAVIGATION_HISTORY_CAP + 4))
+        );
+        assert_eq!(history.back.front().unwrap().root, PathBuf::from("root-5"));
+    }
+
+    #[test]
+    fn history_normal_navigation_clears_the_forward_stack() {
+        let mut history = NavigationHistory::default();
+        history.record_history_back(history_entry("future"));
+        assert!(history.can_go_forward());
+        history.record_normal(history_entry("current"));
+        assert!(!history.can_go_forward());
+        assert!(history.can_go_back());
+    }
+
+    #[test]
+    fn history_back_and_forward_swap_entries_symmetrically() {
+        let mut history = NavigationHistory::default();
+        history.record_normal(history_entry("a"));
+        assert!(history.can_go_back());
+        assert!(!history.can_go_forward());
+
+        let popped = history.pop_back().unwrap();
+        assert_eq!(popped.root, PathBuf::from("a"));
+        history.record_history_back(history_entry("b"));
+        assert!(!history.can_go_back());
+        assert!(history.can_go_forward());
+
+        let popped_forward = history.pop_forward().unwrap();
+        assert_eq!(popped_forward.root, PathBuf::from("b"));
+        history.record_history_forward(history_entry("a"));
+        assert!(history.can_go_back());
+        assert!(!history.can_go_forward());
+    }
+
+    #[test]
+    fn history_pop_without_restore_discards_the_entry() {
+        let mut history = NavigationHistory::default();
+        history.record_normal(history_entry("a"));
+        history.record_normal(history_entry("b"));
+        assert_eq!(history.back.len(), 2);
+        let popped = history.pop_back().unwrap();
+        assert_eq!(popped.root, PathBuf::from("b"));
+        // 無効なentry(削除済みroot等)はgate拒否/load失敗の後、呼び出し元が
+        // restore_backを呼ばずに捨てる。stackへ戻らず、forwardへも移らない。
+        assert_eq!(history.back.len(), 1);
+        assert!(!history.can_go_forward());
+    }
+
+    #[test]
+    fn history_restore_back_returns_the_popped_entry() {
+        let mut history = NavigationHistory::default();
+        history.record_normal(history_entry("a"));
+        let popped = history.pop_back().unwrap();
+        assert!(!history.can_go_back());
+        history.restore_back(popped.clone());
+        assert!(history.can_go_back());
+        assert_eq!(history.pop_back(), Some(popped));
+    }
+
+    #[test]
+    fn refresh_gate_rejects_crashed_dirty_busy_and_defers_offline_to_retry() {
+        assert_eq!(
+            refresh_gate(true, false, false, true, false),
+            RefreshGate::Reject("Cannot refresh a crashed pane")
+        );
+        assert_eq!(
+            refresh_gate(false, true, false, true, false),
+            RefreshGate::RetryOffline
+        );
+        assert_eq!(
+            refresh_gate(false, false, true, true, false),
+            RefreshGate::Reject("Buffer has unsaved changes; save or discard before refresh")
+        );
+        assert_eq!(
+            refresh_gate(false, false, false, false, false),
+            RefreshGate::Reject("Another operation is in progress")
+        );
+        assert_eq!(
+            refresh_gate(false, false, false, true, true),
+            RefreshGate::Reject("Another operation is in progress")
+        );
+        assert_eq!(
+            refresh_gate(false, false, false, true, false),
+            RefreshGate::Allow
+        );
     }
 }

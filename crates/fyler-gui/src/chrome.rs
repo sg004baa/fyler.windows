@@ -12,13 +12,24 @@ pub const NAV_RAIL_WIDTH: f32 = 208.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChromeAction {
     NavigateParent,
+    HistoryBack,
+    HistoryForward,
+    Refresh,
 }
 
 /// タイトルバー・ツールバー・ぱんくずを1行へ統合したトップchrome。
 ///
 /// フレームレスウィンドウのため、空き領域をドラッグ/ダブルクリックで
 /// ウィンドウ移動・最大化に使う。ウィンドウ操作ボタンもこの行に置く。
-pub fn draw_toolbar(ui: &mut egui::Ui) -> Option<ChromeAction> {
+///
+/// `can_go_back` / `can_go_forward` はアクティブpaneのnavigation historyの
+/// 可用性(GUIが把握できる範囲)。↻(reload)は権威判定をapp層に委ねるため
+/// 常に有効にする。
+pub fn draw_toolbar(
+    ui: &mut egui::Ui,
+    can_go_back: bool,
+    can_go_forward: bool,
+) -> Option<ChromeAction> {
     ui.painter().rect_filled(ui.max_rect(), 0.0, theme::SURFACE);
     ui.painter().line_segment(
         [ui.max_rect().left_bottom(), ui.max_rect().right_bottom()],
@@ -46,10 +57,22 @@ pub fn draw_toolbar(ui: &mut egui::Ui) -> Option<ChromeAction> {
     ui.horizontal_centered(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         ui.add_space(8.0);
-        ui.add_enabled(false, chrome_button("←"))
-            .on_disabled_hover_text("Back history is not available");
-        ui.add_enabled(false, chrome_button("→"))
-            .on_disabled_hover_text("Forward history is not available");
+        if ui
+            .add_enabled(can_go_back, chrome_button("←"))
+            .on_hover_text("Go back in history (:back)")
+            .on_disabled_hover_text("No earlier location in history")
+            .clicked()
+        {
+            action = Some(ChromeAction::HistoryBack);
+        }
+        if ui
+            .add_enabled(can_go_forward, chrome_button("→"))
+            .on_hover_text("Go forward in history (:forward)")
+            .on_disabled_hover_text("No later location in history")
+            .clicked()
+        {
+            action = Some(ChromeAction::HistoryForward);
+        }
         if ui
             .add(chrome_button("↑"))
             .on_hover_text("Parent directory")
@@ -57,8 +80,13 @@ pub fn draw_toolbar(ui: &mut egui::Ui) -> Option<ChromeAction> {
         {
             action = Some(ChromeAction::NavigateParent);
         }
-        ui.add_enabled(false, chrome_button("↻"))
-            .on_disabled_hover_text("Filesystem changes refresh automatically");
+        if ui
+            .add(chrome_button("↻"))
+            .on_hover_text("Reload from disk (:reload)")
+            .clicked()
+        {
+            action = Some(ChromeAction::Refresh);
+        }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
