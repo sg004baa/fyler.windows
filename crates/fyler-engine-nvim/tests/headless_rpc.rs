@@ -1239,7 +1239,15 @@ async fn wait_for_lines(
         }
     })
     .await
-    .map_err(|_| anyhow::anyhow!("snapshot lines did not match predicate"))
+    .map_err(|_| {
+        let snapshot = engine.snapshot();
+        let lines: Vec<&str> = snapshot
+            .lines
+            .iter()
+            .map(|line| line.text.as_ref())
+            .collect();
+        anyhow::anyhow!("snapshot lines did not match predicate; last snapshot: {lines:?}")
+    })
 }
 
 async fn wait_for_cursor(
