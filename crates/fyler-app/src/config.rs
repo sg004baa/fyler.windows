@@ -14,12 +14,11 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use fyler_core::keymap;
 use fyler_core::options::{SortKey, SortOrder, StatusItem, TerminalKind};
-use fyler_gui::confirm::{ConfirmDetail, IconStyle};
+use fyler_gui::confirm::ConfirmDetail;
 
 const CONFIG_FILE: &str = "config.toml";
 const RECENT_FILE: &str = "recent.toml";
 const MAX_RECENT_ROOTS: usize = 10;
-const DEFAULT_FONT_Y_OFFSET_FACTOR: f32 = 0.12;
 
 /// ユーザー設定。無指定または不正な項目には安全な既定値を使う。
 #[derive(Debug, Clone, PartialEq)]
@@ -42,13 +41,6 @@ pub struct Config {
     pub confirm_detail: ConfirmDetail,
     /// 日本語fallbackフォントとして読み込むファイルの絶対パス。
     pub font: Option<PathBuf>,
-    /// CJKフォントの上寄りを補正する、フォントサイズ比の下方向オフセット。
-    ///
-    /// CJKフォントはascent metricsが既定フォントと異なり上寄りに描画されるため、
-    /// フォントサイズ比で下方向へずらす。`0`で無効。
-    pub font_y_offset_factor: f32,
-    /// ツリーへ描画するファイルアイコンのスタイル。
-    pub icons: IconStyle,
     /// 名前と絶対パスのブックマーク。設定ファイルでの定義順を保持する。
     pub bookmarks: Vec<(String, PathBuf)>,
     /// 解決済みkeymapバインディング(デフォルト+ユーザー上書き適用済み)。
@@ -71,8 +63,6 @@ impl Default for Config {
             feedback_url: None,
             confirm_detail: ConfirmDetail::Full,
             font: None,
-            font_y_offset_factor: DEFAULT_FONT_Y_OFFSET_FACTOR,
-            icons: IconStyle::Ascii,
             bookmarks: Vec::new(),
             bindings: keymap::default_bindings(keymap::default_leader()),
             statusline_left: fyler_core::options::default_statusline_left(),
@@ -229,19 +219,6 @@ pub fn load() -> (Config, Vec<String>) {
             None => warnings.push("font must be a string".to_owned()),
         }
     }
-    if let Some(value) = table.get("font_y_offset_factor") {
-        match numeric_f32(value) {
-            Some(factor) => config.font_y_offset_factor = factor,
-            None => warnings.push("font_y_offset_factor must be a number".to_owned()),
-        }
-    }
-    if let Some(value) = table.get("icons") {
-        match value.as_str() {
-            Some("ascii") => config.icons = IconStyle::Ascii,
-            Some("nerd") => config.icons = IconStyle::Nerd,
-            _ => warnings.push("icons must be \"ascii\" or \"nerd\"".to_owned()),
-        }
-    }
     if let Some(value) = table.get("bookmarks") {
         match value.as_table() {
             Some(bookmarks) => {
@@ -322,8 +299,6 @@ pub fn load() -> (Config, Vec<String>) {
                 | "feedback_url"
                 | "confirm_detail"
                 | "font"
-                | "font_y_offset_factor"
-                | "icons"
                 | "bookmarks"
                 | "leader"
                 | "keymap"
@@ -334,15 +309,6 @@ pub fn load() -> (Config, Vec<String>) {
     }
 
     (config, warnings)
-}
-
-fn numeric_f32(value: &toml::Value) -> Option<f32> {
-    let value = match value {
-        toml::Value::Float(value) => *value as f32,
-        toml::Value::Integer(value) => *value as f32,
-        _ => return None,
-    };
-    value.is_finite().then_some(value)
 }
 
 /// `[statusline]`の`left`/`right`配列を項目列へ変換する。値が無ければ`None`。
@@ -671,25 +637,29 @@ mod tests {
 
         fs::write(
             &path,
-            "font = true\nfont_y_offset_factor = 'low'\nicons = 1\n",
+            "font = true\nicons = 1\nfont_y_offset_factor = 'low'\n",
         )
         .unwrap();
         let (config, warnings) = load();
         assert_eq!(config.font, None);
-        assert_eq!(config.font_y_offset_factor, DEFAULT_FONT_Y_OFFSET_FACTOR);
-        assert_eq!(config.icons, IconStyle::Ascii);
-        assert!(warnings.iter().any(|warning| warning.contains("font")));
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("font_y_offset_factor"))
+                .any(|warning| warning.contains("font must be a string"))
         );
-        assert!(warnings.iter().any(|warning| warning.contains("icons")));
+        // 廃止済みキーは未知キー警告になる。
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("unknown configuration key: icons"))
+        );
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("unknown configuration key: font_y_offset_factor")
+        }));
 
-        fs::write(&path, "font = 'relative/font.ttf'\nicons = 'ascii'\n").unwrap();
+        fs::write(&path, "font = 'relative/font.ttf'\n").unwrap();
         let (config, warnings) = load();
         assert_eq!(config.font, None);
-        assert_eq!(config.icons, IconStyle::Ascii);
         assert!(
             warnings
                 .iter()
@@ -741,7 +711,7 @@ mod tests {
             format!(
                 "show_hidden = true\nsort = \"mixed\"\nconfirm_detail = \"summary\"\n\
                  sort_key = \"date\"\nsort_reverse = true\n\
-                 font = '{}'\nfont_y_offset_factor = 0.25\nicons = \"nerd\"\n\
+                 font = '{}'\n\
                  [bookmarks]\nzeta = '{}'\nalpha = '{}'\n",
                 font.display(),
                 first.display(),
@@ -757,8 +727,6 @@ mod tests {
         assert!(config.sort_reverse);
         assert_eq!(config.confirm_detail, ConfirmDetail::Summary);
         assert_eq!(config.font, Some(font));
-        assert_eq!(config.font_y_offset_factor, 0.25);
-        assert_eq!(config.icons, IconStyle::Nerd);
         assert_eq!(
             config.bookmarks,
             [("zeta".to_owned(), first), ("alpha".to_owned(), second),]
@@ -795,12 +763,5 @@ mod tests {
                 .len(),
             10
         );
-    }
-
-    #[test]
-    fn font_y_offset_factor_parser_accepts_numbers_and_rejects_other_types() {
-        assert_eq!(numeric_f32(&toml::Value::Float(0.25)), Some(0.25));
-        assert_eq!(numeric_f32(&toml::Value::Integer(0)), Some(0.0));
-        assert_eq!(numeric_f32(&toml::Value::String("0.25".to_owned())), None);
     }
 }
