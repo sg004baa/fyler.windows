@@ -50,6 +50,12 @@ pub enum EditorAction {
     TransferMove,
     /// 選択項目を別paneへコピーする。
     TransferCopy,
+    /// 選択項目をclipboardへコピーする(実FS非変更)。
+    ClipboardCopy,
+    /// 選択項目をclipboardへ切り取る(実FS非変更。移動はpaste側が行う)。
+    ClipboardCut,
+    /// clipboardの内容を現在paneのカーソル位置へ貼り付ける。
+    ClipboardPaste,
     /// 左ナビゲーションドックへfocusを移す、またはエディタへ戻す。
     ToggleDockFocus,
     /// ヘルプを表示する。
@@ -94,6 +100,9 @@ impl EditorAction {
             "open_with" => Self::OpenWith,
             "transfer_move" => Self::TransferMove,
             "transfer_copy" => Self::TransferCopy,
+            "clipboard_copy" => Self::ClipboardCopy,
+            "clipboard_cut" => Self::ClipboardCut,
+            "clipboard_paste" => Self::ClipboardPaste,
             "toggle_dock_focus" => Self::ToggleDockFocus,
             "help" => Self::Help,
             "pane_split_horizontal" => Self::PaneSplitHorizontal,
@@ -128,6 +137,9 @@ impl EditorAction {
             Self::OpenWith => "open_with",
             Self::TransferMove => "transfer_move",
             Self::TransferCopy => "transfer_copy",
+            Self::ClipboardCopy => "clipboard_copy",
+            Self::ClipboardCut => "clipboard_cut",
+            Self::ClipboardPaste => "clipboard_paste",
             Self::ToggleDockFocus => "toggle_dock_focus",
             Self::Help => "help",
             Self::PaneSplitHorizontal => "pane_split_horizontal",
@@ -161,6 +173,9 @@ impl EditorAction {
             Self::OpenWith => "Open with application",
             Self::TransferMove => "Move to another pane",
             Self::TransferCopy => "Copy to another pane",
+            Self::ClipboardCopy => "Copy to clipboard",
+            Self::ClipboardCut => "Cut to clipboard",
+            Self::ClipboardPaste => "Paste from clipboard",
             Self::ToggleDockFocus => "Focus navigation dock / Return to editor",
             Self::Help => "Show help",
             Self::PaneSplitHorizontal => "Split pane horizontally",
@@ -380,6 +395,9 @@ pub fn default_bindings(leader: KeyInput) -> Vec<KeyBinding> {
         ("g o", EditorAction::OpenWith),
         ("g m", EditorAction::TransferMove),
         ("g c", EditorAction::TransferCopy),
+        ("Ctrl+C", EditorAction::ClipboardCopy),
+        ("Ctrl+X", EditorAction::ClipboardCut),
+        ("Ctrl+V", EditorAction::ClipboardPaste),
         ("Leader e", EditorAction::ToggleDockFocus),
         ("?", EditorAction::Help),
         ("Ctrl+W s", EditorAction::PaneSplitHorizontal),

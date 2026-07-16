@@ -42,6 +42,68 @@ impl TransferPlan {
     }
 }
 
+/// clipboard・drag&dropの取り込み効果(コピーか移動か)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropEffect {
+    Copy,
+    Move,
+}
+
+/// 外部source(Explorer clipboard・inbound drop)由来の1件の取り込み操作。
+///
+/// `source`は取り込み元の絶対パス、`target`は[`ImportPlan::destination`]配下に
+/// `source`のbasenameを保って解決した絶対パス。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportOp {
+    pub source: PathBuf,
+    pub target: PathBuf,
+}
+
+/// clipboard・inbound dropで外部sourceを現在paneのdestinationへ取り込む、
+/// 承認待ちの実行計画。
+///
+/// [`TransferPlan`]と異なり、外部sourceは単一rootに収まる保証がない
+/// (ExplorerのCF_HDROP・inbound dropは複数ドライブ・複数フォルダにまたがり
+/// 得るため)。`ops`内のsource/targetは常に絶対パスで持つ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportPlan {
+    pub destination: PathBuf,
+    pub effect: DropEffect,
+    pub ops: Vec<ImportOp>,
+}
+
+impl ImportPlan {
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    /// 絶対sourceパス列とdestinationからplanを構築する。basenameを取れない
+    /// source(ボリュームルート等)と、同一絶対パスの重複selectionは除く。
+    pub fn build(
+        sources: impl IntoIterator<Item = PathBuf>,
+        destination: PathBuf,
+        effect: DropEffect,
+    ) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        let ops = sources
+            .into_iter()
+            .filter(|source| seen.insert(source.clone()))
+            .filter_map(|source| {
+                let name = source.file_name()?.to_owned();
+                Some(ImportOp {
+                    target: destination.join(name),
+                    source,
+                })
+            })
+            .collect();
+        Self {
+            destination,
+            effect,
+            ops,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,5 +130,50 @@ mod tests {
             PathBuf::from("D:/target/file.txt")
         );
         assert!(!plan.is_empty());
+    }
+
+    #[test]
+    fn import_plan_build_joins_destination_and_dedupes_sources() {
+        let plan = ImportPlan::build(
+            vec![
+                PathBuf::from("C:/src/a.txt"),
+                PathBuf::from("C:/src/a.txt"),
+                PathBuf::from("D:/other/b"),
+            ],
+            PathBuf::from("C:/dest"),
+            DropEffect::Move,
+        );
+        assert_eq!(
+            plan.ops,
+            vec![
+                ImportOp {
+                    source: PathBuf::from("C:/src/a.txt"),
+                    target: PathBuf::from("C:/dest").join("a.txt"),
+                },
+                ImportOp {
+                    source: PathBuf::from("D:/other/b"),
+                    target: PathBuf::from("C:/dest").join("b"),
+                },
+            ]
+        );
+        assert!(!plan.is_empty());
+        assert_eq!(plan.effect, DropEffect::Move);
+    }
+
+    #[test]
+    fn import_plan_build_empty_sources_is_empty() {
+        let plan = ImportPlan::build(Vec::new(), PathBuf::from("C:/dest"), DropEffect::Copy);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn import_plan_build_skips_sources_without_a_filename() {
+        let plan = ImportPlan::build(
+            vec![PathBuf::from("."), PathBuf::from("C:/src/a.txt")],
+            PathBuf::from("C:/dest"),
+            DropEffect::Copy,
+        );
+        assert_eq!(plan.ops.len(), 1);
+        assert_eq!(plan.ops[0].source, PathBuf::from("C:/src/a.txt"));
     }
 }
