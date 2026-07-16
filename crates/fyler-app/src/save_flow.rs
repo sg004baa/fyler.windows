@@ -614,10 +614,6 @@ impl SaveController {
         &self,
         statuses: &HashMap<PathBuf, GitBadge>,
     ) -> HashMap<EntryId, GitBadge> {
-        let visible: HashMap<TreePath, EntryId> = visible_entries(&self.baseline, &self.context)
-            .iter()
-            .map(|entry| (entry.path.clone(), entry.id))
-            .collect();
         let mut result: HashMap<EntryId, GitBadge> = HashMap::new();
         for (path, badge) in statuses {
             let Some(tree_path) = tree_path_from_relative(path) else {
@@ -625,9 +621,10 @@ impl SaveController {
             };
             let mut candidate = Some(tree_path);
             while let Some(current) = candidate {
-                if let Some(&id) = visible.get(&current) {
+                if let Some(entry) = visible_entry_by_path(&self.baseline, &self.context, &current)
+                {
                     result
-                        .entry(id)
+                        .entry(entry.id)
                         .and_modify(|existing| {
                             if git_badge_rank(*badge) > git_badge_rank(*existing) {
                                 *existing = *badge;
@@ -1780,7 +1777,36 @@ fn unloaded_roots_within(baseline: &BaselineTree, root: &TreePath) -> Vec<TreePa
 }
 
 fn entry_by_path<'a>(baseline: &'a BaselineTree, path: &TreePath) -> Option<&'a BaselineEntry> {
-    baseline.entries().iter().find(|entry| &entry.path == path)
+    baseline.get_by_path(path)
+}
+
+fn visible_entry_by_path<'a>(
+    baseline: &'a BaselineTree,
+    context: &EditContext,
+    path: &TreePath,
+) -> Option<&'a BaselineEntry> {
+    let entry = baseline.get_by_path(path)?;
+    if entry_is_visible(baseline, context, entry) {
+        Some(entry)
+    } else {
+        None
+    }
+}
+
+fn entry_is_visible(baseline: &BaselineTree, context: &EditContext, entry: &BaselineEntry) -> bool {
+    let components = entry.path.components();
+    for depth in 1..components.len() {
+        let ancestor = TreePath::from_components(components[..depth].iter().cloned());
+        let Some(ancestor_entry) = baseline.get_by_path(&ancestor) else {
+            return false;
+        };
+        if context.collapsed_dirs.contains(&ancestor_entry.id)
+            || baseline.incomplete_dirs().contains_key(&ancestor)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn top_level_ancestor_entry<'a>(
@@ -3934,6 +3960,46 @@ mod tests {
         );
         assert_eq!(controller.visible_file_infos().len(), 1);
         assert_eq!(controller.unreadable_count(), 0);
+    }
+
+    #[test]
+    fn map_git_badges_remaps_collapsed_and_expanded_descendants() {
+        let (mut controller, _) = hierarchy_controller("C:/test-root");
+        let statuses = HashMap::from([(PathBuf::from("a/nested/leaf.txt"), GitBadge::Modified)]);
+        let a_id = controller
+            .baseline
+            .get_by_path(&TreePath::parse("a"))
+            .unwrap()
+            .id;
+        let leaf_id = controller
+            .baseline
+            .get_by_path(&TreePath::parse("a/nested/leaf.txt"))
+            .unwrap()
+            .id;
+
+        assert_eq!(
+            controller.map_git_badges(&statuses),
+            HashMap::from([(leaf_id, GitBadge::Modified)])
+        );
+
+        let visible = controller.visible_lines();
+        let FoldResult::Applied { .. } = controller.fold(&visible, 0, FoldOp::Close) else {
+            panic!("expected fold to collapse");
+        };
+        assert_eq!(
+            controller.map_git_badges(&statuses),
+            HashMap::from([(a_id, GitBadge::Modified)])
+        );
+
+        let collapsed = controller.visible_lines();
+        let FoldResult::Applied { .. } = controller.fold(&collapsed, 0, FoldOp::OpenRecursive)
+        else {
+            panic!("expected fold to expand");
+        };
+        assert_eq!(
+            controller.map_git_badges(&statuses),
+            HashMap::from([(leaf_id, GitBadge::Modified)])
+        );
     }
 
     #[test]
