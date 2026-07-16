@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use fyler_core::path::TreePath;
 use fyler_core::plan::{FsOperation, OperationPlan};
-use fyler_core::transfer::{TransferKind, TransferPlan};
+use fyler_core::transfer::{DropEffect, ImportPlan, TransferKind, TransferPlan};
 
 /// preflight走査の結果。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -169,6 +169,93 @@ pub fn preflight_transfer(plan: &TransferPlan) -> TransferPreflight {
     result
 }
 
+/// 外部source(clipboard・inbound drop)取り込みのpreflight結果。パスはすべて絶対パス。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportPreflight {
+    /// 既存のファイル/シンボリックリンクで、承認後にごみ箱へ退避できる移動先。
+    pub overwritable: Vec<PathBuf>,
+    /// 実行不能な操作に関係するパス(source消滅・自己子孫・dirへの上書き・
+    /// op間干渉等)。plan順で、同じパスは1回だけ格納する。
+    pub blocked: Vec<PathBuf>,
+}
+
+/// [`ImportPlan`]を実FSと照合し、衝突・自己子孫・source消滅・op間干渉を検査する。
+///
+/// 読み取り専用(`fs::symlink_metadata`だけを使い、OneDriveプレースホルダの
+/// hydrationを誘発しない)。[`preflight_transfer`]と同じ意味論: 先行するMoveで
+/// 空くパスは、対象ディレクトリのcase sensitivityを反映した絶対パスキーで追跡する。
+pub fn preflight_import(plan: &ImportPlan) -> ImportPreflight {
+    let mut result = ImportPreflight::default();
+    let mut vacated = HashSet::new();
+
+    for op in &plan.ops {
+        let source = absolute_path(&op.source);
+        let target = absolute_path(&op.target);
+
+        let source_kind = match fs::symlink_metadata(crate::long_path::to_fs(&source)) {
+            Ok(metadata) => Some(crate::scan::kind_from_metadata(&metadata)),
+            Err(_) => {
+                push_unique(&mut result.blocked, source.clone());
+                None
+            }
+        };
+
+        let case_only = is_case_only_path_change(&source, &target)
+            && !target.parent().is_some_and(directory_is_case_sensitive);
+        let same_path = paths_equal(&source, &target) && !case_only;
+        if same_path {
+            push_unique(&mut result.blocked, target.clone());
+        }
+        if source_kind == Some(fyler_core::tree::EntryKind::Dir)
+            && is_strict_ancestor(&source, &target)
+        {
+            push_unique(&mut result.blocked, target.clone());
+        }
+        if plan.effect == DropEffect::Move {
+            vacated.insert(absolute_case_key(&source));
+        }
+
+        if same_path || case_only || vacated.contains(&absolute_case_key(&target)) {
+            continue;
+        }
+
+        match fs::symlink_metadata(crate::long_path::to_fs(&target)) {
+            Ok(metadata)
+                if crate::scan::kind_from_metadata(&metadata)
+                    == fyler_core::tree::EntryKind::Dir =>
+            {
+                push_unique(&mut result.blocked, target.clone());
+            }
+            Ok(_) => push_unique(&mut result.overwritable, target.clone()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // 判定不能な対象は承認可能にせず、破壊を避ける。
+            Err(_) => push_unique(&mut result.blocked, target.clone()),
+        }
+    }
+
+    // v1はop間依存を持たない。from/toの同一・祖先・子孫関係は、実行順に
+    // よって意味が変わるため、関係する両操作をblockedにする。
+    for left in 0..plan.ops.len() {
+        for right in left + 1..plan.ops.len() {
+            let left_from = absolute_path(&plan.ops[left].source);
+            let left_to = absolute_path(&plan.ops[left].target);
+            let right_from = absolute_path(&plan.ops[right].source);
+            let right_to = absolute_path(&plan.ops[right].target);
+            let interferes = [&left_from, &left_to].into_iter().any(|left_path| {
+                [&right_from, &right_to]
+                    .into_iter()
+                    .any(|right_path| paths_overlap(left_path, right_path))
+            });
+            if interferes {
+                push_unique(&mut result.blocked, left_to.clone());
+                push_unique(&mut result.blocked, right_to.clone());
+            }
+        }
+    }
+
+    result
+}
+
 fn absolute_path(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -248,7 +335,7 @@ fn case_folded_key(path: &TreePath) -> String {
 #[cfg(test)]
 mod tests {
     use fyler_core::id::EntryId;
-    use fyler_core::transfer::{TransferKind, TransferOp, TransferPlan};
+    use fyler_core::transfer::{ImportOp, TransferKind, TransferOp, TransferPlan};
     use fyler_core::tree::EntryKind;
     use tempfile::tempdir;
 
@@ -586,6 +673,157 @@ mod tests {
             result
                 .blocked
                 .contains(&absolute_path(&root.path().join("copied")))
+        );
+    }
+
+    fn import_op(source: &Path, target: &Path) -> ImportOp {
+        ImportOp {
+            source: source.to_path_buf(),
+            target: target.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn import_classifies_file_and_symlink_as_overwritable_and_directory_as_blocked() {
+        let source_root = tempdir().unwrap();
+        let dest_root = tempdir().unwrap();
+        fs::write(source_root.path().join("a.txt"), b"a").unwrap();
+        fs::write(source_root.path().join("b.txt"), b"b").unwrap();
+        fs::write(source_root.path().join("c.txt"), b"c").unwrap();
+        fs::write(dest_root.path().join("file.txt"), b"existing").unwrap();
+        fs::create_dir(dest_root.path().join("directory")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("file.txt", dest_root.path().join("link")).unwrap();
+        #[cfg(not(unix))]
+        fs::write(dest_root.path().join("link"), b"link stand-in").unwrap();
+
+        let plan = ImportPlan {
+            destination: dest_root.path().to_path_buf(),
+            effect: DropEffect::Copy,
+            ops: vec![
+                import_op(
+                    &source_root.path().join("a.txt"),
+                    &dest_root.path().join("file.txt"),
+                ),
+                import_op(
+                    &source_root.path().join("b.txt"),
+                    &dest_root.path().join("link"),
+                ),
+                import_op(
+                    &source_root.path().join("c.txt"),
+                    &dest_root.path().join("directory"),
+                ),
+            ],
+        };
+
+        let result = preflight_import(&plan);
+
+        assert_eq!(
+            result.overwritable,
+            [
+                absolute_path(&dest_root.path().join("file.txt")),
+                absolute_path(&dest_root.path().join("link")),
+            ]
+        );
+        assert_eq!(
+            result.blocked,
+            [absolute_path(&dest_root.path().join("directory"))]
+        );
+    }
+
+    #[test]
+    fn import_blocks_missing_source() {
+        let source_root = tempdir().unwrap();
+        let dest_root = tempdir().unwrap();
+        let plan = ImportPlan {
+            destination: dest_root.path().to_path_buf(),
+            effect: DropEffect::Copy,
+            ops: vec![import_op(
+                &source_root.path().join("missing.txt"),
+                &dest_root.path().join("missing.txt"),
+            )],
+        };
+
+        let result = preflight_import(&plan);
+
+        assert_eq!(
+            result.blocked,
+            [absolute_path(&source_root.path().join("missing.txt"))]
+        );
+    }
+
+    #[test]
+    fn import_blocks_directory_move_and_copy_into_own_descendant() {
+        for effect in [DropEffect::Move, DropEffect::Copy] {
+            let root = tempdir().unwrap();
+            fs::create_dir(root.path().join("directory")).unwrap();
+            let destination = root.path().join("directory/child");
+            fs::create_dir_all(&destination).unwrap();
+            let target = destination.join("directory");
+            let plan = ImportPlan {
+                destination: destination.clone(),
+                effect,
+                ops: vec![import_op(&root.path().join("directory"), &target)],
+            };
+
+            assert!(
+                preflight_import(&plan)
+                    .blocked
+                    .contains(&absolute_path(&target))
+            );
+        }
+    }
+
+    #[test]
+    fn import_vacated_path_is_not_reported_as_overwritable() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("a.txt"), b"a").unwrap();
+        fs::write(root.path().join("b.txt"), b"b").unwrap();
+        let plan = ImportPlan {
+            destination: root.path().to_path_buf(),
+            effect: DropEffect::Move,
+            ops: vec![
+                import_op(&root.path().join("b.txt"), &root.path().join("c.txt")),
+                import_op(&root.path().join("a.txt"), &root.path().join("b.txt")),
+            ],
+        };
+
+        assert!(preflight_import(&plan).overwritable.is_empty());
+    }
+
+    #[test]
+    fn import_blocks_interference_between_flat_operations() {
+        let root = tempdir().unwrap();
+        let source_root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("first")).unwrap();
+        fs::write(source_root.path().join("second.txt"), b"second").unwrap();
+        fs::write(source_root.path().join("first-source"), b"source").unwrap();
+        let plan = ImportPlan {
+            destination: root.path().to_path_buf(),
+            effect: DropEffect::Move,
+            ops: vec![
+                import_op(
+                    &source_root.path().join("second.txt"),
+                    &root.path().join("first/new.txt"),
+                ),
+                import_op(
+                    &source_root.path().join("first-source"),
+                    &root.path().join("first"),
+                ),
+            ],
+        };
+
+        let result = preflight_import(&plan);
+
+        assert!(
+            result
+                .blocked
+                .contains(&absolute_path(&root.path().join("first/new.txt")))
+        );
+        assert!(
+            result
+                .blocked
+                .contains(&absolute_path(&root.path().join("first")))
         );
     }
 }

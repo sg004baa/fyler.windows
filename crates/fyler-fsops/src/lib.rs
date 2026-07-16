@@ -12,6 +12,7 @@ pub mod backup;
 pub mod case;
 pub mod catalog;
 pub mod classify;
+pub mod clipboard;
 pub mod dialog;
 pub mod drives;
 pub mod gitstatus;
@@ -30,6 +31,6 @@ pub mod watch;
 
 mod winattr;
 
-pub use apply::apply_transfer_plan_cancellable;
-pub use preflight::{TransferPreflight, preflight_transfer};
+pub use apply::{apply_import_plan_cancellable, apply_transfer_plan_cancellable};
+pub use preflight::{ImportPreflight, TransferPreflight, preflight_import, preflight_transfer};
 pub use undo::{UndoRecorder, apply_undo_cancellable, preflight_undo};
