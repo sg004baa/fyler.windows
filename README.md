@@ -68,3 +68,5 @@ cargo clippy --workspace --all-targets -- -D warnings
 ## ライセンス
 
 MIT License または Apache License 2.0 のいずれかを選択できます。詳細は [LICENSE-MIT](LICENSE-MIT) と [LICENSE-APACHE](LICENSE-APACHE) を参照してください。
+
+配布物には日本語とアイコン(Nerd Font)グリフを含む組み込みフォント **Moralerspace Argon HW** を同梱しています。このフォントは SIL Open Font License 1.1 で提供され、ライセンス全文は [crates/fyler-gui/assets/fonts/LICENSE-Moralerspace.txt](crates/fyler-gui/assets/fonts/LICENSE-Moralerspace.txt) を参照してください。

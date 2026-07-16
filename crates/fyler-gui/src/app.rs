@@ -25,10 +25,10 @@ use fyler_core::report::{ApplyProgress, CommitReport};
 use fyler_core::transfer::{TransferOp, TransferPlan};
 use fyler_core::validate::ValidateError;
 
-use crate::confirm::{ConfirmChoice, ConfirmDetail, IconStyle};
-use crate::{chrome, cmdline, confirm, input, modeline, theme, tree_view};
+use crate::confirm::{ConfirmChoice, ConfirmDetail};
+use crate::{chrome, cmdline, confirm, icon, input, modeline, theme, tree_view};
 
-const CJK_FONT_NAME: &str = "fyler-cjk";
+const BUILTIN_FONT_NAME: &str = "fyler-builtin";
 const INITIAL_WINDOW_SCALE: f32 = 0.7;
 /// ファイルpickerで候補を確定したときの動作。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,13 +93,6 @@ pub struct GuiOptions {
     pub confirm_detail: ConfirmDetail,
     /// ユーザーが明示した日本語fallbackフォントの絶対パス。
     pub font_path: Option<PathBuf>,
-    /// CJKフォントの上寄りを補正する、フォントサイズ比の下方向オフセット。
-    ///
-    /// CJKフォントはascent metricsが既定フォントと異なり上寄りに描画されるため、
-    /// フォントサイズ比で下方向へずらす。`0`で無効。
-    pub font_y_offset_factor: f32,
-    /// ツリーへ描画するファイルアイコンのスタイル。
-    pub icon_style: IconStyle,
     /// ヘルプダイアログへ表示する、エンジン非依存の操作一覧。
     pub help_entries: Vec<HelpEntry>,
     /// ドックfocus操作へ割り当てられた解決済みキーシーケンス。
@@ -117,7 +110,6 @@ pub struct GuiOptions {
 
 struct AppOptions {
     confirm_detail: ConfirmDetail,
-    icon_style: IconStyle,
     help_entries: Vec<HelpEntry>,
     dock_focus_bindings: Vec<KeySequence>,
     bookmarks: Vec<(String, PathBuf)>,
@@ -383,7 +375,6 @@ pub struct FylerApp {
     picker_needs_focus: bool,
     feedback_needs_focus: bool,
     confirm_detail: ConfirmDetail,
-    icon_style: IconStyle,
     help_entries: Vec<HelpEntry>,
     dock_focus_bindings: Vec<KeySequence>,
     navigation_dock: NavigationDockState,
@@ -421,7 +412,6 @@ impl FylerApp {
     ) -> anyhow::Result<Self> {
         let AppOptions {
             confirm_detail,
-            icon_style,
             help_entries,
             dock_focus_bindings,
             bookmarks,
@@ -467,7 +457,6 @@ impl FylerApp {
             picker_needs_focus: false,
             feedback_needs_focus: false,
             confirm_detail,
-            icon_style,
             help_entries,
             dock_focus_bindings,
             navigation_dock: NavigationDockState::default(),
@@ -940,7 +929,6 @@ impl eframe::App for FylerApp {
                         active,
                         &mut self.panes,
                         &snapshots,
-                        self.icon_style,
                         &navigation_entries,
                         self.navigation_dock.open,
                         self.navigation_dock.focused,
@@ -1311,7 +1299,6 @@ fn draw_layout(
     active: PaneId,
     panes: &mut BTreeMap<PaneId, PaneViewState>,
     snapshots: &BTreeMap<PaneId, Arc<fyler_core::editor::EditorSnapshot>>,
-    icon_style: IconStyle,
     navigation_entries: &[chrome::NavigationEntry],
     navigation_open: bool,
     navigation_focused: bool,
@@ -1336,7 +1323,6 @@ fn draw_layout(
                     navigation_entries,
                     navigation_focused,
                     navigation_selected,
-                    icon_style,
                 )
             })
             .inner;
@@ -1351,7 +1337,6 @@ fn draw_layout(
         active,
         panes,
         snapshots,
-        icon_style,
         statusline_left,
         statusline_right,
     );
@@ -1366,7 +1351,6 @@ fn draw_layout_in_rect(
     active: PaneId,
     panes: &mut BTreeMap<PaneId, PaneViewState>,
     snapshots: &BTreeMap<PaneId, Arc<fyler_core::editor::EditorSnapshot>>,
-    icon_style: IconStyle,
     statusline_left: &[StatusItem],
     statusline_right: &[StatusItem],
 ) -> Option<ImeGeometry> {
@@ -1406,7 +1390,6 @@ fn draw_layout_in_rect(
                             &pane.incomplete_dirs,
                             &pane.collapsed_dirs,
                             &pane.file_infos,
-                            icon_style,
                             pane.tree_viewport,
                             *id,
                             *id == active,
@@ -1476,7 +1459,6 @@ fn draw_layout_in_rect(
                 active,
                 panes,
                 snapshots,
-                icon_style,
                 statusline_left,
                 statusline_right,
             );
@@ -1487,7 +1469,6 @@ fn draw_layout_in_rect(
                 active,
                 panes,
                 snapshots,
-                icon_style,
                 statusline_left,
                 statusline_right,
             );
@@ -1947,8 +1928,6 @@ pub fn run(
             let GuiOptions {
                 confirm_detail,
                 font_path,
-                font_y_offset_factor,
-                icon_style,
                 help_entries,
                 dock_focus_bindings,
                 bookmarks,
@@ -1959,17 +1938,12 @@ pub fn run(
             } = gui_options;
             let resize_to_monitor_on_first_frame = initial_window.is_none();
             theme::install(&creation_context.egui_ctx);
-            install_fallback_font(
-                &creation_context.egui_ctx,
-                font_path.as_deref(),
-                font_y_offset_factor,
-            );
+            install_fallback_font(&creation_context.egui_ctx, font_path.as_deref());
             let mut app = FylerApp::new(
                 event_rx,
                 action_tx,
                 AppOptions {
                     confirm_detail,
-                    icon_style,
                     help_entries,
                     dock_focus_bindings,
                     bookmarks,
@@ -1990,67 +1964,56 @@ pub fn run(
     .map_err(|error| anyhow::anyhow!("Failed to start GUI: {error}"))
 }
 
-/// 指定パスを優先し、存在しなければ候補列の先頭から利用可能なパスを返す。
-fn resolve_font_path(configured: Option<&Path>, candidates: &[PathBuf]) -> Option<PathBuf> {
-    configured
-        .filter(|path| path.exists())
-        .map(Path::to_path_buf)
-        .or_else(|| candidates.iter().find(|path| path.exists()).cloned())
-}
-
-fn install_fallback_font(context: &egui::Context, configured: Option<&Path>, y_offset_factor: f32) {
-    let candidates = default_font_candidates();
-    let Some(path) = resolve_font_path(configured, &candidates) else {
-        return;
-    };
-    let Ok(bytes) = fs::read(path) else {
-        return;
-    };
+/// 組み込みフォント(Moralerspace Argon HW)を常に登録する。
+///
+/// - テキストファミリ(Monospace / Proportional): `config.font`があれば
+///   ユーザーフォントを先頭、組み込みフォントをその次(JP・アイコンのfallback)に
+///   置く。なければ組み込みフォントが先頭。eguiの既定フォントはその後ろへ残す。
+/// - アイコン専用ファミリ [`icon::font_family`] には組み込みフォントだけを入れ、
+///   `config.font`に左右されずアイコンが同一に描画されるようにする。
+///
+/// ユーザーフォントの読み込みに失敗しても起動は止めず、組み込みフォントへfallbackする。
+fn install_fallback_font(context: &egui::Context, configured: Option<&Path>) {
+    const BUILTIN_FONT_BYTES: &[u8] =
+        include_bytes!("../assets/fonts/MoralerspaceArgonHW-Regular.ttf");
 
     let mut definitions = egui::FontDefinitions::default();
     definitions.font_data.insert(
-        CJK_FONT_NAME.to_owned(),
-        Arc::new(egui::FontData::from_owned(bytes).tweak(egui::FontTweak {
-            y_offset_factor,
-            ..Default::default()
-        })),
+        BUILTIN_FONT_NAME.to_owned(),
+        Arc::new(egui::FontData::from_static(BUILTIN_FONT_BYTES)),
     );
+
+    // ユーザー指定フォントは実行時に読み込む(絶対パス。config読み込み時に検証済み)。
+    // 読み込めなければ組み込みフォントだけで続行する。
+    let user_font = configured
+        .and_then(|path| fs::read(path).ok())
+        .map(|bytes| {
+            let name = "fyler-user".to_owned();
+            definitions
+                .font_data
+                .insert(name.clone(), Arc::new(egui::FontData::from_owned(bytes)));
+            name
+        });
+
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        definitions
-            .families
-            .entry(family)
-            .or_default()
-            .push(CJK_FONT_NAME.to_owned());
+        let entry = definitions.families.entry(family).or_default();
+        // 既定フォントの前へ、組み込み(+あればユーザー)フォントを差し込む。
+        entry.insert(0, BUILTIN_FONT_NAME.to_owned());
+        if let Some(name) = &user_font {
+            entry.insert(0, name.clone());
+        }
     }
+
+    // アイコン専用ファミリは組み込みフォントだけ。config.fontの影響を受けない。
+    definitions
+        .families
+        .insert(icon::font_family(), vec![BUILTIN_FONT_NAME.to_owned()]);
+
     context.set_fonts(definitions);
-}
-
-fn default_font_candidates() -> Vec<PathBuf> {
-    #[cfg(windows)]
-    {
-        let Some(windows_directory) = std::env::var_os("WINDIR").map(PathBuf::from) else {
-            return Vec::new();
-        };
-        let fonts = windows_directory.join("Fonts");
-        vec![
-            fonts.join("YuGothM.ttc"),
-            fonts.join("meiryo.ttc"),
-            fonts.join("msgothic.ttc"),
-        ]
-    }
-
-    #[cfg(not(windows))]
-    {
-        vec![PathBuf::from(
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        )]
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use super::*;
 
     struct RecordingEngine(Arc<fyler_core::editor::EditorSnapshot>);
@@ -2099,7 +2062,6 @@ mod tests {
                 picker_needs_focus: false,
                 feedback_needs_focus: false,
                 confirm_detail: ConfirmDetail::Full,
-                icon_style: IconStyle::Ascii,
                 help_entries: Vec::new(),
                 dock_focus_bindings: Vec::new(),
                 navigation_dock: NavigationDockState::visible(),
@@ -2114,79 +2076,6 @@ mod tests {
             event_tx,
             action_rx,
         )
-    }
-
-    static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
-
-    struct TestDirectory(PathBuf);
-
-    impl TestDirectory {
-        fn new() -> Self {
-            let suffix = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "fyler-gui-font-test-{}-{suffix}",
-                std::process::id()
-            ));
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TestDirectory {
-        fn drop(&mut self) {
-            fs::remove_dir_all(&self.0).unwrap();
-        }
-    }
-
-    #[test]
-    fn resolve_font_path_prefers_existing_configured_path() {
-        let directory = TestDirectory::new();
-        let configured = directory.path().join("configured.ttf");
-        let candidate = directory.path().join("candidate.ttf");
-        fs::write(&configured, b"configured").unwrap();
-        fs::write(&candidate, b"candidate").unwrap();
-
-        assert_eq!(
-            resolve_font_path(Some(&configured), &[candidate]),
-            Some(configured)
-        );
-    }
-
-    #[test]
-    fn resolve_font_path_falls_back_to_first_existing_candidate() {
-        let directory = TestDirectory::new();
-        let missing_configured = directory.path().join("missing-configured.ttf");
-        let missing_candidate = directory.path().join("missing-candidate.ttf");
-        let existing_candidate = directory.path().join("existing-candidate.ttf");
-        fs::write(&existing_candidate, b"candidate").unwrap();
-
-        assert_eq!(
-            resolve_font_path(
-                Some(&missing_configured),
-                &[missing_candidate, existing_candidate.clone()]
-            ),
-            Some(existing_candidate)
-        );
-    }
-
-    #[test]
-    fn resolve_font_path_returns_none_when_every_path_is_missing() {
-        let directory = TestDirectory::new();
-
-        assert_eq!(
-            resolve_font_path(
-                Some(&directory.path().join("missing-configured.ttf")),
-                &[
-                    directory.path().join("missing-a.ttf"),
-                    directory.path().join("missing-b.ttf"),
-                ]
-            ),
-            None
-        );
     }
 
     #[test]
@@ -2248,7 +2137,6 @@ mod tests {
             picker_needs_focus: false,
             feedback_needs_focus: false,
             confirm_detail: ConfirmDetail::Full,
-            icon_style: IconStyle::Ascii,
             help_entries: Vec::new(),
             dock_focus_bindings: Vec::new(),
             navigation_dock: NavigationDockState::visible(),
