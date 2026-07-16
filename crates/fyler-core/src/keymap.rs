@@ -72,6 +72,12 @@ pub enum EditorAction {
     PaneFocusPrevious,
     /// 現在のpaneを閉じる。
     PaneClose,
+    /// paneのnavigation historyを1つ戻る。
+    HistoryBack,
+    /// paneのnavigation historyを1つ進む。
+    HistoryForward,
+    /// 現在のrootを実FSから明示的に再同期する。
+    Refresh,
 }
 
 impl EditorAction {
@@ -105,6 +111,9 @@ impl EditorAction {
             "pane_focus_next" => Self::PaneFocusNext,
             "pane_focus_previous" => Self::PaneFocusPrevious,
             "pane_close" => Self::PaneClose,
+            "history_back" => Self::HistoryBack,
+            "history_forward" => Self::HistoryForward,
+            "refresh" => Self::Refresh,
             _ => return None,
         })
     }
@@ -139,6 +148,9 @@ impl EditorAction {
             Self::PaneFocusNext => "pane_focus_next",
             Self::PaneFocusPrevious => "pane_focus_previous",
             Self::PaneClose => "pane_close",
+            Self::HistoryBack => "history_back",
+            Self::HistoryForward => "history_forward",
+            Self::Refresh => "refresh",
         }
     }
 
@@ -172,6 +184,9 @@ impl EditorAction {
             Self::PaneFocusNext => "Focus next pane",
             Self::PaneFocusPrevious => "Focus previous pane",
             Self::PaneClose => "Close pane",
+            Self::HistoryBack => "Go back in navigation history",
+            Self::HistoryForward => "Go forward in navigation history",
+            Self::Refresh => "Reload the current root from disk",
         }
     }
 }
@@ -394,6 +409,9 @@ pub fn default_bindings(leader: KeyInput) -> Vec<KeyBinding> {
         ("Ctrl+W p", EditorAction::PaneFocusPrevious),
         ("Ctrl+W q", EditorAction::PaneClose),
         ("Ctrl+W c", EditorAction::PaneClose),
+        ("Ctrl+P", EditorAction::HistoryBack),
+        ("Ctrl+N", EditorAction::HistoryForward),
+        ("Ctrl+R", EditorAction::Refresh),
     ];
     entries
         .into_iter()
