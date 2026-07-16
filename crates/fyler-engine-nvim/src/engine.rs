@@ -337,7 +337,12 @@ impl NvimEngine {
                                 // nvimがhit-enter待ちに入りfylerがフリーズして見える。
                                 // ext_messagesのreturn_promptは外部UIが表示を持つため、
                                 // 即座に<CR>で解除し、プロンプト自体は表示しない。
-                                if outcome.hit_enter_prompt {
+                                // ただしユーザー入力が先にプロンプトを解除していた場合、
+                                // この<CR>はNormalモードでActivateLine(ファイルを開く)に
+                                // 化けるため、実際にblocking中のときだけ送る。
+                                if outcome.hit_enter_prompt
+                                    && input_is_blocking(&nvim).await.unwrap_or(false)
+                                {
                                     let _ = nvim.input("<CR>").await;
                                 }
                             }
