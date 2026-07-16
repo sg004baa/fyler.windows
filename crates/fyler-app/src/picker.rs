@@ -1,4 +1,8 @@
 //! baselineから独立したSearchCatalogと、GUI外でmatchingする単一worker。
+//!
+//! 照合はnucleo-matcher(低レベルcrate)で行う。overlayが削除を表現するため
+//! 高レベル`nucleo`のinjector runtimeは使えない。従来のchunk+overlay+latest-wins
+//! worker構成を維持し、スコアリングだけを差し替える。
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -8,9 +12,11 @@ use std::thread;
 
 use fyler_core::pane::PaneId;
 use fyler_core::path::TreePath;
-use fyler_core::search::{SearchCandidate, search_refs};
+use fyler_core::search::SearchCandidate;
 use fyler_core::tree::EntryKind;
 use fyler_gui::app::{GuiEvent, PickerHit};
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher, Utf32String};
 
 use super::AppEvent;
 use crate::queue_stats::CountingSender;
@@ -24,9 +30,16 @@ struct CatalogOverlay {
     removed_directories: HashSet<Box<str>>,
 }
 
-/// 完了済みchunkは不変なArc sliceとして共有し、検索中のappend lock競合を避ける。
+/// sealed chunk。候補と、nucleoのhaystack(`Utf32String`)を事前変換して保持する。
+/// haystackはchunkと同じ添字で並ぶ。
+struct SealedChunk {
+    candidates: Arc<[SearchCandidate]>,
+    haystacks: Vec<Utf32String>,
+}
+
+/// 完了済みchunkは不変なArcとして共有し、検索中のappend lock競合を避ける。
 pub(super) struct SearchCatalog {
-    chunks: Mutex<Vec<Arc<[SearchCandidate]>>>,
+    chunks: Mutex<Vec<Arc<SealedChunk>>>,
     // directoryは全entryの一部なので、display重複保持と引き換えにwatch処理をO(1)化する。
     dir_index: Mutex<HashSet<Box<str>>>,
     overlay: Mutex<CatalogOverlay>,
@@ -47,7 +60,7 @@ impl SearchCatalog {
         }
     }
 
-    fn chunks(&self) -> Vec<Arc<[SearchCandidate]>> {
+    fn chunks(&self) -> Vec<Arc<SealedChunk>> {
         self.chunks
             .lock()
             .map_or_else(|_| Vec::new(), |chunks| chunks.clone())
@@ -63,8 +76,16 @@ impl SearchCatalog {
                     .map(|candidate| candidate.display.clone()),
             );
         }
+        let haystacks = batch
+            .iter()
+            .map(|candidate| Utf32String::from(candidate.display.as_ref()))
+            .collect();
+        let chunk = Arc::new(SealedChunk {
+            candidates: Arc::from(batch),
+            haystacks,
+        });
         if let Ok(mut chunks) = self.chunks.lock() {
-            chunks.push(Arc::from(batch));
+            chunks.push(chunk);
             self.indexed_count.fetch_add(count, Ordering::Relaxed);
         }
     }
@@ -142,13 +163,17 @@ impl CatalogService {
         }
     }
 
+    /// paneのrootが判明した時点で(startup登録・split)背景indexを先行起動する。
     pub(super) fn register_pane(&mut self, pane_id: PaneId, root: PathBuf) {
-        self.pane_roots.insert(pane_id, root);
+        self.pane_roots.insert(pane_id, root.clone());
+        self.ensure(&root);
     }
 
+    /// root変更でも新rootの背景indexを先行起動し、参照されなくなったrootを解放する。
     pub(super) fn change_root(&mut self, pane_id: PaneId, root: PathBuf) {
-        self.pane_roots.insert(pane_id, root);
+        self.pane_roots.insert(pane_id, root.clone());
         self.drop_unreferenced();
+        self.ensure(&root);
     }
 
     pub(super) fn remove_pane(&mut self, pane_id: PaneId) {
@@ -265,59 +290,17 @@ impl PickerSearchWorker {
             .name("fyler-picker-search".to_owned())
             .stack_size(256 * 1024)
             .spawn(move || {
+                // Matcherはstatefulなscratchメモリなのでworkerで1つを再利用する。
+                let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
                 while let Ok(mut request) = request_rx.recv() {
                     // 連投時は開始前に古いqueryを捨て、最新だけを処理する。
                     while let Ok(latest) = request_rx.try_recv() {
                         request = latest;
                     }
-                    let chunks = request.catalog.chunks();
-                    let overlay = request
-                        .catalog
-                        .overlay
-                        .lock()
-                        .map(|overlay| {
-                            let entries = overlay.entries.clone();
-                            let order = overlay.order.clone();
-                            let removed = overlay.removed_directories.clone();
-                            (entries, order, removed)
-                        })
-                        .unwrap_or_default();
-                    let (overlay_entries, overlay_order, removed_directories) = overlay;
-                    // 未sealed batchのdirがdir_indexへ入る前にdelete通知が先行した場合は、
-                    // 一時的なghostを許容する。選択時のbaseline再解決でstale Warnとなり、
-                    // 次のwatch更新またはcatalog再構築で収束するため、検索毎の全件走査はしない。
-                    let base = chunks
-                        .iter()
-                        .flat_map(|chunk| chunk.iter())
-                        .filter(|candidate| {
-                            let display = candidate.display.as_ref();
-                            !overlay_entries.contains_key(display)
-                                && !removed_directories.iter().any(|directory| {
-                                    display.len() > directory.len()
-                                        && display.starts_with(directory.as_ref())
-                                        && display.as_bytes().get(directory.len()) == Some(&b'/')
-                                })
-                        });
-                    let additions = overlay_order.iter().filter_map(|path| {
-                        overlay_entries.get(path.as_ref()).and_then(Option::as_ref)
-                    });
-                    let hits = search_refs(
-                        base.chain(additions),
-                        &request.query,
-                        PICKER_RESULT_LIMIT,
-                        request.include_hidden,
-                    );
+                    let results = run_search(&request, &mut matcher);
                     if worker_generation.load(Ordering::Acquire) != request.generation {
                         continue;
                     }
-                    let results = hits
-                        .into_iter()
-                        .map(|hit| PickerHit {
-                            path: TreePath::parse(&hit.candidate.display),
-                            display: hit.candidate.display.to_string(),
-                            kind: hit.candidate.kind,
-                        })
-                        .collect();
                     let _ = gui_event_tx.send(GuiEvent::PickerResults {
                         pane_id: request.pane_id,
                         query: request.query,
@@ -356,6 +339,111 @@ impl PickerSearchWorker {
     }
 }
 
+/// sealed chunk + overlayをnucleoで照合し、上位`PICKER_RESULT_LIMIT`件を返す。
+///
+/// scoreは降順、同点はpath昇順で安定させる(並列scan下でも決定的)。空queryは
+/// 走査順の先頭N件をscore 0で返す。matchのみをsortし、候補全体はsortしない。
+fn run_search(request: &SearchRequest, matcher: &mut Matcher) -> Vec<PickerHit> {
+    let chunks = request.catalog.chunks();
+    let (overlay_entries, overlay_order, removed_directories) = request
+        .catalog
+        .overlay
+        .lock()
+        .map(|overlay| {
+            (
+                overlay.entries.clone(),
+                overlay.order.clone(),
+                overlay.removed_directories.clone(),
+            )
+        })
+        .unwrap_or_default();
+
+    // 未sealed batchのdirがdir_indexへ入る前にdelete通知が先行した場合は、一時的な
+    // ghostを許容する。選択時のbaseline再解決でstale Warnとなり、次のwatch更新または
+    // catalog再構築で収束するため、検索毎の全件走査はしない。
+    let shadowed = |display: &str| {
+        overlay_entries.contains_key(display)
+            || removed_directories.iter().any(|directory| {
+                display.len() > directory.len()
+                    && display.starts_with(directory.as_ref())
+                    && display.as_bytes().get(directory.len()) == Some(&b'/')
+            })
+    };
+    let include = |candidate: &SearchCandidate| {
+        (request.include_hidden || !candidate.hidden) && !shadowed(candidate.display.as_ref())
+    };
+
+    let pattern = Pattern::parse(&request.query, CaseMatching::Ignore, Normalization::Smart);
+
+    // 空query: 走査順の先頭N件。sortしない。
+    if pattern.atoms.is_empty() {
+        let mut hits = Vec::with_capacity(PICKER_RESULT_LIMIT);
+        for chunk in &chunks {
+            for candidate in chunk.candidates.iter() {
+                if include(candidate) {
+                    hits.push(picker_hit(candidate));
+                    if hits.len() >= PICKER_RESULT_LIMIT {
+                        return hits;
+                    }
+                }
+            }
+        }
+        for path in &overlay_order {
+            if let Some(Some(candidate)) = overlay_entries.get(path.as_ref())
+                && include(candidate)
+            {
+                hits.push(picker_hit(candidate));
+                if hits.len() >= PICKER_RESULT_LIMIT {
+                    return hits;
+                }
+            }
+        }
+        return hits;
+    }
+
+    let mut matches: Vec<(&SearchCandidate, u32)> = Vec::new();
+    for chunk in &chunks {
+        for (index, candidate) in chunk.candidates.iter().enumerate() {
+            if !include(candidate) {
+                continue;
+            }
+            if let Some(score) = pattern.score(chunk.haystacks[index].slice(..), matcher) {
+                matches.push((candidate, score));
+            }
+        }
+    }
+    for path in &overlay_order {
+        if let Some(Some(candidate)) = overlay_entries.get(path.as_ref())
+            && include(candidate)
+        {
+            let haystack = Utf32String::from(candidate.display.as_ref());
+            if let Some(score) = pattern.score(haystack.slice(..), matcher) {
+                matches.push((candidate, score));
+            }
+        }
+    }
+
+    matches.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| left.0.display.cmp(&right.0.display))
+    });
+    matches.truncate(PICKER_RESULT_LIMIT);
+    matches
+        .into_iter()
+        .map(|(candidate, _)| picker_hit(candidate))
+        .collect()
+}
+
+fn picker_hit(candidate: &SearchCandidate) -> PickerHit {
+    PickerHit {
+        path: TreePath::parse(&candidate.display),
+        display: candidate.display.to_string(),
+        kind: candidate.kind,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ActivePicker {
     pub pane_id: PaneId,
@@ -372,6 +460,17 @@ mod tests {
 
     use super::*;
 
+    fn sealed_chunk(candidates: Vec<SearchCandidate>) -> Arc<SealedChunk> {
+        let haystacks = candidates
+            .iter()
+            .map(|candidate| Utf32String::from(candidate.display.as_ref()))
+            .collect();
+        Arc::new(SealedChunk {
+            candidates: Arc::from(candidates),
+            haystacks,
+        })
+    }
+
     fn catalog(candidates: Vec<SearchCandidate>) -> Arc<SearchCatalog> {
         let dir_index = candidates
             .iter()
@@ -381,11 +480,30 @@ mod tests {
         Arc::new(SearchCatalog {
             indexed_count: AtomicUsize::new(candidates.len()),
             complete: AtomicBool::new(true),
-            chunks: Mutex::new(vec![Arc::from(candidates)]),
+            chunks: Mutex::new(vec![sealed_chunk(candidates)]),
             dir_index: Mutex::new(dir_index),
             overlay: Mutex::new(CatalogOverlay::default()),
             cancel: AtomicBool::new(false),
         })
+    }
+
+    fn file(path: &str) -> SearchCandidate {
+        SearchCandidate::new(path.to_owned(), EntryKind::File, false)
+    }
+
+    fn matched(candidates: Vec<SearchCandidate>, query: &str, include_hidden: bool) -> Vec<String> {
+        let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+        let request = SearchRequest {
+            generation: 0,
+            pane_id: PaneId::new(1),
+            query: query.to_owned(),
+            include_hidden,
+            catalog: catalog(candidates),
+        };
+        run_search(&request, &mut matcher)
+            .into_iter()
+            .map(|hit| hit.display)
+            .collect()
     }
 
     fn visible_overlay_paths(catalog: &SearchCatalog) -> Vec<String> {
@@ -393,7 +511,7 @@ mod tests {
         let overlay = catalog.overlay.lock().unwrap();
         chunks
             .iter()
-            .flat_map(|chunk| chunk.iter())
+            .flat_map(|chunk| chunk.candidates.iter())
             .filter(|candidate| {
                 !overlay.entries.contains_key(candidate.display.as_ref())
                     && !overlay.removed_directories.iter().any(|directory| {
@@ -412,6 +530,76 @@ mod tests {
     }
 
     #[test]
+    fn basename_match_ranks_above_dir_component_match() {
+        let results = matched(
+            vec![
+                file("foo/other.txt"),
+                file("docs/foo.txt"),
+                file("bar/baz.txt"),
+            ],
+            "foo",
+            true,
+        );
+        // basename一致(docs/foo.txt)がdir成分一致(foo/other.txt)より上位。
+        assert_eq!(results[0], "docs/foo.txt");
+        assert!(results.contains(&"foo/other.txt".to_owned()));
+        assert!(!results.contains(&"bar/baz.txt".to_owned()));
+    }
+
+    #[test]
+    fn whitespace_tokens_all_must_match() {
+        let results = matched(
+            vec![
+                file("src/main.rs"),
+                file("src/lib.rs"),
+                file("tests/main.rs"),
+            ],
+            "src main",
+            true,
+        );
+        assert_eq!(results, ["src/main.rs"]);
+    }
+
+    #[test]
+    fn matching_is_case_insensitive() {
+        let results = matched(vec![file("Foo.txt"), file("bar.txt")], "foo", true);
+        assert_eq!(results, ["Foo.txt"]);
+    }
+
+    #[test]
+    fn hidden_candidates_are_filtered_unless_requested() {
+        let candidates = vec![
+            SearchCandidate::new("visible.txt".to_owned(), EntryKind::File, false),
+            SearchCandidate::new(".hidden.txt".to_owned(), EntryKind::File, true),
+        ];
+        assert_eq!(matched(candidates.clone(), "", false).len(), 1);
+        assert_eq!(matched(candidates.clone(), "", true).len(), 2);
+        assert!(matched(candidates, "hidden", false).is_empty());
+    }
+
+    #[test]
+    fn equal_scores_break_ties_by_path_ascending() {
+        // 同一basename・同一構造→同点。path昇順で決定的に並ぶ。
+        let results = matched(
+            vec![file("z/item.txt"), file("a/item.txt"), file("m/item.txt")],
+            "item.txt",
+            true,
+        );
+        assert_eq!(results, ["a/item.txt", "m/item.txt", "z/item.txt"]);
+    }
+
+    #[test]
+    fn empty_query_returns_first_n_in_iteration_order() {
+        let candidates = (0..(PICKER_RESULT_LIMIT + 50))
+            .map(|index| file(&format!("item-{index:04}.txt")))
+            .collect::<Vec<_>>();
+        let results = matched(candidates, "", true);
+        assert_eq!(results.len(), PICKER_RESULT_LIMIT);
+        assert_eq!(results[0], "item-0000.txt");
+        assert_eq!(results[1], "item-0001.txt");
+    }
+
+    #[test]
     fn catalog_is_shared_until_the_last_pane_leaves_the_root() {
         let gauge = Arc::new(QueueGauge::new());
         let (tx, _rx) = mpsc::channel();
@@ -419,8 +607,9 @@ mod tests {
         let root = PathBuf::from("shared-root");
         let catalog = catalog(Vec::new());
         service.catalogs.insert(root.clone(), Arc::clone(&catalog));
-        service.register_pane(PaneId::new(1), root.clone());
-        service.register_pane(PaneId::new(2), root.clone());
+        // register_paneはensureで背景buildを起動しうるが、既存catalogがあれば再利用する。
+        service.pane_roots.insert(PaneId::new(1), root.clone());
+        service.pane_roots.insert(PaneId::new(2), root.clone());
 
         service.remove_pane(PaneId::new(1));
         assert!(service.get(&root).is_some());
@@ -481,7 +670,8 @@ mod tests {
             .collect(),
         );
 
-        let visible = visible_overlay_paths(&catalog);
+        let mut visible = visible_overlay_paths(&catalog);
+        visible.sort();
         assert_eq!(visible, ["created.txt", "renamed.txt"]);
     }
 
@@ -497,7 +687,9 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        assert_eq!(visible_overlay_paths(&catalog), ["X", "X/a"]);
+        let mut visible = visible_overlay_paths(&catalog);
+        visible.sort();
+        assert_eq!(visible, ["X", "X/a"]);
 
         std::fs::remove_dir_all(root.path().join("X")).unwrap();
         catalog.update_overlay(root.path(), &[root.path().join("X")].into_iter().collect());

@@ -2730,10 +2730,11 @@ pub(super) fn run() -> anyhow::Result<()> {
                         };
                         let root = session.root.clone();
                         catalogs.invalidate(&root);
+                        // 背景indexを冷めさせないよう、picker表示の有無に関わらず再起動する。
+                        let catalog = catalogs.ensure(&root);
                         if let Some(picker) = active_picker.as_ref()
                             && picker.root == root
                         {
-                            let catalog = catalogs.ensure(&root);
                             picker_search.request(
                                 picker.pane_id,
                                 picker.query.clone(),
