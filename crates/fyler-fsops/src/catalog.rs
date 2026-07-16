@@ -1,16 +1,37 @@
 //! fuzzy finder専用SearchCatalogの読み取り専用walker。
 //!
-//! 候補はソートせずDFS到達順で追加する。同点scoreの安定順は、この挿入順を正典とする。
+//! `ignore::WalkBuilder`の並列walkで`root`部分木を列挙する。並列walkは到達順が
+//! 非決定的なので、候補の順序に意味は無い(同点scoreの安定順はmatching側で
+//! path昇順として決める。`fyler-app`のpicker参照)。
+//!
+//! フィルタは全て無効化する(`.standard_filters(false)`+個別無効化)。file
+//! managerはgitignore対象・hidden・`.git`配下も含めて全て索引する必要があるため、
+//! 候補カバレッジは従来の単一スレッドwalkerと完全に一致する。symlink/junction/
+//! reparse pointには潜らない(`.follow_links(false)`)。
+//!
+//! `\\?\`変換は`long_path::to_fs`の呼び出し1か所に閉じ込める(絶対ルール3)。
+//! WalkBuilderへ渡すrootだけを拡張形式へ変換し、各entryの論理パスは
+//! `entry.path()`から拡張形式rootをstrip_prefixした相対成分で組み立てる
+//! (`\\?\`文字列自体はこのモジュールに現れない)。
+//!
+//! 効果hiddenの伝播: entryは、自身の名前が`.`始まり/Windows hidden属性/root配下の
+//! いずれかの祖先がhiddenなら hidden とする。並列walkでは、`ignore`が親ディレクトリ
+//! entryを子より先にvisitorへ渡す保証を使い、visit時にdir→累積hiddenを共有mapへ
+//! 記録して子から参照する。
 
-use std::fs;
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 
 use anyhow::Context;
 use fyler_core::search::SearchCandidate;
 use fyler_core::tree::EntryKind;
+use ignore::{WalkBuilder, WalkState};
 
 const BATCH_SIZE: usize = 4096;
+const MAX_THREADS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogProgress {
@@ -31,15 +52,10 @@ pub fn candidate_for_path(root: &Path, path: &Path) -> anyhow::Result<Option<Sea
         Ok(relative) if !relative.as_os_str().is_empty() => relative,
         _ => return Ok(None),
     };
-    let Some(display) = relative
-        .components()
-        .map(|component| component.as_os_str().to_str())
-        .collect::<Option<Vec<_>>>()
-        .map(|components| components.join("/"))
-    else {
+    let Some(display) = join_relative(relative) else {
         return Ok(None);
     };
-    let metadata = match fs::symlink_metadata(crate::long_path::to_fs(path)) {
+    let metadata = match std::fs::symlink_metadata(crate::long_path::to_fs(path)) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -54,53 +70,166 @@ pub fn candidate_for_path(root: &Path, path: &Path) -> anyhow::Result<Option<Sea
     )))
 }
 
-/// `root`以下を読み取り専用で再帰列挙し、候補をbatch単位で返す。
+/// `root`以下を並列列挙し、候補をbatch単位で返す。
 ///
-/// `long_path::to_fs`はsyscall引数だけへ適用し、候補の論理パスは呼び出し側の
-/// 素のパスと`file_name`から構築する。symlink/junction/reparse pointには潜らない。
-/// キャンセルはディレクトリ開始時と各entry処理時に確認し、`Ok(None)`を返す。
+/// walkは専用スレッド上で行い、呼び出し側スレッドはchannelから受けたbatchを
+/// `on_batch`/`on_progress`へ単一consumerとして流す(callbackはworkerスレッドへ
+/// 移動しない)。`cancel`はvisitorが確認し、立っていれば`WalkState::Quit`で巻き取る。
+/// キャンセルが確定していれば`Ok(None)`を返す。
 pub fn build_catalog(
     root: &Path,
     cancel: &AtomicBool,
     mut on_batch: impl FnMut(Vec<SearchCandidate>),
     mut on_progress: impl FnMut(CatalogProgress),
 ) -> anyhow::Result<Option<CatalogSummary>> {
-    let mut state = WalkState {
-        cancel,
-        batch: Vec::with_capacity(BATCH_SIZE),
-        indexed_count: 0,
-        skipped_directories: 0,
-        on_batch: &mut on_batch,
-        on_progress: &mut on_progress,
-    };
-    walk_directory(root, "", false, true, &mut state)?;
+    let fs_root = crate::long_path::to_fs(root);
+    // rootの列挙失敗はfatal(従来契約)。子dirの失敗はskipped扱いで継続する。
+    std::fs::read_dir(&fs_root)
+        .with_context(|| format!("failed to enumerate catalog root: {}", root.display()))?;
+
+    let hidden_by_dir: Mutex<HashMap<String, bool>> = Mutex::new(HashMap::new());
+    let skipped_directories = AtomicUsize::new(0);
+    let (batch_tx, batch_rx) = mpsc::channel::<Vec<SearchCandidate>>();
+
+    let threads = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .clamp(1, MAX_THREADS);
+
+    let mut indexed_count = 0usize;
+
+    std::thread::scope(|scope| {
+        let fs_root = &fs_root;
+        let hidden_by_dir = &hidden_by_dir;
+        let skipped_directories = &skipped_directories;
+        scope.spawn(move || {
+            let walker = WalkBuilder::new(fs_root)
+                .standard_filters(false)
+                .hidden(false)
+                .parents(false)
+                .ignore(false)
+                .git_ignore(false)
+                .git_global(false)
+                .git_exclude(false)
+                .require_git(false)
+                .follow_links(false)
+                .threads(threads)
+                .build_parallel();
+            walker.run(|| {
+                let mut collector = BatchCollector::new(batch_tx.clone());
+                Box::new(move |result| {
+                    if cancel.load(Ordering::Relaxed) {
+                        return WalkState::Quit;
+                    }
+                    let entry = match result {
+                        Ok(entry) => entry,
+                        Err(_) => {
+                            skipped_directories.fetch_add(1, Ordering::Relaxed);
+                            return WalkState::Continue;
+                        }
+                    };
+                    // depth 0 はroot自身。候補にしない。
+                    if entry.depth() == 0 {
+                        return WalkState::Continue;
+                    }
+                    if let Some(candidate) = make_candidate(fs_root, &entry, hidden_by_dir) {
+                        collector.push(candidate);
+                    }
+                    WalkState::Continue
+                })
+            });
+            // batch_tx(と全collectorの複製)はこのクロージャのdropで閉じる。
+        });
+
+        while let Ok(batch) = batch_rx.recv() {
+            indexed_count += batch.len();
+            on_batch(batch);
+            on_progress(CatalogProgress { indexed_count });
+        }
+    });
+
     if cancel.load(Ordering::Relaxed) {
         return Ok(None);
     }
-    state.flush();
     Ok(Some(CatalogSummary {
-        indexed_count: state.indexed_count,
-        skipped_directories: state.skipped_directories,
+        indexed_count,
+        skipped_directories: skipped_directories.load(Ordering::Relaxed),
     }))
 }
 
-struct WalkState<'a, B, P> {
-    cancel: &'a AtomicBool,
-    batch: Vec<SearchCandidate>,
-    indexed_count: usize,
-    skipped_directories: usize,
-    on_batch: &'a mut B,
-    on_progress: &'a mut P,
+/// 相対パスを`/`区切りへ結合する。非UTF-8成分があれば`None`。
+fn join_relative(relative: &Path) -> Option<String> {
+    relative
+        .components()
+        .map(|component| component.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()
+        .map(|components| components.join("/"))
 }
 
-impl<B, P> WalkState<'_, B, P>
-where
-    B: FnMut(Vec<SearchCandidate>),
-    P: FnMut(CatalogProgress),
-{
+/// entryを候補へ変換し、dirなら累積hiddenを共有mapへ記録する。
+fn make_candidate(
+    fs_root: &Path,
+    entry: &ignore::DirEntry,
+    hidden_by_dir: &Mutex<HashMap<String, bool>>,
+) -> Option<SearchCandidate> {
+    let relative = entry.path().strip_prefix(fs_root).ok()?;
+    let display = join_relative(relative)?;
+    let file_name = entry.file_name();
+    let parent_hidden = {
+        let parent = display.rsplit_once('/').map_or("", |(parent, _)| parent);
+        if parent.is_empty() {
+            false
+        } else {
+            hidden_by_dir
+                .lock()
+                .ok()
+                .and_then(|map| map.get(parent).copied())
+                .unwrap_or(false)
+        }
+    };
+    let dot_name = file_name.as_encoded_bytes().first() == Some(&b'.');
+    let file_type = entry.file_type();
+
+    // Unixのsymlinkはlink先を追わずbroken linkでも候補として残すため、metadataを
+    // 呼ばずdot名だけでhiddenを判定する。
+    #[cfg(not(windows))]
+    if file_type.is_some_and(|file_type| file_type.is_symlink()) {
+        let hidden = parent_hidden || dot_name;
+        return Some(SearchCandidate::new(display, EntryKind::Symlink, hidden));
+    }
+
+    let metadata = entry.metadata().ok()?;
+    let own_hidden = dot_name || super::scan::is_hidden(file_name, &metadata);
+    let hidden = parent_hidden || own_hidden;
+    let kind = if file_type.is_some_and(|file_type| file_type.is_symlink()) {
+        EntryKind::Symlink
+    } else {
+        super::scan::kind_from_metadata(&metadata)
+    };
+    if kind == EntryKind::Dir
+        && let Ok(mut map) = hidden_by_dir.lock()
+    {
+        map.insert(display.clone(), hidden);
+    }
+    Some(SearchCandidate::new(display, kind, hidden))
+}
+
+/// worker毎のbatch蓄積。満杯でchannelへ送り、drop時に残りをflushする。
+struct BatchCollector {
+    batch: Vec<SearchCandidate>,
+    tx: mpsc::Sender<Vec<SearchCandidate>>,
+}
+
+impl BatchCollector {
+    fn new(tx: mpsc::Sender<Vec<SearchCandidate>>) -> Self {
+        Self {
+            batch: Vec::with_capacity(BATCH_SIZE),
+            tx,
+        }
+    }
+
     fn push(&mut self, candidate: SearchCandidate) {
         self.batch.push(candidate);
-        self.indexed_count += 1;
         if self.batch.len() >= BATCH_SIZE {
             self.flush();
         }
@@ -108,98 +237,22 @@ where
 
     fn flush(&mut self) {
         if !self.batch.is_empty() {
-            (self.on_batch)(std::mem::replace(
-                &mut self.batch,
-                Vec::with_capacity(BATCH_SIZE),
-            ));
+            let batch = std::mem::replace(&mut self.batch, Vec::with_capacity(BATCH_SIZE));
+            let _ = self.tx.send(batch);
         }
-        (self.on_progress)(CatalogProgress {
-            indexed_count: self.indexed_count,
-        });
     }
 }
 
-fn walk_directory<B, P>(
-    directory: &Path,
-    relative: &str,
-    ancestor_hidden: bool,
-    root: bool,
-    state: &mut WalkState<'_, B, P>,
-) -> anyhow::Result<()>
-where
-    B: FnMut(Vec<SearchCandidate>),
-    P: FnMut(CatalogProgress),
-{
-    if state.cancel.load(Ordering::Relaxed) {
-        return Ok(());
+impl Drop for BatchCollector {
+    fn drop(&mut self) {
+        self.flush();
     }
-    let entries = match fs::read_dir(crate::long_path::to_fs(directory)) {
-        Ok(entries) => entries,
-        Err(_error) if !root => {
-            state.skipped_directories += 1;
-            return Ok(());
-        }
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!("failed to enumerate catalog root: {}", directory.display())
-            });
-        }
-    };
-
-    for entry in entries {
-        if state.cancel.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        // DirEntry::path()はread_dirへ渡した拡張形式を引き継ぐため使用しない。
-        let logical_path = directory.join(&file_name);
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        #[cfg(not(windows))]
-        if file_type.is_symlink() {
-            // UnixではDirEntry::metadataがlink先を追うため、broken linkでも候補として
-            // 残せるようmetadataを呼ばない。hidden判定はdot名だけで完結する。
-            let hidden = ancestor_hidden || file_name.as_encoded_bytes().first() == Some(&b'.');
-            let display = if relative.is_empty() {
-                name.to_owned()
-            } else {
-                format!("{relative}/{name}")
-            };
-            state.push(SearchCandidate::new(display, EntryKind::Symlink, hidden));
-            continue;
-        }
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        let hidden = ancestor_hidden || super::scan::is_hidden(&file_name, &metadata);
-        let display = if relative.is_empty() {
-            name.to_owned()
-        } else {
-            format!("{relative}/{name}")
-        };
-        let kind = if file_type.is_symlink() {
-            EntryKind::Symlink
-        } else {
-            super::scan::kind_from_metadata(&metadata)
-        };
-        state.push(SearchCandidate::new(display.clone(), kind, hidden));
-        if kind == EntryKind::Dir {
-            walk_directory(&logical_path, &display, hidden, false, state)?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs;
     use std::sync::atomic::AtomicBool;
 
     use tempfile::tempdir;
@@ -228,8 +281,17 @@ mod tests {
             .map(|candidate| (&*candidate.display, candidate.hidden))
             .collect::<HashMap<_, _>>();
         assert_eq!(by_path.len(), 4);
+        assert!(!by_path["visible"]);
         assert!(!by_path["visible/file.txt"]);
+        assert!(by_path[".hidden"]);
         assert!(by_path[".hidden/child.txt"]);
+    }
+
+    #[test]
+    fn missing_root_is_a_fatal_error() {
+        let root = tempdir().unwrap();
+        let missing = root.path().join("does-not-exist");
+        assert!(build_catalog(&missing, &AtomicBool::new(false), |_| {}, |_| {}).is_err());
     }
 
     #[cfg(unix)]
@@ -309,6 +371,101 @@ mod tests {
             !candidates
                 .iter()
                 .any(|candidate| candidate.display.as_ref() == "blocked/hidden.txt")
+        );
+    }
+
+    /// 旧実装(単一スレッド再帰walker)。before計測のベースラインとして温存する。
+    fn old_build_catalog(root: &Path) -> usize {
+        fn walk(directory: &Path, relative: &str, out: &mut Vec<SearchCandidate>) {
+            let Ok(entries) = fs::read_dir(crate::long_path::to_fs(directory)) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                let Some(name) = file_name.to_str() else {
+                    continue;
+                };
+                let logical_path = directory.join(&file_name);
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                let display = if relative.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{relative}/{name}")
+                };
+                if file_type.is_symlink() {
+                    out.push(SearchCandidate::new(display, EntryKind::Symlink, false));
+                    continue;
+                }
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                let kind = crate::scan::kind_from_metadata(&metadata);
+                out.push(SearchCandidate::new(display.clone(), kind, false));
+                if kind == EntryKind::Dir {
+                    walk(&logical_path, &display, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, "", &mut out);
+        out.len()
+    }
+
+    #[test]
+    #[ignore = "environment-dependent performance measurement with a ~50k entry tree"]
+    fn bench_build_catalog_on_50k_entries() {
+        use std::time::Instant;
+
+        const DIRECTORY_COUNT: usize = 200;
+        const FILES_PER_DIRECTORY: usize = 250;
+        const ITERATIONS: usize = 10;
+
+        let root = tempdir().unwrap();
+        for directory in 0..DIRECTORY_COUNT {
+            let dir = root.path().join(format!("dir_{directory:04}"));
+            fs::create_dir(&dir).unwrap();
+            for file in 0..FILES_PER_DIRECTORY {
+                fs::write(dir.join(format!("file_{file:04}.txt")), b"x").unwrap();
+            }
+        }
+
+        let mut before_total = std::time::Duration::ZERO;
+        let mut before_count = 0usize;
+        for _ in 0..ITERATIONS {
+            let started = Instant::now();
+            before_count = old_build_catalog(root.path());
+            before_total += started.elapsed();
+        }
+
+        let mut after_total = std::time::Duration::ZERO;
+        let mut after_count = 0usize;
+        for _ in 0..ITERATIONS {
+            let started = Instant::now();
+            let mut count = 0usize;
+            let summary = build_catalog(
+                root.path(),
+                &AtomicBool::new(false),
+                |batch| count += batch.len(),
+                |_| {},
+            )
+            .unwrap()
+            .unwrap();
+            after_total += started.elapsed();
+            after_count = count;
+            assert_eq!(summary.indexed_count, count);
+        }
+
+        assert_eq!(before_count, after_count);
+        eprintln!(
+            "build_catalog bench: entries={after_count}, iterations={ITERATIONS}, threads={}, before(single-thread)={:?}, after(parallel)={:?}",
+            std::thread::available_parallelism()
+                .map(|value| value.get())
+                .unwrap_or(1)
+                .clamp(1, MAX_THREADS),
+            before_total / ITERATIONS as u32,
+            after_total / ITERATIONS as u32,
         );
     }
 }
