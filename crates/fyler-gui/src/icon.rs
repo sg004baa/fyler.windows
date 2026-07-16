@@ -8,13 +8,14 @@ use std::path::Path;
 use eframe::egui;
 use fyler_core::grammar;
 
-const DIRECTORY: &str = " ";
-const DIRECTORY_OPEN: &str = " ";
-const FILE: &str = " ";
-const RUST: &str = " ";
-const MARKDOWN: &str = " ";
-const TEXT: &str = " ";
-const TOML: &str = " ";
+// PUA文字は編集ツールに欠落させられやすいため、エスケープ表記で固定する。
+const DIRECTORY: &str = "\u{f413} ";
+const DIRECTORY_OPEN: &str = "\u{eaf7} ";
+const FILE: &str = "\u{ea7b} ";
+const RUST: &str = "\u{e7a8} ";
+const MARKDOWN: &str = "\u{e73e} ";
+const TEXT: &str = "\u{f15c} ";
+const TOML: &str = "\u{e6b2} ";
 
 /// アイコン描画専用のフォントファミリ名。組み込みフォントだけを含み、
 /// `config.font`に影響されずアイコンが同一に描画されることを保証する。
