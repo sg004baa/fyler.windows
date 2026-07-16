@@ -24,7 +24,10 @@ use fyler_core::undo::UndoTransaction;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
 use fyler_fsops::scan::ScanOptions;
 use fyler_fsops::watch::{FsWatcher, WatchEvent};
-use fyler_gui::app::{FeedbackResultKind, GuiAction, GuiEvent, GuiOptions, PickerAction};
+use fyler_gui::app::{
+    FeedbackResultKind, GuiAction, GuiEvent, GuiOptions, PickerAction, TreeContextItem,
+    TreeRowClickKind,
+};
 use fyler_gui::confirm::ConfirmChoice;
 
 use super::feedback::{FeedbackOutcome, resolve_endpoint, send_feedback};
@@ -39,10 +42,10 @@ use super::transfer_flow::{
 use super::{
     ActivateOutcome, AppEvent, BookmarkResolution, GitRefresher, after_root_change,
     bookmark_list_message, default_root, format_drive_paths, handle_activate_line,
-    handle_external_change, handle_open_file_picker, handle_open_terminal, handle_open_with,
-    handle_picker_select, handle_yank_path, normalize_root, parse_sort_query,
-    resolve_bookmark_query, resolve_cd_target, send_gui_message, send_save_result, send_view_state,
-    sort_state_message,
+    handle_begin_name_edit, handle_external_change, handle_mark_for_deletion,
+    handle_open_file_picker, handle_open_terminal, handle_open_with, handle_picker_select,
+    handle_yank_path, normalize_root, parse_sort_query, resolve_bookmark_query, resolve_cd_target,
+    send_gui_message, send_save_result, send_view_state, sort_state_message, tree_edit_rejection,
 };
 use super::{undo_format, undo_journal};
 use crate::queue_stats::{CountingSender, QueueGauge};
@@ -568,6 +571,25 @@ pub(super) fn run() -> anyhow::Result<()> {
                         AppEvent::FeedbackSubmit { kind, body }
                     }
                     GuiAction::FeedbackClosed => AppEvent::FeedbackClosed,
+                    GuiAction::RequestPaneFocus { pane_id } => AppEvent::RequestPaneFocus(pane_id),
+                    GuiAction::TreeRowClicked {
+                        pane_id,
+                        line,
+                        kind,
+                    } => AppEvent::TreeRowClicked {
+                        pane_id,
+                        line,
+                        kind,
+                    },
+                    GuiAction::TreeContextAction {
+                        pane_id,
+                        line,
+                        item,
+                    } => AppEvent::TreeContextAction {
+                        pane_id,
+                        line,
+                        item,
+                    },
                 };
                 if action_event_tx.send(event).is_err() {
                     return;
@@ -1626,6 +1648,186 @@ pub(super) fn run() -> anyhow::Result<()> {
                             }
                         }
                     }
+                    AppEvent::RequestPaneFocus(pane_id) => {
+                        if pane_id != active && panes.contains_key(&pane_id) {
+                            last_active = active;
+                            active = pane_id;
+                            if gui_event_tx
+                                .send(GuiEvent::LayoutChanged {
+                                    layout: layout.clone(),
+                                    active,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    AppEvent::TreeRowClicked {
+                        pane_id,
+                        line,
+                        kind,
+                    } => {
+                        let was_active = pane_id == active;
+                        if !was_active {
+                            if !panes.contains_key(&pane_id) {
+                                continue;
+                            }
+                            last_active = active;
+                            active = pane_id;
+                            if gui_event_tx
+                                .send(GuiEvent::LayoutChanged {
+                                    layout: layout.clone(),
+                                    active,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        let Some(session) = panes.get(&pane_id) else {
+                            continue;
+                        };
+                        if session.crashed {
+                            continue;
+                        }
+                        // inactiveだったpaneのclickは focus切替+カーソル移動までで、
+                        // double/shift相当の副作用は起こさない(仕様通り単発click扱い)。
+                        if !was_active {
+                            if let Err(error) =
+                                session.engine.send(EditorCommand::SetCursorLine(line))
+                                && send_gui_message(
+                                    &gui_event_tx,
+                                    pane_id,
+                                    MessageKind::Error,
+                                    format!("Failed to move cursor: {error:#}"),
+                                )
+                                .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        match kind {
+                            TreeRowClickKind::Single => {
+                                if let Err(error) =
+                                    session.engine.send(EditorCommand::SetCursorLine(line))
+                                    && send_gui_message(
+                                        &gui_event_tx,
+                                        pane_id,
+                                        MessageKind::Error,
+                                        format!("Failed to move cursor: {error:#}"),
+                                    )
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            TreeRowClickKind::Double => {
+                                // 既存のEditorEvent::ActivateLine経路をそのまま再利用する
+                                // (handle_activate_lineの再実装禁止)。
+                                pending_events.push_front(AppEvent::Editor(
+                                    pane_id,
+                                    EditorEvent::ActivateLine { line },
+                                ));
+                            }
+                            TreeRowClickKind::Shift => {
+                                // anchorはclick前(このイベント処理時点)のカーソル行。
+                                let anchor = session.engine.snapshot().cursor.line;
+                                if let Err(error) = session
+                                    .engine
+                                    .send(EditorCommand::SelectLines { anchor, head: line })
+                                    && send_gui_message(
+                                        &gui_event_tx,
+                                        pane_id,
+                                        MessageKind::Error,
+                                        format!("Failed to select lines: {error:#}"),
+                                    )
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    AppEvent::TreeContextAction {
+                        pane_id,
+                        line,
+                        item,
+                    } => match item {
+                        TreeContextItem::Open => {
+                            pending_events.push_front(AppEvent::Editor(
+                                pane_id,
+                                EditorEvent::ActivateLine { line },
+                            ));
+                        }
+                        TreeContextItem::OpenWith => {
+                            pending_events.push_front(AppEvent::Editor(
+                                pane_id,
+                                EditorEvent::OpenWith { line },
+                            ));
+                        }
+                        TreeContextItem::CopyPath => {
+                            pending_events.push_front(AppEvent::Editor(
+                                pane_id,
+                                EditorEvent::YankPath { line },
+                            ));
+                        }
+                        TreeContextItem::OpenTerminal => {
+                            pending_events.push_front(AppEvent::Editor(
+                                pane_id,
+                                EditorEvent::OpenTerminal { line },
+                            ));
+                        }
+                        TreeContextItem::Rename => {
+                            let Some(session) = panes.get(&pane_id) else {
+                                continue;
+                            };
+                            let rejection = tree_edit_rejection(
+                                dialog_owner.is_some(),
+                                apply_owner.is_some(),
+                                transfer.is_awaiting(),
+                                transfer.is_running(),
+                                session.crashed,
+                                session.save_controller.is_idle(),
+                            );
+                            if handle_begin_name_edit(
+                                pane_id,
+                                session.engine.as_ref(),
+                                line,
+                                rejection,
+                                &gui_event_tx,
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        TreeContextItem::MarkForDeletion => {
+                            let Some(session) = panes.get(&pane_id) else {
+                                continue;
+                            };
+                            let rejection = tree_edit_rejection(
+                                dialog_owner.is_some(),
+                                apply_owner.is_some(),
+                                transfer.is_awaiting(),
+                                transfer.is_running(),
+                                session.crashed,
+                                session.save_controller.is_idle(),
+                            );
+                            if handle_mark_for_deletion(
+                                pane_id,
+                                session.engine.as_ref(),
+                                line,
+                                rejection,
+                                &gui_event_tx,
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    },
                     AppEvent::PickerSelect {
                         pane_id,
                         path,
