@@ -686,6 +686,15 @@ async fn handle_command(
                 .await
                 .map_err(|error| anyhow::anyhow!("Redo RPC failed: {error}"))?;
         }
+        EngineCommand::Editor(EditorCommand::SelectLines { anchor, head }) => {
+            select_lines(nvim, buffer, anchor, head).await?;
+        }
+        EngineCommand::Editor(EditorCommand::BeginNameEdit { line }) => {
+            begin_name_edit(nvim, buffer, line).await?;
+        }
+        EngineCommand::Editor(EditorCommand::DeleteLine { line }) => {
+            delete_line(nvim, buffer, line).await?;
+        }
         EngineCommand::SetInitialLines(editor_lines) => {
             replace_buffer_lines(nvim, buffer, editor_lines, None, "initialization").await?;
         }
@@ -704,10 +713,21 @@ async fn set_cursor_line(
         anyhow::anyhow!("Failed to get line count for cursor movement: {error}")
     })?;
     let target_line = clamp_cursor_line(requested_line, line_count);
+    move_cursor_to_line(nvim, buffer, target_line, "cursor movement").await
+}
+
+/// 指定行の名前部分の先頭(表示上のカーソル位置)へカーソルを移動する共通処理。
+/// `set_cursor_line` / `select_lines` が共有する。
+async fn move_cursor_to_line(
+    nvim: &Nvim,
+    buffer: &Buffer<NvimWriter>,
+    target_line: i64,
+    purpose: &str,
+) -> anyhow::Result<()> {
     let line = buffer
         .get_lines(target_line, target_line + 1, false)
         .await
-        .map_err(|error| anyhow::anyhow!("Failed to get line for cursor movement: {error}"))?
+        .map_err(|error| anyhow::anyhow!("Failed to get line for {purpose}: {error}"))?
         .into_iter()
         .next()
         .unwrap_or_default();
@@ -716,17 +736,109 @@ async fn set_cursor_line(
     let window = nvim
         .get_current_win()
         .await
-        .map_err(|error| anyhow::anyhow!("Failed to get window for cursor movement: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("Failed to get window for {purpose}: {error}"))?;
     window
         .set_cursor((target_line + 1, target_column))
         .await
-        .map_err(|error| anyhow::anyhow!("Failed to set cursor: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("Failed to set cursor for {purpose}: {error}"))?;
     Ok(())
 }
 
 fn clamp_cursor_line(requested_line: usize, line_count: i64) -> i64 {
     let requested_line = i64::try_from(requested_line).unwrap_or(i64::MAX);
     requested_line.min(line_count.saturating_sub(1)).max(0)
+}
+
+/// `anchor`行から`head`行までのlinewise Visual選択を行う(Shift+click契約)。
+///
+/// 現在のモードは`<Esc>`で正規化してから選択を開始する(Insert/Visual等の
+/// 途中状態から呼ばれても安全なように)。`anchor`・`head`は個別にクランプする
+/// (どちらかが範囲外でも他方は有効な選択として成立させる)。
+async fn select_lines(
+    nvim: &Nvim,
+    buffer: &Buffer<NvimWriter>,
+    anchor: usize,
+    head: usize,
+) -> anyhow::Result<()> {
+    let line_count = buffer
+        .line_count()
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to get line count for line selection: {error}"))?;
+    let anchor_line = clamp_cursor_line(anchor, line_count);
+    let head_line = clamp_cursor_line(head, line_count);
+    nvim.input("<Esc>")
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to reset mode before line selection: {error}"))?;
+    move_cursor_to_line(nvim, buffer, anchor_line, "line selection anchor").await?;
+    nvim.command("normal! V")
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to start line-wise selection: {error}"))?;
+    move_cursor_to_line(nvim, buffer, head_line, "line selection head").await?;
+    Ok(())
+}
+
+/// 対象行の名前部分の先頭へカーソルを移動し、Insert modeで編集を開始する
+/// (Rename契約)。IDプレフィックス・インデントはそのまま(削除しない)。
+async fn begin_name_edit(
+    nvim: &Nvim,
+    buffer: &Buffer<NvimWriter>,
+    requested_line: usize,
+) -> anyhow::Result<()> {
+    let line_count = buffer
+        .line_count()
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to get line count for name edit: {error}"))?;
+    let target_line = clamp_cursor_line(requested_line, line_count);
+    let line = buffer
+        .get_lines(target_line, target_line + 1, false)
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to get line for name edit: {error}"))?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let target_column = name_start_column(&line);
+    let window = nvim
+        .get_current_win()
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to get window for name edit: {error}"))?;
+    window
+        .set_cursor((target_line + 1, target_column))
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to move cursor for name edit: {error}"))?;
+    nvim.input("i")
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to start insert mode for name edit: {error}"))?;
+    Ok(())
+}
+
+/// 行の名前部分(IDプレフィックス+インデントの直後)が始まるバイトオフセットを返す。
+/// `fyler-gui::conceal::conceal_line`の`concealed_bytes`と同じ計算(GUIの表示
+/// カーソル補正と一致させる。nvim語彙には触れない純粋計算)。
+fn name_start_column(line: &str) -> i64 {
+    let prefix_bytes = fyler_core::grammar::id_prefix_len(line);
+    let rest = &line[prefix_bytes..];
+    let (_, display) = fyler_core::grammar::split_indent(rest);
+    let indent_bytes = rest.len() - display.len();
+    i64::try_from(prefix_bytes + indent_bytes).unwrap_or(i64::MAX)
+}
+
+/// 該当表示行をバッファから1行除去する(Mark for deletion契約)。実FSへは触れない。
+async fn delete_line(
+    nvim: &Nvim,
+    buffer: &Buffer<NvimWriter>,
+    requested_line: usize,
+) -> anyhow::Result<()> {
+    let _ = nvim;
+    let line_count = buffer
+        .line_count()
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to get line count for line deletion: {error}"))?;
+    let target_line = clamp_cursor_line(requested_line, line_count);
+    buffer
+        .set_lines(target_line, target_line + 1, false, Vec::new())
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to delete line: {error}"))?;
+    Ok(())
 }
 
 /// Rust側のプログラム的な全行差し替えを実行する。
@@ -1511,6 +1623,17 @@ mod tests {
             event_rx.try_recv(),
             Ok(EditorEvent::SnapshotUpdated)
         ));
+    }
+
+    #[test]
+    fn name_start_column_skips_id_prefix_and_indent() {
+        // IDプレフィックスのみ(インデント無し)。
+        assert_eq!(name_start_column("/012 src/"), 5);
+        // IDプレフィックス + インデント(タブ2つ)。
+        assert_eq!(name_start_column("/013 \t\tmain.rs"), 7);
+        // 未保存行(IDプレフィックス無し)はインデントだけ飛ばす。
+        assert_eq!(name_start_column("\tchild.txt"), 1);
+        assert_eq!(name_start_column("root.txt"), 0);
     }
 
     #[test]
