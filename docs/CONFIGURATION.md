@@ -40,13 +40,9 @@ terminal = "auto"
 # Show every operation in confirmation dialogs
 confirm_detail = "full"
 
-# Japanese fallback font and vertical alignment adjustment
+# Override the text font (icons always use the embedded font)
 # TOML literal strings are convenient for Windows paths because backslashes need no escaping
 font = 'C:\Windows\Fonts\meiryo.ttc'
-font_y_offset_factor = 0.12
-
-# Use "nerd" for Nerd Font icons or "ascii" for portable icons
-icons = "ascii"
 
 # Leader must be one unmodified key. The default is Space.
 leader = "Space"
@@ -73,9 +69,7 @@ projects = 'D:\projects'
 | `restore_session` | boolean | `true` | Restore pane layout, roots, cursor hints, folds, and per-pane display settings |
 | `terminal` | string | `"auto"` | `"auto"`, `"windows_terminal"`, `"powershell"`, or `"cmd"` |
 | `confirm_detail` | string | `"full"` | `"full"` or `"summary"` |
-| `font` | string | unset | Absolute path to a fallback font |
-| `font_y_offset_factor` | number | `0.12` | Downward CJK font offset as a font-size ratio; `0` disables it |
-| `icons` | string | `"ascii"` | `"ascii"` or `"nerd"` |
+| `font` | string | unset | Absolute path to a text font that overrides the built-in default; icons are unaffected |
 | `leader` | string | `"Space"` | One unmodified key used to expand `Leader` bindings |
 | `[bookmarks]` | table | empty | Bookmark names mapped to absolute paths |
 | `[keymap.normal]` | table | built-in keymap | Key sequences mapped to action names |
@@ -155,18 +149,21 @@ PowerShell, and cmd in that order. Non-Windows builds use `x-terminal-emulator` 
 
 ### Fonts and icons
 
-`font` accepts only an absolute font-file path. Relative paths are ignored with a warning. TOML
-literal strings keep Windows paths readable:
+fyler bundles **Moralerspace Argon HW** (SIL OFL 1.1) and always registers it. It covers Latin,
+Japanese, and the Nerd Font icon glyphs that fyler draws, so text and icons render without
+relying on system fonts.
+
+`font` accepts only an absolute font-file path and overrides the **text** font only. When set,
+the user font is tried first and the built-in font stays behind it as a Japanese and icon
+fallback. Relative paths are ignored with a warning, and a font file that fails to load is
+skipped in favor of the built-in font. TOML literal strings keep Windows paths readable:
 
 ```toml
 font = 'C:\Windows\Fonts\meiryo.ttc'
 ```
 
-`font_y_offset_factor` moves CJK glyphs downward by a ratio of the font size when their metrics
-make them appear too high. Set it to `0` to disable the adjustment.
-
-`icons = "nerd"` uses Nerd Font glyphs. Use `"ascii"` when the display font does not provide
-those glyphs.
+Tree and dock icons always use the embedded font through a dedicated font family, so they render
+identically regardless of `font`. There is no icon-style setting.
 
 ### Bookmarks
 
