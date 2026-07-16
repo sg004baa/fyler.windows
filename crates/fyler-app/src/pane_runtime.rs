@@ -37,11 +37,12 @@ use super::transfer_flow::{
     resolve_selection, resolve_target, start_rejection,
 };
 use super::{
-    AppEvent, BookmarkResolution, GitRefresher, after_root_change, bookmark_list_message,
-    default_root, format_drive_paths, handle_activate_line, handle_external_change,
-    handle_open_file_picker, handle_open_terminal, handle_open_with, handle_picker_select,
-    handle_yank_path, normalize_root, parse_sort_query, resolve_bookmark_query, resolve_cd_target,
-    send_gui_message, send_save_result, send_view_state, sort_state_message,
+    ActivateOutcome, AppEvent, BookmarkResolution, GitRefresher, after_root_change,
+    bookmark_list_message, default_root, format_drive_paths, handle_activate_line,
+    handle_external_change, handle_open_file_picker, handle_open_terminal, handle_open_with,
+    handle_picker_select, handle_yank_path, normalize_root, parse_sort_query,
+    resolve_bookmark_query, resolve_cd_target, send_gui_message, send_save_result, send_view_state,
+    sort_state_message,
 };
 use super::{undo_format, undo_journal};
 use crate::queue_stats::{CountingSender, QueueGauge};
@@ -58,6 +59,8 @@ struct PaneSession {
     watch_tx: mpsc::Sender<WatchEvent>,
     watch_degraded: bool,
     git_badges: HashMap<EntryId, GitBadge>,
+    raw_git_statuses: HashMap<PathBuf, GitBadge>,
+    git_branch: Option<String>,
     deferred_changes: BTreeSet<PathBuf>,
     undo_slot: Option<UndoTransaction>,
     crashed: bool,
@@ -234,6 +237,8 @@ fn create_pane(
         watch_tx,
         watch_degraded: false,
         git_badges: HashMap::new(),
+        raw_git_statuses: HashMap::new(),
+        git_branch: None,
         deferred_changes: BTreeSet::new(),
         undo_slot: None,
         crashed: false,
@@ -977,7 +982,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 }
                             }
                             EditorEvent::ActivateLine { line } => {
-                                let load = match handle_activate_line(
+                                let outcome = match handle_activate_line(
                                     pane_id,
                                     &mut session.save_controller,
                                     session.engine.as_ref(),
@@ -985,22 +990,39 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     line,
                                     &gui_event_tx,
                                 ) {
-                                    Ok(load) => load,
+                                    Ok(outcome) => outcome,
                                     Err(_) => return,
                                 };
-                                if let Some(dir) = load
-                                    && request_directory_load(
-                                        pane_id,
-                                        dir,
-                                        line,
-                                        session,
-                                        &shared_ids,
-                                        &event_tx,
-                                        &mut loader_owner,
-                                    )
-                                    .is_err()
-                                {
-                                    return;
+                                match outcome {
+                                    ActivateOutcome::Done => {}
+                                    ActivateOutcome::Toggled => {
+                                        // 折りたたみ/展開で可視行が変わったので、キャッシュ済み
+                                        // statusからgit badgeを再マップして祖先ロールアップを追従させる。
+                                        if send_git_badges_from_cache(
+                                            pane_id,
+                                            session,
+                                            &gui_event_tx,
+                                        )
+                                        .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    ActivateOutcome::Load(dir) => {
+                                        if request_directory_load(
+                                            pane_id,
+                                            dir,
+                                            line,
+                                            session,
+                                            &shared_ids,
+                                            &event_tx,
+                                            &mut loader_owner,
+                                        )
+                                        .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
                                 }
                             }
                             EditorEvent::NavigateInto { line } => {
@@ -1386,6 +1408,15 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             &gui_event_tx,
                                             pane_id,
                                             &mut session.save_controller,
+                                        )
+                                        .is_err()
+                                        {
+                                            return;
+                                        }
+                                        if send_git_badges_from_cache(
+                                            pane_id,
+                                            session,
+                                            &gui_event_tx,
                                         )
                                         .is_err()
                                         {
@@ -2204,7 +2235,9 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     if finish.is_err() {
                                         return;
                                     }
-                                    git.request(pane_id, session.root.clone());
+                                    if !is_root_load {
+                                        git.request(pane_id, session.root.clone());
+                                    }
                                 }
                                 LoaderResult::Cancelled => {
                                     if showed_dialog
@@ -2815,11 +2848,15 @@ pub(super) fn run() -> anyhow::Result<()> {
                         if session.root != root {
                             continue;
                         }
-                        session.git_badges = session.save_controller.map_git_badges(&statuses);
+                        session.raw_git_statuses = statuses;
+                        session.git_branch = branch;
+                        session.git_badges = session
+                            .save_controller
+                            .map_git_badges(&session.raw_git_statuses);
                         if gui_event_tx
                             .send(GuiEvent::GitBadges {
                                 pane_id,
-                                branch,
+                                branch: session.git_branch.clone(),
                                 badges: session.git_badges.clone(),
                             })
                             .is_err()
@@ -3678,6 +3715,9 @@ fn finish_session_root_change(
     session.root = new_root;
     session.watcher = new_watcher;
     session.watch_degraded = false;
+    session.raw_git_statuses.clear();
+    session.git_branch = None;
+    session.git_badges.clear();
     if let Err(error) = session.engine.send(EditorCommand::SetLines {
         lines: new_lines,
         cursor_line,
@@ -3705,6 +3745,21 @@ fn finish_session_root_change(
         git,
         &session.root,
     )
+}
+
+fn send_git_badges_from_cache(
+    pane_id: PaneId,
+    session: &mut PaneSession,
+    gui_event_tx: &CountingSender<GuiEvent>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    session.git_badges = session
+        .save_controller
+        .map_git_badges(&session.raw_git_statuses);
+    gui_event_tx.send(GuiEvent::GitBadges {
+        pane_id,
+        branch: session.git_branch.clone(),
+        badges: session.git_badges.clone(),
+    })
 }
 
 fn finish_directory_load(
@@ -3776,6 +3831,9 @@ fn finish_directory_load(
             format!("Failed to display loaded directory: {error:#}"),
         )?;
     }
+    // ロード直後もキャッシュ済みstatusから即座に再マップし、直後のgit.request
+    // (新鮮な結果)が届くまでの展開行のbadge表示ギャップを埋める。
+    send_git_badges_from_cache(pane_id, session, gui_event_tx)?;
     send_view_state(gui_event_tx, pane_id, &mut session.save_controller)
 }
 
