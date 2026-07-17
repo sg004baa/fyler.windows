@@ -359,7 +359,6 @@ pub(crate) mod win {
         // SAFETY: `GetClipboardData`が返した有効なhandle。
         unsafe { read_hglobal_bytes(HGLOBAL(handle.0)) }
     }
-
 }
 
 #[cfg(not(windows))]

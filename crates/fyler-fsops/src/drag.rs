@@ -81,9 +81,7 @@ fn continue_drag_decision(escape_pressed: bool, left_button_down: bool) -> DragC
 /// FORMATETCが「HGLOBAL渡しのcontent形式`candidate`」として提供可能かの純ロジック。
 /// `tymed`と`aspect`はbit集合(呼び出し側は複数bitを立てて問い合わせてよい)。
 fn format_supported(cf_format: u16, tymed: u32, aspect: u32, candidate: u16) -> bool {
-    cf_format == candidate
-        && tymed & TYMED_HGLOBAL_BIT != 0
-        && aspect & DVASPECT_CONTENT_BIT != 0
+    cf_format == candidate && tymed & TYMED_HGLOBAL_BIT != 0 && aspect & DVASPECT_CONTENT_BIT != 0
 }
 
 /// `DoDragDrop`の完了状態(drop成立か)と、戻り値effect・targetが書き込んだ
@@ -93,7 +91,11 @@ fn format_supported(cf_format: u16, tymed: u32, aspect: u32, candidate: u16) -> 
 /// 戻り値をNONEにし、"Performed DropEffect"側で報告する場合がある)ため、
 /// 両方のMOVE bitをORで見る。move未報告の効果(copy/link)はsource側の
 /// 後始末が不要なので[`DropEffect::Copy`]へ畳む。
-fn resolve_outcome(dropped: bool, returned_effect: u32, performed_effect: Option<u32>) -> DragOutcome {
+fn resolve_outcome(
+    dropped: bool,
+    returned_effect: u32,
+    performed_effect: Option<u32>,
+) -> DragOutcome {
     if !dropped {
         return DragOutcome::Cancelled;
     }
@@ -376,11 +378,10 @@ mod win {
         let hdrop_payload = crate::clipboard::encode_hdrop(paths)?;
         // Preferred DropEffect: sourceとして許可する効果の全bit。dragでは
         // targetは主にDoDragDropの許可effectとkey状態で効果を決めるため参考値。
-        let preferred_payload = (super::DROPEFFECT_COPY_BIT
-            | super::DROPEFFECT_MOVE_BIT
-            | super::DROPEFFECT_LINK_BIT)
-            .to_le_bytes()
-            .to_vec();
+        let preferred_payload =
+            (super::DROPEFFECT_COPY_BIT | super::DROPEFFECT_MOVE_BIT | super::DROPEFFECT_LINK_BIT)
+                .to_le_bytes()
+                .to_vec();
         let preferred_format =
             clip_win::register_clipboard_format(crate::clipboard::PREFERRED_DROPEFFECT_FORMAT)?;
         let performed_format =
@@ -456,10 +457,25 @@ mod tests {
     #[test]
     fn format_supported_requires_matching_format_and_hglobal_content() {
         const CF: u16 = 15;
-        assert!(format_supported(CF, TYMED_HGLOBAL_BIT, DVASPECT_CONTENT_BIT, CF));
+        assert!(format_supported(
+            CF,
+            TYMED_HGLOBAL_BIT,
+            DVASPECT_CONTENT_BIT,
+            CF
+        ));
         // tymedはbit集合として問い合わせられる。
-        assert!(format_supported(CF, TYMED_HGLOBAL_BIT | 4, DVASPECT_CONTENT_BIT, CF));
-        assert!(!format_supported(CF, TYMED_HGLOBAL_BIT, DVASPECT_CONTENT_BIT, CF + 1));
+        assert!(format_supported(
+            CF,
+            TYMED_HGLOBAL_BIT | 4,
+            DVASPECT_CONTENT_BIT,
+            CF
+        ));
+        assert!(!format_supported(
+            CF,
+            TYMED_HGLOBAL_BIT,
+            DVASPECT_CONTENT_BIT,
+            CF + 1
+        ));
         assert!(!format_supported(CF, 4, DVASPECT_CONTENT_BIT, CF)); // TYMED_ISTREAMのみ
         assert!(!format_supported(CF, TYMED_HGLOBAL_BIT, 4, CF)); // DVASPECT_ICONのみ
     }
