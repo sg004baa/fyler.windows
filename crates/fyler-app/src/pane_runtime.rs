@@ -30,6 +30,7 @@ use fyler_gui::app::{
 };
 use fyler_gui::confirm::ConfirmChoice;
 
+use super::extract_flow::{self, ExtractController, ExtractFlowResult};
 use super::feedback::{FeedbackOutcome, resolve_endpoint, send_feedback};
 use super::import_flow::{self, ImportController, ImportFlowResult};
 use super::nvim_locate;
@@ -43,11 +44,11 @@ use super::transfer_flow::{
 use super::{
     ActivateOutcome, AppEvent, BookmarkResolution, GitRefresher, after_root_change,
     bookmark_list_message, default_root, format_drive_paths, handle_activate_line,
-    handle_begin_name_edit, handle_clipboard_copy_or_cut, handle_external_change,
-    handle_mark_for_deletion, handle_open_file_picker, handle_open_terminal, handle_open_with,
-    handle_picker_select, handle_yank_path, normalize_root, parse_sort_query,
-    resolve_bookmark_query, resolve_cd_target, send_gui_message, send_save_result, send_view_state,
-    sort_state_message, tree_edit_rejection,
+    handle_begin_name_edit, handle_clipboard_copy_or_cut, handle_create_shortcut,
+    handle_external_change, handle_mark_for_deletion, handle_open_as_admin,
+    handle_open_file_picker, handle_open_terminal, handle_open_with, handle_picker_select,
+    handle_yank_path, normalize_root, parse_sort_query, resolve_bookmark_query, resolve_cd_target,
+    send_gui_message, send_save_result, send_view_state, sort_state_message, tree_edit_rejection,
 };
 use super::{undo_format, undo_journal};
 use crate::queue_stats::{CountingSender, QueueGauge};
@@ -384,6 +385,18 @@ fn help_entries(bindings: &[KeyBinding]) -> Vec<HelpEntry> {
         HelpEntry {
             command: ":terminal".to_owned(),
             description: "Open terminal here".to_owned(),
+        },
+        HelpEntry {
+            command: ":admin".to_owned(),
+            description: "Open as administrator".to_owned(),
+        },
+        HelpEntry {
+            command: ":shortcut".to_owned(),
+            description: "Create shortcut".to_owned(),
+        },
+        HelpEntry {
+            command: ":extract".to_owned(),
+            description: "Extract a .zip archive here".to_owned(),
         },
         HelpEntry {
             command: ":feedback".to_owned(),
@@ -753,11 +766,13 @@ pub(super) fn run() -> anyhow::Result<()> {
             let mut loader_owner: Option<LoaderOwner> = None;
             let mut transfer = TransferController::new();
             let mut import = ImportController::new();
+            let mut extract = ExtractController::new();
             let mut pending_recovery = pending_recovery;
             let mut pending_open_with: Option<(
                 PathBuf,
                 Vec<fyler_fsops::openwith::OpenWithHandler>,
             )> = None;
+            let mut pending_shortcut: Option<(PaneId, PathBuf, PathBuf)> = None;
 
             for (pane_id, pane) in &mut panes {
                 if send_view_state(&gui_event_tx, *pane_id, &mut pane.save_controller).is_err() {
@@ -856,8 +871,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                             apply_owner.is_some()
                                 || transfer.is_awaiting()
                                 || transfer.is_running()
-                                || import.is_awaiting()
-                                || import.is_running()
+                                || import.is_awaiting() || extract.is_awaiting()
+                                || import.is_running() || extract.is_running()
                                 || loader_owner.is_some(),
                         )
                         .is_err()
@@ -918,6 +933,11 @@ pub(super) fn run() -> anyhow::Result<()> {
                         {
                             return;
                         }
+                        if extract.invalidate_if_involves(pane_id)
+                            && gui_event_tx.send(GuiEvent::CloseDialog).is_err()
+                        {
+                            return;
+                        }
                         if gui_event_tx
                             .send(GuiEvent::Editor {
                                 pane_id,
@@ -954,8 +974,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 || dialog_owner.is_some()
                                 || transfer.is_awaiting()
                                 || transfer.is_running()
-                                || import.is_awaiting()
-                                || import.is_running(),
+                                || import.is_awaiting() || extract.is_awaiting()
+                                || import.is_running() || extract.is_running(),
                             &mut transfer,
                             &gui_event_tx,
                         )
@@ -982,8 +1002,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                             || dialog_owner.is_some()
                             || transfer.is_awaiting()
                             || transfer.is_running()
-                            || import.is_awaiting()
-                            || import.is_running();
+                            || import.is_awaiting() || extract.is_awaiting()
+                            || import.is_running() || extract.is_running();
                         if let Some(reason) =
                             import_flow::start_rejection(pane_state, globally_busy)
                         {
@@ -1026,8 +1046,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                             || dialog_owner.is_some()
                             || transfer.is_awaiting()
                             || transfer.is_running()
-                            || import.is_awaiting()
-                            || import.is_running();
+                            || import.is_awaiting() || extract.is_awaiting()
+                            || import.is_running() || extract.is_running();
                         if let Some(reason) =
                             import_flow::start_rejection(pane_state, globally_busy)
                         {
@@ -1064,8 +1084,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 || dialog_owner.is_some()
                                 || transfer.is_awaiting()
                                 || transfer.is_running()
-                                || import.is_awaiting()
-                                || import.is_running(),
+                                || import.is_awaiting() || extract.is_awaiting()
+                                || import.is_running() || extract.is_running(),
                             &mut import,
                             &gui_event_tx,
                         )
@@ -1090,8 +1110,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 || dialog_owner.is_some()
                                 || transfer.is_awaiting()
                                 || transfer.is_running()
-                                || import.is_awaiting()
-                                || import.is_running(),
+                                || import.is_awaiting() || extract.is_awaiting()
+                                || import.is_running() || extract.is_running(),
                             active_picker.is_some(),
                             &mut import,
                             &gui_event_tx,
@@ -1155,8 +1175,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     session.crashed,
                                     dialog_owner.is_some(),
                                     apply_owner.is_some(),
-                                    transfer.is_awaiting() || import.is_awaiting(),
-                                    transfer.is_running() || import.is_running(),
+                                    transfer.is_awaiting() || import.is_awaiting() || extract.is_awaiting(),
+                                    transfer.is_running() || import.is_running() || extract.is_running(),
                                     &gui_event_tx,
                                 ) {
                                     Ok(opened) => opened,
@@ -1186,8 +1206,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     || dialog_owner.is_some()
                                     || transfer.is_awaiting()
                                     || transfer.is_running()
-                                    || import.is_awaiting()
-                                    || import.is_running()
+                                    || import.is_awaiting() || extract.is_awaiting()
+                                    || import.is_running() || extract.is_running()
                                 {
                                     if send_gui_message(
                                         &gui_event_tx,
@@ -1218,8 +1238,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         || dialog_owner.is_some()
                                         || transfer.is_awaiting()
                                         || transfer.is_running()
-                                        || import.is_awaiting()
-                                        || import.is_running(),
+                                        || import.is_awaiting() || extract.is_awaiting()
+                                        || import.is_running() || extract.is_running(),
                                 ) {
                                     if send_gui_message(
                                         &gui_event_tx,
@@ -1369,8 +1389,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         || apply_owner.is_some()
                                         || transfer.is_awaiting()
                                         || transfer.is_running()
-                                        || import.is_awaiting()
-                                        || import.is_running(),
+                                        || import.is_awaiting() || extract.is_awaiting()
+                                        || import.is_running() || extract.is_running(),
                                 )
                                 .is_err()
                                 {
@@ -1389,8 +1409,83 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     session.crashed,
                                     dialog_owner.is_some(),
                                     apply_owner.is_some(),
-                                    transfer.is_awaiting() || import.is_awaiting(),
-                                    transfer.is_running() || import.is_running(),
+                                    transfer.is_awaiting() || import.is_awaiting() || extract.is_awaiting(),
+                                    transfer.is_running() || import.is_running() || extract.is_running(),
+                                    &gui_event_tx,
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            EditorEvent::OpenAsAdmin { line } => {
+                                let snapshot = session.engine.snapshot();
+                                if handle_open_as_admin(
+                                    pane_id,
+                                    &session.save_controller,
+                                    &snapshot.lines,
+                                    &session.root,
+                                    line,
+                                    session.crashed,
+                                    dialog_owner.is_some(),
+                                    apply_owner.is_some(),
+                                    transfer.is_awaiting() || import.is_awaiting() || extract.is_awaiting(),
+                                    transfer.is_running() || import.is_running() || extract.is_running(),
+                                    &gui_event_tx,
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            EditorEvent::CreateShortcut { line } => {
+                                let rejection = tree_edit_rejection(
+                                    dialog_owner.is_some() || pending_shortcut.is_some(),
+                                    apply_owner.is_some(),
+                                    transfer.is_awaiting(),
+                                    transfer.is_running(),
+                                    session.crashed,
+                                    session.save_controller.is_idle(),
+                                );
+                                let snapshot = session.engine.snapshot();
+                                match handle_create_shortcut(
+                                    pane_id,
+                                    &session.save_controller,
+                                    &snapshot.lines,
+                                    &session.root,
+                                    line,
+                                    rejection,
+                                    &gui_event_tx,
+                                ) {
+                                    Ok(Some(pending)) => pending_shortcut = Some(pending),
+                                    Ok(None) => {}
+                                    Err(_) => return,
+                                }
+                            }
+                            EditorEvent::ExtractArchive { line } => {
+                                let snapshot = session.engine.snapshot();
+                                let pane_state = TransferPaneState {
+                                    dirty: snapshot.dirty,
+                                    idle: session.save_controller.is_idle(),
+                                    crashed: session.crashed,
+                                    offline: session.save_controller.is_offline(),
+                                };
+                                if handle_extract_request(
+                                    pane_id,
+                                    &session.save_controller,
+                                    &snapshot.lines,
+                                    &session.root,
+                                    line,
+                                    pane_state,
+                                    apply_owner.is_some()
+                                        || dialog_owner.is_some()
+                                        || transfer.is_awaiting()
+                                        || transfer.is_running()
+                                        || import.is_awaiting()
+                                        || import.is_running()
+                                        || extract.is_awaiting()
+                                        || extract.is_running(),
+                                    &mut extract,
                                     &gui_event_tx,
                                 )
                                 .is_err()
@@ -1452,8 +1547,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         || apply_owner.is_some()
                                         || transfer.is_awaiting()
                                         || transfer.is_running()
-                                        || import.is_awaiting()
-                                        || import.is_running(),
+                                        || import.is_awaiting() || extract.is_awaiting()
+                                        || import.is_running() || extract.is_running(),
                                 )
                                 .is_err()
                                 {
@@ -1608,8 +1703,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         || apply_owner.is_some()
                                         || transfer.is_awaiting()
                                         || transfer.is_running()
-                                        || import.is_awaiting()
-                                        || import.is_running(),
+                                        || import.is_awaiting() || extract.is_awaiting()
+                                        || import.is_running() || extract.is_running(),
                                 )
                                 .is_err()
                                 {
@@ -1648,8 +1743,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                                 || apply_owner.is_some()
                                                 || transfer.is_awaiting()
                                                 || transfer.is_running()
-                                                || import.is_awaiting()
-                                                || import.is_running(),
+                                                || import.is_awaiting() || extract.is_awaiting()
+                                                || import.is_running() || extract.is_running(),
                                         )
                                         .is_err()
                                         {
@@ -2118,8 +2213,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     || apply_owner.is_some()
                                     || transfer.is_awaiting()
                                     || transfer.is_running()
-                                    || import.is_awaiting()
-                                    || import.is_running()
+                                    || import.is_awaiting() || extract.is_awaiting()
+                                    || import.is_running() || extract.is_running()
                                 {
                                     continue;
                                 }
@@ -2265,6 +2360,12 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 EditorEvent::OpenWith { line },
                             ));
                         }
+                        TreeContextItem::OpenAsAdmin => {
+                            pending_events.push_front(AppEvent::Editor(
+                                pane_id,
+                                EditorEvent::OpenAsAdmin { line },
+                            ));
+                        }
                         TreeContextItem::CopyPath => {
                             pending_events.push_front(AppEvent::Editor(
                                 pane_id,
@@ -2275,6 +2376,24 @@ pub(super) fn run() -> anyhow::Result<()> {
                             pending_events.push_front(AppEvent::Editor(
                                 pane_id,
                                 EditorEvent::OpenTerminal { line },
+                            ));
+                        }
+                        TreeContextItem::ClipboardCopy => {
+                            pending_events.push_front(AppEvent::Editor(
+                                pane_id,
+                                EditorEvent::ClipboardCopyRequested { lines: vec![line] },
+                            ));
+                        }
+                        TreeContextItem::ClipboardCut => {
+                            pending_events.push_front(AppEvent::Editor(
+                                pane_id,
+                                EditorEvent::ClipboardCutRequested { lines: vec![line] },
+                            ));
+                        }
+                        TreeContextItem::ClipboardPaste => {
+                            pending_events.push_front(AppEvent::Editor(
+                                pane_id,
+                                EditorEvent::ClipboardPasteRequested { line },
                             ));
                         }
                         TreeContextItem::Rename => {
@@ -2325,6 +2444,24 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 return;
                             }
                         }
+                        TreeContextItem::Extract => {
+                            pending_events.push_front(AppEvent::Editor(
+                                pane_id,
+                                EditorEvent::ExtractArchive { line },
+                            ));
+                        }
+                        TreeContextItem::CreateShortcut => {
+                            pending_events.push_front(AppEvent::Editor(
+                                pane_id,
+                                EditorEvent::CreateShortcut { line },
+                            ));
+                        }
+                        TreeContextItem::Refresh => {
+                            pending_events.push_front(AppEvent::Editor(
+                                pane_id,
+                                EditorEvent::RefreshRequested,
+                            ));
+                        }
                     },
                     AppEvent::PickerSelect {
                         pane_id,
@@ -2352,8 +2489,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     || apply_owner.is_some()
                                     || transfer.is_awaiting()
                                     || transfer.is_running()
-                                    || import.is_awaiting()
-                                    || import.is_running(),
+                                    || import.is_awaiting() || extract.is_awaiting()
+                                    || import.is_running() || extract.is_running(),
                                 session.crashed,
                                 session.save_controller.is_idle(),
                             ) {
@@ -2480,6 +2617,28 @@ pub(super) fn run() -> anyhow::Result<()> {
                         if pending_open_with.is_some() {
                             // open-withダイアログのキャンセル。保存フローへ流さない。
                             pending_open_with = None;
+                            continue;
+                        }
+                        if let Some((owner, target, lnk_path)) = pending_shortcut.take() {
+                            if choice == ConfirmChoice::Approve {
+                                let result = fyler_fsops::shortcut::create_shortcut(&target, &lnk_path);
+                                if gui_event_tx.send(GuiEvent::CloseDialog).is_err() {
+                                    return;
+                                }
+                                if let Err(error) = result
+                                    && send_gui_message(
+                                        &gui_event_tx,
+                                        owner,
+                                        MessageKind::Error,
+                                        format!("Failed to create shortcut: {error:#}"),
+                                    )
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            } else if gui_event_tx.send(GuiEvent::CloseDialog).is_err() {
+                                return;
+                            }
                             continue;
                         }
                         if !pending_recovery.is_empty() {
@@ -2667,6 +2826,82 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 }
                                 ImportFlowResult::Finished { .. }
                                 | ImportFlowResult::Ignored => {}
+                            }
+                            continue;
+                        }
+                        if extract.is_awaiting() || extract.is_running() {
+                            match extract.on_choice(choice) {
+                                ExtractFlowResult::StartApply { pane, plan, cancel } => {
+                                    discard_all_undo_slots(&mut panes, journal.as_ref());
+                                    if let Some(session) = panes.get(&pane) {
+                                        let _ = session
+                                            .engine
+                                            .send(EditorCommand::SetModifiable(false));
+                                    }
+                                    if gui_event_tx
+                                        .send(GuiEvent::ShowApplyProgress {
+                                            total: plan.ops.len(),
+                                        })
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    let worker_plan = plan.clone();
+                                    let worker_event_tx = event_tx.clone();
+                                    let spawn_result = thread::Builder::new()
+                                        .name("fyler-extract".to_owned())
+                                        .spawn(move || {
+                                            let report = fyler_fsops::extract::apply_extract_cancellable(
+                                                &worker_plan,
+                                                &cancel,
+                                                &mut |progress| {
+                                                    let _ = worker_event_tx.send(
+                                                        AppEvent::ExtractProgress(progress),
+                                                    );
+                                                },
+                                            );
+                                            let _ = worker_event_tx
+                                                .send(AppEvent::ExtractFinished(report));
+                                        });
+                                    if let Err(error) = spawn_result {
+                                        let error =
+                                            format!("Failed to start extract worker: {error}");
+                                        let report = CommitReport {
+                                            results: plan
+                                                .ops
+                                                .into_iter()
+                                                .map(|op| OpResult {
+                                                    op,
+                                                    outcome: OpOutcome::Failed {
+                                                        error: error.clone(),
+                                                        progress: None,
+                                                    },
+                                                })
+                                                .collect(),
+                                        };
+                                        if event_tx
+                                            .send(AppEvent::ExtractFinished(report))
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                                ExtractFlowResult::Cancelled => {
+                                    if gui_event_tx.send(GuiEvent::CloseDialog).is_err() {
+                                        return;
+                                    }
+                                }
+                                ExtractFlowResult::CancelRequested => {
+                                    if gui_event_tx
+                                        .send(GuiEvent::ApplyCancelRequested)
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                ExtractFlowResult::Finished { .. }
+                                | ExtractFlowResult::Ignored => {}
                             }
                             continue;
                         }
@@ -2956,8 +3191,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                         let other_busy = apply_owner.is_some()
                             || transfer.is_awaiting()
                             || transfer.is_running()
-                            || import.is_awaiting()
-                            || import.is_running()
+                            || import.is_awaiting() || extract.is_awaiting()
+                            || import.is_running() || extract.is_running()
                             || if showed_dialog {
                                 dialog_owner != Some(pane_id)
                             } else {
@@ -3093,6 +3328,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                             && apply_owner.is_none()
                             && !transfer.is_running()
                             && !import.is_running()
+                            && !extract.is_running()
                         {
                             let changed_paths = std::mem::take(&mut session.deferred_changes);
                             if handle_external_change(
@@ -3504,6 +3740,88 @@ pub(super) fn run() -> anyhow::Result<()> {
                             }
                         }
                     }
+                    AppEvent::ExtractProgress(progress) => {
+                        if extract.is_running() {
+                            let progress = ApplyProgress {
+                                completed: progress.completed,
+                                total: progress.total,
+                                current: progress.current.map(|op| op.name),
+                            };
+                            if gui_event_tx.send(GuiEvent::ExtractProgress(progress)).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    AppEvent::ExtractFinished(report) => {
+                        let ExtractFlowResult::Finished { pane, report } =
+                            extract.on_finished(report)
+                        else {
+                            continue;
+                        };
+                        let (lines, any_failed) = extract_flow::report_lines(&report);
+                        let mut reconcile_error = None;
+                        if let Some(session) = panes.get_mut(&pane) {
+                            if let Err(error) = session.save_controller.reconcile_after_transfer()
+                            {
+                                reconcile_error = Some(format!("pane {pane}: {error:#}"));
+                            }
+                            if !session.save_controller.is_offline() {
+                                let _ =
+                                    session.engine.send(EditorCommand::SetModifiable(true));
+                            }
+                            if send_view_state(&gui_event_tx, pane, &mut session.save_controller)
+                                .is_err()
+                            {
+                                return;
+                            }
+                            git.request(pane, session.root.clone());
+                        }
+                        if gui_event_tx
+                            .send(GuiEvent::ShowActionReport {
+                                title: "Extract result".to_owned(),
+                                lines,
+                                any_failed,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        if let Some(error) = reconcile_error
+                            && send_gui_message(
+                                &gui_event_tx,
+                                pane,
+                                MessageKind::Error,
+                                format!(
+                                    "A folder became offline or unreachable after extract and will retry automatically: {error}"
+                                ),
+                            )
+                            .is_err()
+                        {
+                            return;
+                        }
+                        let pane_ids = panes.keys().copied().collect::<Vec<_>>();
+                        for deferred_id in pane_ids {
+                            let Some(deferred) = panes.get_mut(&deferred_id) else {
+                                continue;
+                            };
+                            if deferred.deferred_changes.is_empty() {
+                                continue;
+                            }
+                            let changed_paths = std::mem::take(&mut deferred.deferred_changes);
+                            if handle_external_change(
+                                deferred_id,
+                                &changed_paths,
+                                &mut deferred.save_controller,
+                                &gui_event_tx,
+                                &mut git,
+                                &deferred.root,
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
                     AppEvent::ExternalChange(pane_id, change) => {
                         let mut by_pane = BTreeMap::<PaneId, BTreeSet<PathBuf>>::new();
                         by_pane.entry(pane_id).or_default().extend(change.paths);
@@ -3545,7 +3863,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                             };
                             if should_defer_external_change(
                                 apply_owner.is_some(),
-                                transfer.is_running() || import.is_running(),
+                                transfer.is_running() || import.is_running() || extract.is_running(),
                                 loader_owner.as_ref().is_some_and(|owner| {
                                     owner.pane_id == changed_id && owner.loads_directory()
                                 }),
@@ -3584,6 +3902,24 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         changed_id,
                                         MessageKind::Warn,
                                         "Paste was cancelled because files changed externally. Review the changes and try again.",
+                                    )
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                let extract_invalidated =
+                                    extract.invalidate_if_involves(changed_id);
+                                if extract_invalidated
+                                    && gui_event_tx.send(GuiEvent::CloseDialog).is_err()
+                                {
+                                    return;
+                                }
+                                if extract_invalidated
+                                    && send_gui_message(
+                                        &gui_event_tx,
+                                        changed_id,
+                                        MessageKind::Warn,
+                                        "Extract was cancelled because files changed externally. Review the changes and try again.",
                                     )
                                     .is_err()
                                 {
@@ -3644,7 +3980,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                         }
                     }
                     AppEvent::OfflineRetryTick => {
-                        if apply_owner.is_some() || transfer.is_running() || import.is_running() {
+                        if apply_owner.is_some() || transfer.is_running() || import.is_running() || extract.is_running() {
                             continue;
                         }
                         let pane_ids = panes.keys().copied().collect::<Vec<_>>();
@@ -4245,6 +4581,82 @@ fn start_import(
         pane_id,
         plan,
         overwrites: preflight.overwritable,
+    })
+}
+
+/// zip展開の確認前段。行→archive解決(.zip Fileのみ)・dest_dir算出・preflightまでを
+/// 行い、承認は`AppEvent::Confirm`側([`extract_flow::ExtractController`])が扱う
+/// (絶対ルール1: ここではFSへ一切書き込まない)。
+#[allow(clippy::too_many_arguments)]
+fn handle_extract_request(
+    pane_id: PaneId,
+    save_controller: &SaveController,
+    lines: &[fyler_core::editor::EditorLine],
+    root: &Path,
+    line: usize,
+    pane_state: TransferPaneState,
+    globally_busy: bool,
+    extract: &mut ExtractController,
+    gui_event_tx: &CountingSender<GuiEvent>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    if let Some(reason) = extract_flow::start_rejection(pane_state, globally_busy) {
+        return send_gui_message(gui_event_tx, pane_id, MessageKind::Info, reason);
+    }
+    let Some((path, EntryKind::File)) = save_controller.resolve_line(lines, line) else {
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Info,
+            "Extract is for .zip archive files only",
+        );
+    };
+    let archive = path.to_fs_path(root);
+    let is_zip = archive
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"));
+    if !is_zip {
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Info,
+            "Extract is for .zip archive files only",
+        );
+    }
+    let Some(parent) = archive.parent() else {
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            "Cannot resolve the extraction destination",
+        );
+    };
+    let Some(stem) = archive.file_stem().and_then(|stem| stem.to_str()) else {
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            "Archive name is not valid Unicode",
+        );
+    };
+    let dest_dir = parent.join(stem);
+    let plan = match fyler_fsops::extract::preflight_extract(&archive, &dest_dir) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Error,
+                format!("Cannot extract archive: {error:#}"),
+            );
+        }
+    };
+    let dialog_lines = extract_flow::confirm_lines(&plan);
+    extract.begin(pane_id, plan);
+    gui_event_tx.send(GuiEvent::ShowActionConfirm {
+        title: "Extract archive".to_owned(),
+        approve_label: "Extract (y)".to_owned(),
+        lines: dialog_lines,
     })
 }
 
