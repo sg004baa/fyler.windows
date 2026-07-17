@@ -48,6 +48,26 @@ pub enum DropEffect {
     Copy,
     Move,
 }
+/// OLE drag-out(fylerのentryを外部Shellターゲットへdragする)の結果。
+///
+/// fsops層がDoDragDropの戻り値とtargetが書き込む"Performed DropEffect"から
+/// 判定して返す、エンジン・OS非依存の要約。app層はこれだけを見て
+/// 「何もしない」か「source側の後始末(確認付きごみ箱退避)」かを決める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragOutcome {
+    /// Escキャンセル、またはtargetがdropしないままdragが終了した。
+    Cancelled,
+    /// targetがdropを受理した。
+    Dropped {
+        /// 判定済みの取り込み効果。moveが報告されなかった場合は[`DropEffect::Copy`]
+        /// (link等、source側の後始末が不要な効果もCopyへ畳む)。
+        effect: DropEffect,
+        /// DoDragDropの戻り値または"Performed DropEffect"でmoveが報告されたか。
+        /// trueでもsourceの削除はtarget(Explorer等)が済ませている場合がある
+        /// (optimized move)ため、app層はsourceの存在を確認してから後始末する。
+        move_reported: bool,
+    },
+}
 
 /// 外部source(Explorer clipboard・inbound drop)由来の1件の取り込み操作。
 ///
