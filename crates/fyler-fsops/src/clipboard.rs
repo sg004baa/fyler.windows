@@ -25,13 +25,14 @@ use anyhow::{Context, bail};
 use fyler_core::transfer::DropEffect;
 
 /// Win32標準クリップボード形式 `CF_HDROP`(WinUser.h)。値は全Windows版で固定。
+/// OLE drag(`crate::drag`)のFORMATETCでも同じ値を使う。
 #[cfg(windows)]
-const CF_HDROP: u32 = 15;
+pub(crate) const CF_HDROP: u32 = 15;
 
 /// `RegisterClipboardFormatW` へ渡すカスタム形式名。Explorerが読み書きする
-/// drag effect(copy/move)のヒント。
+/// drag effect(copy/move)のヒント。OLE drag(`crate::drag`)とも共有する。
 #[cfg(windows)]
-const PREFERRED_DROPEFFECT_FORMAT: &str = "Preferred DropEffect";
+pub(crate) const PREFERRED_DROPEFFECT_FORMAT: &str = "Preferred DropEffect";
 
 /// `DROPFILES` 構造体のヘッダ長(バイト)。
 /// `DWORD pFiles; POINT pt; BOOL fNC; BOOL fWide;` = 4 + 8 + 4 + 4 = 20。
@@ -208,7 +209,7 @@ pub fn read() -> anyhow::Result<Option<ClipboardFiles>> {
 }
 
 #[cfg(windows)]
-mod win {
+pub(crate) mod win {
     use std::time::Duration;
 
     use anyhow::anyhow;
@@ -262,28 +263,32 @@ mod win {
     }
 
     pub(super) fn register_preferred_dropeffect_format() -> anyhow::Result<u32> {
-        let name = to_wide(super::PREFERRED_DROPEFFECT_FORMAT);
-        // SAFETY: `name`はこの呼び出し中有効なNUL終端UTF-16文字列。
-        let format = unsafe { RegisterClipboardFormatW(PCWSTR(name.as_ptr())) };
+        register_clipboard_format(super::PREFERRED_DROPEFFECT_FORMAT)
+    }
+
+    /// 名前付きclipboard形式を登録してformat値を返す(OLE dragのFORMATETCとも
+    /// 同じatom空間を共有する)。
+    pub(crate) fn register_clipboard_format(name: &str) -> anyhow::Result<u32> {
+        let wide = to_wide(name);
+        // SAFETY: `wide`はこの呼び出し中有効なNUL終端UTF-16文字列。
+        let format = unsafe { RegisterClipboardFormatW(PCWSTR(wide.as_ptr())) };
         if format == 0 {
-            anyhow::bail!("Failed to register the \"Preferred DropEffect\" clipboard format");
+            anyhow::bail!("Failed to register the \"{name}\" clipboard format");
         }
         Ok(format)
     }
 
-    /// `payload` をGMEM_MOVEABLEハンドルへ確保・コピーし、`SetClipboardData` で
-    /// clipboardへ渡す。成功後の所有権はclipboardが持つため`GlobalFree`しない。
-    /// 失敗経路では確保した領域を必ず解放する。
-    pub(super) fn set_clipboard_global(format: u32, payload: &[u8]) -> anyhow::Result<()> {
-        // SAFETY: 呼び出し元がclipboardを開いた状態でのみ呼ぶ。
+    /// `payload` をGMEM_MOVEABLEハンドルへ確保・コピーして返す。所有権は呼び出し元
+    /// (clipboard/OLEへ渡すか、失敗経路で`Free`する責務も呼び出し元)。
+    pub(crate) fn alloc_hglobal_bytes(payload: &[u8]) -> anyhow::Result<HGLOBAL> {
+        // SAFETY: サイズ0確保を避けるためmax(1)。成功時のhandleは呼び出し元が所有する。
         let handle: HGLOBAL = unsafe { GlobalAlloc(GMEM_MOVEABLE, payload.len().max(1)) }
-            .map_err(|error| anyhow!("Failed to allocate clipboard memory: {error}"))?;
-
+            .map_err(|error| anyhow!("Failed to allocate global memory: {error}"))?;
         let write_result: anyhow::Result<()> = (|| {
             // SAFETY: 直前に`GlobalAlloc`で確保した有効なhandle。
             let ptr = unsafe { GlobalLock(handle) };
             if ptr.is_null() {
-                anyhow::bail!("Failed to lock clipboard memory for writing");
+                anyhow::bail!("Failed to lock global memory for writing");
             }
             // SAFETY: `ptr`は`GlobalAlloc(payload.len())`以上確保済みの領域。
             unsafe {
@@ -296,11 +301,42 @@ mod win {
         })();
         if let Err(error) = write_result {
             let mut handle = handle;
-            // SAFETY: `SetClipboardData`へまだ渡していないため所有権はこちらにある。
+            // SAFETY: まだ誰にも渡していないため所有権はこちらにある。
             unsafe { handle.free() };
             return Err(error);
         }
+        Ok(handle)
+    }
 
+    /// HGLOBALの内容を丸ごとコピーして返す。handleの所有権は移らない。
+    ///
+    /// # Safety
+    /// `hglobal` は有効なグローバルメモリハンドルであること。
+    pub(crate) unsafe fn read_hglobal_bytes(hglobal: HGLOBAL) -> anyhow::Result<Vec<u8>> {
+        // SAFETY: 呼び出し元が有効性を保証するhandle。
+        let size = unsafe { GlobalSize(hglobal) };
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        // SAFETY: 同じ有効なhandle。
+        let ptr = unsafe { GlobalLock(hglobal) };
+        if ptr.is_null() {
+            anyhow::bail!("Failed to lock global memory for reading");
+        }
+        // SAFETY: `ptr`は`GlobalSize`が報告した`size`バイト以上有効。
+        let bytes =
+            unsafe { std::slice::from_raw_parts(ptr.cast::<u8>() as *const u8, size) }.to_vec();
+        // SAFETY: 直前にlockした同じhandle。戻り値は無視する(上記と同じ理由)。
+        let _ = unsafe { GlobalUnlock(hglobal) };
+        Ok(bytes)
+    }
+
+    /// `payload` をGMEM_MOVEABLEハンドルへ確保・コピーし、`SetClipboardData` で
+    /// clipboardへ渡す。成功後の所有権はclipboardが持つため`GlobalFree`しない。
+    /// 失敗経路では確保した領域を必ず解放する。
+    pub(super) fn set_clipboard_global(format: u32, payload: &[u8]) -> anyhow::Result<()> {
+        // SAFETY: 呼び出し元がclipboardを開いた状態でのみ呼ぶ。
+        let handle = alloc_hglobal_bytes(payload)?;
         // SAFETY: `handle`はロック解除済みでSetClipboardDataへ渡す前提を満たす。
         let set_result = unsafe { SetClipboardData(format, Some(HANDLE(handle.0))) };
         if let Err(error) = set_result {
@@ -320,23 +356,8 @@ mod win {
         // SAFETY: 呼び出し元がclipboardを開いた状態でのみ呼ぶ。
         let handle = unsafe { GetClipboardData(format) }
             .map_err(|error| anyhow!("Failed to read clipboard data: {error}"))?;
-        let hglobal = HGLOBAL(handle.0);
         // SAFETY: `GetClipboardData`が返した有効なhandle。
-        let size = unsafe { GlobalSize(hglobal) };
-        if size == 0 {
-            return Ok(Vec::new());
-        }
-        // SAFETY: 同じ有効なhandle。
-        let ptr = unsafe { GlobalLock(hglobal) };
-        if ptr.is_null() {
-            anyhow::bail!("Failed to lock clipboard memory for reading");
-        }
-        // SAFETY: `ptr`は`GlobalSize`が報告した`size`バイト以上有効。
-        let bytes =
-            unsafe { std::slice::from_raw_parts(ptr.cast::<u8>() as *const u8, size) }.to_vec();
-        // SAFETY: 直前にlockした同じhandle。戻り値は無視する(上記と同じ理由)。
-        let _ = unsafe { GlobalUnlock(hglobal) };
-        Ok(bytes)
+        unsafe { read_hglobal_bytes(HGLOBAL(handle.0)) }
     }
 }
 

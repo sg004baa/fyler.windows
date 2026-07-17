@@ -7,6 +7,7 @@
 //! 「保存状態機械の副作用(SaveEffect)の実行」のみ。
 
 mod config;
+mod drag_flow;
 mod extract_flow;
 mod feedback;
 mod import_flow;
@@ -38,7 +39,7 @@ use fyler_core::options::{SortKey, TerminalKind};
 use fyler_core::pane::PaneId;
 use fyler_core::path::TreePath;
 use fyler_core::report::{ApplyProgress, CommitReport};
-use fyler_core::transfer::{DropEffect, ImportOp, TransferOp};
+use fyler_core::transfer::{DragOutcome, DropEffect, ImportOp, TransferOp};
 use fyler_core::tree::EntryKind;
 use fyler_core::undo::{UndoStep, UndoTransaction};
 use fyler_fsops::extract::ExtractOp;
@@ -122,6 +123,35 @@ enum AppEvent {
         pane_id: PaneId,
         line: usize,
         item: TreeContextItem,
+    },
+    /// GUI window内で開始したtree行dragがwindow境界を離れた
+    /// (OLE drag-outを開始する)。
+    TreeDragOut {
+        pane_id: PaneId,
+        line: usize,
+    },
+    /// OLE drag-out(使い捨てSTAスレッド)の完了。`existing`はdragした絶対パス
+    /// のうち`perform_drag`直後もまだFS上に存在するもの。
+    TreeDragFinished {
+        pane_id: PaneId,
+        outcome: DragOutcome,
+        existing: Vec<PathBuf>,
+        /// `perform_drag`自体の失敗(OleInitialize等)。発生時のみSome。
+        /// outcomeはCancelled扱いだが、silent fallbackにしないためユーザーへ表示する。
+        error: Option<String>,
+    },
+    /// 承認後のごみ箱退避workerの完了。
+    TreeDragCleanupFinished {
+        pane_id: PaneId,
+        errors: Vec<String>,
+    },
+    /// GUI window内で完結したtree行drag(pane間)。
+    TreeDragDrop {
+        source_pane: PaneId,
+        source_line: usize,
+        target_pane: PaneId,
+        target_line: Option<usize>,
+        copy: bool,
     },
 }
 

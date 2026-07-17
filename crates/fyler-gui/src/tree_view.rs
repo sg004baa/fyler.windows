@@ -56,6 +56,20 @@ pub struct RowClick {
     pub is_zip: bool,
 }
 
+/// ツリー行からOLE drag-out候補のdragが開始されたことを示す情報。
+///
+/// fylerのwindow**内**でのdrag(pane間含む)はOLEを使わずegui内で完結し、
+/// pointerがwindow境界を離れた時点でのみapp層がOLE dragへ移行する
+/// (親セッション設計確定事項)。この構造体はGUI側drag状態機械の開始点。
+#[derive(Debug, Clone, Copy)]
+pub struct RowDragStart {
+    /// dragが開始された表示行(0始まり)。
+    pub line: usize,
+    /// 行がID付き(保存済み)かどうか。未保存行はdrag対象にしない。
+    pub has_id: bool,
+    pub is_dir: bool,
+}
+
 /// ツリー描画後にapp層へ返す表示情報。
 #[derive(Debug, Clone, Copy)]
 pub struct TreeViewOutput {
@@ -65,8 +79,11 @@ pub struct TreeViewOutput {
     pub tree_rect: egui::Rect,
     /// 次フレームのカーソル追従判定に使う現在の可視範囲。
     pub viewport: TreeViewport,
-    /// `drag_active`時、pointer直下の行(inbound dropの取り込み先候補)。
+    /// `drag_active`(inbound drop)または`internal_drag_active`(GUI内tree drag)
+    /// のいずれか時、pointer直下の行(取り込み/dropの対象候補)。
     pub drop_target_line: Option<usize>,
+    /// このフレームで行のdragが開始されていればその詳細(最初の1件のみ)。
+    pub drag_started: Option<RowDragStart>,
     /// このフレームで行がクリックされていればその詳細。
     pub click: Option<RowClick>,
     /// 行の外(ツリー領域内の空白)がクリックされたか(pane focus要求のみ、
@@ -130,6 +147,9 @@ pub fn draw(
     pane_id: PaneId,
     is_active: bool,
     drag_active: bool,
+    // GUI window内で開始したtree行drag(pane間dragを含む)が進行中か。
+    // trueの間、全行が`contains_pointer()`ベースでdrop先候補を判定する。
+    internal_drag_active: bool,
 ) -> TreeViewOutput {
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
     let icon_font_id = egui::FontId::new(font_id.size, icon::font_family());
@@ -163,6 +183,7 @@ pub fn draw(
         let mut cursor_rect = None;
         let mut hovered_line = None;
         let mut row_click: Option<RowClick> = None;
+        let mut row_drag_start: Option<RowDragStart> = None;
         let first_line = row_range.start;
         for (line_offset, line) in snapshot.lines[row_range].iter().enumerate() {
             let line_index = first_line + line_offset;
@@ -228,8 +249,12 @@ pub fn draw(
                     + badge_galley.size().x
                     + 44.0,
             );
-            let (rect, response) =
-                ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::click());
+            let (rect, response) = ui
+                .allocate_exact_size(egui::vec2(width, row_height), egui::Sense::click_and_drag());
+            let has_id = matches!(
+                fyler_core::grammar::split_id_prefix(&line.text),
+                PrefixParse::WithId { .. }
+            );
             if row_click.is_none()
                 && let Some(kind) = classify_row_click(
                     response.secondary_clicked(),
@@ -238,10 +263,6 @@ pub fn draw(
                     ui.input(|input| input.modifiers.shift),
                 )
             {
-                let has_id = matches!(
-                    fyler_core::grammar::split_id_prefix(&line.text),
-                    PrefixParse::WithId { .. }
-                );
                 let pos = response
                     .interact_pointer_pos()
                     .unwrap_or_else(|| rect.center());
@@ -254,12 +275,25 @@ pub fn draw(
                     is_zip: display_name_is_zip(concealed.display),
                 });
             }
+            if row_drag_start.is_none() && response.drag_started_by(egui::PointerButton::Primary) {
+                row_drag_start = Some(RowDragStart {
+                    line: line_index,
+                    has_id,
+                    is_dir,
+                });
+            }
 
             if response.hovered() {
                 painter.rect_filled(rect, 0.0, theme::HOVER);
                 if drag_active {
                     hovered_line = Some(line_index);
                 }
+            }
+            // GUI内tree drag中は、drag元の行がpointer/press captureを保持するため
+            // 他行の`hovered()`は立たない。`contains_pointer()`はdrag中でも
+            // hit-testされるため、drop先候補の判定にはこちらを使う。
+            if internal_drag_active && response.contains_pointer() {
+                hovered_line = Some(line_index);
             }
             if snapshot.cursor.line == line_index {
                 painter.rect_filled(rect, 0.0, theme::accent_selection_fill());
@@ -340,10 +374,10 @@ pub fn draw(
                 ));
             }
         }
-        (cursor_rect, hovered_line, row_click)
+        (cursor_rect, hovered_line, row_click, row_drag_start)
     });
 
-    let (cursor_rect, hovered_line, click) = output.inner;
+    let (cursor_rect, hovered_line, click, drag_started) = output.inner;
     let drop_target_line =
         hovered_line.and_then(|hovered| resolve_drop_target_line(&snapshot.lines, hovered));
     if let Some(target) = drop_target_line {
@@ -386,6 +420,7 @@ pub fn draw(
             cursor_line: snapshot.cursor.line,
         },
         drop_target_line,
+        drag_started,
         click,
         blank_clicked,
     }
