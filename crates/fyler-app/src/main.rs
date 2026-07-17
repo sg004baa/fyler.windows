@@ -7,6 +7,7 @@
 //! 「保存状態機械の副作用(SaveEffect)の実行」のみ。
 
 mod config;
+mod extract_flow;
 mod feedback;
 mod import_flow;
 mod nvim_locate;
@@ -40,6 +41,7 @@ use fyler_core::report::{ApplyProgress, CommitReport};
 use fyler_core::transfer::{DropEffect, ImportOp, TransferOp};
 use fyler_core::tree::EntryKind;
 use fyler_core::undo::{UndoStep, UndoTransaction};
+use fyler_fsops::extract::{ExtractOp, ExtractPlan};
 use fyler_fsops::openwith::OpenWithHandler;
 use fyler_fsops::watch::ExternalChange;
 use fyler_gui::app::{GuiEvent, PickerAction, TreeContextItem, TreeRowClickKind};
@@ -95,6 +97,8 @@ enum AppEvent {
     TransferFinished(CommitReport<TransferOp>),
     ImportProgress(ApplyProgress<ImportOp>),
     ImportFinished(CommitReport<ImportOp>),
+    ExtractProgress(ApplyProgress<ExtractOp>),
+    ExtractFinished(CommitReport<ExtractOp>),
     FilesDropped {
         pane_id: PaneId,
         line: Option<usize>,

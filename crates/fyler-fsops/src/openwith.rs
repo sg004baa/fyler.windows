@@ -234,14 +234,15 @@ unsafe fn take_cotaskmem_string(
     Ok(text)
 }
 
+/// COM apartment初期化のRAIIガード。[`crate::shortcut`]とも共有する。
 #[cfg(windows)]
-struct ComApartment {
+pub(crate) struct ComApartment {
     uninitialize: bool,
 }
 
 #[cfg(windows)]
 impl ComApartment {
-    fn initialize() -> anyhow::Result<Self> {
+    pub(crate) fn initialize() -> anyhow::Result<Self> {
         use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
         use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 
