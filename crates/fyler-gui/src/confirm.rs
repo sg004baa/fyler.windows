@@ -329,6 +329,73 @@ pub fn draw_import_plan(
         })
         .inner
 }
+/// 汎用の承認確認ダイアログ(shortcut作成・zip展開)。行はapp層で整形済み。
+/// キー操作は他planダイアログと同じ(y/Enter=承認、n/Esc=キャンセル)。
+pub fn draw_action_confirm(
+    ui: &mut egui::Ui,
+    title: &str,
+    approve_label: &str,
+    lines: &[String],
+) -> Option<ConfirmChoice> {
+    let key_choice = ui.ctx().input(|input| {
+        plan_choice_from_keys(
+            input.key_pressed(egui::Key::Y),
+            input.key_pressed(egui::Key::Enter),
+            input.key_pressed(egui::Key::N),
+            input.key_pressed(egui::Key::Escape),
+        )
+    });
+
+    egui::Modal::new(egui::Id::new("action-confirmation"))
+        .show(ui.ctx(), |ui| {
+            ui.heading(title);
+            ui.add_space(8.0);
+            for line in lines {
+                ui.monospace(line);
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let approve_clicked = ui.button(approve_label).clicked();
+                let cancel_clicked = ui.button("Cancel (n / Esc)").clicked();
+                confirm_choice_from_buttons(approve_clicked, cancel_clicked, key_choice)
+            })
+            .inner
+        })
+        .inner
+}
+
+/// 汎用の結果ダイアログ(zip展開結果)。行はapp層で整形済み。
+/// `NG`で始まる行はエラー色で描画する(undo reportと同じ規約)。
+pub fn draw_action_report(
+    ui: &mut egui::Ui,
+    title: &str,
+    lines: &[String],
+    any_failed: bool,
+) -> bool {
+    let dismiss_from_keyboard = ui
+        .ctx()
+        .input(|input| input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape));
+
+    egui::Modal::new(egui::Id::new("action-report"))
+        .show(ui.ctx(), |ui| {
+            ui.heading(title);
+            ui.add_space(8.0);
+            if any_failed {
+                ui.colored_label(ui.visuals().warn_fg_color, "Some operations did not run.");
+                ui.add_space(4.0);
+            }
+            for line in lines {
+                if line.starts_with("NG") {
+                    ui.colored_label(ui.visuals().error_fg_color, line);
+                } else {
+                    ui.monospace(line);
+                }
+            }
+            ui.add_space(12.0);
+            ui.button("Close (Enter / Esc)").clicked() || dismiss_from_keyboard
+        })
+        .inner
+}
 
 /// undo確認ダイアログを表示する。行はapp層で整形済み。
 pub fn draw_undo_plan(ui: &mut egui::Ui, lines: &[String]) -> Option<ConfirmChoice> {

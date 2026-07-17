@@ -415,6 +415,21 @@ pub enum EditorEvent {
     OpenTerminal {
         line: usize,
     },
+    /// ユーザーが指定行のファイルを管理者権限で開くよう要求した。
+    /// `line`は0始まり。行の解釈とパス解決はapp層が行う。
+    OpenAsAdmin {
+        line: usize,
+    },
+    /// ユーザーが指定行のエントリへのショートカット(.lnk)作成を要求した。
+    /// `line`は0始まり。行の解釈・lnkパスの衝突回避・確認はapp層が行う。
+    CreateShortcut {
+        line: usize,
+    },
+    /// ユーザーが指定行のzipアーカイブの展開を要求した。
+    /// `line`は0始まり。行の解釈・展開先解決・確認はapp層が行う。
+    ExtractArchive {
+        line: usize,
+    },
     /// ユーザーが現在の表示ルートの親ディレクトリへの移動を要求した。
     NavigateParent,
     /// ユーザーがnavigation historyを1つ戻る移動を要求した。

@@ -442,6 +442,53 @@ impl NvimEngine {
                                     ),
                                 }
                             }
+                            "fyler_admin" => {
+                                let line = notification.args.first()
+                                    .and_then(value_as_u64)
+                                    .and_then(|line| usize::try_from(line).ok());
+                                match line {
+                                    Some(line) => {
+                                        let _ = event_tx.send(EditorEvent::OpenAsAdmin { line });
+                                    }
+                                    None => send_message(
+                                        &event_tx,
+                                        MessageKind::Error,
+                                        "Failed to get the line number for open-as-administrator"
+                                            .to_owned(),
+                                    ),
+                                }
+                            }
+                            "fyler_shortcut" => {
+                                let line = notification.args.first()
+                                    .and_then(value_as_u64)
+                                    .and_then(|line| usize::try_from(line).ok());
+                                match line {
+                                    Some(line) => {
+                                        let _ = event_tx.send(EditorEvent::CreateShortcut { line });
+                                    }
+                                    None => send_message(
+                                        &event_tx,
+                                        MessageKind::Error,
+                                        "Failed to get the line number for create-shortcut"
+                                            .to_owned(),
+                                    ),
+                                }
+                            }
+                            "fyler_extract" => {
+                                let line = notification.args.first()
+                                    .and_then(value_as_u64)
+                                    .and_then(|line| usize::try_from(line).ok());
+                                match line {
+                                    Some(line) => {
+                                        let _ = event_tx.send(EditorEvent::ExtractArchive { line });
+                                    }
+                                    None => send_message(
+                                        &event_tx,
+                                        MessageKind::Error,
+                                        "Failed to get the line number for extract".to_owned(),
+                                    ),
+                                }
+                            }
                             "fyler_toggle_hidden" => {
                                 let _ = event_tx.send(EditorEvent::ToggleHidden);
                             }

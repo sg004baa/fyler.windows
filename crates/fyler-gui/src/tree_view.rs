@@ -52,6 +52,8 @@ pub struct RowClick {
     pub has_id: bool,
     /// 行がディレクトリかどうか。
     pub is_dir: bool,
+    /// 行が.zipアーカイブのファイルか。context menuのExtract gatingに使う。
+    pub is_zip: bool,
 }
 
 /// ツリー行からOLE drag-out候補のdragが開始されたことを示す情報。
@@ -111,6 +113,17 @@ fn classify_row_click(
     } else {
         None
     }
+}
+
+/// 表示名が.zipアーカイブのファイルかを判定する純ロジック(unit test対象)。
+/// ディレクトリsuffix付きは常にfalse。拡張子はcase-insensitiveに比較する。
+/// Explorer同様、名前全体が`.zip`のファイルもzip扱いとする(ends_with判定)。
+pub(crate) fn display_name_is_zip(display: &str) -> bool {
+    let (name, is_dir) = fyler_core::grammar::split_dir_suffix(display);
+    !is_dir
+        && name
+            .get(name.len().wrapping_sub(4)..)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(".zip"))
 }
 
 /// snapshotのバッファ行をツリーとして描画する。
@@ -259,6 +272,7 @@ pub fn draw(
                     pos,
                     has_id,
                     is_dir,
+                    is_zip: display_name_is_zip(concealed.display),
                 });
             }
             if row_drag_start.is_none() && response.drag_started_by(egui::PointerButton::Primary) {
@@ -781,6 +795,16 @@ mod tests {
             .iter()
             .map(|text| fyler_core::editor::EditorLine::new(*text))
             .collect()
+    }
+
+    #[test]
+    fn display_name_is_zip_matches_extension_case_insensitively() {
+        assert!(display_name_is_zip("Archive.ZIP"));
+        assert!(display_name_is_zip("bundle.zip"));
+        assert!(!display_name_is_zip("photos/"));
+        assert!(!display_name_is_zip("backup.zip/"));
+        assert!(!display_name_is_zip("report.txt"));
+        assert!(!display_name_is_zip("zip"));
     }
 
     #[test]

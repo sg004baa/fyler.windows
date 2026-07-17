@@ -64,12 +64,26 @@ pub enum TreeContextItem {
     /// Open / Enter directory。
     Open,
     OpenWith,
+    /// 管理者権限(elevated)でfileを開く(UAC確認はOS側)。
+    OpenAsAdmin,
     /// buffer上で名前編集を開始するだけ(実FSは変更しない)。
     Rename,
     /// bufferから行を除去するだけ(実FSは変更しない)。
     MarkForDeletion,
+    /// OSクリップボードへcopyとして載せる(実FSはPaste確認後)。
+    ClipboardCopy,
+    /// OSクリップボードへcutとして載せる(実FSはPaste確認後)。
+    ClipboardCut,
+    /// OSクリップボードの内容をこの場所へ貼り付ける(確認後に実FS反映)。
+    ClipboardPaste,
+    /// .zipアーカイブをその場に展開する(確認後)。
+    Extract,
+    /// エントリへの.lnkショートカットを同じ場所に作成する。
+    CreateShortcut,
     CopyPath,
     OpenTerminal,
+    /// paneのツリーを再読込する。
+    Refresh,
 }
 
 /// GUIからapp層へ返すユーザー操作。
@@ -322,6 +336,25 @@ pub enum GuiEvent {
         report: CommitReport<ImportOp>,
         effect: DropEffect,
     },
+    /// 汎用の承認確認ダイアログを表示する(shortcut作成・zip展開の確認)。
+    /// 行はapp層で整形済み。承認は`GuiAction::Confirm(Approve)`で返る。
+    ShowActionConfirm {
+        /// ダイアログ見出し(英語)。
+        title: String,
+        /// 承認ボタンのラベル(英語、"(y)"付き)。
+        approve_label: String,
+        lines: Vec<String>,
+    },
+    /// extract applyワーカーから届いた操作単位の進捗を表示へ反映する。
+    /// ラベルはapp層で整形済み。
+    ExtractProgress(ApplyProgress<String>),
+    /// 汎用の結果ダイアログを表示する(zip展開結果)。行はapp層で整形済み。
+    /// `NG`で始まる行はエラー色で描画する。
+    ShowActionReport {
+        title: String,
+        lines: Vec<String>,
+        any_failed: bool,
+    },
     /// OLE drag-out完了後、Move報告でsourceが残存している場合の後始末
     /// (ごみ箱退避)確認ダイアログを表示する。
     ShowDragCleanupConfirm {
@@ -344,6 +377,11 @@ enum DialogState {
         overwrites: Vec<TreePath>,
     },
     UndoPlan {
+        lines: Vec<String>,
+    },
+    ActionConfirm {
+        title: String,
+        approve_label: String,
         lines: Vec<String>,
     },
     TransferPlan {
@@ -370,6 +408,11 @@ enum DialogState {
     },
     Report(CommitReport),
     UndoReport {
+        lines: Vec<String>,
+        any_failed: bool,
+    },
+    ActionReport {
+        title: String,
         lines: Vec<String>,
         any_failed: bool,
     },
@@ -409,6 +452,8 @@ enum DialogState {
         pos: egui::Pos2,
         has_id: bool,
         is_dir: bool,
+        /// 行が.zipアーカイブのファイルか(Extract gating用)。
+        is_zip: bool,
         /// 表示中のpaneのengineが健全か(crashed=false)。
         engine_ok: bool,
         /// 表示中のpaneのrootがoffline(到達不能)か。
@@ -704,6 +749,9 @@ impl FylerApp {
                     EditorEvent::ClipboardCopyRequested { .. } => {}
                     EditorEvent::ClipboardCutRequested { .. } => {}
                     EditorEvent::ClipboardPasteRequested { .. } => {}
+                    EditorEvent::OpenAsAdmin { .. } => {}
+                    EditorEvent::CreateShortcut { .. } => {}
+                    EditorEvent::ExtractArchive { .. } => {}
                     EditorEvent::CommitRequested { .. } => {}
                     EditorEvent::UndoRequested => {}
                     EditorEvent::CmdlineShow(state) if self.active == Some(pane_id) => {
@@ -876,6 +924,17 @@ impl FylerApp {
                 GuiEvent::ShowUndoPlan { lines } => {
                     self.dialog = Some(DialogState::UndoPlan { lines });
                 }
+                GuiEvent::ShowActionConfirm {
+                    title,
+                    approve_label,
+                    lines,
+                } => {
+                    self.dialog = Some(DialogState::ActionConfirm {
+                        title,
+                        approve_label,
+                        lines,
+                    });
+                }
                 GuiEvent::ShowTransferPlan {
                     plan,
                     target,
@@ -952,6 +1011,19 @@ impl FylerApp {
                         *current = progress.current;
                     }
                 }
+                GuiEvent::ExtractProgress(progress) => {
+                    if let Some(DialogState::Progress {
+                        completed,
+                        total,
+                        current,
+                        ..
+                    }) = &mut self.dialog
+                    {
+                        *completed = progress.completed;
+                        *total = progress.total;
+                        *current = progress.current;
+                    }
+                }
                 GuiEvent::TransferProgress(progress) => {
                     if let Some(DialogState::Progress {
                         completed,
@@ -997,6 +1069,17 @@ impl FylerApp {
                 }
                 GuiEvent::ShowUndoReport { lines, any_failed } => {
                     self.dialog = Some(DialogState::UndoReport { lines, any_failed });
+                }
+                GuiEvent::ShowActionReport {
+                    title,
+                    lines,
+                    any_failed,
+                } => {
+                    self.dialog = Some(DialogState::ActionReport {
+                        title,
+                        lines,
+                        any_failed,
+                    });
                 }
                 GuiEvent::ShowTransferReport(report) => {
                     self.dialog = Some(DialogState::TransferReport(report));
@@ -1217,6 +1300,7 @@ impl eframe::App for FylerApp {
                         pos: row.pos,
                         has_id: row.has_id,
                         is_dir: row.is_dir,
+                        is_zip: row.is_zip,
                         engine_ok,
                         offline,
                     });
@@ -1391,11 +1475,25 @@ impl eframe::App for FylerApp {
             Some(DialogState::UndoPlan { lines }) => {
                 confirm_choice = confirm::draw_undo_plan(ui, lines);
             }
+            Some(DialogState::ActionConfirm {
+                title,
+                approve_label,
+                lines,
+            }) => {
+                confirm_choice = confirm::draw_action_confirm(ui, title, approve_label, lines);
+            }
             Some(DialogState::Report(report)) => {
                 dismiss_report = confirm::draw_report(ui, report);
             }
             Some(DialogState::UndoReport { lines, any_failed }) => {
                 dismiss_report = confirm::draw_undo_report(ui, lines, *any_failed);
+            }
+            Some(DialogState::ActionReport {
+                title,
+                lines,
+                any_failed,
+            }) => {
+                dismiss_report = confirm::draw_action_report(ui, title, lines, *any_failed);
             }
             Some(DialogState::TransferReport(report)) => {
                 dismiss_report = confirm::draw_transfer_report(ui, report);
@@ -1497,13 +1595,16 @@ impl eframe::App for FylerApp {
                 pos,
                 has_id,
                 is_dir,
+                is_zip,
                 engine_ok,
                 offline,
             }) => {
                 tree_context_result = Some((
                     *pane_id,
                     *line,
-                    draw_tree_context_menu(ui, *pos, *has_id, *is_dir, *engine_ok, *offline),
+                    draw_tree_context_menu(
+                        ui, *pos, *has_id, *is_dir, *is_zip, *engine_ok, *offline,
+                    ),
                 ));
             }
             None => {}
@@ -2363,14 +2464,30 @@ enum TreeContextOutcome {
     Dismissed,
 }
 
-/// context menuに表示する項目(表示順)。
-const TREE_CONTEXT_ITEMS: [TreeContextItem; 6] = [
-    TreeContextItem::Open,
-    TreeContextItem::OpenWith,
-    TreeContextItem::Rename,
-    TreeContextItem::MarkForDeletion,
-    TreeContextItem::CopyPath,
-    TreeContextItem::OpenTerminal,
+/// context menuに表示する項目(グループ順・グループ内表示順)。
+/// グループ間はseparatorで区切って描画する。
+const TREE_CONTEXT_GROUPS: [&[TreeContextItem]; 4] = [
+    &[
+        TreeContextItem::Open,
+        TreeContextItem::OpenWith,
+        TreeContextItem::OpenAsAdmin,
+    ],
+    &[
+        TreeContextItem::ClipboardCopy,
+        TreeContextItem::ClipboardCut,
+        TreeContextItem::ClipboardPaste,
+    ],
+    &[
+        TreeContextItem::Rename,
+        TreeContextItem::MarkForDeletion,
+        TreeContextItem::Extract,
+        TreeContextItem::CreateShortcut,
+    ],
+    &[
+        TreeContextItem::CopyPath,
+        TreeContextItem::OpenTerminal,
+        TreeContextItem::Refresh,
+    ],
 ];
 
 fn context_item_label(item: TreeContextItem, is_dir: bool) -> &'static str {
@@ -2383,10 +2500,17 @@ fn context_item_label(item: TreeContextItem, is_dir: bool) -> &'static str {
             }
         }
         TreeContextItem::OpenWith => "Open with...",
+        TreeContextItem::OpenAsAdmin => "Open as administrator",
         TreeContextItem::Rename => "Rename",
         TreeContextItem::MarkForDeletion => "Mark for deletion",
+        TreeContextItem::ClipboardCopy => "Copy",
+        TreeContextItem::ClipboardCut => "Cut",
+        TreeContextItem::ClipboardPaste => "Paste",
+        TreeContextItem::Extract => "Extract here",
+        TreeContextItem::CreateShortcut => "Create shortcut",
         TreeContextItem::CopyPath => "Copy path",
         TreeContextItem::OpenTerminal => "Open terminal here",
+        TreeContextItem::Refresh => "Refresh",
     }
 }
 
@@ -2399,6 +2523,7 @@ fn context_item_enabled(
     item: TreeContextItem,
     has_id: bool,
     is_dir: bool,
+    is_zip: bool,
     engine_ok: bool,
     offline: bool,
 ) -> bool {
@@ -2407,9 +2532,14 @@ fn context_item_enabled(
     }
     match item {
         TreeContextItem::Open | TreeContextItem::Rename | TreeContextItem::CopyPath => has_id,
-        TreeContextItem::OpenWith => has_id && !is_dir && !offline,
+        TreeContextItem::OpenWith | TreeContextItem::OpenAsAdmin => has_id && !is_dir && !offline,
         TreeContextItem::MarkForDeletion => true,
+        TreeContextItem::ClipboardCopy | TreeContextItem::ClipboardCut => has_id && !offline,
+        TreeContextItem::ClipboardPaste => !offline,
+        TreeContextItem::Extract => has_id && !is_dir && !offline && is_zip,
+        TreeContextItem::CreateShortcut => has_id && !offline,
         TreeContextItem::OpenTerminal => has_id && !offline,
+        TreeContextItem::Refresh => true,
     }
 }
 
@@ -2423,6 +2553,7 @@ fn draw_tree_context_menu(
     pos: egui::Pos2,
     has_id: bool,
     is_dir: bool,
+    is_zip: bool,
     engine_ok: bool,
     offline: bool,
 ) -> TreeContextOutcome {
@@ -2438,19 +2569,25 @@ fn draw_tree_context_menu(
     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
     .open(true)
     .show(|ui| {
-        for item in TREE_CONTEXT_ITEMS {
-            let enabled = context_item_enabled(item, has_id, is_dir, engine_ok, offline);
-            let label = context_item_label(item, is_dir);
-            let response = ui.add_enabled(enabled, egui::Button::new(label));
-            let response = if enabled {
-                response
-            } else {
-                response.on_disabled_hover_text(context_item_disabled_reason(
-                    engine_ok, has_id, is_dir, offline,
-                ))
-            };
-            if response.clicked() {
-                chosen = Some(item);
+        for (group_index, group) in TREE_CONTEXT_GROUPS.iter().enumerate() {
+            if group_index > 0 {
+                ui.separator();
+            }
+            for &item in *group {
+                let enabled =
+                    context_item_enabled(item, has_id, is_dir, is_zip, engine_ok, offline);
+                let label = context_item_label(item, is_dir);
+                let response = ui.add_enabled(enabled, egui::Button::new(label));
+                let response = if enabled {
+                    response
+                } else {
+                    response.on_disabled_hover_text(context_item_disabled_reason(
+                        item, engine_ok, has_id, is_dir, offline, is_zip,
+                    ))
+                };
+                if response.clicked() {
+                    chosen = Some(item);
+                }
             }
         }
     });
@@ -2469,24 +2606,35 @@ fn draw_tree_context_menu(
     }
 }
 
-/// disableされた項目のtooltip文言。優先度: crashed > offline > is_dir(open-with専用) > has_id。
+/// disableされた項目のtooltip文言。優先度: crashed > offline > item固有 > has_id。
 fn context_item_disabled_reason(
+    item: TreeContextItem,
     engine_ok: bool,
     has_id: bool,
     is_dir: bool,
     offline: bool,
+    is_zip: bool,
 ) -> &'static str {
     if !engine_ok {
-        "Editor engine has stopped"
-    } else if offline {
-        "Location is offline"
-    } else if is_dir {
-        "Open with is for files only"
-    } else if !has_id {
-        "This entry has not been saved yet"
-    } else {
-        ""
+        return "Editor engine has stopped";
     }
+    if offline {
+        return "Location is offline";
+    }
+    match item {
+        TreeContextItem::OpenWith if is_dir => return "Open with is for files only",
+        TreeContextItem::OpenAsAdmin if is_dir => {
+            return "Open as administrator is for files only";
+        }
+        TreeContextItem::Extract if is_dir || !is_zip => {
+            return "Extract is for .zip archives only";
+        }
+        _ => {}
+    }
+    if !has_id {
+        return "This entry has not been saved yet";
+    }
+    ""
 }
 
 fn current_window_geometry(context: &egui::Context) -> Option<WindowGeometry> {
@@ -2830,13 +2978,19 @@ mod tests {
             TreeContextItem::Rename,
             TreeContextItem::CopyPath,
             TreeContextItem::OpenWith,
+            TreeContextItem::OpenAsAdmin,
             TreeContextItem::OpenTerminal,
+            TreeContextItem::ClipboardCopy,
+            TreeContextItem::ClipboardCut,
+            TreeContextItem::Extract,
+            TreeContextItem::CreateShortcut,
         ] {
-            assert!(!context_item_enabled(item, false, false, true, false));
+            assert!(!context_item_enabled(item, false, false, true, true, false));
         }
         // Mark for deletionはIDなし(unsaved)行でも有効。
         assert!(context_item_enabled(
             TreeContextItem::MarkForDeletion,
+            false,
             false,
             false,
             true,
@@ -2846,8 +3000,10 @@ mod tests {
 
     #[test]
     fn context_item_enabled_disables_everything_when_engine_crashed() {
-        for item in TREE_CONTEXT_ITEMS {
-            assert!(!context_item_enabled(item, true, false, false, false));
+        for group in TREE_CONTEXT_GROUPS {
+            for &item in group {
+                assert!(!context_item_enabled(item, true, false, true, false, false));
+            }
         }
     }
 
@@ -2857,6 +3013,7 @@ mod tests {
             TreeContextItem::OpenWith,
             true,
             false,
+            false,
             true,
             false
         ));
@@ -2864,6 +3021,7 @@ mod tests {
             TreeContextItem::OpenWith,
             true,
             true,
+            false,
             true,
             false
         ));
@@ -2871,8 +3029,128 @@ mod tests {
             TreeContextItem::OpenWith,
             true,
             false,
+            false,
             true,
             true
+        ));
+    }
+
+    #[test]
+    fn context_item_enabled_open_as_admin_is_files_only_and_requires_online() {
+        assert!(context_item_enabled(
+            TreeContextItem::OpenAsAdmin,
+            true,
+            false,
+            false,
+            true,
+            false
+        ));
+        assert!(!context_item_enabled(
+            TreeContextItem::OpenAsAdmin,
+            true,
+            true,
+            false,
+            true,
+            false
+        ));
+        assert!(!context_item_enabled(
+            TreeContextItem::OpenAsAdmin,
+            true,
+            false,
+            false,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn context_item_enabled_extract_requires_zip_file() {
+        // zip fileなら有効。
+        assert!(context_item_enabled(
+            TreeContextItem::Extract,
+            true,
+            false,
+            true,
+            true,
+            false
+        ));
+        // 非zip fileでは無効。
+        assert!(!context_item_enabled(
+            TreeContextItem::Extract,
+            true,
+            false,
+            false,
+            true,
+            false
+        ));
+        // directoryでは無効(is_zipが立っていても)。
+        assert!(!context_item_enabled(
+            TreeContextItem::Extract,
+            true,
+            true,
+            true,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn context_item_enabled_create_shortcut_allows_directories_but_needs_saved_entry() {
+        assert!(context_item_enabled(
+            TreeContextItem::CreateShortcut,
+            true,
+            true,
+            false,
+            true,
+            false
+        ));
+        assert!(!context_item_enabled(
+            TreeContextItem::CreateShortcut,
+            false,
+            true,
+            false,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn context_item_enabled_clipboard_paste_ignores_id_but_requires_online() {
+        assert!(context_item_enabled(
+            TreeContextItem::ClipboardPaste,
+            false,
+            false,
+            false,
+            true,
+            false
+        ));
+        assert!(!context_item_enabled(
+            TreeContextItem::ClipboardPaste,
+            false,
+            false,
+            false,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn context_item_enabled_refresh_only_requires_healthy_engine() {
+        assert!(context_item_enabled(
+            TreeContextItem::Refresh,
+            false,
+            true,
+            false,
+            true,
+            true
+        ));
+        assert!(!context_item_enabled(
+            TreeContextItem::Refresh,
+            true,
+            false,
+            false,
+            false,
+            false
         ));
     }
 
@@ -2882,6 +3160,7 @@ mod tests {
             TreeContextItem::OpenTerminal,
             true,
             true,
+            false,
             true,
             false
         ));
@@ -2889,6 +3168,7 @@ mod tests {
             TreeContextItem::OpenTerminal,
             true,
             true,
+            false,
             true,
             true
         ));
@@ -2900,6 +3180,7 @@ mod tests {
             TreeContextItem::Rename,
             true,
             false,
+            false,
             true,
             true
         ));
@@ -2907,9 +3188,49 @@ mod tests {
             TreeContextItem::CopyPath,
             true,
             false,
+            false,
             true,
             true
         ));
+    }
+
+    #[test]
+    fn context_item_disabled_reason_prefers_engine_then_offline_then_item_specific() {
+        assert_eq!(
+            context_item_disabled_reason(TreeContextItem::Extract, false, true, false, true, false),
+            "Editor engine has stopped"
+        );
+        assert_eq!(
+            context_item_disabled_reason(TreeContextItem::Extract, true, true, false, true, false),
+            "Location is offline"
+        );
+        assert_eq!(
+            context_item_disabled_reason(TreeContextItem::Extract, true, true, false, false, false),
+            "Extract is for .zip archives only"
+        );
+        assert_eq!(
+            context_item_disabled_reason(TreeContextItem::Extract, true, true, true, false, true),
+            "Extract is for .zip archives only"
+        );
+        assert_eq!(
+            context_item_disabled_reason(TreeContextItem::OpenWith, true, true, true, false, false),
+            "Open with is for files only"
+        );
+        assert_eq!(
+            context_item_disabled_reason(
+                TreeContextItem::OpenAsAdmin,
+                true,
+                true,
+                true,
+                false,
+                false
+            ),
+            "Open as administrator is for files only"
+        );
+        assert_eq!(
+            context_item_disabled_reason(TreeContextItem::Open, true, false, false, false, false),
+            "This entry has not been saved yet"
+        );
     }
 
     #[test]
@@ -2919,6 +3240,34 @@ mod tests {
             "Enter directory"
         );
         assert_eq!(context_item_label(TreeContextItem::Open, false), "Open");
+        assert_eq!(
+            context_item_label(TreeContextItem::OpenAsAdmin, false),
+            "Open as administrator"
+        );
+        assert_eq!(
+            context_item_label(TreeContextItem::ClipboardCopy, false),
+            "Copy"
+        );
+        assert_eq!(
+            context_item_label(TreeContextItem::ClipboardCut, false),
+            "Cut"
+        );
+        assert_eq!(
+            context_item_label(TreeContextItem::ClipboardPaste, false),
+            "Paste"
+        );
+        assert_eq!(
+            context_item_label(TreeContextItem::Extract, false),
+            "Extract here"
+        );
+        assert_eq!(
+            context_item_label(TreeContextItem::CreateShortcut, true),
+            "Create shortcut"
+        );
+        assert_eq!(
+            context_item_label(TreeContextItem::Refresh, true),
+            "Refresh"
+        );
     }
 
     #[test]
