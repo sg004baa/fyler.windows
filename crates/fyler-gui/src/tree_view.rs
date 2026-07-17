@@ -27,6 +27,33 @@ pub struct TreeViewport {
     pub cursor_line: usize,
 }
 
+/// 行クリックの種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowClickKind {
+    /// 単純click(左クリック1回)。
+    Single,
+    /// 左クリックのdouble-click。
+    Double,
+    /// Shift押下中の左クリック(anchorからlinewise選択する対象行)。
+    Shift,
+    /// 右クリック(secondary button)。
+    Secondary,
+}
+
+/// ツリー行へのクリック結果。
+#[derive(Debug, Clone, Copy)]
+pub struct RowClick {
+    /// クリックされた表示行(0始まり、`EditorSnapshot::lines`のindex)。
+    pub line: usize,
+    pub kind: RowClickKind,
+    /// クリック位置(screen座標)。context menuの表示位置に使う。
+    pub pos: egui::Pos2,
+    /// 行がID付き(保存済み)かどうか。context menuのgatingに使う。
+    pub has_id: bool,
+    /// 行がディレクトリかどうか。
+    pub is_dir: bool,
+}
+
 /// ツリー描画後にapp層へ返す表示情報。
 #[derive(Debug, Clone, Copy)]
 pub struct TreeViewOutput {
@@ -38,6 +65,35 @@ pub struct TreeViewOutput {
     pub viewport: TreeViewport,
     /// `drag_active`時、pointer直下の行(inbound dropの取り込み先候補)。
     pub drop_target_line: Option<usize>,
+    /// このフレームで行がクリックされていればその詳細。
+    pub click: Option<RowClick>,
+    /// 行の外(ツリー領域内の空白)がクリックされたか(pane focus要求のみ、
+    /// カーソルは変えない)。スクロールバー領域のクリックは含まない。
+    pub blank_clicked: bool,
+}
+
+/// egui responseフラグから行クリックの種別を決める純ロジック(unit test対象)。
+/// `secondary`(右click)を最優先、次に`double`、最後に`primary`(左click)を見る。
+/// いずれも成立しなければ`None`(この行はクリックされていない)。
+fn classify_row_click(
+    secondary: bool,
+    double: bool,
+    primary: bool,
+    shift: bool,
+) -> Option<RowClickKind> {
+    if secondary {
+        Some(RowClickKind::Secondary)
+    } else if double {
+        Some(RowClickKind::Double)
+    } else if primary {
+        Some(if shift {
+            RowClickKind::Shift
+        } else {
+            RowClickKind::Single
+        })
+    } else {
+        None
+    }
 }
 
 /// snapshotのバッファ行をツリーとして描画する。
@@ -93,6 +149,7 @@ pub fn draw(
     let output = scroll_area.show_rows(ui, row_height, snapshot.lines.len(), |ui, row_range| {
         let mut cursor_rect = None;
         let mut hovered_line = None;
+        let mut row_click: Option<RowClick> = None;
         let first_line = row_range.start;
         for (line_offset, line) in snapshot.lines[row_range].iter().enumerate() {
             let line_index = first_line + line_offset;
@@ -159,7 +216,30 @@ pub fn draw(
                     + 44.0,
             );
             let (rect, response) =
-                ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::hover());
+                ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::click());
+            if row_click.is_none()
+                && let Some(kind) = classify_row_click(
+                    response.secondary_clicked(),
+                    response.double_clicked(),
+                    response.clicked(),
+                    ui.input(|input| input.modifiers.shift),
+                )
+            {
+                let has_id = matches!(
+                    fyler_core::grammar::split_id_prefix(&line.text),
+                    PrefixParse::WithId { .. }
+                );
+                let pos = response
+                    .interact_pointer_pos()
+                    .unwrap_or_else(|| rect.center());
+                row_click = Some(RowClick {
+                    line: line_index,
+                    kind,
+                    pos,
+                    has_id,
+                    is_dir,
+                });
+            }
 
             if response.hovered() {
                 painter.rect_filled(rect, 0.0, theme::HOVER);
@@ -246,10 +326,10 @@ pub fn draw(
                 ));
             }
         }
-        (cursor_rect, hovered_line)
+        (cursor_rect, hovered_line, row_click)
     });
 
-    let (cursor_rect, hovered_line) = output.inner;
+    let (cursor_rect, hovered_line, click) = output.inner;
     let drop_target_line =
         hovered_line.and_then(|hovered| resolve_drop_target_line(&snapshot.lines, hovered));
     if let Some(target) = drop_target_line {
@@ -271,6 +351,14 @@ pub fn draw(
             );
         }
     }
+    // 行がクリックされなかった場合のみ、ツリー可視領域内の空白clickを判定する
+    // (行は常にツリー全幅を覆うため、行外clickは「行より下の余白」のみになる。
+    // スクロールバーは可視領域の外側にあるため誤認しない)。
+    let blank_clicked = click.is_none()
+        && ui.input(|input| input.pointer.primary_clicked() || input.pointer.secondary_clicked())
+        && ui
+            .input(|input| input.pointer.interact_pos())
+            .is_some_and(|pos| output.inner_rect.contains(pos));
 
     TreeViewOutput {
         cursor_rect: cursor_rect.filter(|cursor_rect| {
@@ -284,6 +372,8 @@ pub fn draw(
             cursor_line: snapshot.cursor.line,
         },
         drop_target_line,
+        click,
+        blank_clicked,
     }
 }
 
@@ -684,6 +774,32 @@ mod tests {
         assert_eq!(badge_character(GitBadge::Renamed), "R");
         assert_eq!(badge_character(GitBadge::Untracked), "?");
         assert_eq!(badge_character(GitBadge::Conflicted), "!");
+    }
+
+    #[test]
+    fn row_click_classification_priority_secondary_double_single() {
+        // 右clickは他フラグの有無に関わらず最優先。
+        assert_eq!(
+            classify_row_click(true, true, true, true),
+            Some(RowClickKind::Secondary)
+        );
+        // double-clickはSecondaryが立っていなければ優先。
+        assert_eq!(
+            classify_row_click(false, true, true, false),
+            Some(RowClickKind::Double)
+        );
+        // 単純click(Shift無し)。
+        assert_eq!(
+            classify_row_click(false, false, true, false),
+            Some(RowClickKind::Single)
+        );
+        // Shift押下中のclickはShift種別。
+        assert_eq!(
+            classify_row_click(false, false, true, true),
+            Some(RowClickKind::Shift)
+        );
+        // どれも立っていなければクリックなし。
+        assert_eq!(classify_row_click(false, false, false, false), None);
     }
 
     #[test]

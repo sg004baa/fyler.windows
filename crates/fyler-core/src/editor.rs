@@ -61,6 +61,25 @@ pub enum EditorCommand {
     RequestCommit,
     Undo,
     Redo,
+    /// Shift+click等でlinewise Visual選択を行う。`anchor`はclick前のカーソル行、
+    /// `head`はclick対象行(共に0始まり)。行数を超える指定は最終行へクランプする。
+    /// 前方(anchor < head)・後方(anchor > head)どちらの選択方向にも対応する。
+    SelectLines {
+        anchor: usize,
+        head: usize,
+    },
+    /// 対象行の名前部分(IDプレフィックス・インデントの直後)にカーソルを置き、
+    /// Insert modeで編集を開始する。IDプレフィックス・インデントは変更しない。
+    /// 実FSへは一切触れない(バッファ編集のみ)。`line`は0始まり。
+    BeginNameEdit {
+        line: usize,
+    },
+    /// バッファから該当表示行を1行除去する。実FSへは一切触れず、通常の
+    /// dirty → `:w` → 確認 → apply経路に乗せる(collapsed dirの行削除は
+    /// 配下ごとDELETE planになる、既存文法どおり)。`line`は0始まり。
+    DeleteLine {
+        line: usize,
+    },
 }
 
 /// エンジン状態の整合スナップショット。GUIはこれだけを描画する。
@@ -398,6 +417,10 @@ pub enum EditorEvent {
     },
     /// ユーザーが現在の表示ルートの親ディレクトリへの移動を要求した。
     NavigateParent,
+    /// ユーザーがnavigation historyを1つ戻る移動を要求した。
+    HistoryBack,
+    /// ユーザーがnavigation historyを1つ進む移動を要求した。
+    HistoryForward,
     /// ユーザーがパス指定での表示ルート変更を要求した。
     /// `query`は生パス文字列。`None`は現在ルートと候補の表示要求。
     /// パスの解決(絶対/相対/`~`)はapp層が行う。
@@ -412,6 +435,8 @@ pub enum EditorEvent {
     },
     /// ユーザーが隠しファイル表示の切り替えを要求した。
     ToggleHidden,
+    /// ユーザーが現在のrootの明示的な再同期(manual refresh)を要求した。
+    RefreshRequested,
     /// ユーザーが指定行を基準に折りたたみ操作を要求した。
     /// `line`は0始まり。
     Fold {

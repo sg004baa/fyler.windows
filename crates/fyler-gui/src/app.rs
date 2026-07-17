@@ -47,6 +47,31 @@ pub struct PickerHit {
     pub kind: fyler_core::tree::EntryKind,
 }
 
+/// ツリー行クリックの種別(app層へ伝える語彙。エンジン非依存)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeRowClickKind {
+    /// 単純click(right-clickによる行選択もこれとして扱う)。
+    Single,
+    /// double-click(directory展開/折りたたみ、file/symlink open)。
+    Double,
+    /// Shift押下中のclick(anchorからlinewise選択)。
+    Shift,
+}
+
+/// ツリーのcontext menu項目。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeContextItem {
+    /// Open / Enter directory。
+    Open,
+    OpenWith,
+    /// buffer上で名前編集を開始するだけ(実FSは変更しない)。
+    Rename,
+    /// bufferから行を除去するだけ(実FSは変更しない)。
+    MarkForDeletion,
+    CopyPath,
+    OpenTerminal,
+}
+
 /// GUIからapp層へ返すユーザー操作。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuiAction {
@@ -78,6 +103,23 @@ pub enum GuiAction {
         line: Option<usize>,
         paths: Vec<PathBuf>,
         effect: DropEffect,
+    },
+    /// ユーザーがpaneのツリー領域(行または空白部分)をクリックしてfocusを
+    /// 要求した。pane_runtimeが`active`/`last_active`を更新する。
+    RequestPaneFocus {
+        pane_id: PaneId,
+    },
+    /// ツリー行のクリック(single/double/shift)をapp層へ伝える。
+    TreeRowClicked {
+        pane_id: PaneId,
+        line: usize,
+        kind: TreeRowClickKind,
+    },
+    /// ツリーのcontext menu項目実行を要求する。
+    TreeContextAction {
+        pane_id: PaneId,
+        line: usize,
+        item: TreeContextItem,
     },
 }
 
@@ -164,6 +206,12 @@ pub enum GuiEvent {
         pane_id: PaneId,
         offline: bool,
         unreadable: usize,
+    },
+    /// paneのnavigation historyのback/forward可用性をtoolbarへ反映する。
+    HistoryState {
+        pane_id: PaneId,
+        can_go_back: bool,
+        can_go_forward: bool,
     },
     /// 表示中のエントリIDに対応する表示用メタデータを全件差し替える。
     FileInfos {
@@ -334,6 +382,19 @@ enum DialogState {
         stage: FeedbackStage,
     },
     Help,
+    /// ツリーの右click context menu(GUI local。app層の往復を待たず即表示する)。
+    TreeContext {
+        pane_id: PaneId,
+        line: usize,
+        /// 表示位置(右clickのscreen座標)。
+        pos: egui::Pos2,
+        has_id: bool,
+        is_dir: bool,
+        /// 表示中のpaneのengineが健全か(crashed=false)。
+        engine_ok: bool,
+        /// 表示中のpaneのrootがoffline(到達不能)か。
+        offline: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -426,6 +487,8 @@ struct PaneViewState {
     collapsed_dirs: HashSet<EntryId>,
     engine_error: Option<String>,
     tree_viewport: Option<tree_view::TreeViewport>,
+    can_go_back: bool,
+    can_go_forward: bool,
 }
 
 impl FylerApp {
@@ -519,17 +582,18 @@ impl FylerApp {
                             collapsed_dirs: HashSet::new(),
                             engine_error: None,
                             tree_viewport: None,
+                            can_go_back: false,
+                            can_go_forward: false,
                         },
                     );
                 }
                 GuiEvent::RemovePane(pane_id) => {
                     self.panes.remove(&pane_id);
                     if matches!(
-                        self.dialog,
-                        Some(DialogState::FilePicker {
-                            pane_id: owner,
-                            ..
-                        }) if owner == pane_id
+                        &self.dialog,
+                        Some(DialogState::FilePicker { pane_id: owner, .. })
+                            | Some(DialogState::TreeContext { pane_id: owner, .. })
+                                if *owner == pane_id
                     ) {
                         self.dialog = None;
                     }
@@ -550,6 +614,9 @@ impl FylerApp {
                     EditorEvent::NavigateInto { .. } => {}
                     EditorEvent::OpenTerminal { .. } => {}
                     EditorEvent::NavigateParent => {}
+                    EditorEvent::HistoryBack => {}
+                    EditorEvent::HistoryForward => {}
+                    EditorEvent::RefreshRequested => {}
                     EditorEvent::ChangeDirectory { .. } => {}
                     EditorEvent::ChangeSort { .. } => {}
                     EditorEvent::ToggleHidden => {}
@@ -592,11 +659,10 @@ impl FylerApp {
                     EditorEvent::Message(message) => self.message = Some(message),
                     EditorEvent::EngineCrashed { reason } => {
                         if matches!(
-                            self.dialog,
-                            Some(DialogState::FilePicker {
-                                pane_id: owner,
-                                ..
-                            }) if owner == pane_id
+                            &self.dialog,
+                            Some(DialogState::FilePicker { pane_id: owner, .. })
+                                | Some(DialogState::TreeContext { pane_id: owner, .. })
+                                    if *owner == pane_id
                         ) {
                             self.dialog = None;
                         }
@@ -637,6 +703,16 @@ impl FylerApp {
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
                         pane.offline = offline;
                         pane.unreadable = unreadable;
+                    }
+                }
+                GuiEvent::HistoryState {
+                    pane_id,
+                    can_go_back,
+                    can_go_forward,
+                } => {
+                    if let Some(pane) = self.panes.get_mut(&pane_id) {
+                        pane.can_go_back = can_go_back;
+                        pane.can_go_forward = can_go_forward;
                     }
                 }
                 GuiEvent::FileInfos { pane_id, infos } => {
@@ -905,25 +981,37 @@ impl eframe::App for FylerApp {
 
         let chrome_state = self.active.and_then(|pane_id| {
             let pane = self.panes.get(&pane_id)?;
-            Some((pane_id, pane.root.clone()))
+            Some((
+                pane_id,
+                pane.root.clone(),
+                pane.can_go_back,
+                pane.can_go_forward,
+            ))
         });
         let mut chrome_action = None;
         egui::Panel::top("fyler-toolbar")
             .exact_size(theme::TOOLBAR_HEIGHT)
             .show(ui, |ui| {
-                chrome_action = chrome::draw_toolbar(ui);
+                let (can_go_back, can_go_forward) = chrome_state
+                    .as_ref()
+                    .map(|(_, _, back, forward)| (*back, *forward))
+                    .unwrap_or((false, false));
+                chrome_action = chrome::draw_toolbar(ui, can_go_back, can_go_forward);
             });
         let navigation_entries = chrome_state
             .as_ref()
-            .map(|(_, root)| {
+            .map(|(_, root, ..)| {
                 chrome::navigation_entries(root, &self.bookmarks, &self.recent_roots, &self.drives)
             })
             .unwrap_or_default();
         if self.dialog.is_none()
-            && let (Some((pane_id, _)), Some(action)) = (chrome_state.as_ref(), chrome_action)
+            && let (Some((pane_id, ..)), Some(action)) = (chrome_state.as_ref(), chrome_action)
         {
             let event = match action {
                 chrome::ChromeAction::NavigateParent => EditorEvent::NavigateParent,
+                chrome::ChromeAction::HistoryBack => EditorEvent::HistoryBack,
+                chrome::ChromeAction::HistoryForward => EditorEvent::HistoryForward,
+                chrome::ChromeAction::Refresh => EditorEvent::RefreshRequested,
             };
             if self
                 .action_tx
@@ -973,11 +1061,11 @@ impl eframe::App for FylerApp {
         let fatal_error = self.fatal_error.clone();
 
         let dragging_files = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
-        let (ime, navigation_clicked, drop_target_line) = egui::CentralPanel::default()
+        let (ime, navigation_clicked, tree_click, drop_target_line) = egui::CentralPanel::default()
             .show(ui, |ui| {
                 if let Some(error) = fatal_error {
                     ui.colored_label(ui.visuals().error_fg_color, error);
-                    (None, None, None)
+                    (None, None, None, None)
                 } else if let (Some(layout), Some(active)) = (layout.as_ref(), active) {
                     draw_layout(
                         ui,
@@ -994,7 +1082,7 @@ impl eframe::App for FylerApp {
                         dragging_files,
                     )
                 } else {
-                    (None, None, None)
+                    (None, None, None, None)
                 }
             })
             .inner;
@@ -1032,6 +1120,69 @@ impl eframe::App for FylerApp {
                 .is_err()
         {
             self.fatal_error = Some("Failed to send navigation action to app".to_owned());
+        }
+        if self.dialog.is_none()
+            && let Some(TreeClickEvent { pane_id, click }) = tree_click
+        {
+            match click {
+                TreeClickEventKind::Row(row) if row.kind == tree_view::RowClickKind::Secondary => {
+                    let engine_ok = self
+                        .panes
+                        .get(&pane_id)
+                        .is_some_and(|pane| pane.engine_error.is_none());
+                    let offline = self.panes.get(&pane_id).is_some_and(|pane| pane.offline);
+                    self.dialog = Some(DialogState::TreeContext {
+                        pane_id,
+                        line: row.line,
+                        pos: row.pos,
+                        has_id: row.has_id,
+                        is_dir: row.is_dir,
+                        engine_ok,
+                        offline,
+                    });
+                    if self
+                        .action_tx
+                        .send(GuiAction::TreeRowClicked {
+                            pane_id,
+                            line: row.line,
+                            kind: TreeRowClickKind::Single,
+                        })
+                        .is_err()
+                    {
+                        self.fatal_error = Some("Failed to send tree click to app".to_owned());
+                    }
+                }
+                TreeClickEventKind::Row(row) => {
+                    let kind = match row.kind {
+                        tree_view::RowClickKind::Single => TreeRowClickKind::Single,
+                        tree_view::RowClickKind::Double => TreeRowClickKind::Double,
+                        tree_view::RowClickKind::Shift => TreeRowClickKind::Shift,
+                        // 上のガード付きアームで処理済み。到達しない。
+                        tree_view::RowClickKind::Secondary => TreeRowClickKind::Single,
+                    };
+                    if self
+                        .action_tx
+                        .send(GuiAction::TreeRowClicked {
+                            pane_id,
+                            line: row.line,
+                            kind,
+                        })
+                        .is_err()
+                    {
+                        self.fatal_error = Some("Failed to send tree click to app".to_owned());
+                    }
+                }
+                TreeClickEventKind::Blank => {
+                    if self
+                        .action_tx
+                        .send(GuiAction::RequestPaneFocus { pane_id })
+                        .is_err()
+                    {
+                        self.fatal_error =
+                            Some("Failed to send pane focus request to app".to_owned());
+                    }
+                }
+            }
         }
         if self.dialog.is_none()
             && let Some(ime) = ime
@@ -1083,6 +1234,7 @@ impl eframe::App for FylerApp {
         let mut picker_result = None;
         let mut picker_owner = None;
         let mut feedback_result = None;
+        let mut tree_context_result = None;
         match &mut self.dialog {
             Some(DialogState::Plan {
                 plan,
@@ -1204,6 +1356,21 @@ impl eframe::App for FylerApp {
                 feedback_result =
                     draw_feedback(ui, kind, body, stage, &mut self.feedback_needs_focus);
             }
+            Some(DialogState::TreeContext {
+                pane_id,
+                line,
+                pos,
+                has_id,
+                is_dir,
+                engine_ok,
+                offline,
+            }) => {
+                tree_context_result = Some((
+                    *pane_id,
+                    *line,
+                    draw_tree_context_menu(ui, *pos, *has_id, *is_dir, *engine_ok, *offline),
+                ));
+            }
             None => {}
         }
 
@@ -1261,6 +1428,29 @@ impl eframe::App for FylerApp {
                             Some("Failed to send feedback request to app".to_owned());
                     }
                 }
+            }
+        }
+        if let Some((pane_id, line, outcome)) = tree_context_result {
+            match outcome {
+                TreeContextOutcome::Chosen(item) => {
+                    self.dialog = None;
+                    if self
+                        .action_tx
+                        .send(GuiAction::TreeContextAction {
+                            pane_id,
+                            line,
+                            item,
+                        })
+                        .is_err()
+                    {
+                        self.fatal_error =
+                            Some("Failed to send context menu action to app".to_owned());
+                    }
+                }
+                TreeContextOutcome::Dismissed => {
+                    self.dialog = None;
+                }
+                TreeContextOutcome::Pending => {}
             }
         }
     }
@@ -1386,6 +1576,17 @@ struct ImeGeometry {
     cursor_rect: egui::Rect,
 }
 
+/// このフレームでツリー上に起きたクリックの詳細(pane_id込み)。
+struct TreeClickEvent {
+    pane_id: PaneId,
+    click: TreeClickEventKind,
+}
+
+enum TreeClickEventKind {
+    Row(tree_view::RowClick),
+    Blank,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_layout(
     ui: &mut egui::Ui,
@@ -1400,7 +1601,12 @@ fn draw_layout(
     statusline_left: &[StatusItem],
     statusline_right: &[StatusItem],
     drag_active: bool,
-) -> (Option<ImeGeometry>, Option<usize>, Option<usize>) {
+) -> (
+    Option<ImeGeometry>,
+    Option<usize>,
+    Option<TreeClickEvent>,
+    Option<usize>,
+) {
     let rect = ui.available_rect_before_wrap();
     ui.allocate_rect(rect, egui::Sense::hover());
     let (content_rect, navigation_clicked) = if navigation_open {
@@ -1426,7 +1632,7 @@ fn draw_layout(
         (rect, None)
     };
     let mut drop_target_line = None;
-    let ime = draw_layout_in_rect(
+    let (ime, tree_click) = draw_layout_in_rect(
         ui,
         content_rect,
         layout,
@@ -1438,7 +1644,7 @@ fn draw_layout(
         drag_active,
         &mut drop_target_line,
     );
-    (ime, navigation_clicked, drop_target_line)
+    (ime, navigation_clicked, tree_click, drop_target_line)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1453,11 +1659,15 @@ fn draw_layout_in_rect(
     statusline_right: &[StatusItem],
     drag_active: bool,
     drop_target_line: &mut Option<usize>,
-) -> Option<ImeGeometry> {
+) -> (Option<ImeGeometry>, Option<TreeClickEvent>) {
     match layout {
         PaneLayout::Leaf(id) => {
-            let pane = panes.get_mut(id)?;
-            let snapshot = snapshots.get(id)?;
+            let Some(pane) = panes.get_mut(id) else {
+                return (None, None);
+            };
+            let Some(snapshot) = snapshots.get(id) else {
+                return (None, None);
+            };
             ui.painter().rect_filled(rect, 0.0, theme::CANVAS);
             ui.painter().rect_stroke(
                 rect,
@@ -1516,12 +1726,27 @@ fn draw_layout_in_rect(
                 ui.painter()
                     .rect_filled(rect, 0.0, theme::inactive_pane_veil());
             }
-            let output = output?;
+            let Some(output) = output else {
+                return (None, None);
+            };
             pane.tree_viewport = Some(output.viewport);
             if *id == active {
                 *drop_target_line = output.drop_target_line;
             }
-            if *id == active
+            let click = if let Some(row) = output.click {
+                Some(TreeClickEvent {
+                    pane_id: *id,
+                    click: TreeClickEventKind::Row(row),
+                })
+            } else if output.blank_clicked {
+                Some(TreeClickEvent {
+                    pane_id: *id,
+                    click: TreeClickEventKind::Blank,
+                })
+            } else {
+                None
+            };
+            let ime = if *id == active
                 && matches!(snapshot.mode, Mode::Insert | Mode::Replace | Mode::Cmdline)
             {
                 output.cursor_rect.map(|cursor_rect| ImeGeometry {
@@ -1530,7 +1755,8 @@ fn draw_layout_in_rect(
                 })
             } else {
                 None
-            }
+            };
+            (ime, click)
         }
         PaneLayout::Split {
             direction,
@@ -1556,7 +1782,7 @@ fn draw_layout_in_rect(
                     )
                 }
             };
-            let first_ime = draw_layout_in_rect(
+            let (first_ime, first_click) = draw_layout_in_rect(
                 ui,
                 first_rect,
                 first,
@@ -1568,7 +1794,7 @@ fn draw_layout_in_rect(
                 drag_active,
                 drop_target_line,
             );
-            let second_ime = draw_layout_in_rect(
+            let (second_ime, second_click) = draw_layout_in_rect(
                 ui,
                 second_rect,
                 second,
@@ -1580,7 +1806,7 @@ fn draw_layout_in_rect(
                 drag_active,
                 drop_target_line,
             );
-            first_ime.or(second_ime)
+            (first_ime.or(second_ime), first_click.or(second_click))
         }
     }
 }
@@ -1973,6 +2199,142 @@ fn draw_help(ui: &mut egui::Ui, help_entries: &[HelpEntry]) -> bool {
     dismiss_from_keyboard
 }
 
+/// [`draw_tree_context_menu`] の描画結果。
+enum TreeContextOutcome {
+    /// まだ何も選ばれていない(閉じてもいない)。
+    Pending,
+    /// 項目がクリックされた。
+    Chosen(TreeContextItem),
+    /// outside click / Escapeで閉じられた(項目は選ばれていない)。
+    Dismissed,
+}
+
+/// context menuに表示する項目(表示順)。
+const TREE_CONTEXT_ITEMS: [TreeContextItem; 6] = [
+    TreeContextItem::Open,
+    TreeContextItem::OpenWith,
+    TreeContextItem::Rename,
+    TreeContextItem::MarkForDeletion,
+    TreeContextItem::CopyPath,
+    TreeContextItem::OpenTerminal,
+];
+
+fn context_item_label(item: TreeContextItem, is_dir: bool) -> &'static str {
+    match item {
+        TreeContextItem::Open => {
+            if is_dir {
+                "Enter directory"
+            } else {
+                "Open"
+            }
+        }
+        TreeContextItem::OpenWith => "Open with...",
+        TreeContextItem::Rename => "Rename",
+        TreeContextItem::MarkForDeletion => "Mark for deletion",
+        TreeContextItem::CopyPath => "Copy path",
+        TreeContextItem::OpenTerminal => "Open terminal here",
+    }
+}
+
+/// context menu項目の有効/無効判定(純ロジック。unit test対象)。
+///
+/// `has_id` / `is_dir` / `offline` はGUIがクリック時点で確定させた値、
+/// `engine_ok` はpaneのengine健全性(crashed=false)。dirty・保存中などの
+/// 権威判定はapp層の最終防衛(rejection helper)に委ねる(ここでは行わない)。
+fn context_item_enabled(
+    item: TreeContextItem,
+    has_id: bool,
+    is_dir: bool,
+    engine_ok: bool,
+    offline: bool,
+) -> bool {
+    if !engine_ok {
+        return false;
+    }
+    match item {
+        TreeContextItem::Open | TreeContextItem::Rename | TreeContextItem::CopyPath => has_id,
+        TreeContextItem::OpenWith => has_id && !is_dir && !offline,
+        TreeContextItem::MarkForDeletion => true,
+        TreeContextItem::OpenTerminal => has_id && !offline,
+    }
+}
+
+/// ツリー右clickのcontext menuを描画する。
+///
+/// gatingは呼び出し側がクリック時点で確定させた `has_id` / `is_dir` /
+/// `engine_ok` / `offline`(GUIが確実に知っている状態)だけで行う。
+/// dirty・保存中などの権威判定はapp層の最終防衛(rejection helper)に委ねる。
+fn draw_tree_context_menu(
+    ui: &mut egui::Ui,
+    pos: egui::Pos2,
+    has_id: bool,
+    is_dir: bool,
+    engine_ok: bool,
+    offline: bool,
+) -> TreeContextOutcome {
+    let mut chosen = None;
+    let popup = egui::Popup::new(
+        egui::Id::new("fyler-tree-context-menu"),
+        ui.ctx().clone(),
+        pos,
+        ui.layer_id(),
+    )
+    .kind(egui::PopupKind::Menu)
+    .layout(egui::Layout::top_down_justified(egui::Align::Min))
+    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+    .open(true)
+    .show(|ui| {
+        for item in TREE_CONTEXT_ITEMS {
+            let enabled = context_item_enabled(item, has_id, is_dir, engine_ok, offline);
+            let label = context_item_label(item, is_dir);
+            let response = ui.add_enabled(enabled, egui::Button::new(label));
+            let response = if enabled {
+                response
+            } else {
+                response.on_disabled_hover_text(context_item_disabled_reason(
+                    engine_ok, has_id, is_dir, offline,
+                ))
+            };
+            if response.clicked() {
+                chosen = Some(item);
+            }
+        }
+    });
+
+    match popup {
+        None => TreeContextOutcome::Dismissed,
+        Some(response) => {
+            if let Some(item) = chosen {
+                TreeContextOutcome::Chosen(item)
+            } else if response.response.should_close() {
+                TreeContextOutcome::Dismissed
+            } else {
+                TreeContextOutcome::Pending
+            }
+        }
+    }
+}
+
+/// disableされた項目のtooltip文言。優先度: crashed > offline > is_dir(open-with専用) > has_id。
+fn context_item_disabled_reason(
+    engine_ok: bool,
+    has_id: bool,
+    is_dir: bool,
+    offline: bool,
+) -> &'static str {
+    if !engine_ok {
+        "Editor engine has stopped"
+    } else if offline {
+        "Location is offline"
+    } else if is_dir {
+        "Open with is for files only"
+    } else if !has_id {
+        "This entry has not been saved yet"
+    } else {
+        ""
+    }
+}
+
 fn current_window_geometry(context: &egui::Context) -> Option<WindowGeometry> {
     context.input(|input| window_geometry_from_viewport(input.viewport()))
 }
@@ -2213,6 +2575,8 @@ mod tests {
                         collapsed_dirs: HashSet::new(),
                         engine_error: None,
                         tree_viewport: None,
+                        can_go_back: false,
+                        can_go_forward: false,
                     },
                 ),
                 (
@@ -2229,6 +2593,8 @@ mod tests {
                         collapsed_dirs: HashSet::new(),
                         engine_error: None,
                         tree_viewport: None,
+                        can_go_back: false,
+                        can_go_forward: false,
                     },
                 ),
             ]),
@@ -2299,6 +2665,104 @@ mod tests {
         assert!(app.panes[&second].offline);
         assert_eq!(app.panes[&second].unreadable, 2);
         assert!(!app.panes[&first].offline);
+    }
+
+    #[test]
+    fn context_item_enabled_requires_saved_entry_for_id_gated_items() {
+        for item in [
+            TreeContextItem::Open,
+            TreeContextItem::Rename,
+            TreeContextItem::CopyPath,
+            TreeContextItem::OpenWith,
+            TreeContextItem::OpenTerminal,
+        ] {
+            assert!(!context_item_enabled(item, false, false, true, false));
+        }
+        // Mark for deletionはIDなし(unsaved)行でも有効。
+        assert!(context_item_enabled(
+            TreeContextItem::MarkForDeletion,
+            false,
+            false,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn context_item_enabled_disables_everything_when_engine_crashed() {
+        for item in TREE_CONTEXT_ITEMS {
+            assert!(!context_item_enabled(item, true, false, false, false));
+        }
+    }
+
+    #[test]
+    fn context_item_enabled_open_with_is_files_only_and_requires_online() {
+        assert!(context_item_enabled(
+            TreeContextItem::OpenWith,
+            true,
+            false,
+            true,
+            false
+        ));
+        assert!(!context_item_enabled(
+            TreeContextItem::OpenWith,
+            true,
+            true,
+            true,
+            false
+        ));
+        assert!(!context_item_enabled(
+            TreeContextItem::OpenWith,
+            true,
+            false,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn context_item_enabled_open_terminal_requires_online_but_allows_directories() {
+        assert!(context_item_enabled(
+            TreeContextItem::OpenTerminal,
+            true,
+            true,
+            true,
+            false
+        ));
+        assert!(!context_item_enabled(
+            TreeContextItem::OpenTerminal,
+            true,
+            true,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn context_item_enabled_rename_and_copy_path_ignore_offline() {
+        assert!(context_item_enabled(
+            TreeContextItem::Rename,
+            true,
+            false,
+            true,
+            true
+        ));
+        assert!(context_item_enabled(
+            TreeContextItem::CopyPath,
+            true,
+            false,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn context_item_label_reflects_directory_vs_file_for_open() {
+        assert_eq!(
+            context_item_label(TreeContextItem::Open, true),
+            "Enter directory"
+        );
+        assert_eq!(context_item_label(TreeContextItem::Open, false), "Open");
     }
 
     #[test]

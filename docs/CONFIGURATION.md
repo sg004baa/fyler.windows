@@ -283,6 +283,9 @@ Rules and limitations:
 | `pane_focus_next` | Focus the next pane | `Ctrl+W w`, `Ctrl+W Ctrl+W` |
 | `pane_focus_previous` | Focus the previous pane | `Ctrl+W p` |
 | `pane_close` | Close the current pane | `Ctrl+W q`, `Ctrl+W c` |
+| `history_back` | Go back in navigation history | `Ctrl+P` |
+| `history_forward` | Go forward in navigation history | `Ctrl+N` |
+| `refresh` | Reload the current root from disk | `Ctrl+R` |
 
 `none` is not an action. It is a special value that removes the binding for the specified key
 sequence.
@@ -293,3 +296,18 @@ omits actions with no remaining bindings and reflects added or reassigned keys.
 While the navigation dock has focus, use `j`/`k` or the arrow keys to move and `Enter` to change
 the active pane's root. `Esc` returns keyboard input to the editor without closing the dock.
 Invoke `toggle_dock_focus` again to hide the dock.
+
+### Navigation history and manual refresh
+
+Root changes (`^`, `g d`, `:cd`, bookmarks, recent roots, and drive selection) are tracked in a
+per-pane back/forward history, capped at 100 entries per direction. `:back` (`Ctrl+P` by default)
+and `:forward` (`Ctrl+N`) step through it; both are rejected while editing, offline, or during
+another operation, and an entry pointing at a since-removed root is discarded with a message
+instead of being retried. `:reload` (`Ctrl+R`) re-scans the current root from disk without writing
+anything; it is also rejected while editing or busy, except on an offline pane, where it retries
+the connection immediately instead of waiting for the periodic retry.
+
+`Ctrl+R` normally performs Neovim's built-in redo, and `Ctrl+P` / `Ctrl+N` normally move the
+cursor up/down like `k` / `j`. Fyler's default keymap shadows all three inside fyler buffers;
+rebind or remove `history_back` / `history_forward` / `refresh` (assign `"none"`) if you need the
+native behavior back.

@@ -57,6 +57,9 @@ fn binding_payload(action: EditorAction) -> BindingPayload {
         PaneFocusNext => ("pane", Some("focus_next"), &["n"]),
         PaneFocusPrevious => ("pane", Some("focus_previous"), &["n"]),
         PaneClose => ("pane", Some("close"), &["n"]),
+        HistoryBack => ("history", Some("back"), &["n"]),
+        HistoryForward => ("history", Some("forward"), &["n"]),
+        Refresh => ("refresh", None, &["n"]),
     };
     BindingPayload { kind, arg, modes }
 }
@@ -347,6 +350,10 @@ local function dispatch(binding)
     vim.rpcnotify(channel, "fyler_help")
   elseif binding.kind == "pane" then
     vim.rpcnotify(channel, "fyler_pane", binding.arg)
+  elseif binding.kind == "history" then
+    vim.rpcnotify(channel, "fyler_history", binding.arg)
+  elseif binding.kind == "refresh" then
+    vim.rpcnotify(channel, "fyler_refresh")
   end
 end
 
@@ -399,6 +406,18 @@ vim.api.nvim_buf_create_user_command(buffer, "FylerCd", function(opts)
   vim.rpcnotify(channel, "fyler_cd", opts.args)
 end, { nargs = "?", complete = "dir" })
 
+vim.api.nvim_buf_create_user_command(buffer, "FylerBack", function()
+  vim.rpcnotify(channel, "fyler_history", "back")
+end, {})
+
+vim.api.nvim_buf_create_user_command(buffer, "FylerForward", function()
+  vim.rpcnotify(channel, "fyler_history", "forward")
+end, {})
+
+vim.api.nvim_buf_create_user_command(buffer, "FylerReload", function()
+  vim.rpcnotify(channel, "fyler_refresh")
+end, {})
+
 local sort_keys = { "name", "date", "size", "ext" }
 vim.api.nvim_buf_create_user_command(buffer, "FylerSort", function(opts)
   local arg = opts.args
@@ -420,7 +439,7 @@ vim.api.nvim_buf_create_user_command(buffer, "FylerTerminal", function(opts)
 end, { nargs = "*", bang = true })
 
 vim.o.wildcharm = 26
-local command_aliases = { b = "FylerBookmark", cd = "FylerCd", feedback = "FylerFeedback", sort = "FylerSort", terminal = "FylerTerminal" }
+local command_aliases = { b = "FylerBookmark", cd = "FylerCd", feedback = "FylerFeedback", sort = "FylerSort", terminal = "FylerTerminal", back = "FylerBack", forward = "FylerForward", reload = "FylerReload" }
 -- nvim_paste経由ではcnoreabbrevが展開されないため、実行/補完直前に先頭語を正式コマンドへ書き換える。
 local function rewrite_command_alias()
   if vim.fn.getcmdtype() ~= ":" then return end
@@ -568,6 +587,9 @@ mod tests {
                 &["n"][..],
             ),
             (PaneClose, "pane", Some("close"), &["n"][..]),
+            (HistoryBack, "history", Some("back"), &["n"][..]),
+            (HistoryForward, "history", Some("forward"), &["n"][..]),
+            (Refresh, "refresh", None, &["n"][..]),
         ];
         for (action, kind, arg, modes) in cases {
             assert_eq!(
@@ -583,7 +605,7 @@ mod tests {
     fn defaults_split_into_normal_maps_and_ctrl_w_trie() {
         let bindings = fyler_core::keymap::default_bindings(fyler_core::keymap::default_leader());
         let (normal, trie) = binding_values(&bindings);
-        assert_eq!(normal.as_array().unwrap().len(), 21);
+        assert_eq!(normal.as_array().unwrap().len(), 24);
         let trie = trie.as_map().unwrap();
         assert_eq!(trie.len(), 12);
         assert!(trie.iter().any(|(key, _)| key.as_str() == Some("<C-w>")));
