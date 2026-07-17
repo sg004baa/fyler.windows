@@ -89,7 +89,7 @@ pub fn preflight_extract(archive: &Path, dest_dir: &Path) -> anyhow::Result<Extr
         })?;
         total_bytes += entry.size();
         ops.push(ExtractOp {
-            name: relative.to_string_lossy().into_owned(),
+            name: normalized_entry_name(&relative),
             target: dest_dir.join(&relative),
             is_dir: entry.is_dir(),
         });
@@ -195,6 +195,20 @@ pub fn apply_extract_cancellable(
     CommitReport { results }
 }
 
+/// [`zip::read::ZipFile::enclosed_name`]が返す相対パスを、OSセパレータに
+/// 依存しない`/`区切りの表示用文字列へ正規化する(WindowsのPath Displayは
+/// `\`区切りになるため、そのままではLinuxとplan内容が食い違う)。
+fn normalized_entry_name(relative: &Path) -> String {
+    let mut name = String::new();
+    for component in relative.components() {
+        if !name.is_empty() {
+            name.push('/');
+        }
+        name.push_str(&component.as_os_str().to_string_lossy());
+    }
+    name
+}
+
 fn open_archive(archive: &Path) -> anyhow::Result<ZipArchive<fs::File>> {
     let file = fs::File::open(crate::long_path::to_fs(archive))
         .with_context(|| format!("Failed to open zip archive: {}", archive.display()))?;
@@ -214,7 +228,7 @@ fn execute_extract_operation(
         .with_context(|| format!("Failed to read zip entry: {}", operation.name))?;
     let relative = entry
         .enclosed_name()
-        .filter(|relative| relative.to_string_lossy() == operation.name.as_str());
+        .filter(|relative| normalized_entry_name(relative) == operation.name);
     if relative.is_none() {
         bail!(
             "Zip archive changed since preflight (entry #{index} is no longer {})",
