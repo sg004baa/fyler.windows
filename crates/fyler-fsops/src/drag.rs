@@ -39,12 +39,22 @@ use fyler_core::transfer::{DragOutcome, DropEffect};
 
 /// DROPEFFECT bit値(OleIdl.h)。Shell共通の慣例値で全Windows版固定。
 /// 純粋層をcfg非依存に保つためローカル定義する(clipboard.rsのencode値と同じ)。
+///
+/// `cfg(not(windows))`ではプラットフォーム層(`mod win`)が存在せず、この定数
+/// を読むのはunit testだけになるため、`cargo check`(テスト抜き)で
+/// dead_code誤検知が出る。Windows実機ではプラットフォーム層が確実に使うため
+/// `allow`はnon-windowsに限定する。
+#[cfg_attr(not(windows), allow(dead_code))]
 const DROPEFFECT_COPY_BIT: u32 = 1;
+#[cfg_attr(not(windows), allow(dead_code))]
 const DROPEFFECT_MOVE_BIT: u32 = 2;
+#[cfg_attr(not(windows), allow(dead_code))]
 const DROPEFFECT_LINK_BIT: u32 = 4;
 
 /// `TYMED_HGLOBAL` / `DVASPECT_CONTENT` のbit値(ObjIdl.h)。同じく固定値。
+#[cfg_attr(not(windows), allow(dead_code))]
 const TYMED_HGLOBAL_BIT: u32 = 1;
+#[cfg_attr(not(windows), allow(dead_code))]
 const DVASPECT_CONTENT_BIT: u32 = 1;
 
 /// targetが`IDataObject::SetData`で書き込む「実際に行われた効果」の形式名。
@@ -57,6 +67,7 @@ const PERFORMED_DROPEFFECT_FORMAT: &str = "Performed DropEffect";
 
 /// `IDropSource::QueryContinueDrag`の判定結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
 enum DragContinue {
     /// dragを継続する(S_OK)。
     Continue,
@@ -68,6 +79,7 @@ enum DragContinue {
 
 /// `QueryContinueDrag`の純ロジック。Escキャンセルを最優先し、
 /// 左button解放でdrop確定、それ以外は継続。
+#[cfg_attr(not(windows), allow(dead_code))]
 fn continue_drag_decision(escape_pressed: bool, left_button_down: bool) -> DragContinue {
     if escape_pressed {
         DragContinue::Cancel
@@ -80,6 +92,7 @@ fn continue_drag_decision(escape_pressed: bool, left_button_down: bool) -> DragC
 
 /// FORMATETCが「HGLOBAL渡しのcontent形式`candidate`」として提供可能かの純ロジック。
 /// `tymed`と`aspect`はbit集合(呼び出し側は複数bitを立てて問い合わせてよい)。
+#[cfg_attr(not(windows), allow(dead_code))]
 fn format_supported(cf_format: u16, tymed: u32, aspect: u32, candidate: u16) -> bool {
     cf_format == candidate && tymed & TYMED_HGLOBAL_BIT != 0 && aspect & DVASPECT_CONTENT_BIT != 0
 }
@@ -91,6 +104,7 @@ fn format_supported(cf_format: u16, tymed: u32, aspect: u32, candidate: u16) -> 
 /// 戻り値をNONEにし、"Performed DropEffect"側で報告する場合がある)ため、
 /// 両方のMOVE bitをORで見る。move未報告の効果(copy/link)はsource側の
 /// 後始末が不要なので[`DropEffect::Copy`]へ畳む。
+#[cfg_attr(not(windows), allow(dead_code))]
 fn resolve_outcome(
     dropped: bool,
     returned_effect: u32,
