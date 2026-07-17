@@ -121,6 +121,20 @@ pub enum GuiAction {
         line: usize,
         item: TreeContextItem,
     },
+    /// GUI window内で開始したtree行dragがwindow境界を離れた。app層がOLE
+    /// drag(Explorer等の外部Shellターゲットへのdrag-and-drop)へ移行する。
+    TreeDragOut {
+        pane_id: PaneId,
+        line: usize,
+    },
+    /// GUI window内で完結したtree行drag(pane間)。`copy`はCtrl押下時true。
+    TreeDragDrop {
+        source_pane: PaneId,
+        source_line: usize,
+        target_pane: PaneId,
+        target_line: Option<usize>,
+        copy: bool,
+    },
 }
 
 /// GUIへ通知するフィードバック送信結果。
@@ -308,6 +322,11 @@ pub enum GuiEvent {
         report: CommitReport<ImportOp>,
         effect: DropEffect,
     },
+    /// OLE drag-out完了後、Move報告でsourceが残存している場合の後始末
+    /// (ごみ箱退避)確認ダイアログを表示する。
+    ShowDragCleanupConfirm {
+        paths: Vec<PathBuf>,
+    },
     ShowValidationErrors(Vec<ValidateError>),
     /// 起動時復旧ダイアログを表示する。行はapp層で整形済み。
     ShowUndoRecovery {
@@ -395,6 +414,10 @@ enum DialogState {
         /// 表示中のpaneのrootがoffline(到達不能)か。
         offline: bool,
     },
+    /// OLE drag-out完了後、Move報告でsourceが残存している場合の後始末確認。
+    DragCleanupConfirm {
+        paths: Vec<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -440,6 +463,52 @@ impl NavigationDockState {
     }
 }
 
+/// GUI window内で開始したtree行drag(pane間dragを含む)のセッション。
+///
+/// fylerのwindow**内**でのdragはOLEを使わずegui内で完結する。windowの境界を
+/// 離れた時点でのみ`GuiAction::TreeDragOut`を送りOLE dragへ移行する
+/// (親セッション設計確定事項)。
+///
+/// v1は単一行のみを対象とする。visual選択中の複数行dragへの拡張は、
+/// 選択範囲を実entry行の一覧へ解決する既存ヘルパーがこの層に露出しておらず
+/// (app層の`resolve_selection`はTreePath解決までを担い、GUI層はsnapshotの
+/// 生selectionしか持たない)、境界越え検知と二重化して1turnで安全に実装する
+/// 判断ができなかったため見送った。
+#[derive(Debug, Clone, Copy)]
+struct TreeDragSession {
+    pane_id: PaneId,
+    line: usize,
+}
+
+/// 1フレームでの内部tree drag描画結果を集約する。
+#[derive(Default)]
+struct DragCollect {
+    /// このフレームで最初に開始された行drag(pane_id込み)。
+    started: Option<(PaneId, tree_view::RowDragStart)>,
+    /// internal drag中、全paneのdrop先候補(pane_id, tree領域, drop対象行)。
+    rects: Vec<(PaneId, egui::Rect, Option<usize>)>,
+}
+
+/// internal tree drag中、pointerがwindow境界(viewport)を離れたかを判定する
+/// 純ロジック。座標不明(`None`)は離脱と誤判定しない。
+fn pointer_left_window(pointer: Option<egui::Pos2>, viewport: egui::Rect) -> bool {
+    match pointer {
+        Some(pos) => !viewport.contains(pos),
+        None => false,
+    }
+}
+
+/// internal tree drag中、pointer位置からdrop先pane・行を解決する純ロジック。
+/// 同一paneへのdrop(`source_pane`と一致)は「何もしない」ため`None`を返す。
+fn resolve_drag_drop_target(
+    pointer: egui::Pos2,
+    source_pane: PaneId,
+    rects: &[(PaneId, egui::Rect, Option<usize>)],
+) -> Option<(PaneId, Option<usize>)> {
+    let (pane_id, _, line) = rects.iter().find(|(_, rect, _)| rect.contains(pointer))?;
+    (*pane_id != source_pane).then_some((*pane_id, *line))
+}
+
 /// fylerのGUIアプリケーション。
 ///
 /// 描画契約:
@@ -473,6 +542,9 @@ pub struct FylerApp {
     /// native window geometryが未保存の初回起動だけ、monitor比率でサイズを設定する。
     resize_to_monitor_on_first_frame: bool,
     window_geometry: Arc<Mutex<Option<WindowGeometry>>>,
+    /// GUI window内で進行中のtree行drag(pane間dragを含む)。
+    /// windowの境界を離れたら`GuiAction::TreeDragOut`を送って`None`へ戻す。
+    tree_drag: Option<TreeDragSession>,
 }
 
 struct PaneViewState {
@@ -556,6 +628,7 @@ impl FylerApp {
             statusline_right,
             resize_to_monitor_on_first_frame: false,
             window_geometry: Arc::new(Mutex::new(None)),
+            tree_drag: None,
         })
     }
 
@@ -931,6 +1004,9 @@ impl FylerApp {
                 GuiEvent::ShowImportReport { report, effect } => {
                     self.dialog = Some(DialogState::ImportReport { report, effect });
                 }
+                GuiEvent::ShowDragCleanupConfirm { paths } => {
+                    self.dialog = Some(DialogState::DragCleanupConfirm { paths });
+                }
                 GuiEvent::ShowValidationErrors(errors) => {
                     self.dialog = Some(DialogState::ValidationErrors(errors));
                 }
@@ -1061,6 +1137,8 @@ impl eframe::App for FylerApp {
         let fatal_error = self.fatal_error.clone();
 
         let dragging_files = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
+        let internal_drag_active = self.tree_drag.is_some();
+        let mut drag_collect = DragCollect::default();
         let (ime, navigation_clicked, tree_click, drop_target_line) = egui::CentralPanel::default()
             .show(ui, |ui| {
                 if let Some(error) = fatal_error {
@@ -1080,6 +1158,8 @@ impl eframe::App for FylerApp {
                         &self.statusline_left,
                         &self.statusline_right,
                         dragging_files,
+                        internal_drag_active,
+                        &mut drag_collect,
                     )
                 } else {
                     (None, None, None, None)
@@ -1225,6 +1305,58 @@ impl eframe::App for FylerApp {
             }
         }
 
+        // GUI window内のtree drag(pane間drag含む)。境界を離れたらOLE dragへ、
+        // window内でbutton releaseしたら別paneの場合のみTreeDragDropを送る。
+        if self.dialog.is_none() {
+            if let Some((pane_id, started)) = drag_collect.started
+                && self.tree_drag.is_none()
+                && started.has_id
+            {
+                self.tree_drag = Some(TreeDragSession {
+                    pane_id,
+                    line: started.line,
+                });
+            }
+            if let Some(session) = self.tree_drag {
+                let pointer = ui.ctx().input(|i| i.pointer.latest_pos());
+                let viewport = ui.ctx().input(|i| i.viewport_rect());
+                let button_down = ui.ctx().input(|i| i.pointer.primary_down());
+                if !button_down {
+                    self.tree_drag = None;
+                    if let Some(pos) = pointer
+                        && let Some((target_pane, target_line)) =
+                            resolve_drag_drop_target(pos, session.pane_id, &drag_collect.rects)
+                        && self
+                            .action_tx
+                            .send(GuiAction::TreeDragDrop {
+                                source_pane: session.pane_id,
+                                source_line: session.line,
+                                target_pane,
+                                target_line,
+                                copy: ui.ctx().input(|i| i.modifiers.ctrl),
+                            })
+                            .is_err()
+                    {
+                        self.fatal_error = Some("Failed to send tree drag drop to app".to_owned());
+                    }
+                } else if pointer_left_window(pointer, viewport) {
+                    self.tree_drag = None;
+                    if self
+                        .action_tx
+                        .send(GuiAction::TreeDragOut {
+                            pane_id: session.pane_id,
+                            line: session.line,
+                        })
+                        .is_err()
+                    {
+                        self.fatal_error = Some("Failed to send tree drag-out to app".to_owned());
+                    }
+                }
+            }
+        } else {
+            self.tree_drag = None;
+        }
+
         let mut confirm_choice = None;
         let mut cancel_apply = false;
         let mut cancel_loader = false;
@@ -1270,6 +1402,9 @@ impl eframe::App for FylerApp {
             }
             Some(DialogState::ImportReport { report, effect }) => {
                 dismiss_report = confirm::draw_import_report(ui, report, *effect);
+            }
+            Some(DialogState::DragCleanupConfirm { paths }) => {
+                confirm_choice = confirm::draw_drag_cleanup_confirm(ui, paths);
             }
             Some(DialogState::UndoRecovery { descriptions }) => {
                 confirm_choice = confirm::draw_undo_recovery(ui, descriptions);
@@ -1601,6 +1736,8 @@ fn draw_layout(
     statusline_left: &[StatusItem],
     statusline_right: &[StatusItem],
     drag_active: bool,
+    internal_drag_active: bool,
+    drag_collect: &mut DragCollect,
 ) -> (
     Option<ImeGeometry>,
     Option<usize>,
@@ -1642,7 +1779,9 @@ fn draw_layout(
         statusline_left,
         statusline_right,
         drag_active,
+        internal_drag_active,
         &mut drop_target_line,
+        drag_collect,
     );
     (ime, navigation_clicked, tree_click, drop_target_line)
 }
@@ -1658,7 +1797,9 @@ fn draw_layout_in_rect(
     statusline_left: &[StatusItem],
     statusline_right: &[StatusItem],
     drag_active: bool,
+    internal_drag_active: bool,
     drop_target_line: &mut Option<usize>,
+    drag_collect: &mut DragCollect,
 ) -> (Option<ImeGeometry>, Option<TreeClickEvent>) {
     match layout {
         PaneLayout::Leaf(id) => {
@@ -1704,6 +1845,7 @@ fn draw_layout_in_rect(
                             *id,
                             *id == active,
                             *id == active && drag_active,
+                            internal_drag_active,
                         ))
                     }
                 })
@@ -1730,6 +1872,14 @@ fn draw_layout_in_rect(
                 return (None, None);
             };
             pane.tree_viewport = Some(output.viewport);
+            if let Some(started) = output.drag_started {
+                drag_collect.started.get_or_insert((*id, started));
+            }
+            if internal_drag_active {
+                drag_collect
+                    .rects
+                    .push((*id, output.tree_rect, output.drop_target_line));
+            }
             if *id == active {
                 *drop_target_line = output.drop_target_line;
             }
@@ -1792,7 +1942,9 @@ fn draw_layout_in_rect(
                 statusline_left,
                 statusline_right,
                 drag_active,
+                internal_drag_active,
                 drop_target_line,
+                drag_collect,
             );
             let (second_ime, second_click) = draw_layout_in_rect(
                 ui,
@@ -1804,7 +1956,9 @@ fn draw_layout_in_rect(
                 statusline_left,
                 statusline_right,
                 drag_active,
+                internal_drag_active,
                 drop_target_line,
+                drag_collect,
             );
             (first_ime.or(second_ime), first_click.or(second_click))
         }
@@ -2547,6 +2701,7 @@ mod tests {
                 statusline_right: Vec::new(),
                 resize_to_monitor_on_first_frame: false,
                 window_geometry: Arc::new(Mutex::new(None)),
+                tree_drag: None,
             },
             event_tx,
             action_rx,
@@ -2626,6 +2781,7 @@ mod tests {
             statusline_right: Vec::new(),
             resize_to_monitor_on_first_frame: false,
             window_geometry: Arc::new(Mutex::new(None)),
+            tree_drag: None,
         };
         let (tx, rx) = mpsc::channel();
         app.event_rx = rx;
@@ -3171,5 +3327,48 @@ mod tests {
             WindowGeometry::new(1000.0, 600.0, 30.0, 40.0, false)
         );
         assert!(window_geometry_from_viewport(&egui::ViewportInfo::default()).is_none());
+    }
+
+    #[test]
+    fn pointer_left_window_detects_exit_but_not_unknown_position() {
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        assert!(!pointer_left_window(Some(egui::pos2(10.0, 10.0)), viewport));
+        assert!(pointer_left_window(Some(egui::pos2(-5.0, 10.0)), viewport));
+        assert!(pointer_left_window(Some(egui::pos2(900.0, 10.0)), viewport));
+        // 座標不明(latest_posがNone)は離脱と誤判定しない。
+        assert!(!pointer_left_window(None, viewport));
+    }
+
+    #[test]
+    fn resolve_drag_drop_target_ignores_source_pane_and_picks_hit_pane() {
+        let source = PaneId::new(1);
+        let target = PaneId::new(2);
+        let rects = vec![
+            (
+                source,
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0)),
+                Some(3),
+            ),
+            (
+                target,
+                egui::Rect::from_min_size(egui::pos2(100.0, 0.0), egui::vec2(100.0, 100.0)),
+                Some(7),
+            ),
+        ];
+        // 同一paneへのdropは何もしない(None)。
+        assert_eq!(
+            resolve_drag_drop_target(egui::pos2(50.0, 50.0), source, &rects),
+            None
+        );
+        // 別paneへのdropはそのpaneとdrop対象行を返す。
+        assert_eq!(
+            resolve_drag_drop_target(egui::pos2(150.0, 50.0), source, &rects),
+            Some((target, Some(7)))
+        );
+        // どのpane矩形にも入っていなければNone。
+        assert_eq!(
+            resolve_drag_drop_target(egui::pos2(500.0, 500.0), source, &rects),
+            None
+        );
     }
 }

@@ -14,6 +14,7 @@ pub mod catalog;
 pub mod classify;
 pub mod clipboard;
 pub mod dialog;
+pub mod drag;
 pub mod drives;
 pub mod gitstatus;
 pub mod identity;

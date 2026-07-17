@@ -655,6 +655,45 @@ pub fn draw_undo_recovery(ui: &mut egui::Ui, descriptions: &[String]) -> Option<
         .inner
 }
 
+/// OLE drag-out完了後、Move報告でsourceが残存している場合の後始末確認。
+///
+/// **絶対ルール1**: 承認なしにsourceを消さない。承認 = ごみ箱へ退避
+/// (実FSの削除・上書きではない)。target(Explorer等)が既に消していた
+/// (optimized move)場合はこのダイアログ自体が呼ばれない。
+pub fn draw_drag_cleanup_confirm(ui: &mut egui::Ui, paths: &[PathBuf]) -> Option<ConfirmChoice> {
+    let key_choice = ui.ctx().input(|input| {
+        plan_choice_from_keys(
+            input.key_pressed(egui::Key::Y),
+            input.key_pressed(egui::Key::Enter),
+            input.key_pressed(egui::Key::N),
+            input.key_pressed(egui::Key::Escape),
+        )
+    });
+
+    egui::Modal::new(egui::Id::new("drag-cleanup-confirm"))
+        .show(ui.ctx(), |ui| {
+            ui.heading("Finish move");
+            ui.add_space(8.0);
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "The drop target reported a move, but these items are still present. \
+                 Move them to the Recycle Bin to finish?",
+            );
+            ui.add_space(4.0);
+            for path in paths {
+                ui.monospace(path.display().to_string());
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let approve_clicked = ui.button("Move to Recycle Bin (y)").clicked();
+                let cancel_clicked = ui.button("Leave in place (n / Esc)").clicked();
+                confirm_choice_from_buttons(approve_clicked, cancel_clicked, key_choice)
+            })
+            .inner
+        })
+        .inner
+}
+
 /// apply進捗ダイアログを描画する。
 ///
 /// キャンセルボタンまたは`n`/`Esc`が押されたら`true`を返す。キャンセル要求後は
