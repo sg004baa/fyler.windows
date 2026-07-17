@@ -41,7 +41,7 @@ use fyler_core::report::{ApplyProgress, CommitReport};
 use fyler_core::transfer::{DropEffect, ImportOp, TransferOp};
 use fyler_core::tree::EntryKind;
 use fyler_core::undo::{UndoStep, UndoTransaction};
-use fyler_fsops::extract::{ExtractOp, ExtractPlan};
+use fyler_fsops::extract::ExtractOp;
 use fyler_fsops::openwith::OpenWithHandler;
 use fyler_fsops::watch::ExternalChange;
 use fyler_gui::app::{GuiEvent, PickerAction, TreeContextItem, TreeRowClickKind};
@@ -881,6 +881,63 @@ fn handle_open_terminal(
     Ok(())
 }
 
+/// 管理者権限(elevated)でファイルを開く。UACはOS側が扱うため確認ダイアログは
+/// 不要(絶対ルール1はFS状態の変更を対象とし、プロセス起動のみのため対象外)。
+/// busyゲートは`open_terminal_rejection`と同じ意味論(起動のみで実FS非変更)。
+#[allow(clippy::too_many_arguments)]
+fn handle_open_as_admin(
+    pane_id: PaneId,
+    save_controller: &SaveController,
+    lines: &[fyler_core::editor::EditorLine],
+    root: &Path,
+    line: usize,
+    crashed: bool,
+    dialog_open: bool,
+    apply_running: bool,
+    transfer_awaiting: bool,
+    transfer_running: bool,
+    gui_event_tx: &CountingSender<GuiEvent>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    if let Some(message) = open_terminal_rejection(
+        dialog_open,
+        apply_running,
+        transfer_awaiting,
+        transfer_running,
+        crashed,
+        save_controller.is_idle(),
+    ) {
+        return send_gui_message(gui_event_tx, pane_id, MessageKind::Info, message);
+    }
+
+    let Some((path, kind)) = save_controller.resolve_line(lines, line) else {
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            "Entry to open as administrator was not found",
+        );
+    };
+    if kind == EntryKind::Dir {
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Info,
+            "Open as administrator is for files only",
+        );
+    }
+
+    let fs_path = path.to_fs_path(root);
+    if let Err(error) = fyler_fsops::open::open_as_admin(&fs_path) {
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            format!("Failed to open as administrator: {error:#}"),
+        );
+    }
+    Ok(())
+}
+
 /// Rename / Mark for deletion(バッファ編集のみのcontext menu項目)の権威判定。
 /// `open_terminal_rejection` と同じ形((dialog/apply/transfer/crashed/save)。
 fn tree_edit_rejection(
@@ -988,6 +1045,68 @@ fn handle_mark_for_deletion(
         );
     }
     Ok(())
+}
+
+/// Create shortcut(context menu「Create shortcut」/`:shortcut`)の確認前段。
+/// 行→target解決・衝突回避済みlnkパス算出までを行い、実FSへは一切書き込まない
+/// (絶対ルール1: 承認は`AppEvent::Confirm`側が扱う)。busyゲートは
+/// `tree_edit_rejection`と同じ形(呼び出し側が`pending_shortcut.is_some()`を
+/// `dialog_open`へ合成する)。
+fn handle_create_shortcut(
+    pane_id: PaneId,
+    save_controller: &SaveController,
+    lines: &[fyler_core::editor::EditorLine],
+    root: &Path,
+    line: usize,
+    rejection: Option<&'static str>,
+    gui_event_tx: &CountingSender<GuiEvent>,
+) -> Result<Option<(PaneId, PathBuf, PathBuf)>, mpsc::SendError<GuiEvent>> {
+    if let Some(message) = rejection {
+        send_gui_message(gui_event_tx, pane_id, MessageKind::Info, message)?;
+        return Ok(None);
+    }
+
+    let Some((path, _kind)) = save_controller.resolve_line(lines, line) else {
+        send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            "Entry to create a shortcut for was not found",
+        )?;
+        return Ok(None);
+    };
+    let target = path.to_fs_path(root);
+    let Some(parent) = target.parent() else {
+        send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            "Cannot create a shortcut for the root",
+        )?;
+        return Ok(None);
+    };
+    let Some(name) = target.file_name().and_then(|name| name.to_str()) else {
+        send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            "Entry name is not valid Unicode",
+        )?;
+        return Ok(None);
+    };
+    let lnk_name = fyler_fsops::shortcut::available_shortcut_name(name, |candidate| {
+        std::fs::symlink_metadata(parent.join(candidate)).is_ok()
+    });
+    let lnk_path = parent.join(&lnk_name);
+    gui_event_tx.send(GuiEvent::ShowActionConfirm {
+        title: "Create shortcut".to_owned(),
+        approve_label: "Create (y)".to_owned(),
+        lines: vec![format!(
+            "CREATE SHORTCUT {lnk_name} \u{2192} {}",
+            target.display()
+        )],
+    })?;
+    Ok(Some((pane_id, target, lnk_path)))
 }
 
 #[allow(clippy::too_many_arguments)]
