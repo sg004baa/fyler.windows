@@ -18,7 +18,7 @@ use fyler_core::keymap::{EditorAction, HelpEntry, KeyBinding, KeySequence};
 use fyler_core::pane::{FocusDirection, PaneAction, PaneId, PaneLayout, SplitDirection};
 use fyler_core::path::TreePath;
 use fyler_core::report::{ApplyProgress, CommitReport, OpOutcome, OpResult};
-use fyler_core::transfer::{DropEffect, ImportPlan, TransferKind};
+use fyler_core::transfer::{DragOutcome, DropEffect, ImportPlan, TransferKind};
 use fyler_core::tree::{BaselineTree, EntryKind};
 use fyler_core::undo::UndoTransaction;
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
@@ -30,6 +30,7 @@ use fyler_gui::app::{
 };
 use fyler_gui::confirm::ConfirmChoice;
 
+use super::drag_flow::{self, CleanupChoiceResult, DragOutController, DragOutFlowResult};
 use super::feedback::{FeedbackOutcome, resolve_endpoint, send_feedback};
 use super::import_flow::{self, ImportController, ImportFlowResult};
 use super::nvim_locate;
@@ -701,6 +702,22 @@ pub(super) fn run() -> anyhow::Result<()> {
                         line,
                         item,
                     },
+                    GuiAction::TreeDragOut { pane_id, line } => {
+                        AppEvent::TreeDragOut { pane_id, line }
+                    }
+                    GuiAction::TreeDragDrop {
+                        source_pane,
+                        source_line,
+                        target_pane,
+                        target_line,
+                        copy,
+                    } => AppEvent::TreeDragDrop {
+                        source_pane,
+                        source_line,
+                        target_pane,
+                        target_line,
+                        copy,
+                    },
                 };
                 if action_event_tx.send(event).is_err() {
                     return;
@@ -753,6 +770,7 @@ pub(super) fn run() -> anyhow::Result<()> {
             let mut loader_owner: Option<LoaderOwner> = None;
             let mut transfer = TransferController::new();
             let mut import = ImportController::new();
+            let mut drag_out = DragOutController::new();
             let mut pending_recovery = pending_recovery;
             let mut pending_open_with: Option<(
                 PathBuf,
@@ -858,7 +876,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 || transfer.is_running()
                                 || import.is_awaiting()
                                 || import.is_running()
-                                || loader_owner.is_some(),
+                                || loader_owner.is_some()
+                                || drag_out.is_busy(),
                         )
                         .is_err()
                         {
@@ -918,6 +937,11 @@ pub(super) fn run() -> anyhow::Result<()> {
                         {
                             return;
                         }
+                        if drag_out.invalidate_if_involves(pane_id)
+                            && gui_event_tx.send(GuiEvent::CloseDialog).is_err()
+                        {
+                            return;
+                        }
                         if gui_event_tx
                             .send(GuiEvent::Editor {
                                 pane_id,
@@ -955,7 +979,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 || transfer.is_awaiting()
                                 || transfer.is_running()
                                 || import.is_awaiting()
-                                || import.is_running(),
+                                || import.is_running()
+                                || drag_out.is_busy(),
                             &mut transfer,
                             &gui_event_tx,
                         )
@@ -983,7 +1008,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                             || transfer.is_awaiting()
                             || transfer.is_running()
                             || import.is_awaiting()
-                            || import.is_running();
+                            || import.is_running()
+                            || drag_out.is_busy();
                         if let Some(reason) =
                             import_flow::start_rejection(pane_state, globally_busy)
                         {
@@ -1027,7 +1053,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                             || transfer.is_awaiting()
                             || transfer.is_running()
                             || import.is_awaiting()
-                            || import.is_running();
+                            || import.is_running()
+                            || drag_out.is_busy();
                         if let Some(reason) =
                             import_flow::start_rejection(pane_state, globally_busy)
                         {
@@ -1065,7 +1092,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 || transfer.is_awaiting()
                                 || transfer.is_running()
                                 || import.is_awaiting()
-                                || import.is_running(),
+                                || import.is_running()
+                                || drag_out.is_busy(),
                             &mut import,
                             &gui_event_tx,
                         )
@@ -1091,9 +1119,98 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 || transfer.is_awaiting()
                                 || transfer.is_running()
                                 || import.is_awaiting()
-                                || import.is_running(),
+                                || import.is_running()
+                                || drag_out.is_busy(),
                             active_picker.is_some(),
                             &mut import,
+                            &gui_event_tx,
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    AppEvent::TreeDragOut { pane_id, line } => {
+                        if handle_tree_drag_out(
+                            pane_id,
+                            line,
+                            &panes,
+                            apply_owner.is_some()
+                                || dialog_owner.is_some()
+                                || transfer.is_awaiting()
+                                || transfer.is_running()
+                                || import.is_awaiting()
+                                || import.is_running()
+                                || drag_out.is_busy(),
+                            &mut drag_out,
+                            &event_tx,
+                            &gui_event_tx,
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    AppEvent::TreeDragFinished {
+                        pane_id,
+                        outcome,
+                        existing,
+                    } => match drag_out.on_outcome(pane_id, outcome, existing) {
+                        DragOutFlowResult::NeedsCleanupConfirm { pane_id, remaining } => {
+                            dialog_owner = Some(pane_id);
+                            if gui_event_tx
+                                .send(GuiEvent::ShowDragCleanupConfirm { paths: remaining })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        DragOutFlowResult::Done | DragOutFlowResult::Ignored => {}
+                    },
+                    AppEvent::TreeDragCleanupFinished { pane_id, mut errors } => {
+                        drag_out.finish_cleanup(pane_id);
+                        if let Some(session) = panes.get_mut(&pane_id)
+                            && let Err(error) = session.save_controller.reconcile_after_transfer()
+                        {
+                            errors.push(format!("pane {pane_id}: {error:#}"));
+                        }
+                        if !errors.is_empty()
+                            && send_gui_message(
+                                &gui_event_tx,
+                                pane_id,
+                                MessageKind::Error,
+                                format!(
+                                    "Failed to finish moving dragged items: {}",
+                                    errors.join(" / ")
+                                ),
+                            )
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    AppEvent::TreeDragDrop {
+                        source_pane,
+                        source_line,
+                        target_pane,
+                        target_line,
+                        copy,
+                    } => {
+                        if handle_tree_drag_drop(
+                            source_pane,
+                            source_line,
+                            target_pane,
+                            target_line,
+                            copy,
+                            &panes,
+                            apply_owner.is_some()
+                                || dialog_owner.is_some()
+                                || transfer.is_awaiting()
+                                || transfer.is_running()
+                                || import.is_awaiting()
+                                || import.is_running()
+                                || drag_out.is_busy(),
+                            &mut transfer,
                             &gui_event_tx,
                         )
                         .is_err()
@@ -1156,7 +1273,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     dialog_owner.is_some(),
                                     apply_owner.is_some(),
                                     transfer.is_awaiting() || import.is_awaiting(),
-                                    transfer.is_running() || import.is_running(),
+                                    transfer.is_running() || import.is_running() || drag_out.is_busy(),
                                     &gui_event_tx,
                                 ) {
                                     Ok(opened) => opened,
@@ -1188,6 +1305,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     || transfer.is_running()
                                     || import.is_awaiting()
                                     || import.is_running()
+                                    || drag_out.is_busy()
                                 {
                                     if send_gui_message(
                                         &gui_event_tx,
@@ -1219,7 +1337,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         || transfer.is_awaiting()
                                         || transfer.is_running()
                                         || import.is_awaiting()
-                                        || import.is_running(),
+                                        || import.is_running()
+                                        || drag_out.is_busy(),
                                 ) {
                                     if send_gui_message(
                                         &gui_event_tx,
@@ -1370,7 +1489,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         || transfer.is_awaiting()
                                         || transfer.is_running()
                                         || import.is_awaiting()
-                                        || import.is_running(),
+                                        || import.is_running()
+                                        || drag_out.is_busy(),
                                 )
                                 .is_err()
                                 {
@@ -1390,7 +1510,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     dialog_owner.is_some(),
                                     apply_owner.is_some(),
                                     transfer.is_awaiting() || import.is_awaiting(),
-                                    transfer.is_running() || import.is_running(),
+                                    transfer.is_running() || import.is_running() || drag_out.is_busy(),
                                     &gui_event_tx,
                                 )
                                 .is_err()
@@ -1453,7 +1573,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         || transfer.is_awaiting()
                                         || transfer.is_running()
                                         || import.is_awaiting()
-                                        || import.is_running(),
+                                        || import.is_running()
+                                        || drag_out.is_busy(),
                                 )
                                 .is_err()
                                 {
@@ -1609,7 +1730,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         || transfer.is_awaiting()
                                         || transfer.is_running()
                                         || import.is_awaiting()
-                                        || import.is_running(),
+                                        || import.is_running()
+                                        || drag_out.is_busy(),
                                 )
                                 .is_err()
                                 {
@@ -1649,7 +1771,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                                 || transfer.is_awaiting()
                                                 || transfer.is_running()
                                                 || import.is_awaiting()
-                                                || import.is_running(),
+                                                || import.is_running()
+                                                || drag_out.is_busy(),
                                         )
                                         .is_err()
                                         {
@@ -2120,6 +2243,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     || transfer.is_running()
                                     || import.is_awaiting()
                                     || import.is_running()
+                                    || drag_out.is_busy()
                                 {
                                     continue;
                                 }
@@ -2353,7 +2477,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     || transfer.is_awaiting()
                                     || transfer.is_running()
                                     || import.is_awaiting()
-                                    || import.is_running(),
+                                    || import.is_running()
+                                    || drag_out.is_busy(),
                                 session.crashed,
                                 session.save_controller.is_idle(),
                             ) {
@@ -2670,6 +2795,71 @@ pub(super) fn run() -> anyhow::Result<()> {
                             }
                             continue;
                         }
+                        if drag_out.is_confirming() {
+                            match drag_out.on_choice(choice) {
+                                CleanupChoiceResult::Approved { pane_id, remaining } => {
+                                    dialog_owner = None;
+                                    if gui_event_tx.send(GuiEvent::CloseDialog).is_err() {
+                                        return;
+                                    }
+                                    let cleanup_event_tx = event_tx.clone();
+                                    // ごみ箱I/Oは再帰深度が読めないため既定stackを維持する。
+                                    let spawn_result = thread::Builder::new()
+                                        .name("fyler-drag-cleanup".to_owned())
+                                        .spawn(move || {
+                                            let mut errors = Vec::new();
+                                            for path in &remaining {
+                                                if let Err(error) =
+                                                    fyler_fsops::recycle::delete_to_recycle_bin(
+                                                        path,
+                                                    )
+                                                {
+                                                    errors.push(format!(
+                                                        "{}: {error:#}",
+                                                        path.display()
+                                                    ));
+                                                }
+                                            }
+                                            let _ = cleanup_event_tx.send(
+                                                AppEvent::TreeDragCleanupFinished {
+                                                    pane_id,
+                                                    errors,
+                                                },
+                                            );
+                                        });
+                                    if spawn_result.is_err()
+                                        && event_tx
+                                            .send(AppEvent::TreeDragCleanupFinished {
+                                                pane_id,
+                                                errors: vec![
+                                                    "Failed to start cleanup worker".to_owned(),
+                                                ],
+                                            })
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                CleanupChoiceResult::Cancelled { pane_id } => {
+                                    dialog_owner = None;
+                                    if gui_event_tx.send(GuiEvent::CloseDialog).is_err() {
+                                        return;
+                                    }
+                                    if send_gui_message(
+                                        &gui_event_tx,
+                                        pane_id,
+                                        MessageKind::Info,
+                                        "Left dragged items in place",
+                                    )
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                CleanupChoiceResult::Ignored => {}
+                            }
+                            continue;
+                        }
                         let Some(pane_id) = dialog_owner.or(apply_owner) else {
                             continue;
                         };
@@ -2958,6 +3148,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                             || transfer.is_running()
                             || import.is_awaiting()
                             || import.is_running()
+                            || drag_out.is_busy()
                             || if showed_dialog {
                                 dialog_owner != Some(pane_id)
                             } else {
@@ -3093,6 +3284,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                             && apply_owner.is_none()
                             && !transfer.is_running()
                             && !import.is_running()
+                            && !drag_out.is_busy()
                         {
                             let changed_paths = std::mem::take(&mut session.deferred_changes);
                             if handle_external_change(
@@ -3545,7 +3737,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                             };
                             if should_defer_external_change(
                                 apply_owner.is_some(),
-                                transfer.is_running() || import.is_running(),
+                                transfer.is_running() || import.is_running() || drag_out.is_busy(),
                                 loader_owner.as_ref().is_some_and(|owner| {
                                     owner.pane_id == changed_id && owner.loads_directory()
                                 }),
@@ -3644,7 +3836,11 @@ pub(super) fn run() -> anyhow::Result<()> {
                         }
                     }
                     AppEvent::OfflineRetryTick => {
-                        if apply_owner.is_some() || transfer.is_running() || import.is_running() {
+                        if apply_owner.is_some()
+                            || transfer.is_running()
+                            || import.is_running()
+                            || drag_out.is_busy()
+                        {
                             continue;
                         }
                         let pane_ids = panes.keys().copied().collect::<Vec<_>>();
@@ -4244,6 +4440,177 @@ fn start_import(
     gui_event_tx.send(GuiEvent::ShowImportPlan {
         pane_id,
         plan,
+        overwrites: preflight.overwritable,
+    })
+}
+
+/// OLE drag-outを開始する。実FSは一切変更しない
+/// (`fyler_fsops::drag::perform_drag`のcontract)。
+fn handle_tree_drag_out(
+    pane_id: PaneId,
+    line: usize,
+    panes: &BTreeMap<PaneId, PaneSession>,
+    globally_busy: bool,
+    drag_out: &mut DragOutController,
+    event_tx: &CountingSender<AppEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    let Some(session) = panes.get(&pane_id) else {
+        return Ok(());
+    };
+    let snapshot = session.engine.snapshot();
+    let pane_state = TransferPaneState {
+        dirty: snapshot.dirty,
+        idle: session.save_controller.is_idle(),
+        crashed: session.crashed,
+        offline: session.save_controller.is_offline(),
+    };
+    if let Some(reason) = drag_flow::start_rejection(pane_state, globally_busy) {
+        return send_gui_message(gui_event_tx, pane_id, MessageKind::Info, reason);
+    }
+    let selected = match resolve_selection(&session.save_controller, &snapshot.lines, &[line]) {
+        Ok(selected) => selected,
+        // GUIがhas_id(保存済み行)を確認済みなので通常到達しない。
+        Err(_) => return Ok(()),
+    };
+    let root = session.root.clone();
+    let paths: Vec<PathBuf> = selected
+        .into_iter()
+        .map(|(path, _)| path.to_fs_path(&root))
+        .collect();
+    if paths.is_empty() {
+        return Ok(());
+    }
+    drag_out.begin(pane_id);
+    let drag_event_tx = event_tx.clone();
+    // DoDragDropはdrag終了までblockするため使い捨てSTAスレッドで実行する
+    // (`perform_drag`が呼び出しスレッドでOleInitialize/OleUninitializeする)。
+    let spawn_result = thread::Builder::new()
+        .name("fyler-drag-out".to_owned())
+        .spawn(move || {
+            let outcome = match fyler_fsops::drag::perform_drag(&paths) {
+                Ok(outcome) => outcome,
+                Err(_) => DragOutcome::Cancelled,
+            };
+            let existing = paths.into_iter().filter(|path| path.exists()).collect();
+            let _ = drag_event_tx.send(AppEvent::TreeDragFinished {
+                pane_id,
+                outcome,
+                existing,
+            });
+        });
+    if spawn_result.is_err() {
+        drag_out.invalidate_if_involves(pane_id);
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            "Failed to start drag-and-drop",
+        );
+    }
+    Ok(())
+}
+
+/// GUI window内で完結したtree行drag(pane間)を、既存のpane間transfer経路
+/// (`gm`/`gc`と同じ`TransferController`)へ合流させる。
+#[allow(clippy::too_many_arguments)]
+fn handle_tree_drag_drop(
+    source_pane: PaneId,
+    source_line: usize,
+    target_pane: PaneId,
+    target_line: Option<usize>,
+    copy: bool,
+    panes: &BTreeMap<PaneId, PaneSession>,
+    globally_busy: bool,
+    transfer: &mut TransferController,
+    gui_event_tx: &CountingSender<GuiEvent>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    if source_pane == target_pane {
+        return Ok(());
+    }
+    let Some(source_session) = panes.get(&source_pane) else {
+        return Ok(());
+    };
+    let Some(target_session) = panes.get(&target_pane) else {
+        return Ok(());
+    };
+    let source_snapshot = source_session.engine.snapshot();
+    let target_snapshot = target_session.engine.snapshot();
+    let source_state = TransferPaneState {
+        dirty: source_snapshot.dirty,
+        idle: source_session.save_controller.is_idle(),
+        crashed: source_session.crashed,
+        offline: source_session.save_controller.is_offline(),
+    };
+    let target_state = TransferPaneState {
+        dirty: target_snapshot.dirty,
+        idle: target_session.save_controller.is_idle(),
+        crashed: target_session.crashed,
+        offline: target_session.save_controller.is_offline(),
+    };
+    if start_rejection(source_state, target_state, globally_busy).is_some() {
+        // dragはclickのような明示的な起点を経ないため、拒否理由はメッセージで
+        // 出さず静かに無視する(drop先の視覚feedbackで十分)。
+        return Ok(());
+    }
+    let selected = match resolve_selection(
+        &source_session.save_controller,
+        &source_snapshot.lines,
+        &[source_line],
+    ) {
+        Ok(selected) => selected,
+        Err(_) => return Ok(()),
+    };
+    let target_is_empty = target_line.is_none();
+    let resolved_target = target_line.and_then(|line| {
+        target_session
+            .save_controller
+            .resolve_line(&target_snapshot.lines, line)
+    });
+    let Some(destination) = destination_directory(target_is_empty, resolved_target) else {
+        return Ok(());
+    };
+    let kind = if copy {
+        TransferKind::Copy
+    } else {
+        TransferKind::Move
+    };
+    let plan = build_plan(
+        kind,
+        source_session.root.clone(),
+        target_session.root.clone(),
+        &destination,
+        selected,
+    );
+    if plan.is_empty() {
+        return Ok(());
+    }
+    let preflight = fyler_fsops::preflight_transfer(&plan);
+    if !preflight.blocked.is_empty() {
+        return send_gui_message(
+            gui_event_tx,
+            source_pane,
+            MessageKind::Error,
+            format!(
+                "Some paths cannot be transferred: {}",
+                preflight
+                    .blocked
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
+    transfer.begin(
+        source_pane,
+        target_pane,
+        plan.clone(),
+        preflight.overwritable.clone(),
+    );
+    gui_event_tx.send(GuiEvent::ShowTransferPlan {
+        plan,
+        target: target_pane,
         overwrites: preflight.overwritable,
     })
 }
