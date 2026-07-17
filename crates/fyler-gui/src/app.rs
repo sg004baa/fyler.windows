@@ -2378,9 +2378,7 @@ fn context_item_enabled(
     }
     match item {
         TreeContextItem::Open | TreeContextItem::Rename | TreeContextItem::CopyPath => has_id,
-        TreeContextItem::OpenWith | TreeContextItem::OpenAsAdmin => {
-            has_id && !is_dir && !offline
-        }
+        TreeContextItem::OpenWith | TreeContextItem::OpenAsAdmin => has_id && !is_dir && !offline,
         TreeContextItem::MarkForDeletion => true,
         TreeContextItem::ClipboardCopy | TreeContextItem::ClipboardCut => has_id && !offline,
         TreeContextItem::ClipboardPaste => !offline,
@@ -2422,7 +2420,8 @@ fn draw_tree_context_menu(
                 ui.separator();
             }
             for &item in *group {
-                let enabled = context_item_enabled(item, has_id, is_dir, is_zip, engine_ok, offline);
+                let enabled =
+                    context_item_enabled(item, has_id, is_dir, is_zip, engine_ok, offline);
                 let label = context_item_label(item, is_dir);
                 let response = ui.add_enabled(enabled, egui::Button::new(label));
                 let response = if enabled {
@@ -3109,7 +3108,10 @@ mod tests {
             context_item_label(TreeContextItem::CreateShortcut, true),
             "Create shortcut"
         );
-        assert_eq!(context_item_label(TreeContextItem::Refresh, true), "Refresh");
+        assert_eq!(
+            context_item_label(TreeContextItem::Refresh, true),
+            "Refresh"
+        );
     }
 
     #[test]

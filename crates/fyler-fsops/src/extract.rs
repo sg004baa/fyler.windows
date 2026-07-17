@@ -66,9 +66,9 @@ pub fn preflight_extract(archive: &Path, dest_dir: &Path) -> anyhow::Result<Extr
     let mut ops = Vec::with_capacity(zip.len());
     let mut total_bytes: u64 = 0;
     for index in 0..zip.len() {
-        let entry = zip.by_index_raw(index).with_context(|| {
-            format!("Failed to read zip entry #{index}: {}", archive.display())
-        })?;
+        let entry = zip
+            .by_index_raw(index)
+            .with_context(|| format!("Failed to read zip entry #{index}: {}", archive.display()))?;
         // 生バイトがUTF-8であり、かつzipクレートのデコード結果と一致することを
         // 要求する(UTF-8宣言なしの非ASCII名はcp437でデコードされ食い違う)。
         let raw_name = std::str::from_utf8(entry.name_raw()).map_err(|_| {
@@ -224,18 +224,14 @@ fn execute_extract_operation(
 
     if operation.is_dir {
         fs::create_dir_all(crate::long_path::to_fs(&operation.target)).with_context(|| {
-            format!(
-                "Failed to create directory: {}",
-                operation.target.display()
-            )
+            format!("Failed to create directory: {}", operation.target.display())
         })?;
         return Ok(());
     }
 
     if let Some(parent) = operation.target.parent() {
-        fs::create_dir_all(crate::long_path::to_fs(parent)).with_context(|| {
-            format!("Failed to create parent directory: {}", parent.display())
-        })?;
+        fs::create_dir_all(crate::long_path::to_fs(parent))
+            .with_context(|| format!("Failed to create parent directory: {}", parent.display()))?;
     }
     let mut output = fs::File::create(crate::long_path::to_fs(&operation.target))
         .with_context(|| format!("Failed to create file: {}", operation.target.display()))?;
@@ -298,10 +294,7 @@ mod tests {
 
         assert!(report.all_succeeded());
         assert_eq!(report.results.len(), 3);
-        assert_eq!(
-            fs::read(dest.join("nested/inner.txt")).unwrap(),
-            b"hello"
-        );
+        assert_eq!(fs::read(dest.join("nested/inner.txt")).unwrap(), b"hello");
         assert_eq!(fs::read(dest.join("root.txt")).unwrap(), b"root");
         // 最終通知は completed=総数, current=None。
         let last = progress.last().unwrap();
@@ -316,7 +309,10 @@ mod tests {
         write_zip(&archive, &[("../evil.txt", Some(b"evil"))]);
 
         let error = preflight_extract(&archive, &dir.path().join("out")).unwrap_err();
-        assert!(error.to_string().contains("Unsafe zip entry name"), "{error}");
+        assert!(
+            error.to_string().contains("Unsafe zip entry name"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -335,7 +331,10 @@ mod tests {
                 patched += 1;
             }
         }
-        assert!(patched >= 2, "local header + central directory を書き換えたはず");
+        assert!(
+            patched >= 2,
+            "local header + central directory を書き換えたはず"
+        );
         fs::write(&archive, bytes).unwrap();
 
         let error = preflight_extract(&archive, &dir.path().join("out")).unwrap_err();
