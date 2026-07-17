@@ -1155,7 +1155,20 @@ pub(super) fn run() -> anyhow::Result<()> {
                         pane_id,
                         outcome,
                         existing,
-                    } => match drag_out.on_outcome(pane_id, outcome, existing) {
+                        error,
+                    } => {
+                        if let Some(error) = error
+                            && send_gui_message(
+                                &gui_event_tx,
+                                pane_id,
+                                MessageKind::Error,
+                                format!("Drag-and-drop failed: {error}"),
+                            )
+                            .is_err()
+                        {
+                            return;
+                        }
+                        match drag_out.on_outcome(pane_id, outcome, existing) {
                         DragOutFlowResult::NeedsCleanupConfirm { pane_id, remaining } => {
                             dialog_owner = Some(pane_id);
                             if gui_event_tx
@@ -1166,7 +1179,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                             }
                         }
                         DragOutFlowResult::Done | DragOutFlowResult::Ignored => {}
-                    },
+                        }
+                    }
                     AppEvent::TreeDragCleanupFinished { pane_id, mut errors } => {
                         drag_out.finish_cleanup(pane_id);
                         if let Some(session) = panes.get_mut(&pane_id)
@@ -4488,15 +4502,18 @@ fn handle_tree_drag_out(
     let spawn_result = thread::Builder::new()
         .name("fyler-drag-out".to_owned())
         .spawn(move || {
-            let outcome = match fyler_fsops::drag::perform_drag(&paths) {
-                Ok(outcome) => outcome,
-                Err(_) => DragOutcome::Cancelled,
+            let (outcome, error) = match fyler_fsops::drag::perform_drag(&paths) {
+                Ok(outcome) => (outcome, None),
+                // 失敗もdrag不成立としてbusyは解除するが、silent fallbackに
+                // しないためエラー文言をapp層へ運びユーザーへ表示する。
+                Err(error) => (DragOutcome::Cancelled, Some(format!("{error:#}"))),
             };
             let existing = paths.into_iter().filter(|path| path.exists()).collect();
             let _ = drag_event_tx.send(AppEvent::TreeDragFinished {
                 pane_id,
                 outcome,
                 existing,
+                error,
             });
         });
     if spawn_result.is_err() {

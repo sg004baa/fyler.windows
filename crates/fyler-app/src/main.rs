@@ -132,6 +132,9 @@ enum AppEvent {
         pane_id: PaneId,
         outcome: DragOutcome,
         existing: Vec<PathBuf>,
+        /// `perform_drag`自体の失敗(OleInitialize等)。発生時のみSome。
+        /// outcomeはCancelled扱いだが、silent fallbackにしないためユーザーへ表示する。
+        error: Option<String>,
     },
     /// 承認後のごみ箱退避workerの完了。
     TreeDragCleanupFinished {
