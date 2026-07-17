@@ -30,8 +30,8 @@ use fyler_gui::app::{
 };
 use fyler_gui::confirm::ConfirmChoice;
 
-use super::extract_flow::{self, ExtractController, ExtractFlowResult};
 use super::drag_flow::{self, CleanupChoiceResult, DragOutController, DragOutFlowResult};
+use super::extract_flow::{self, ExtractController, ExtractFlowResult};
 use super::feedback::{FeedbackOutcome, resolve_endpoint, send_feedback};
 use super::import_flow::{self, ImportController, ImportFlowResult};
 use super::nvim_locate;
