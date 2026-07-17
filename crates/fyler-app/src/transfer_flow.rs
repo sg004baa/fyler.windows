@@ -107,14 +107,11 @@ pub(super) fn resolve_selection(
     }
 }
 
-pub(super) fn build_plan(
-    kind: TransferKind,
-    from_root: PathBuf,
-    to_root: PathBuf,
-    destination: &TreePath,
-    selected: Vec<(TreePath, EntryKind)>,
-) -> TransferPlan {
-    let selected = selected
+/// 選択の親子孫重複を最上位祖先だけへ畳み込む。`gm`/`gc`のtransfer選択と
+/// clipboard copy/cutの選択で共通に使う(選択に祖先と子孫が両方含まれる場合、
+/// 子孫は祖先の操作へ既に含まれるため個別に扱わない)。
+pub(super) fn dedupe_ancestors(selected: &[(TreePath, EntryKind)]) -> Vec<(TreePath, EntryKind)> {
+    selected
         .iter()
         .enumerate()
         .filter(|(index, (path, _))| {
@@ -125,8 +122,19 @@ pub(super) fn build_plan(
                     *index != other_index && other.is_strict_ancestor_of(path)
                 })
         })
-        .map(|(_, entry)| entry.clone());
-    let ops = selected
+        .map(|(_, entry)| entry.clone())
+        .collect()
+}
+
+pub(super) fn build_plan(
+    kind: TransferKind,
+    from_root: PathBuf,
+    to_root: PathBuf,
+    destination: &TreePath,
+    selected: Vec<(TreePath, EntryKind)>,
+) -> TransferPlan {
+    let ops = dedupe_ancestors(&selected)
+        .into_iter()
         .filter_map(|(from, entry_kind)| {
             let name = from.name()?.to_owned();
             Some(TransferOp {
@@ -417,6 +425,33 @@ mod tests {
         assert_eq!(plan.ops[0].to, TreePath::parse("inbox/other.txt"));
         assert_eq!(plan.ops[1].from, TreePath::parse("dir"));
         assert_eq!(plan.ops[1].to, TreePath::parse("inbox/dir"));
+    }
+
+    #[test]
+    fn dedupe_ancestors_keeps_top_level_selection_and_drops_nested_children() {
+        let selected = vec![
+            (TreePath::parse("dir/child.txt"), EntryKind::File),
+            (TreePath::parse("dir/sub/grandchild.txt"), EntryKind::File),
+            (TreePath::parse("other.txt"), EntryKind::File),
+            (TreePath::parse("dir"), EntryKind::Dir),
+        ];
+        let result = dedupe_ancestors(&selected);
+        assert_eq!(
+            result,
+            vec![
+                (TreePath::parse("other.txt"), EntryKind::File),
+                (TreePath::parse("dir"), EntryKind::Dir),
+            ]
+        );
+    }
+
+    #[test]
+    fn dedupe_ancestors_is_a_no_op_when_no_selection_is_nested() {
+        let selected = vec![
+            (TreePath::parse("a.txt"), EntryKind::File),
+            (TreePath::parse("b.txt"), EntryKind::File),
+        ];
+        assert_eq!(dedupe_ancestors(&selected), selected);
     }
 
     #[test]

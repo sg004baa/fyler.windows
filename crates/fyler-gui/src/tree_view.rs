@@ -63,6 +63,8 @@ pub struct TreeViewOutput {
     pub tree_rect: egui::Rect,
     /// 次フレームのカーソル追従判定に使う現在の可視範囲。
     pub viewport: TreeViewport,
+    /// `drag_active`時、pointer直下の行(inbound dropの取り込み先候補)。
+    pub drop_target_line: Option<usize>,
     /// このフレームで行がクリックされていればその詳細。
     pub click: Option<RowClick>,
     /// 行の外(ツリー領域内の空白)がクリックされたか(pane focus要求のみ、
@@ -114,6 +116,7 @@ pub fn draw(
     previous_viewport: Option<TreeViewport>,
     pane_id: PaneId,
     is_active: bool,
+    drag_active: bool,
 ) -> TreeViewOutput {
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
     let icon_font_id = egui::FontId::new(font_id.size, icon::font_family());
@@ -145,6 +148,7 @@ pub fn draw(
     }
     let output = scroll_area.show_rows(ui, row_height, snapshot.lines.len(), |ui, row_range| {
         let mut cursor_rect = None;
+        let mut hovered_line = None;
         let mut row_click: Option<RowClick> = None;
         let first_line = row_range.start;
         for (line_offset, line) in snapshot.lines[row_range].iter().enumerate() {
@@ -239,6 +243,9 @@ pub fn draw(
 
             if response.hovered() {
                 painter.rect_filled(rect, 0.0, theme::HOVER);
+                if drag_active {
+                    hovered_line = Some(line_index);
+                }
             }
             if snapshot.cursor.line == line_index {
                 painter.rect_filled(rect, 0.0, theme::accent_selection_fill());
@@ -319,10 +326,31 @@ pub fn draw(
                 ));
             }
         }
-        (cursor_rect, row_click)
+        (cursor_rect, hovered_line, row_click)
     });
 
-    let (cursor_rect, click) = output.inner;
+    let (cursor_rect, hovered_line, click) = output.inner;
+    let drop_target_line =
+        hovered_line.and_then(|hovered| resolve_drop_target_line(&snapshot.lines, hovered));
+    if let Some(target) = drop_target_line {
+        let (top, bottom) = row_bounds(target, row_height, row_pitch);
+        let screen_top = output.inner_rect.top() - output.state.offset.y + top;
+        let screen_bottom = output.inner_rect.top() - output.state.offset.y + bottom;
+        let highlight_rect = egui::Rect::from_min_max(
+            egui::pos2(output.inner_rect.left(), screen_top),
+            egui::pos2(output.inner_rect.right(), screen_bottom),
+        );
+        if highlight_rect.bottom() > output.inner_rect.top()
+            && highlight_rect.top() < output.inner_rect.bottom()
+        {
+            ui.painter().with_clip_rect(output.inner_rect).rect_stroke(
+                highlight_rect,
+                0.0,
+                egui::Stroke::new(2.0, theme::ACCENT),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
     // 行がクリックされなかった場合のみ、ツリー可視領域内の空白clickを判定する
     // (行は常にツリー全幅を覆うため、行外clickは「行より下の余白」のみになる。
     // スクロールバーは可視領域の外側にあるため誤認しない)。
@@ -343,6 +371,7 @@ pub fn draw(
             height: output.inner_rect.height(),
             cursor_line: snapshot.cursor.line,
         },
+        drop_target_line,
         click,
         blank_clicked,
     }
@@ -667,6 +696,24 @@ fn row_bounds(line: usize, row_height: f32, row_pitch: f32) -> (f32, f32) {
     (top, top + row_height)
 }
 
+/// pointer直下の行から、inbound dropの取り込み先候補行を解決する。
+/// ディレクトリ行はその行、file/symlink行は最も近い祖先ディレクトリ行を返す
+/// (祖先が無いルート直下ファイルは`None`。呼び出し側でrootとして扱う)。
+fn resolve_drop_target_line(
+    lines: &[fyler_core::editor::EditorLine],
+    hovered: usize,
+) -> Option<usize> {
+    let hovered_line = lines.get(hovered)?;
+    let hovered_concealed = conceal::conceal_line(&hovered_line.text);
+    let (_, is_dir) = fyler_core::grammar::split_dir_suffix(hovered_concealed.display);
+    if is_dir {
+        return Some(hovered);
+    }
+    (0..hovered).rev().find(|&candidate| {
+        conceal::conceal_line(&lines[candidate].text).depth < hovered_concealed.depth
+    })
+}
+
 fn follow_offset(
     cursor_top: f32,
     cursor_bottom: f32,
@@ -693,6 +740,31 @@ fn valid_byte_index(text: &str, requested: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lines_from(texts: &[&str]) -> Vec<fyler_core::editor::EditorLine> {
+        texts
+            .iter()
+            .map(|text| fyler_core::editor::EditorLine::new(*text))
+            .collect()
+    }
+
+    #[test]
+    fn resolve_drop_target_line_targets_hovered_directory_itself() {
+        let lines = lines_from(&["/001 dir/", "/002 \tfile.txt"]);
+        assert_eq!(resolve_drop_target_line(&lines, 0), Some(0));
+    }
+
+    #[test]
+    fn resolve_drop_target_line_targets_nearest_ancestor_directory_for_a_file() {
+        let lines = lines_from(&["/001 dir/", "/002 \tsub/", "/003 \t\tfile.txt"]);
+        assert_eq!(resolve_drop_target_line(&lines, 2), Some(1));
+    }
+
+    #[test]
+    fn resolve_drop_target_line_is_none_for_a_root_level_file() {
+        let lines = lines_from(&["/001 file.txt"]);
+        assert_eq!(resolve_drop_target_line(&lines, 0), None);
+    }
 
     #[test]
     fn git_badge_characters_match_decoration_contract() {

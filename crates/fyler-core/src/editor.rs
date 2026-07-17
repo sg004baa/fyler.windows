@@ -465,6 +465,22 @@ pub enum EditorEvent {
         kind: TransferKind,
         lines: Vec<usize>,
     },
+    /// ユーザーが指定行のエントリをclipboardへコピーするよう要求した(実FS非変更)。
+    /// `lines`は要求時点の0始まり行番号で、visual選択では範囲内の全行を含む
+    /// (`TransferRequested`と同形)。
+    ClipboardCopyRequested {
+        lines: Vec<usize>,
+    },
+    /// ユーザーが指定行のエントリをclipboardへ切り取るよう要求した(実FS非変更。
+    /// 実際の移動はpaste側が行う)。`lines`は`ClipboardCopyRequested`と同形。
+    ClipboardCutRequested {
+        lines: Vec<usize>,
+    },
+    /// ユーザーがclipboardの内容をカーソル行の位置へ貼り付けるよう要求した。
+    /// `line`は0始まり。destination解決(dir/file/empty root)はapp層が行う。
+    ClipboardPasteRequested {
+        line: usize,
+    },
     /// ユーザーが保存(`:w` 相当)を要求した。`lines` は保存要求時点のsnapshotに
     /// 属する行で、後続編集で更新されたsnapshotを誤ってplanしないため同梱する。
     /// [`crate::save::SaveEvent::CommitRequested`] へ接続する。

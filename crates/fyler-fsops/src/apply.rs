@@ -14,7 +14,9 @@ use anyhow::{Context, anyhow, bail};
 use fyler_core::path::TreePath;
 use fyler_core::plan::{FsOperation, OperationPlan};
 use fyler_core::report::{ApplyProgress, CommitReport, OpOutcome, OpResult};
-use fyler_core::transfer::{TransferKind, TransferOp, TransferPlan};
+use fyler_core::transfer::{
+    DropEffect, ImportOp, ImportPlan, TransferKind, TransferOp, TransferPlan,
+};
 use fyler_core::tree::EntryKind;
 
 use crate::classify::MoveClass;
@@ -608,6 +610,143 @@ fn is_case_only_absolute_rename(from: &Path, to: &Path) -> bool {
             .is_some_and(|(left, right)| {
                 left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
             })
+}
+
+/// 承認済みの[`ImportPlan`](clipboard・inbound drop取り込み)を実行する。
+///
+/// **呼び出し契約**: app層の取り込み確認ダイアログでplanと`overwrites`を提示し、
+/// ユーザーが承認した後に限ってapply workerから呼ぶこと。この関数をpreflightや
+/// プレビュー目的で呼んではならない。
+///
+/// 実装契約:
+/// - `plan.ops`を並べ替えず、`CommitReport.results`を同順・同数で返す
+/// - キャンセルは操作間だけで反映し、残りを[`OpOutcome::Skipped`]にする
+/// - `plan.effect`(plan全体で共通)に応じてCopy/Moveを実行する。Moveは
+///   [`crate::classify::classify_move`]で同一/クロスvolumeを分類する
+/// - source存在は実行直前に再検証する(Cutはpaste成功前にsourceを削除しない
+///   契約の裏付け。preflight時点からの外部変更もここで検出する)
+/// - 承認済み上書きも実行直前に再確認し、非ディレクトリだけをごみ箱へ退避する
+///   ([`execute_with_staged_overwrite`]を[`apply_transfer_plan_cancellable`]と
+///   共通利用する)
+/// - FS APIの直前には必ず[`crate::long_path::to_fs`]を通す
+pub fn apply_import_plan_cancellable(
+    plan: &ImportPlan,
+    overwrites: &HashSet<PathBuf>,
+    cancel: &AtomicBool,
+    on_progress: &mut dyn FnMut(ApplyProgress<ImportOp>),
+) -> CommitReport<ImportOp> {
+    let mut results = Vec::with_capacity(plan.ops.len());
+    let mut attempted = 0;
+    let total = plan.ops.len();
+
+    for (index, operation) in plan.ops.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            results.extend(plan.ops[index..].iter().cloned().map(|op| OpResult {
+                op,
+                outcome: OpOutcome::Skipped {
+                    reason: "Cancelled by user".to_owned(),
+                },
+            }));
+            break;
+        }
+
+        on_progress(ApplyProgress {
+            completed: index,
+            total,
+            current: Some(operation.clone()),
+        });
+        attempted += 1;
+
+        let outcome = match execute_import_operation(plan.effect, operation, overwrites) {
+            Ok(()) => OpOutcome::Success,
+            Err(failure) => OpOutcome::Failed {
+                error: failure.error,
+                progress: failure.progress,
+            },
+        };
+        results.push(OpResult {
+            op: operation.clone(),
+            outcome,
+        });
+    }
+
+    on_progress(ApplyProgress {
+        completed: attempted,
+        total,
+        current: None,
+    });
+
+    CommitReport { results }
+}
+
+fn execute_import_operation(
+    effect: DropEffect,
+    operation: &ImportOp,
+    overwrites: &HashSet<PathBuf>,
+) -> Result<(), OpFailure> {
+    let source = &operation.source;
+    let target = &operation.target;
+    let metadata = fs::symlink_metadata(crate::long_path::to_fs(source))
+        .with_context(|| format!("Import source no longer exists: {}", source.display()))
+        .map_err(OpFailure::from)?;
+    let kind = crate::scan::kind_from_metadata(&metadata);
+
+    let approved_overwrite = overwrites
+        .iter()
+        .any(|approved| transfer_paths_equal(approved, target));
+    let case_only_rename = effect == DropEffect::Move
+        && is_case_only_absolute_rename(source, target)
+        && !source
+            .parent()
+            .is_some_and(|parent| crate::case::dir_is_case_sensitive(parent).unwrap_or(false));
+
+    if case_only_rename {
+        return crate::case::case_only_rename(source, target).map_err(OpFailure::from);
+    }
+    execute_with_staged_overwrite(target, approved_overwrite, None, || {
+        ensure_target_vacant(target)?;
+        match effect {
+            DropEffect::Copy => {
+                fault_point("import_copy", target).map_err(OpFailure::from)?;
+                match kind {
+                    EntryKind::Dir => copy_tree(source, target).map(|_| ()),
+                    kind @ (EntryKind::File | EntryKind::Symlink) => {
+                        copy_single_entry(source, target, kind).map_err(|error| {
+                            OpFailure::with_progress(
+                                error,
+                                "Copy complete: 0/1 entries; an incomplete file may remain at the destination",
+                            )
+                        })
+                    }
+                }
+            }
+            DropEffect::Move => {
+                fault_point("import_move", target).map_err(OpFailure::from)?;
+                match crate::classify::classify_move(source, target, kind)
+                    .map_err(OpFailure::from)?
+                {
+                    MoveClass::SameVolumeRename => fs::rename(
+                        crate::long_path::to_fs(source),
+                        crate::long_path::to_fs(target),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Failed to move: {} → {}",
+                            source.display(),
+                            target.display()
+                        )
+                    })
+                    .map_err(OpFailure::from),
+                    MoveClass::CrossVolumeFileMove => {
+                        move_file_across_volumes(source, target, kind)
+                    }
+                    MoveClass::CrossVolumeDirectoryMove => {
+                        move_directory_across_volumes(source, target)
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn execute_operation(
@@ -2526,5 +2665,191 @@ mod tests {
         ));
         assert!(target.join("first.txt").exists());
         assert!(!target.join("second.txt").exists());
+    }
+
+    fn import_op(source: &Path, target: &Path) -> ImportOp {
+        ImportOp {
+            source: source.to_path_buf(),
+            target: target.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn import_applies_copy_and_move() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(source.join("copy.txt"), b"copy").unwrap();
+        fs::write(source.join("move.txt"), b"move").unwrap();
+        let copy_plan = ImportPlan {
+            destination: dest.clone(),
+            effect: DropEffect::Copy,
+            ops: vec![import_op(&source.join("copy.txt"), &dest.join("copy.txt"))],
+        };
+        let move_plan = ImportPlan {
+            destination: dest.clone(),
+            effect: DropEffect::Move,
+            ops: vec![import_op(&source.join("move.txt"), &dest.join("move.txt"))],
+        };
+        let cancel = AtomicBool::new(false);
+
+        let copy_report =
+            apply_import_plan_cancellable(&copy_plan, &HashSet::new(), &cancel, &mut |_| {});
+        let move_report =
+            apply_import_plan_cancellable(&move_plan, &HashSet::new(), &cancel, &mut |_| {});
+
+        assert!(copy_report.all_succeeded());
+        assert!(move_report.all_succeeded());
+        assert_eq!(fs::read(source.join("copy.txt")).unwrap(), b"copy");
+        assert_eq!(fs::read(dest.join("copy.txt")).unwrap(), b"copy");
+        assert!(!source.join("move.txt").exists());
+        assert_eq!(fs::read(dest.join("move.txt")).unwrap(), b"move");
+    }
+
+    #[test]
+    fn import_report_preserves_partial_failure_in_plan_order() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(source.join("present.txt"), b"present").unwrap();
+        let plan = ImportPlan {
+            destination: dest.clone(),
+            effect: DropEffect::Copy,
+            ops: vec![
+                import_op(&source.join("present.txt"), &dest.join("present.txt")),
+                import_op(&source.join("missing.txt"), &dest.join("missing.txt")),
+            ],
+        };
+        let cancel = AtomicBool::new(false);
+
+        let report = apply_import_plan_cancellable(&plan, &HashSet::new(), &cancel, &mut |_| {});
+
+        assert_eq!(report.results.len(), plan.ops.len());
+        assert!(matches!(report.results[0].outcome, OpOutcome::Success));
+        assert!(matches!(
+            report.results[1].outcome,
+            OpOutcome::Failed { .. }
+        ));
+        assert_eq!(fs::read(dest.join("present.txt")).unwrap(), b"present");
+        // Cutはsourceを削除しない: 実行直前の存在検証で失敗しても他のsourceは無傷。
+        assert_eq!(fs::read(source.join("present.txt")).unwrap(), b"present");
+    }
+
+    #[test]
+    fn import_only_recycles_preflight_approved_file_overwrite() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(source.join("new.txt"), b"new").unwrap();
+        fs::write(dest.join("occupied.txt"), b"old").unwrap();
+        let plan = ImportPlan {
+            destination: dest.clone(),
+            effect: DropEffect::Copy,
+            ops: vec![import_op(
+                &source.join("new.txt"),
+                &dest.join("occupied.txt"),
+            )],
+        };
+        let cancel = AtomicBool::new(false);
+        let approved = HashSet::from([absolute_path(&dest.join("occupied.txt"))]);
+
+        let report = apply_import_plan_cancellable(&plan, &approved, &cancel, &mut |_| {});
+
+        assert!(report.all_succeeded());
+        assert_eq!(fs::read(dest.join("occupied.txt")).unwrap(), b"new");
+        assert_eq!(fs::read(source.join("new.txt")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn import_move_without_approval_fails_and_leaves_source_intact() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(source.join("new.txt"), b"new").unwrap();
+        fs::write(dest.join("occupied.txt"), b"old").unwrap();
+        let plan = ImportPlan {
+            destination: dest.clone(),
+            effect: DropEffect::Move,
+            ops: vec![import_op(
+                &source.join("new.txt"),
+                &dest.join("occupied.txt"),
+            )],
+        };
+        let cancel = AtomicBool::new(false);
+
+        let report = apply_import_plan_cancellable(&plan, &HashSet::new(), &cancel, &mut |_| {});
+
+        assert!(matches!(
+            report.results[0].outcome,
+            OpOutcome::Failed { .. }
+        ));
+        assert_eq!(fs::read(source.join("new.txt")).unwrap(), b"new");
+        assert_eq!(fs::read(dest.join("occupied.txt")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn import_cancel_skips_remaining_operations() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(source.join("first.txt"), b"first").unwrap();
+        fs::write(source.join("second.txt"), b"second").unwrap();
+        let plan = ImportPlan {
+            destination: dest.clone(),
+            effect: DropEffect::Copy,
+            ops: vec![
+                import_op(&source.join("first.txt"), &dest.join("first.txt")),
+                import_op(&source.join("second.txt"), &dest.join("second.txt")),
+            ],
+        };
+        let cancel = AtomicBool::new(false);
+
+        let report =
+            apply_import_plan_cancellable(&plan, &HashSet::new(), &cancel, &mut |progress| {
+                if progress.current.is_some() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            });
+
+        assert!(matches!(report.results[0].outcome, OpOutcome::Success));
+        assert!(matches!(
+            report.results[1].outcome,
+            OpOutcome::Skipped { .. }
+        ));
+        assert!(dest.join("first.txt").exists());
+        assert!(!dest.join("second.txt").exists());
+    }
+
+    #[test]
+    fn import_source_removed_after_plan_built_fails_without_touching_destination() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        // sourceは存在しない(preflight後・apply直前に外部で消えた状況を模す)。
+        let plan = ImportPlan {
+            destination: dest.clone(),
+            effect: DropEffect::Move,
+            ops: vec![import_op(&source.join("gone.txt"), &dest.join("gone.txt"))],
+        };
+        let cancel = AtomicBool::new(false);
+
+        let report = apply_import_plan_cancellable(&plan, &HashSet::new(), &cancel, &mut |_| {});
+
+        assert!(matches!(
+            report.results[0].outcome,
+            OpOutcome::Failed { .. }
+        ));
+        assert!(!dest.join("gone.txt").exists());
     }
 }

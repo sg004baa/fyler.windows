@@ -22,7 +22,7 @@ use fyler_core::pane::{PaneId, PaneLayout, SplitDirection};
 use fyler_core::path::TreePath;
 use fyler_core::plan::OperationPlan;
 use fyler_core::report::{ApplyProgress, CommitReport};
-use fyler_core::transfer::{TransferOp, TransferPlan};
+use fyler_core::transfer::{DropEffect, ImportOp, ImportPlan, TransferOp, TransferPlan};
 use fyler_core::validate::ValidateError;
 
 use crate::confirm::{ConfirmChoice, ConfirmDetail};
@@ -98,6 +98,12 @@ pub enum GuiAction {
         body: String,
     },
     FeedbackClosed,
+    FilesDropped {
+        pane_id: PaneId,
+        line: Option<usize>,
+        paths: Vec<PathBuf>,
+        effect: DropEffect,
+    },
     /// ユーザーがpaneのツリー領域(行または空白部分)をクリックしてfocusを
     /// 要求した。pane_runtimeが`active`/`last_active`を更新する。
     RequestPaneFocus {
@@ -290,6 +296,18 @@ pub enum GuiEvent {
         any_failed: bool,
     },
     ShowTransferReport(CommitReport<TransferOp>),
+    /// clipboard・inbound drop取り込みplanと実行前に確認すべき上書き警告を表示する。
+    ShowImportPlan {
+        pane_id: PaneId,
+        plan: ImportPlan,
+        overwrites: Vec<PathBuf>,
+    },
+    /// import applyワーカーから届いた操作単位の進捗を表示へ反映する。
+    ImportProgress(ApplyProgress<ImportOp>),
+    ShowImportReport {
+        report: CommitReport<ImportOp>,
+        effect: DropEffect,
+    },
     ShowValidationErrors(Vec<ValidateError>),
     /// 起動時復旧ダイアログを表示する。行はapp層で整形済み。
     ShowUndoRecovery {
@@ -314,6 +332,10 @@ enum DialogState {
         target: PaneId,
         overwrites: Vec<PathBuf>,
     },
+    ImportPlan {
+        plan: ImportPlan,
+        overwrites: Vec<PathBuf>,
+    },
     Progress {
         completed: usize,
         total: usize,
@@ -333,6 +355,10 @@ enum DialogState {
         any_failed: bool,
     },
     TransferReport(CommitReport<TransferOp>),
+    ImportReport {
+        report: CommitReport<ImportOp>,
+        effect: DropEffect,
+    },
     ValidationErrors(Vec<ValidateError>),
     OpenWith {
         file_name: String,
@@ -602,6 +628,9 @@ impl FylerApp {
                     EditorEvent::ShowHelp => self.dialog = Some(DialogState::Help),
                     EditorEvent::PaneAction(_) => {}
                     EditorEvent::TransferRequested { .. } => {}
+                    EditorEvent::ClipboardCopyRequested { .. } => {}
+                    EditorEvent::ClipboardCutRequested { .. } => {}
+                    EditorEvent::ClipboardPasteRequested { .. } => {}
                     EditorEvent::CommitRequested { .. } => {}
                     EditorEvent::UndoRequested => {}
                     EditorEvent::CmdlineShow(state) if self.active == Some(pane_id) => {
@@ -785,6 +814,13 @@ impl FylerApp {
                         overwrites,
                     });
                 }
+                GuiEvent::ShowImportPlan {
+                    pane_id: _,
+                    plan,
+                    overwrites,
+                } => {
+                    self.dialog = Some(DialogState::ImportPlan { plan, overwrites });
+                }
                 GuiEvent::ShowApplyProgress { total } => {
                     self.dialog = Some(DialogState::Progress {
                         completed: 0,
@@ -859,6 +895,22 @@ impl FylerApp {
                             .map(|operation| confirm::transfer_operation_label(operation, None));
                     }
                 }
+                GuiEvent::ImportProgress(progress) => {
+                    if let Some(DialogState::Progress {
+                        completed,
+                        total,
+                        current,
+                        ..
+                    }) = &mut self.dialog
+                    {
+                        *completed = progress.completed;
+                        *total = progress.total;
+                        *current = progress
+                            .current
+                            .as_ref()
+                            .map(|operation| confirm::import_operation_label(operation, None));
+                    }
+                }
                 GuiEvent::ApplyCancelRequested => {
                     if let Some(DialogState::Progress {
                         cancel_requested, ..
@@ -875,6 +927,9 @@ impl FylerApp {
                 }
                 GuiEvent::ShowTransferReport(report) => {
                     self.dialog = Some(DialogState::TransferReport(report));
+                }
+                GuiEvent::ShowImportReport { report, effect } => {
+                    self.dialog = Some(DialogState::ImportReport { report, effect });
                 }
                 GuiEvent::ShowValidationErrors(errors) => {
                     self.dialog = Some(DialogState::ValidationErrors(errors));
@@ -1005,11 +1060,12 @@ impl eframe::App for FylerApp {
         let active = self.active;
         let fatal_error = self.fatal_error.clone();
 
-        let (ime, navigation_clicked, tree_click) = egui::CentralPanel::default()
+        let dragging_files = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
+        let (ime, navigation_clicked, tree_click, drop_target_line) = egui::CentralPanel::default()
             .show(ui, |ui| {
                 if let Some(error) = fatal_error {
                     ui.colored_label(ui.visuals().error_fg_color, error);
-                    (None, None, None)
+                    (None, None, None, None)
                 } else if let (Some(layout), Some(active)) = (layout.as_ref(), active) {
                     draw_layout(
                         ui,
@@ -1023,9 +1079,10 @@ impl eframe::App for FylerApp {
                         self.navigation_dock.selected,
                         &self.statusline_left,
                         &self.statusline_right,
+                        dragging_files,
                     )
                 } else {
-                    (None, None, None)
+                    (None, None, None, None)
                 }
             })
             .inner;
@@ -1138,6 +1195,35 @@ impl eframe::App for FylerApp {
                 });
             });
         }
+        let dropped_paths: Vec<PathBuf> = ui.ctx().input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect()
+        });
+        if !dropped_paths.is_empty()
+            && let Some(active) = self.active
+        {
+            let effect = if ui.ctx().input(|input| input.modifiers.shift) {
+                DropEffect::Move
+            } else {
+                DropEffect::Copy
+            };
+            if self
+                .action_tx
+                .send(GuiAction::FilesDropped {
+                    pane_id: active,
+                    line: drop_target_line,
+                    paths: dropped_paths,
+                    effect,
+                })
+                .is_err()
+            {
+                self.fatal_error = Some("Failed to send dropped files to app".to_owned());
+            }
+        }
 
         let mut confirm_choice = None;
         let mut cancel_apply = false;
@@ -1165,6 +1251,11 @@ impl eframe::App for FylerApp {
             }) => {
                 confirm_choice = confirm::draw_transfer_plan(ui, plan, *target, overwrites);
             }
+            Some(DialogState::ImportPlan {
+                plan, overwrites, ..
+            }) => {
+                confirm_choice = confirm::draw_import_plan(ui, plan, overwrites);
+            }
             Some(DialogState::UndoPlan { lines }) => {
                 confirm_choice = confirm::draw_undo_plan(ui, lines);
             }
@@ -1176,6 +1267,9 @@ impl eframe::App for FylerApp {
             }
             Some(DialogState::TransferReport(report)) => {
                 dismiss_report = confirm::draw_transfer_report(ui, report);
+            }
+            Some(DialogState::ImportReport { report, effect }) => {
+                dismiss_report = confirm::draw_import_report(ui, report, *effect);
             }
             Some(DialogState::UndoRecovery { descriptions }) => {
                 confirm_choice = confirm::draw_undo_recovery(ui, descriptions);
@@ -1506,7 +1600,13 @@ fn draw_layout(
     navigation_selected: usize,
     statusline_left: &[StatusItem],
     statusline_right: &[StatusItem],
-) -> (Option<ImeGeometry>, Option<usize>, Option<TreeClickEvent>) {
+    drag_active: bool,
+) -> (
+    Option<ImeGeometry>,
+    Option<usize>,
+    Option<TreeClickEvent>,
+    Option<usize>,
+) {
     let rect = ui.available_rect_before_wrap();
     ui.allocate_rect(rect, egui::Sense::hover());
     let (content_rect, navigation_clicked) = if navigation_open {
@@ -1531,6 +1631,7 @@ fn draw_layout(
     } else {
         (rect, None)
     };
+    let mut drop_target_line = None;
     let (ime, tree_click) = draw_layout_in_rect(
         ui,
         content_rect,
@@ -1540,8 +1641,10 @@ fn draw_layout(
         snapshots,
         statusline_left,
         statusline_right,
+        drag_active,
+        &mut drop_target_line,
     );
-    (ime, navigation_clicked, tree_click)
+    (ime, navigation_clicked, tree_click, drop_target_line)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1554,6 +1657,8 @@ fn draw_layout_in_rect(
     snapshots: &BTreeMap<PaneId, Arc<fyler_core::editor::EditorSnapshot>>,
     statusline_left: &[StatusItem],
     statusline_right: &[StatusItem],
+    drag_active: bool,
+    drop_target_line: &mut Option<usize>,
 ) -> (Option<ImeGeometry>, Option<TreeClickEvent>) {
     match layout {
         PaneLayout::Leaf(id) => {
@@ -1598,6 +1703,7 @@ fn draw_layout_in_rect(
                             pane.tree_viewport,
                             *id,
                             *id == active,
+                            *id == active && drag_active,
                         ))
                     }
                 })
@@ -1624,6 +1730,9 @@ fn draw_layout_in_rect(
                 return (None, None);
             };
             pane.tree_viewport = Some(output.viewport);
+            if *id == active {
+                *drop_target_line = output.drop_target_line;
+            }
             let click = if let Some(row) = output.click {
                 Some(TreeClickEvent {
                     pane_id: *id,
@@ -1682,6 +1791,8 @@ fn draw_layout_in_rect(
                 snapshots,
                 statusline_left,
                 statusline_right,
+                drag_active,
+                drop_target_line,
             );
             let (second_ime, second_click) = draw_layout_in_rect(
                 ui,
@@ -1692,6 +1803,8 @@ fn draw_layout_in_rect(
                 snapshots,
                 statusline_left,
                 statusline_right,
+                drag_active,
+                drop_target_line,
             );
             (first_ime.or(second_ime), first_click.or(second_click))
         }

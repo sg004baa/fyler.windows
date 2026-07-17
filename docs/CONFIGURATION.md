@@ -202,8 +202,18 @@ leader = "Space"
 "g ." = "none"             # Remove an existing binding
 ```
 
-`activate`, `transfer_move`, and `transfer_copy` are mapped in both Normal and Visual modes. All
-other actions are mapped in Normal mode.
+`activate`, `transfer_move`, `transfer_copy`, `clipboard_copy`, `clipboard_cut`, and
+`clipboard_paste` are mapped in both Normal and Visual modes. All other actions are mapped in
+Normal mode.
+
+`clipboard_paste` is bound to `Ctrl+V` by default, which shadows Neovim's built-in Visual Block
+mode (`Ctrl+V` in Normal mode). If you rely on Visual Block selection, rebind or remove
+`clipboard_paste`:
+
+```toml
+[keymap.normal]
+"Ctrl+V" = "none"          # Restore native Visual Block mode
+```
 
 ### Key notation
 
@@ -259,6 +269,9 @@ Rules and limitations:
 | `open_with` | Choose an application and open the entry | `g o` |
 | `transfer_move` | Move entries to another pane | `g m` |
 | `transfer_copy` | Copy entries to another pane | `g c` |
+| `clipboard_copy` | Copy selected entries to the Windows clipboard | `Ctrl+C` |
+| `clipboard_cut` | Cut selected entries to the Windows clipboard | `Ctrl+X` |
+| `clipboard_paste` | Paste files from the Windows clipboard | `Ctrl+V` |
 | `toggle_dock_focus` | Focus the navigation dock or return to the editor | `Leader e` |
 | `help` | Show help | `?` |
 | `pane_split_horizontal` | Split the pane horizontally | `Ctrl+W s`, `Ctrl+W S` |

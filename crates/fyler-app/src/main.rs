@@ -8,6 +8,7 @@
 
 mod config;
 mod feedback;
+mod import_flow;
 mod nvim_locate;
 mod pane_runtime;
 mod picker;
@@ -36,7 +37,7 @@ use fyler_core::options::{SortKey, TerminalKind};
 use fyler_core::pane::PaneId;
 use fyler_core::path::TreePath;
 use fyler_core::report::{ApplyProgress, CommitReport};
-use fyler_core::transfer::TransferOp;
+use fyler_core::transfer::{DropEffect, ImportOp, TransferOp};
 use fyler_core::tree::EntryKind;
 use fyler_core::undo::{UndoStep, UndoTransaction};
 use fyler_fsops::openwith::OpenWithHandler;
@@ -92,6 +93,14 @@ enum AppEvent {
     UndoFinished(PaneId, CommitReport<UndoStep>),
     TransferProgress(ApplyProgress<TransferOp>),
     TransferFinished(CommitReport<TransferOp>),
+    ImportProgress(ApplyProgress<ImportOp>),
+    ImportFinished(CommitReport<ImportOp>),
+    FilesDropped {
+        pane_id: PaneId,
+        line: Option<usize>,
+        paths: Vec<PathBuf>,
+        effect: DropEffect,
+    },
     Shutdown {
         save_session: bool,
         window: Option<fyler_core::WindowGeometry>,
@@ -688,6 +697,85 @@ fn handle_yank_path(
     };
     let path = path.to_fs_path(root);
     gui_event_tx.send(GuiEvent::CopyPath(path.to_string_lossy().into_owned()))
+}
+
+/// Copy/Cut(`Ctrl+C`/`Ctrl+X`)を実行する。実在entry(IDなし行を除く)を絶対パスへ
+/// 解決し、Windows Shell clipboardへ書き込む。実FSは一切変更しない。
+fn handle_clipboard_copy_or_cut(
+    pane_id: PaneId,
+    save_controller: &SaveController,
+    engine: &dyn EditorEngine,
+    root: &Path,
+    effect: fyler_core::transfer::DropEffect,
+    selected_lines: &[usize],
+    gui_event_tx: &CountingSender<GuiEvent>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    let snapshot = engine.snapshot();
+    let selected = match crate::transfer_flow::resolve_selection(
+        save_controller,
+        &snapshot.lines,
+        selected_lines,
+    ) {
+        Ok(selected) => selected,
+        Err(crate::transfer_flow::SelectionError::UnsavedLine) => {
+            return send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Info,
+                "Cannot copy because the selection contains an unsaved new line. Save first.",
+            );
+        }
+        Err(crate::transfer_flow::SelectionError::Empty) => {
+            return send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Info,
+                "No item is selected",
+            );
+        }
+        Err(crate::transfer_flow::SelectionError::MissingLine) => {
+            return send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Error,
+                "Line to copy was not found",
+            );
+        }
+        Err(crate::transfer_flow::SelectionError::UnknownId) => {
+            return send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Error,
+                "Failed to resolve the selection in the current file list",
+            );
+        }
+    };
+    let paths: Vec<PathBuf> = crate::transfer_flow::dedupe_ancestors(&selected)
+        .into_iter()
+        .map(|(path, _)| path.to_fs_path(root))
+        .collect();
+    let count = paths.len();
+    match fyler_fsops::clipboard::write(&paths, effect) {
+        Ok(()) => {
+            let verb = match effect {
+                fyler_core::transfer::DropEffect::Copy => "Copied",
+                fyler_core::transfer::DropEffect::Move => "Cut",
+            };
+            let noun = if count == 1 { "item" } else { "items" };
+            send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Info,
+                format!("{verb} {count} {noun} to clipboard"),
+            )
+        }
+        Err(error) => send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            format!("Failed to write to the clipboard: {error:#}"),
+        ),
+    }
 }
 
 fn open_file_picker_rejection(

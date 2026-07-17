@@ -9,7 +9,9 @@ use fyler_core::pane::PaneId;
 use fyler_core::path::TreePath;
 use fyler_core::plan::{FsOperation, OperationPlan};
 use fyler_core::report::{CommitReport, OpOutcome, OpResult};
-use fyler_core::transfer::{TransferKind, TransferOp, TransferPlan};
+use fyler_core::transfer::{
+    DropEffect, ImportOp, ImportPlan, TransferKind, TransferOp, TransferPlan,
+};
 use fyler_core::validate::ValidateError;
 
 use crate::theme;
@@ -281,6 +283,53 @@ pub fn draw_transfer_plan(
         .inner
 }
 
+/// clipboard・inbound drop取り込みを既存の確認モーダルパターンで表示する。
+pub fn draw_import_plan(
+    ui: &mut egui::Ui,
+    plan: &ImportPlan,
+    overwrites: &[PathBuf],
+) -> Option<ConfirmChoice> {
+    let key_choice = ui.ctx().input(|input| {
+        plan_choice_from_keys(
+            input.key_pressed(egui::Key::Y),
+            input.key_pressed(egui::Key::Enter),
+            input.key_pressed(egui::Key::N),
+            input.key_pressed(egui::Key::Escape),
+        )
+    });
+    egui::Modal::new(egui::Id::new("import-plan-confirmation"))
+        .show(ui.ctx(), |ui| {
+            ui.heading("Confirm import");
+            ui.add_space(8.0);
+            for operation in &plan.ops {
+                ui.monospace(import_operation_label(operation, Some(plan.effect)));
+            }
+            if !overwrites.is_empty() {
+                ui.add_space(8.0);
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "These existing files will be moved to the recycle bin before overwrite:",
+                );
+                for path in overwrites {
+                    ui.colored_label(ui.visuals().warn_fg_color, path.display().to_string());
+                }
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let approve_label = if overwrites.is_empty() {
+                    "Approve (y)"
+                } else {
+                    "Overwrite and apply (y)"
+                };
+                let approve_clicked = ui.button(approve_label).clicked();
+                let cancel_clicked = ui.button("Cancel (n / Esc)").clicked();
+                confirm_choice_from_buttons(approve_clicked, cancel_clicked, key_choice)
+            })
+            .inner
+        })
+        .inner
+}
+
 /// undo確認ダイアログを表示する。行はapp層で整形済み。
 pub fn draw_undo_plan(ui: &mut egui::Ui, lines: &[String]) -> Option<ConfirmChoice> {
     let key_choice = ui.ctx().input(|input| {
@@ -522,6 +571,39 @@ pub fn draw_transfer_report(ui: &mut egui::Ui, report: &CommitReport<TransferOp>
             for result in &report.results {
                 let label =
                     outcome_label(transfer_operation_label(&result.op, None), &result.outcome);
+                match result.outcome {
+                    OpOutcome::Failed { .. } => {
+                        ui.colored_label(ui.visuals().error_fg_color, label);
+                    }
+                    OpOutcome::Success | OpOutcome::Skipped { .. } => {
+                        ui.monospace(label);
+                    }
+                }
+            }
+            ui.add_space(12.0);
+            ui.button("Close (Enter / Esc)").clicked() || dismiss_from_keyboard
+        })
+        .inner
+}
+
+/// clipboard・inbound drop取り込みのCommitReportを既存reportモーダルで表示する。
+pub fn draw_import_report(
+    ui: &mut egui::Ui,
+    report: &CommitReport<ImportOp>,
+    effect: DropEffect,
+) -> bool {
+    let dismiss_from_keyboard = ui
+        .ctx()
+        .input(|input| input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape));
+    egui::Modal::new(egui::Id::new("import-commit-report"))
+        .show(ui.ctx(), |ui| {
+            ui.heading("Import result");
+            ui.add_space(8.0);
+            for result in &report.results {
+                let label = outcome_label(
+                    import_operation_label(&result.op, Some(effect)),
+                    &result.outcome,
+                );
                 match result.outcome {
                     OpOutcome::Failed { .. } => {
                         ui.colored_label(ui.visuals().error_fg_color, label);
@@ -851,6 +933,21 @@ pub(crate) fn transfer_operation_label(operation: &TransferOp, target: Option<Pa
         .map(|pane| format!("[pane {pane}] "))
         .unwrap_or_default();
     format!("{kind} {} → {pane}{}", operation.from, operation.to)
+}
+
+/// import(clipboard・inbound drop)操作を確認・進捗・結果ダイアログで共通利用する
+/// 表示ラベルへ変換する。effectが不明な進捗表示中は`IMPORT`を使う。
+pub(crate) fn import_operation_label(operation: &ImportOp, effect: Option<DropEffect>) -> String {
+    let kind = match effect {
+        Some(DropEffect::Copy) => "COPY",
+        Some(DropEffect::Move) => "MOVE",
+        None => "IMPORT",
+    };
+    format!(
+        "{kind} {} → {}",
+        operation.source.display(),
+        operation.target.display()
+    )
 }
 
 /// 操作を確認・進捗・結果ダイアログで共通利用する表示ラベルへ変換する。

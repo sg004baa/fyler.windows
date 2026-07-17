@@ -538,6 +538,47 @@ impl NvimEngine {
                                     ),
                                 }
                             }
+                            "fyler_clipboard" => {
+                                let kind = notification.args.first().and_then(Value::as_str);
+                                let first = notification.args.get(1)
+                                    .and_then(value_as_u64)
+                                    .and_then(|line| usize::try_from(line).ok());
+                                let last = notification.args.get(2)
+                                    .and_then(value_as_u64)
+                                    .and_then(|line| usize::try_from(line).ok());
+                                match (kind, first, last) {
+                                    (Some("copy"), Some(first), Some(last)) if first <= last => {
+                                        let _ = event_tx.send(EditorEvent::ClipboardCopyRequested {
+                                            lines: (first..=last).collect(),
+                                        });
+                                    }
+                                    (Some("cut"), Some(first), Some(last)) if first <= last => {
+                                        let _ = event_tx.send(EditorEvent::ClipboardCutRequested {
+                                            lines: (first..=last).collect(),
+                                        });
+                                    }
+                                    _ => send_message(
+                                        &event_tx,
+                                        MessageKind::Error,
+                                        "Failed to get the line range for clipboard".to_owned(),
+                                    ),
+                                }
+                            }
+                            "fyler_clipboard_paste" => {
+                                let line = notification.args.first()
+                                    .and_then(value_as_u64)
+                                    .and_then(|line| usize::try_from(line).ok());
+                                match line {
+                                    Some(line) => {
+                                        let _ = event_tx.send(EditorEvent::ClipboardPasteRequested { line });
+                                    }
+                                    None => send_message(
+                                        &event_tx,
+                                        MessageKind::Error,
+                                        "Failed to get the cursor line for paste".to_owned(),
+                                    ),
+                                }
+                            }
                             "fyler_cd" => {
                                 let query = notification
                                     .args
