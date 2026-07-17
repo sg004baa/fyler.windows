@@ -1139,6 +1139,96 @@ async fn terminal_alias_fires_open_terminal_event() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a compatible nvim executable"]
+async fn admin_alias_fires_open_as_admin_event() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+
+    engine.set_initial_lines(vec![EditorLine::new("/001 alpha")])?;
+    wait_for(&engine, |line| line == "/001 alpha").await?;
+    engine.send(key_command(Key::Char(':')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::CmdlineShow(_))
+    })
+    .await
+    .context(": did not open the command line")?;
+    engine.send(EditorCommand::Text("admin".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::OpenAsAdmin { line: 0 })
+    })
+    .await
+    .context(":admin did not emit OpenAsAdmin")?;
+    wait_for(&engine, |line| line == "/001 alpha").await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn shortcut_alias_fires_create_shortcut_event() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+
+    engine.set_initial_lines(vec![EditorLine::new("/001 alpha")])?;
+    wait_for(&engine, |line| line == "/001 alpha").await?;
+    engine.send(key_command(Key::Char(':')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::CmdlineShow(_))
+    })
+    .await
+    .context(": did not open the command line")?;
+    engine.send(EditorCommand::Text("shortcut".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::CreateShortcut { line: 0 })
+    })
+    .await
+    .context(":shortcut did not emit CreateShortcut")?;
+    wait_for(&engine, |line| line == "/001 alpha").await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn extract_alias_fires_extract_archive_event() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+
+    engine.set_initial_lines(vec![EditorLine::new("/001 alpha.zip")])?;
+    wait_for(&engine, |line| line == "/001 alpha.zip").await?;
+    engine.send(key_command(Key::Char(':')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::CmdlineShow(_))
+    })
+    .await
+    .context(": did not open the command line")?;
+    engine.send(EditorCommand::Text("extract".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::ExtractArchive { line: 0 })
+    })
+    .await
+    .context(":extract did not emit ExtractArchive")?;
+    wait_for(&engine, |line| line == "/001 alpha.zip").await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
 async fn feedback_alias_fires_feedback_requested_event() -> anyhow::Result<()> {
     let _serial = NVIM_TEST_SERIAL.lock().await;
     let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
