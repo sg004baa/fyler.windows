@@ -140,6 +140,28 @@ selected directory as its working directory. Supported values are `"auto"` (the 
 `"windows_terminal"`, `"powershell"`, and `"cmd"`. On Windows, `"auto"` tries Windows Terminal,
 PowerShell, and cmd in that order. Non-Windows builds use `x-terminal-emulator` for development.
 
+### Context menu
+
+Right-clicking a tree row opens a context menu; each item is also available as a command so it
+can be bound to a key or typed directly. Disabled items show why in a tooltip (offline pane,
+stopped engine, wrong entry kind, and so on).
+
+| Command | Menu item | Description |
+|---|---|---|
+| `<CR>` / double-click | Open / Enter directory | Open the entry with the OS default application, or expand/collapse a directory |
+| | Open with... | Choose a Shell-registered application to open the entry with |
+| `:admin` | Open as administrator | Open a file with an elevated (UAC) process. Files only; the OS handles the UAC prompt, so there is no confirmation dialog |
+| `Ctrl+C` | Copy | Copy the selected entries to the Windows clipboard |
+| `Ctrl+X` | Cut | Cut the selected entries to the Windows clipboard |
+| `Ctrl+V` | Paste | Paste the clipboard contents at the cursor, with a confirmation dialog before any file is touched |
+| | Rename | Start editing the entry's name in the buffer (no filesystem change until `:w`) |
+| | Mark for deletion | Remove the buffer line (no filesystem change until `:w`) |
+| `:extract` | Extract here | Extract a `.zip` archive into a sibling directory named after the archive, after a confirmation dialog showing the entry count and approximate size. `.zip` files only |
+| `:shortcut` | Create shortcut | Create a `.lnk` shortcut next to the entry, after a confirmation dialog. Filesystem writes happen only after approval |
+| | Copy path | Copy the entry's absolute path to the OS clipboard |
+| `:terminal` | Open terminal here | Open an external terminal (see below) |
+| `:reload` | Refresh | Re-scan the pane's root from disk |
+
 ### Confirmation dialogs
 
 `confirm_detail` controls how save and transfer operations appear before they are applied:
