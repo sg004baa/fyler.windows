@@ -11,7 +11,5 @@ fyler-core.workspace = true
 anyhow.workspace = true
 eframe.workspace = true
 
-# build.rsでassets/fyler.icoを生RGBAへデコードしウィンドウ/タスクバーアイコンに埋め込むためだけに使う。
-# ランタイム依存はeframeのみに保つ方針なので、あえてbuild-dependenciesに隔離する。
 [build-dependencies]
 ico = "0.4"

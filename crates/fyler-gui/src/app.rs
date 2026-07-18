@@ -2663,11 +2663,6 @@ fn initial_window_geometry(monitor_size: Option<egui::Vec2>) -> Option<(egui::Ve
     Some((size, egui::pos2(margin.x, margin.y)))
 }
 
-/// ウィンドウ/タスクバー/Alt+Tabのアイコン。
-///
-/// build.rsが`assets/fyler.ico`の最大解像度エントリを生RGBAへデコードして埋め込む。
-/// exe自体のファイルアイコン(fyler-app/build.rsのwinresource)とは別系統で、winitの
-/// 暗黙フォールバックに頼らず明示指定することで全表示箇所を確実に揃える。
 fn window_icon() -> egui::IconData {
     let rgba = include_bytes!(concat!(env!("OUT_DIR"), "/window_icon.rgba")).to_vec();
     egui::IconData {

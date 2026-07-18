@@ -1,15 +1,11 @@
 use std::path::PathBuf;
 
-// assets/fyler.icoの最大解像度エントリを生RGBAへデコードし、ウィンドウ/タスクバー
-// アイコン(eframeのViewportBuilder::with_icon)へ埋め込む。exe自体のアイコンは
-// fyler-app/build.rsがwinresourceで別途埋め込む(そちらはファイルアイコン用)。
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let icon_path = manifest_dir.join("../../assets/fyler.ico");
 
     let file = std::fs::File::open(&icon_path).expect("Failed to open fyler.ico");
     let icon_dir = ico::IconDir::read(file).expect("Failed to parse fyler.ico");
-    // winitが各表示サイズへ縮小するため、最大解像度を1枚だけ渡す。
     let entry = icon_dir
         .entries()
         .iter()
