@@ -308,6 +308,7 @@ Rules and limitations:
 | `history_back` | Go back in navigation history | `Ctrl+P` |
 | `history_forward` | Go forward in navigation history | `Ctrl+N` |
 | `refresh` | Reload the current root from disk | `Ctrl+R` |
+| `dir_size` | Compute the size of the directory under the cursor | `g s` |
 
 `none` is not an action. It is a special value that removes the binding for the specified key
 sequence.
