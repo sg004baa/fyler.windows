@@ -23,8 +23,8 @@ mod undo_journal;
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::thread;
 
@@ -42,6 +42,7 @@ use fyler_core::report::{ApplyProgress, CommitReport};
 use fyler_core::transfer::{DragOutcome, DropEffect, ImportOp, TransferOp};
 use fyler_core::tree::EntryKind;
 use fyler_core::undo::{UndoStep, UndoTransaction};
+use fyler_fsops::dirsize::DirSizeOutcome;
 use fyler_fsops::extract::ExtractOp;
 use fyler_fsops::openwith::OpenWithHandler;
 use fyler_fsops::watch::ExternalChange;
@@ -82,6 +83,16 @@ enum AppEvent {
         root: PathBuf,
         branch: Option<String>,
         statuses: HashMap<PathBuf, GitBadge>,
+    },
+    /// カーソル行dirサイズ計算(issue #38フォローアップ、案B)の完了。
+    /// `cancel`は要求時に生成したtoken。pane側の現在のtokenとポインタ一致する
+    /// 場合のみ反映する(再実行やroot変更でsupersedeされた完了は無視する)。
+    DirSizeComputed {
+        pane_id: PaneId,
+        id: EntryId,
+        path: TreePath,
+        cancel: Arc<AtomicBool>,
+        result: anyhow::Result<Option<DirSizeOutcome>>,
     },
     LoaderProgress(PaneId, usize),
     LoaderFinished {
@@ -281,6 +292,7 @@ fn handle_external_change(
     gui_event_tx: &CountingSender<GuiEvent>,
     git: &mut GitRefresher,
     root: &Path,
+    computed_dir_sizes: &mut HashMap<EntryId, u64>,
 ) -> Result<ExternalChangeOutcome, mpsc::SendError<GuiEvent>> {
     let result = save_controller.on_external_change(changed_paths);
     let invalidated_dialog = matches!(
@@ -294,7 +306,10 @@ fn handle_external_change(
     if !matches!(&result, SaveFlowResult::NoChanges) {
         send_save_result(gui_event_tx, pane_id, result)?;
     }
-    send_view_state(gui_event_tx, pane_id, save_controller)?;
+    // 外部変更はbaselineを再同期するため、カーソル行dirサイズのoverlayを破棄する
+    // (issue #38フォローアップ、案B)。
+    computed_dir_sizes.clear();
+    send_view_state(gui_event_tx, pane_id, save_controller, computed_dir_sizes)?;
     git.request(pane_id, root.to_path_buf());
     Ok(ExternalChangeOutcome {
         invalidated_dialog,
@@ -308,6 +323,7 @@ fn after_root_change(
     save_controller: &mut SaveController,
     git: &mut GitRefresher,
     root: &Path,
+    computed_dir_sizes: &HashMap<EntryId, u64>,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     gui_event_tx.send(GuiEvent::RootChanged {
         pane_id,
@@ -318,7 +334,7 @@ fn after_root_change(
         branch: None,
         badges: HashMap::new(),
     })?;
-    send_view_state(gui_event_tx, pane_id, save_controller)?;
+    send_view_state(gui_event_tx, pane_id, save_controller, computed_dir_sizes)?;
     git.request(pane_id, root.to_path_buf());
     Ok(())
 }
@@ -393,6 +409,22 @@ fn sort_key_name(key: SortKey) -> &'static str {
         SortKey::Date => "date",
         SortKey::Size => "size",
         SortKey::Extension => "ext",
+    }
+}
+
+/// カーソル行dirサイズ計算(issue #38フォローアップ、案B)の完了メッセージを整形する。
+/// 列挙できなかったサブディレクトリがある場合は`total`を下限として`≥`を付け、
+/// 件数も添えてsilent fallbackにしない。
+fn dir_size_message(name: &str, outcome: &DirSizeOutcome) -> String {
+    let size = fyler_core::fileinfo::human_readable_size(outcome.total);
+    let files = outcome.files;
+    if outcome.unreadable_dirs > 0 {
+        format!(
+            "{name}: ≥ {size} ({files} files, {} subdirectories unreadable)",
+            outcome.unreadable_dirs
+        )
+    } else {
+        format!("{name}: {size} ({files} files)")
     }
 }
 
@@ -472,6 +504,7 @@ fn handle_activate_line(
     root: &Path,
     line: usize,
     gui_event_tx: &CountingSender<GuiEvent>,
+    computed_dir_sizes: &HashMap<EntryId, u64>,
 ) -> Result<ActivateOutcome, mpsc::SendError<GuiEvent>> {
     let snapshot = engine.snapshot();
     let Some(editor_line) = snapshot.lines.get(line) else {
@@ -554,7 +587,7 @@ fn handle_activate_line(
                             format!("Failed to update folded view: {error:#}"),
                         )?;
                     }
-                    send_view_state(gui_event_tx, pane_id, save_controller)?;
+                    send_view_state(gui_event_tx, pane_id, save_controller, computed_dir_sizes)?;
                     return Ok(ActivateOutcome::Toggled);
                 }
                 ToggleCollapseResult::NotADirectory => {
@@ -1196,6 +1229,7 @@ fn handle_picker_select_with(
     engine: &dyn EditorEngine,
     root: &Path,
     gui_event_tx: &CountingSender<GuiEvent>,
+    computed_dir_sizes: &HashMap<EntryId, u64>,
     open_path: &mut dyn FnMut(&Path) -> anyhow::Result<()>,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     if action == PickerAction::Open {
@@ -1274,7 +1308,7 @@ fn handle_picker_select_with(
                     format!("Failed to reveal search candidate: {error:#}"),
                 )?;
             }
-            send_view_state(gui_event_tx, pane_id, save_controller)?;
+            send_view_state(gui_event_tx, pane_id, save_controller, computed_dir_sizes)?;
         }
         RevealResult::NotFound => {
             send_gui_message(
@@ -1306,6 +1340,7 @@ fn next_picker_reveal_directory(
         .find(|path| baseline.is_unloaded(path))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_picker_select(
     pane_id: PaneId,
     path: TreePath,
@@ -1314,6 +1349,7 @@ fn handle_picker_select(
     engine: &dyn EditorEngine,
     root: &Path,
     gui_event_tx: &CountingSender<GuiEvent>,
+    computed_dir_sizes: &HashMap<EntryId, u64>,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
     handle_picker_select_with(
         pane_id,
@@ -1323,6 +1359,7 @@ fn handle_picker_select(
         engine,
         root,
         gui_event_tx,
+        computed_dir_sizes,
         &mut fyler_fsops::open::open_with_default_app,
     )
 }
@@ -1350,11 +1387,15 @@ fn send_view_state(
     gui_event_tx: &CountingSender<GuiEvent>,
     pane_id: PaneId,
     save_controller: &mut SaveController,
+    computed_dir_sizes: &HashMap<EntryId, u64>,
 ) -> Result<(), mpsc::SendError<GuiEvent>> {
-    gui_event_tx.send(GuiEvent::FileInfos {
-        pane_id,
-        infos: save_controller.visible_file_infos(),
-    })?;
+    let mut infos = save_controller.visible_file_infos();
+    for (id, size) in computed_dir_sizes {
+        if let Some(info) = infos.get_mut(id) {
+            info.size = Some(*size);
+        }
+    }
+    gui_event_tx.send(GuiEvent::FileInfos { pane_id, infos })?;
     gui_event_tx.send(GuiEvent::CollapsedDirs {
         pane_id,
         dirs: save_controller.collapsed_dirs(),
@@ -1903,6 +1944,7 @@ mod tests {
             engine.as_ref(),
             Path::new("root"),
             &gui_tx,
+            &HashMap::new(),
             &mut |path| {
                 opened.push(path.to_path_buf());
                 Ok(())
@@ -1971,6 +2013,7 @@ mod tests {
             engine.as_ref(),
             root.path(),
             &gui_tx,
+            &HashMap::new(),
             &mut |_| Ok(()),
         )
         .unwrap();
@@ -2032,6 +2075,7 @@ mod tests {
             engine.as_ref(),
             root.path(),
             &gui_tx,
+            &HashMap::new(),
             &mut |_| Ok(()),
         )
         .unwrap();
@@ -2053,6 +2097,7 @@ mod tests {
             engine.as_ref(),
             Path::new("root"),
             &gui_tx,
+            &HashMap::new(),
             &mut |_| Ok(()),
         )
         .unwrap();
@@ -2073,6 +2118,7 @@ mod tests {
             engine.as_ref(),
             Path::new("root"),
             &gui_tx,
+            &HashMap::new(),
             &mut |_| Ok(()),
         )
         .unwrap();
@@ -2105,6 +2151,7 @@ mod tests {
             engine.as_ref(),
             Path::new("root"),
             &gui_tx,
+            &HashMap::new(),
             &mut |_| Ok(()),
         )
         .unwrap();
@@ -2130,6 +2177,7 @@ mod tests {
             engine.as_ref(),
             Path::new("root"),
             &gui_tx,
+            &HashMap::new(),
             &mut |_| Ok(()),
         )
         .unwrap();
@@ -2153,6 +2201,7 @@ mod tests {
                 engine.as_ref(),
                 Path::new("root"),
                 &gui_tx,
+                &HashMap::new(),
                 &mut |path| {
                     opened.push(path.to_path_buf());
                     Ok(())
@@ -2185,6 +2234,7 @@ mod tests {
             engine.as_ref(),
             Path::new("root"),
             &gui_tx,
+            &HashMap::new(),
             &mut |path| {
                 opened.push(path.to_path_buf());
                 Ok(())
@@ -2194,5 +2244,68 @@ mod tests {
 
         assert_eq!(opened, [PathBuf::from("root/unloaded/deep.txt")]);
         assert!(engine.commands().is_empty());
+    }
+
+    #[test]
+    fn send_view_state_merges_computed_dir_sizes_over_scanned_metadata() {
+        let root = tempdir().unwrap();
+        std::fs::create_dir(root.path().join("dir")).unwrap();
+        std::fs::write(root.path().join("dir/file.txt"), b"hello").unwrap();
+        let mut ids = IdAllocator::new();
+        let baseline = fyler_fsops::scan::scan_baseline_shallow_with(
+            root.path(),
+            &mut ids,
+            &fyler_fsops::scan::ScanOptions::default(),
+        )
+        .unwrap();
+        let dir_id = baseline.get_by_path(&TreePath::parse("dir")).unwrap().id;
+        let engine = Arc::new(PickerEngine::default());
+        let save_engine: Arc<dyn EditorEngine> = engine.clone();
+        let mut controller =
+            SaveController::new(root.path().to_path_buf(), ids, baseline, save_engine);
+        let (gui_tx, gui_rx) = counting_channel();
+        let mut overlay = HashMap::new();
+        overlay.insert(dir_id, 1_234_567_u64);
+
+        send_view_state(&gui_tx, PaneId::new(1), &mut controller, &overlay).unwrap();
+
+        let GuiEvent::FileInfos { infos, .. } = gui_rx.recv().unwrap() else {
+            panic!("expected FileInfos event")
+        };
+        // overlayが計算済みサイズでNoneを上書きする(issue #38フォローアップ、案B)。
+        assert_eq!(infos[&dir_id].size, Some(1_234_567));
+    }
+
+    #[test]
+    fn send_view_state_leaves_scanned_metadata_untouched_without_an_overlay_entry() {
+        let root = tempdir().unwrap();
+        std::fs::create_dir(root.path().join("dir")).unwrap();
+        std::fs::write(root.path().join("file.txt"), b"hello").unwrap();
+        let mut ids = IdAllocator::new();
+        let baseline = fyler_fsops::scan::scan_baseline_shallow_with(
+            root.path(),
+            &mut ids,
+            &fyler_fsops::scan::ScanOptions::default(),
+        )
+        .unwrap();
+        let dir_id = baseline.get_by_path(&TreePath::parse("dir")).unwrap().id;
+        let file_id = baseline
+            .get_by_path(&TreePath::parse("file.txt"))
+            .unwrap()
+            .id;
+        let engine = Arc::new(PickerEngine::default());
+        let save_engine: Arc<dyn EditorEngine> = engine.clone();
+        let mut controller =
+            SaveController::new(root.path().to_path_buf(), ids, baseline, save_engine);
+        let (gui_tx, gui_rx) = counting_channel();
+
+        send_view_state(&gui_tx, PaneId::new(1), &mut controller, &HashMap::new()).unwrap();
+
+        let GuiEvent::FileInfos { infos, .. } = gui_rx.recv().unwrap() else {
+            panic!("expected FileInfos event")
+        };
+        // overlayが空ならdirはscan結果どおりNoneのまま(常時再帰列挙しない、案Bの前提)。
+        assert_eq!(infos[&dir_id].size, None);
+        assert_eq!(infos[&file_id].size, Some(5));
     }
 }

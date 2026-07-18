@@ -840,7 +840,10 @@ impl SaveController {
         }
     }
 
-    fn resolve_line_entry(&self, lines: &[EditorLine], line: usize) -> Option<BaselineEntry> {
+    /// バッファの`line`に埋め込まれたIDを現在のbaselineへ解決し、`id`込みの
+    /// エントリを返す。[`resolve_line`](Self::resolve_line)と異なりIDも必要な
+    /// 呼び出し元(dir sizeのcursor行解決等)向け。
+    pub fn resolve_line_entry(&self, lines: &[EditorLine], line: usize) -> Option<BaselineEntry> {
         let editor_line = lines.get(line)?;
         let PrefixParse::WithId { id, .. } =
             fyler_core::grammar::split_id_prefix(&editor_line.text)
