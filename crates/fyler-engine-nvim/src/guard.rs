@@ -60,6 +60,7 @@ fn binding_payload(action: EditorAction) -> BindingPayload {
         HistoryBack => ("history", Some("back"), &["n"]),
         HistoryForward => ("history", Some("forward"), &["n"]),
         Refresh => ("refresh", None, &["n"]),
+        DirSize => ("dir_size", None, &["n"]),
     };
     BindingPayload { kind, arg, modes }
 }
@@ -354,6 +355,8 @@ local function dispatch(binding)
     vim.rpcnotify(channel, "fyler_history", binding.arg)
   elseif binding.kind == "refresh" then
     vim.rpcnotify(channel, "fyler_refresh")
+  elseif binding.kind == "dir_size" then
+    vim.rpcnotify(channel, "fyler_dir_size", line)
   end
 end
 
@@ -605,6 +608,7 @@ mod tests {
             (HistoryBack, "history", Some("back"), &["n"][..]),
             (HistoryForward, "history", Some("forward"), &["n"][..]),
             (Refresh, "refresh", None, &["n"][..]),
+            (DirSize, "dir_size", None, &["n"][..]),
         ];
         for (action, kind, arg, modes) in cases {
             assert_eq!(
@@ -620,7 +624,7 @@ mod tests {
     fn defaults_split_into_normal_maps_and_ctrl_w_trie() {
         let bindings = fyler_core::keymap::default_bindings(fyler_core::keymap::default_leader());
         let (normal, trie) = binding_values(&bindings);
-        assert_eq!(normal.as_array().unwrap().len(), 24);
+        assert_eq!(normal.as_array().unwrap().len(), 25);
         let trie = trie.as_map().unwrap();
         assert_eq!(trie.len(), 12);
         assert!(trie.iter().any(|(key, _)| key.as_str() == Some("<C-w>")));
