@@ -651,7 +651,7 @@ mod tests {
     #[test]
     fn defaults_split_into_normal_maps_and_ctrl_w_trie() {
         let bindings = fyler_core::keymap::default_bindings(fyler_core::keymap::default_leader());
-        let (normal, trie) = binding_values(&bindings);
+        let (normal, _keys, trie) = binding_values(&bindings);
         assert_eq!(normal.as_array().unwrap().len(), 25);
         let trie = trie.as_map().unwrap();
         assert_eq!(trie.len(), 12);
