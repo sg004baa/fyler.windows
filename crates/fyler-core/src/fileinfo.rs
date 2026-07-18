@@ -26,12 +26,20 @@ pub struct EntryMeta {
     pub is_placeholder: bool,
 }
 
-/// バイト数を人間可読形式("2.0 KB" / "1.5 MB")にする。
+/// バイト数を人間可読形式(`"512 B"` / `"2.0 KB"` / `"1.5 MB"` / `"2.3 GB"`)にする。
+/// 全クレート共通の正典フォーマッタ(行表示・modeline・backup警告が共有する)。
+/// 1024バイト未満は整数バイト表記、それ以上は1024進で小数点1桁に整形する。
 pub fn human_readable_size(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
     let bytes = bytes as f64;
-    if bytes >= MIB {
+    if bytes >= GIB {
+        format!("{:.1} GB", bytes / GIB)
+    } else if bytes >= MIB {
         format!("{:.1} MB", bytes / MIB)
     } else {
         format!("{:.1} KB", bytes / KIB)
@@ -43,11 +51,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn human_readable_size_uses_kibibyte_and_mebibyte_boundaries() {
-        assert_eq!(human_readable_size(0), "0.0 KB");
+    fn human_readable_size_uses_byte_kibibyte_mebibyte_and_gibibyte_boundaries() {
+        assert_eq!(human_readable_size(0), "0 B");
+        assert_eq!(human_readable_size(512), "512 B");
+        assert_eq!(human_readable_size(1023), "1023 B");
         assert_eq!(human_readable_size(1024), "1.0 KB");
         assert_eq!(human_readable_size(1024 * 1024 - 1), "1024.0 KB");
         assert_eq!(human_readable_size(1024 * 1024), "1.0 MB");
         assert_eq!(human_readable_size(1536 * 1024), "1.5 MB");
+        assert_eq!(human_readable_size(1024 * 1024 * 1024 - 1), "1024.0 MB");
+        assert_eq!(human_readable_size(1024 * 1024 * 1024), "1.0 GB");
+        assert_eq!(human_readable_size(1024 * 1024 * 1024 * 3 / 2), "1.5 GB");
     }
 }
