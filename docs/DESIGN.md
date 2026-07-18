@@ -1,18 +1,16 @@
-# fyler for windows — 実装設計書 v2（Claude Code向け）
+# fyler for windows — 実装設計書
 
-> v2 (2026-07-03): 外部レビューを反映した全面改訂。主な変更点: (1) 行ID追跡をextmarkからin-buffer ID方式（oil.nvim方式）へ変更、(2) 保存処理を明示的な状態機械化、(3) EditorEngineをsnapshot + command channel型へ再設計、(4) parse/validateパイプライン追加、(5) M0スパイク追加。
-
-> このファイルは本プロジェクトの**正典**。Notionページ「idea > fyler for windows」の設計書 v2 のコピー。実装判断に迷ったら必ずここに従うこと。
+> このファイルは本プロジェクトの**正典**。Notionページ「idea > fyler for windows」の設計書。実装判断に迷ったら必ずここに従うこと。
 
 ## 概要
 
 fyler.nvim（ツリー表示のファイルシステムをバッファのように編集するNeovimファイラー）のコンセプトを、Windowsネイティブの**スタンドアロンGUIファイラー**としてRustで実装する。
 
-- 編集エンジンとして組み込みNeovimを利用する（**方式A**）。Neovimは「Vim編集状態マシン」としてのみ使い、描画エンジンとしては使わない
+- 編集エンジンとして組み込みNeovimを利用する。Neovimは「Vim編集状態マシン」としてのみ使い、描画エンジンとしては使わない
 - neovide方式（UIグリッドをそのまま描画）は採用しない。**描画はすべてRust側で自前**
-- 将来、自前vimサブセット実装（方式B）へ移行できるよう、編集エンジンをトレイトで抽象化する
+- 将来、自前vimサブセット実装へ移行できるよう、編集エンジンをトレイトで抽象化する
 
-## 脅威モデル（先に確定）
+## 脅威モデル
 
 本アプリの防御対象は**「ローカルの信頼済みユーザー自身の誤操作」のみ**とする。
 
@@ -200,42 +198,6 @@ Idle
 - モードライン（NORMAL / INSERT / VISUAL）・カーソル・cmdline・messagesの描画も自前
 - IDプレフィックスの隠蔽とカーソル列オフセット補正を描画層で行う
 
-## マイルストーン
-
-**M0: 成立性スパイク（実装前に必ず通す）**
-
-- in-buffer ID方式の検証: `dd`/`p`/`yy`/`p`/`:m`/`:s`/undo/redoでIDが行に追従すること、カーソル列補正と描画隠蔽が破綻しないこと
-- `--embed --headless` 起動 + 後付け `nvim_ui_attach` + ext_cmdline / ext_messages のイベント疎通確認
-- Windows IME（日本語入力）の入力経路確認（`EditorCommand::Text`）
-- 保存状態機械の遷移をコードで確定
-- バッファ文法（本書の決定事項）の最終確定
-
-**M1: read-only表示**
-
-- nvim spawn、RPC疎通、snapshot取得、ツリーのread-only描画
-- nvimプロセスのクラッシュ・終了検知
-
-**M2: rename限定dry-run（背骨）**
-
-- 既存行の行内renameのみ対象
-- `:w`（BufWriteCmd）→ parse → validate → OperationPlan を確認ダイアログに表示。**実行はしない**
-- 「`i` でrenameを書いて `:w` するとダイアログに `RENAME a → b` が出る」がゴール
-
-**M3: create / delete / rename 実行**
-
-- 同一ボリューム限定。削除はごみ箱経由
-- 部分失敗時のCommitReport
-- commit後、実FSから再読込してreconcile
-
-**M4: 構造編集**
-
-- move / copy（ID重複 = COPY判定）
-- クロスボリューム対応（3分類の実装）
-
-**M5: 統合・装飾**
-
-- notify監視、OneDrive属性対応、アイコン、git status
-
 ## 実装上の絶対ルール
 
 1. 確認ダイアログの承認なしに実ファイルへ触れないこと（M2まではdry-runのみ）
@@ -253,10 +215,3 @@ Idle
 | ごみ箱削除 | trash | IFileOperation移行時はSTAスレッド必須 |
 | ファイル監視 | notify | 外部変更検知 |
 | Win32 API | windows | CREATE_NO_WINDOW、属性取得、case sensitivity判定等 |
-
-## リスクと撤退ルート
-
-- in-buffer ID方式はエンジン非依存のため、方式B（ropey + 自前modalキーマップ）へ移行してもdiff層はそのまま流用できる
-- snapshot + command channel型のトレイトは方式Bでも同じ形で実装可能（同期API型より意味論の互換が取りやすい）
-- 方式Bが必要になる条件: 単一バイナリ配布が絶対条件になった場合、またはRPC往復の遅延が許容できない場合のみ
-- M0スパイクでin-buffer IDのカーソル補正が破綻した場合: IDプレフィックスを固定幅にする、またはカーソル移動をフックして補正するfallbackを検討する

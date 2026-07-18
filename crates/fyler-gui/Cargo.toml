@@ -10,3 +10,6 @@ publish.workspace = true
 fyler-core.workspace = true
 anyhow.workspace = true
 eframe.workspace = true
+
+[build-dependencies]
+ico = "0.4"

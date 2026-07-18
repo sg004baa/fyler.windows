@@ -27,7 +27,7 @@ WizardStyle=modern
 ChangesAssociations=yes
 
 [Tasks]
-Name: "contextmenu"; Description: "Explorerのコンテキストメニューに「fylerで開く」を追加"; GroupDescription: "追加タスク:"; Flags: unchecked
+Name: "contextmenu"; Description: "Add 'Open in fyler' to context menu"; GroupDescription: "Add:"; Flags: unchecked
 
 [Files]
 Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -36,9 +36,9 @@ Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs c
 Name: "{userprograms}\fyler"; Filename: "{app}\fyler.exe"; WorkingDir: "{app}"; IconFilename: "{app}\fyler.exe"
 
 [Registry]
-Root: HKCU; Subkey: "Software\Classes\Directory\shell\fyler"; ValueType: string; ValueName: ""; ValueData: "fylerで開く"; Flags: uninsdeletekey; Tasks: contextmenu
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\fyler"; ValueType: string; ValueName: ""; ValueData: "Open in fyler"; Flags: uninsdeletekey; Tasks: contextmenu
 Root: HKCU; Subkey: "Software\Classes\Directory\shell\fyler"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\fyler.exe"; Tasks: contextmenu
 Root: HKCU; Subkey: "Software\Classes\Directory\shell\fyler\command"; ValueType: string; ValueName: ""; ValueData: """{app}\fyler.exe"" ""%1"""; Tasks: contextmenu
-Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\fyler"; ValueType: string; ValueName: ""; ValueData: "fylerで開く"; Flags: uninsdeletekey; Tasks: contextmenu
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\fyler"; ValueType: string; ValueName: ""; ValueData: "Open in fyler"; Flags: uninsdeletekey; Tasks: contextmenu
 Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\fyler"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\fyler.exe"; Tasks: contextmenu
 Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\fyler\command"; ValueType: string; ValueName: ""; ValueData: """{app}\fyler.exe"" ""%V"""; Tasks: contextmenu
