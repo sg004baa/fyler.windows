@@ -3319,7 +3319,7 @@ mod tests {
         assert!(!state.focused);
 
         state.focused = true;
-        let binding = fyler_core::keymap::parse_key_sequence("x e", None).unwrap();
+        let binding = fyler_core::keymap::parse_key_sequence("xe", None).unwrap();
         assert_eq!(
             handle_navigation_keys(&mut state, binding.0.clone(), &[binding], &entries),
             None
@@ -3371,7 +3371,7 @@ mod tests {
         assert!(!state.focused);
         assert_eq!(state.selected, 0);
 
-        let binding = fyler_core::keymap::parse_key_sequence("x e", None).unwrap();
+        let binding = fyler_core::keymap::parse_key_sequence("xe", None).unwrap();
         let mut state = NavigationDockState {
             focused: true,
             ..NavigationDockState::visible()

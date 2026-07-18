@@ -14,7 +14,7 @@ use fyler_core::feedback::{FeedbackPayload, validate_body};
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::{EntryId, IdAllocator};
-use fyler_core::keymap::{EditorAction, HelpEntry, KeyBinding, KeySequence};
+use fyler_core::keymap::{BindingTarget, EditorAction, HelpEntry, KeyBinding, KeySequence};
 use fyler_core::pane::{FocusDirection, PaneAction, PaneId, PaneLayout, SplitDirection};
 use fyler_core::path::TreePath;
 use fyler_core::report::{ApplyProgress, CommitReport, OpOutcome, OpResult};
@@ -353,14 +353,24 @@ fn create_pane(
 
 fn help_entries(bindings: &[KeyBinding]) -> Vec<HelpEntry> {
     let mut actions = Vec::<(EditorAction, Vec<String>)>::new();
+    let mut keys_entries = Vec::<HelpEntry>::new();
     for binding in bindings {
-        if let Some((_, sequences)) = actions
-            .iter_mut()
-            .find(|(action, _)| *action == binding.action)
-        {
-            sequences.push(binding.sequence.to_string());
-        } else {
-            actions.push((binding.action, vec![binding.sequence.to_string()]));
+        match &binding.target {
+            BindingTarget::Action(action) => {
+                if let Some((_, sequences)) =
+                    actions.iter_mut().find(|(existing, _)| existing == action)
+                {
+                    sequences.push(binding.sequence.to_string());
+                } else {
+                    actions.push((*action, vec![binding.sequence.to_string()]));
+                }
+            }
+            BindingTarget::Keys(keys) => {
+                keys_entries.push(HelpEntry {
+                    command: binding.sequence.to_string(),
+                    description: format!("Feed keys: {keys}"),
+                });
+            }
         }
     }
     let mut entries = actions
@@ -370,6 +380,7 @@ fn help_entries(bindings: &[KeyBinding]) -> Vec<HelpEntry> {
             description: action.description().to_owned(),
         })
         .collect::<Vec<_>>();
+    entries.extend(keys_entries);
     entries.extend([
         HelpEntry {
             command: ":w".to_owned(),
@@ -498,7 +509,9 @@ pub(super) fn run() -> anyhow::Result<()> {
         help_entries: help_entries(&bindings),
         dock_focus_bindings: bindings
             .iter()
-            .filter(|binding| binding.action == EditorAction::ToggleDockFocus)
+            .filter(|binding| {
+                binding.target == BindingTarget::Action(EditorAction::ToggleDockFocus)
+            })
             .map(|binding| KeySequence(binding.sequence.0.clone()))
             .collect(),
         bookmarks: config.bookmarks.clone(),
@@ -5886,16 +5899,20 @@ mod tests {
         let defaults = fyler_core::keymap::default_bindings(fyler_core::keymap::default_leader());
         let default_entries = help_entries(&defaults);
         assert!(default_entries.iter().any(|entry| {
-            entry.command == "Enter" && entry.description == EditorAction::Activate.description()
+            entry.command == "<CR>" && entry.description == EditorAction::Activate.description()
         }));
 
         let mut customized = defaults
             .into_iter()
-            .filter(|binding| binding.action != EditorAction::ToggleHidden)
+            .filter(|binding| binding.target != BindingTarget::Action(EditorAction::ToggleHidden))
             .collect::<Vec<_>>();
         customized.push(KeyBinding {
             sequence: fyler_core::keymap::parse_key_sequence("x", None).unwrap(),
-            action: EditorAction::FilePicker,
+            target: BindingTarget::Action(EditorAction::FilePicker),
+        });
+        customized.push(KeyBinding {
+            sequence: fyler_core::keymap::parse_key_sequence(";", None).unwrap(),
+            target: BindingTarget::Keys(fyler_core::keymap::parse_key_sequence(":", None).unwrap()),
         });
         let custom_entries = help_entries(&customized);
         assert!(
@@ -5904,9 +5921,13 @@ mod tests {
                 .any(|entry| { entry.description == EditorAction::ToggleHidden.description() })
         );
         assert!(custom_entries.iter().any(|entry| {
-            entry.command == "g / / x"
-                && entry.description == EditorAction::FilePicker.description()
+            entry.command == "g/ / x" && entry.description == EditorAction::FilePicker.description()
         }));
+        assert!(
+            custom_entries
+                .iter()
+                .any(|entry| { entry.command == ";" && entry.description == "Feed keys: :" })
+        );
     }
 
     #[test]
