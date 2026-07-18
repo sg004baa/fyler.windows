@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use eframe::egui;
-use fyler_core::WindowGeometry;
 use fyler_core::editor::{
     CmdlineState, EditorEngine, EditorEvent, EditorMessage, Key, KeyInput, Mode, Modifiers,
     PopupmenuState,
@@ -24,6 +23,7 @@ use fyler_core::plan::OperationPlan;
 use fyler_core::report::{ApplyProgress, CommitReport};
 use fyler_core::transfer::{DropEffect, ImportOp, ImportPlan, TransferOp, TransferPlan};
 use fyler_core::validate::ValidateError;
+use fyler_core::{StartupWindow, WindowGeometry};
 
 use crate::confirm::{ConfirmChoice, ConfirmDetail};
 use crate::{chrome, cmdline, confirm, icon, input, modeline, theme, tree_view};
@@ -587,6 +587,10 @@ pub struct FylerApp {
     /// native window geometryが未保存の初回起動だけ、monitor比率でサイズを設定する。
     resize_to_monitor_on_first_frame: bool,
     window_geometry: Arc<Mutex<Option<WindowGeometry>>>,
+    /// 起動直後、保存位置と実際の配置(`ViewportInfo::outer_rect`)を最大1回だけ
+    /// 比較して`ViewportCommand::OuterPosition`で補正するための状態。
+    /// `None`は「補正の必要がない、または判定・補正済み」を表す。
+    position_correction: Option<PositionCorrection>,
     /// GUI window内で進行中のtree行drag(pane間dragを含む)。
     /// windowの境界を離れたら`GuiAction::TreeDragOut`を送って`None`へ戻す。
     tree_drag: Option<TreeDragSession>,
@@ -673,6 +677,7 @@ impl FylerApp {
             statusline_right,
             resize_to_monitor_on_first_frame: false,
             window_geometry: Arc::new(Mutex::new(None)),
+            position_correction: None,
             tree_drag: None,
         })
     }
@@ -1115,6 +1120,16 @@ impl eframe::App for FylerApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
             self.resize_to_monitor_on_first_frame = false;
+        }
+        if let Some(state) = self.position_correction {
+            let observed = ctx
+                .input(|input| input.viewport().outer_rect)
+                .map(|rect| rect.min);
+            let (next, should_correct) = state.poll(observed);
+            self.position_correction = next;
+            if should_correct {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(state.target));
+            }
         }
         if let Some(geometry) = current_window_geometry(ctx)
             && let Ok(mut current) = self.window_geometry.lock()
@@ -2638,10 +2653,14 @@ fn context_item_disabled_reason(
 }
 
 fn current_window_geometry(context: &egui::Context) -> Option<WindowGeometry> {
-    context.input(|input| window_geometry_from_viewport(input.viewport()))
+    let scale = context.pixels_per_point();
+    context.input(|input| window_geometry_from_viewport(input.viewport(), scale))
 }
 
-fn window_geometry_from_viewport(viewport: &egui::ViewportInfo) -> Option<WindowGeometry> {
+fn window_geometry_from_viewport(
+    viewport: &egui::ViewportInfo,
+    scale: f32,
+) -> Option<WindowGeometry> {
     let inner = viewport.inner_rect?;
     let outer = viewport.outer_rect?;
     WindowGeometry::new(
@@ -2650,7 +2669,60 @@ fn window_geometry_from_viewport(viewport: &egui::ViewportInfo) -> Option<Window
         outer.min.x,
         outer.min.y,
         viewport.maximized.unwrap_or(false),
+        scale,
     )
+}
+
+/// 起動直後の1回だけの位置補正状態機械。
+///
+/// DPIが異なるセカンダリモニタでは、window生成時の論理→物理px変換に
+/// プライマリモニタの`scale`が使われてしまう(winit issue #2645: `with_position`
+/// はwindow生成前に呼ばれるため、生成直後のwindowにはまだ「実際のモニタの
+/// scale」が存在せずプライマリモニタのscaleで暫定変換される)。
+/// `ViewportCommand::OuterPosition`はwindow生成後に送るコマンドなので、その時点の
+/// 実際のscaleで変換され直され正しい位置へ補正できる。
+///
+/// 生成直後の数フレームで実際の配置(`outer_rect`)が保存位置とズレていれば
+/// 1回だけ補正する。無限補正ループ防止のため、判定自体も`MAX_FRAMES`で
+/// 打ち切り、補正は最大1回しか送らない。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PositionCorrection {
+    target: egui::Pos2,
+    frames_remaining: u8,
+}
+
+const POSITION_CORRECTION_EPSILON: f32 = 1.0;
+const POSITION_CORRECTION_MAX_FRAMES: u8 = 5;
+
+impl PositionCorrection {
+    fn new(target: egui::Pos2) -> Self {
+        Self {
+            target,
+            frames_remaining: POSITION_CORRECTION_MAX_FRAMES,
+        }
+    }
+
+    /// このフレームの判定結果を返す。戻り値の1つ目は次フレームへ持ち越す状態
+    /// (`None`なら判定終了、以後このwindowでは二度と補正しない)、2つ目は
+    /// `target`へ`OuterPosition`を送るべきかどうか。
+    fn poll(self, observed: Option<egui::Pos2>) -> (Option<Self>, bool) {
+        let Some(observed) = observed else {
+            let frames_remaining = self.frames_remaining.saturating_sub(1);
+            if frames_remaining == 0 {
+                return (None, false);
+            }
+            return (
+                Some(Self {
+                    frames_remaining,
+                    ..self
+                }),
+                false,
+            );
+        };
+        let drifted = (observed.x - self.target.x).abs() > POSITION_CORRECTION_EPSILON
+            || (observed.y - self.target.y).abs() > POSITION_CORRECTION_EPSILON;
+        (None, drifted)
+    }
 }
 
 fn initial_window_geometry(monitor_size: Option<egui::Vec2>) -> Option<(egui::Vec2, egui::Pos2)> {
@@ -2676,13 +2748,17 @@ fn window_icon() -> egui::IconData {
     }
 }
 
-fn native_options(window: Option<WindowGeometry>) -> eframe::NativeOptions {
+fn native_options(window: Option<StartupWindow>) -> eframe::NativeOptions {
     let viewport = window
         .map_or_else(egui::ViewportBuilder::default, |window| {
-            egui::ViewportBuilder::default()
-                .with_inner_size([window.inner_width, window.inner_height])
-                .with_position([window.outer_x, window.outer_y])
-                .with_maximized(window.maximized)
+            let builder = egui::ViewportBuilder::default()
+                .with_inner_size([window.geometry.inner_width, window.geometry.inner_height])
+                .with_maximized(window.geometry.maximized);
+            if window.apply_position {
+                builder.with_position([window.geometry.outer_x, window.geometry.outer_y])
+            } else {
+                builder
+            }
         })
         .with_decorations(false)
         .with_min_inner_size([720.0, 480.0])
@@ -2708,7 +2784,7 @@ pub fn run(
     action_tx: mpsc::Sender<GuiAction>,
     gui_options: GuiOptions,
     event_dequeued: Arc<dyn Fn() + Send + Sync>,
-    initial_window: Option<WindowGeometry>,
+    initial_window: Option<StartupWindow>,
     window_geometry: Arc<Mutex<Option<WindowGeometry>>>,
 ) -> anyhow::Result<()> {
     let native_options = native_options(initial_window);
@@ -2728,6 +2804,17 @@ pub fn run(
                 statusline_right,
             } = gui_options;
             let resize_to_monitor_on_first_frame = initial_window.is_none();
+            // オフスクリーンガードで位置を捨てた場合(`apply_position: false`)は、
+            // 補正の基準になる保存位置がそもそも信頼できないため状態機械を作らない。
+            let position_correction =
+                initial_window
+                    .filter(|window| window.apply_position)
+                    .map(|window| {
+                        PositionCorrection::new(egui::pos2(
+                            window.geometry.outer_x,
+                            window.geometry.outer_y,
+                        ))
+                    });
             theme::install(&creation_context.egui_ctx);
             install_fallback_font(&creation_context.egui_ctx, font_path.as_deref());
             let mut app = FylerApp::new(
@@ -2748,6 +2835,7 @@ pub fn run(
             )
             .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
             app.resize_to_monitor_on_first_frame = resize_to_monitor_on_first_frame;
+            app.position_correction = position_correction;
             app.window_geometry = window_geometry;
             Ok(Box::new(app))
         }),
@@ -2863,6 +2951,7 @@ mod tests {
                 statusline_right: Vec::new(),
                 resize_to_monitor_on_first_frame: false,
                 window_geometry: Arc::new(Mutex::new(None)),
+                position_correction: None,
                 tree_drag: None,
             },
             event_tx,
@@ -2943,6 +3032,7 @@ mod tests {
             statusline_right: Vec::new(),
             resize_to_monitor_on_first_frame: false,
             window_geometry: Arc::new(Mutex::new(None)),
+            position_correction: None,
             tree_drag: None,
         };
         let (tx, rx) = mpsc::channel();
@@ -3663,12 +3753,29 @@ mod tests {
         assert!(initial_window_geometry(None).is_none());
         assert!(initial_window_geometry(Some(egui::Vec2::ZERO)).is_none());
 
-        let geometry = WindowGeometry::new(1200.0, 700.0, 30.0, 40.0, true).unwrap();
-        let options = native_options(Some(geometry));
+        let geometry = WindowGeometry::new(1200.0, 700.0, 30.0, 40.0, true, 1.5).unwrap();
+        let options = native_options(Some(StartupWindow {
+            geometry,
+            apply_position: true,
+        }));
         assert_eq!(options.viewport.inner_size, Some(egui::vec2(1200.0, 700.0)));
         assert_eq!(options.viewport.position, Some(egui::pos2(30.0, 40.0)));
         assert_eq!(options.viewport.maximized, Some(true));
         assert!(!options.persist_window);
+    }
+
+    #[test]
+    fn native_options_omits_position_when_offscreen_guard_disables_it() {
+        // オフスクリーンガードで`apply_position: false`になった場合、サイズと
+        // maximizedだけ適用し、位置(`outer_x`/`outer_y`)はwith_positionへ渡さない。
+        let geometry = WindowGeometry::new(1200.0, 700.0, 30.0, 40.0, true, 1.5).unwrap();
+        let options = native_options(Some(StartupWindow {
+            geometry,
+            apply_position: false,
+        }));
+        assert_eq!(options.viewport.inner_size, Some(egui::vec2(1200.0, 700.0)));
+        assert_eq!(options.viewport.position, None);
+        assert_eq!(options.viewport.maximized, Some(true));
     }
 
     #[test]
@@ -3699,10 +3806,52 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            window_geometry_from_viewport(&viewport),
-            WindowGeometry::new(1000.0, 600.0, 30.0, 40.0, false)
+            window_geometry_from_viewport(&viewport, 1.5),
+            WindowGeometry::new(1000.0, 600.0, 30.0, 40.0, false, 1.5)
         );
-        assert!(window_geometry_from_viewport(&egui::ViewportInfo::default()).is_none());
+        assert!(window_geometry_from_viewport(&egui::ViewportInfo::default(), 1.5).is_none());
+    }
+
+    #[test]
+    fn position_correction_fires_at_most_once_when_position_drifts() {
+        let target = egui::pos2(30.0, 40.0);
+        let state = PositionCorrection::new(target);
+
+        // outer_rectがまだ届いていないフレームは判定を持ち越す。
+        let (state, corrected) = state.poll(None);
+        assert!(!corrected);
+        let state = state.expect("still waiting for outer_rect");
+
+        // 保存位置から大きくズレた配置を観測したら、1回だけ補正すべきと判定する。
+        let (state, corrected) = state.poll(Some(egui::pos2(500.0, 500.0)));
+        assert!(corrected);
+        assert!(state.is_none(), "state must be consumed after a decision");
+    }
+
+    #[test]
+    fn position_correction_does_not_fire_when_position_matches() {
+        let target = egui::pos2(30.0, 40.0);
+        let state = PositionCorrection::new(target);
+        let (state, corrected) = state.poll(Some(egui::pos2(30.4, 39.6)));
+        assert!(
+            !corrected,
+            "sub-epsilon drift must not trigger a correction"
+        );
+        assert!(state.is_none());
+    }
+
+    #[test]
+    fn position_correction_gives_up_after_max_frames_without_outer_rect() {
+        let mut state = Some(PositionCorrection::new(egui::pos2(0.0, 0.0)));
+        for _ in 0..POSITION_CORRECTION_MAX_FRAMES {
+            let (next, corrected) = state.unwrap().poll(None);
+            assert!(!corrected);
+            state = next;
+        }
+        assert!(
+            state.is_none(),
+            "correction judging must not wait forever if outer_rect never appears"
+        );
     }
 
     #[test]

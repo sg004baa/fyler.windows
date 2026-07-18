@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use fyler_core::WindowGeometry;
 use fyler_core::editor::{EditorCommand, EditorEngine, EditorEvent, FoldOp, MessageKind};
 use fyler_core::feedback::{FeedbackPayload, validate_body};
 use fyler_core::gitstatus::GitBadge;
@@ -21,6 +20,7 @@ use fyler_core::report::{ApplyProgress, CommitReport, OpOutcome, OpResult};
 use fyler_core::transfer::{DragOutcome, DropEffect, ImportPlan, TransferKind};
 use fyler_core::tree::{BaselineTree, EntryKind};
 use fyler_core::undo::UndoTransaction;
+use fyler_core::{StartupWindow, WindowGeometry};
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
 use fyler_fsops::scan::ScanOptions;
 use fyler_fsops::watch::{FsWatcher, WatchEvent};
@@ -411,6 +411,37 @@ fn should_restore_session(explicit_root: bool, restore_session: bool) -> bool {
     !explicit_root && restore_session
 }
 
+/// window geometryはpane session復元のゲート([`should_restore_session`])から独立
+/// して常に読み込む。pane復元が無効(明示root起動や`restore_session=false`)でも、
+/// 直前に保存されたwindow位置・サイズ・maximizedはそのまま使う。
+fn resolve_initial_window(loaded_session: Option<&SessionState>) -> Option<WindowGeometry> {
+    loaded_session.and_then(|session| session.window)
+}
+
+/// 保存されたwindow geometryをGUI起動用の[`fyler_core::StartupWindow`]へ変換する。
+/// 保存先モニタが切断されている場合はオフスクリーンガードで位置を捨て、
+/// サイズ・maximizedだけ復元する(DESIGN.md「オフスクリーンガード」)。
+fn resolve_startup_window(geometry: Option<WindowGeometry>) -> Option<StartupWindow> {
+    geometry.map(|geometry| StartupWindow {
+        geometry,
+        apply_position: window_position_is_onscreen(geometry),
+    })
+}
+
+#[cfg(windows)]
+fn window_position_is_onscreen(geometry: WindowGeometry) -> bool {
+    !fyler_fsops::display::is_offscreen(geometry.physical_outer_rect())
+}
+
+#[cfg(not(windows))]
+fn window_position_is_onscreen(_geometry: WindowGeometry) -> bool {
+    // オフスクリーン判定はWindows専用API(`MonitorFromRect`)に依存し、
+    // `fyler_fsops::display`はcfg(windows)限定でしか存在しない。fylerは
+    // Windows専用アプリのため非Windows向けの実行パスは存在せず、常に
+    // 保存位置をそのまま使ってよい。
+    true
+}
+
 fn existing_root_or_ancestor(requested: &Path, fallback: &Path) -> PathBuf {
     requested
         .ancestors()
@@ -459,22 +490,27 @@ pub(super) fn run() -> anyhow::Result<()> {
     let fallback_root = normalize_root(&default_root()?)?;
     let (config, config_warnings) = super::config::load();
     let mut startup_warnings = Vec::new();
+    let loaded_session = match session::load() {
+        Ok(session) => session,
+        Err(error) => {
+            startup_warnings.push(format!(
+                "Could not restore the previous session; starting with one pane: {error:#}"
+            ));
+            None
+        }
+    };
+    // window geometryはpane session復元のゲート(`should_restore_session`)から独立
+    // して常に読み込む(明示root起動や`restore_session=false`でも位置は復元する)。
+    // pane layout/rootの復元だけ従来どおりゲートする。
+    let initial_window = resolve_initial_window(loaded_session.as_ref());
     let restored_session =
         if should_restore_session(explicit_root.is_some(), config.restore_session) {
-            match session::load() {
-                Ok(session) => session,
-                Err(error) => {
-                    startup_warnings.push(format!(
-                        "Could not restore the previous session; starting with one pane: {error:#}"
-                    ));
-                    None
-                }
-            }
+            loaded_session
         } else {
             None
         };
-    let initial_window = restored_session.as_ref().and_then(|session| session.window);
     let window_geometry = Arc::new(Mutex::new(initial_window));
+    let startup_window = resolve_startup_window(initial_window);
     let root = explicit_root
         .as_deref()
         .map(normalize_root)
@@ -4321,7 +4357,7 @@ pub(super) fn run() -> anyhow::Result<()> {
         action_tx,
         gui_options,
         Arc::new(move || gui_dequeue_gauge.dequeue()),
-        initial_window,
+        startup_window,
         Arc::clone(&window_geometry),
     );
     let final_window = window_geometry.lock().ok().and_then(|window| *window);
@@ -6101,6 +6137,61 @@ mod tests {
         assert!(!should_restore_session(true, true));
         assert!(!should_restore_session(false, false));
         assert!(should_restore_session(false, true));
+    }
+
+    #[test]
+    fn window_geometry_restores_independent_of_pane_session_restore_gate() {
+        let window = WindowGeometry::new(1280.0, 720.0, 12.0, 34.0, false, 1.5).unwrap();
+        let pane_id = PaneId::new(1);
+        let root = if cfg!(windows) {
+            PathBuf::from(r"C:\root")
+        } else {
+            PathBuf::from("/tmp/root")
+        };
+        let session = SessionState {
+            layout: PaneLayout::leaf(pane_id),
+            active: pane_id,
+            panes: BTreeMap::from([(
+                pane_id,
+                SessionPane {
+                    root,
+                    cursor: None,
+                    collapsed: Vec::new(),
+                    expanded: Vec::new(),
+                    scan_options: ScanOptions::default(),
+                },
+            )]),
+            window: Some(window),
+        };
+        let loaded_session = Some(session);
+        for (explicit_root, restore_session) in [(true, true), (false, false), (true, false)] {
+            assert!(!should_restore_session(explicit_root, restore_session));
+            let restored_session = if should_restore_session(explicit_root, restore_session) {
+                loaded_session.clone()
+            } else {
+                None
+            };
+            assert!(
+                restored_session.is_none(),
+                "pane restore gate must stay disabled here"
+            );
+            assert_eq!(
+                resolve_initial_window(loaded_session.as_ref()),
+                Some(window),
+                "window geometry must restore even when pane session restore is disabled"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_startup_window_carries_geometry_and_position_flag() {
+        let window = WindowGeometry::new(1280.0, 720.0, 12.0, 34.0, false, 1.5).unwrap();
+        assert!(resolve_startup_window(None).is_none());
+        let startup = resolve_startup_window(Some(window)).unwrap();
+        assert_eq!(startup.geometry, window);
+        // 非Windows(このテストの実行環境)にはオフスクリーン判定手段が存在せず、
+        // fyler-fsopsのdisplayモジュール自体がcfg(windows)限定のため常に位置を適用する。
+        assert!(startup.apply_position);
     }
 
     #[test]
