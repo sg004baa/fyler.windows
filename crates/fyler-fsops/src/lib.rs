@@ -14,6 +14,7 @@ pub mod catalog;
 pub mod classify;
 pub mod clipboard;
 pub mod dialog;
+pub mod dirsize;
 pub mod drag;
 pub mod drives;
 pub mod extract;
