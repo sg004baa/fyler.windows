@@ -1,6 +1,6 @@
 # fyler for windows
 
-fyler は、ツリー表示されたファイルシステムを Neovim のバッファのように編集できる、Windows 用のスタンドアロン GUI ファイラーです。Neovim は Vim の操作状態を処理する組み込みエンジンとして使い、画面は Rust と egui で描画します。
+fyler.windows は、[fyler.nvim](https://github.com/FylerOrg/fyler.nvim) にインスパイアされたwindows用Windows 用のスタンドアロン GUI ファイラーです。ツリー表示されたファイルシステムを Neovim のバッファのように編集することができます。
 
 ## 主な機能
 
@@ -12,13 +12,10 @@ fyler は、ツリー表示されたファイルシステムを Neovim のバッ
 - ブックマークと最近使ったルート
 - キーマップと leader key のカスタマイズ
 - `:terminal` による現在位置での外部ターミナル起動
-- `:feedback` による匿名フィードバック送信
 
 ## インストール
 
 [GitHub Releases](https://github.com/sg004baa/fyler.windows/releases) から、installer の `fyler-vX.Y.Z-windows-x64-setup.exe`、または portable zip をダウンロードしてください。
-
-配布物には Neovim v0.12.4 が同梱されているため、Neovim を別途インストールする必要はありません。fyler が利用する nvim-rs はこの固定バージョンの Neovim との組み合わせで検証します。
 
 アンインストールは Windows の「インストールされているアプリ」から行えます。設定や undo データなどのユーザーデータはアンインストールでは削除されません。完全に削除する場合は、アンインストール後に `%APPDATA%\fyler` と `%LOCALAPPDATA%\fyler` を手動で削除してください。
 
@@ -28,21 +25,15 @@ fyler は、ツリー表示されたファイルシステムを Neovim のバッ
 - コマンドラインから `fyler.exe [ルートディレクトリ]` を実行
 - installer で任意の Explorer コンテキストメニュー統合を選び、ディレクトリから起動
 
-fyler は次の順序で Neovim の実行ファイルを解決します。
-
-1. `FYLER_NVIM_EXE` で指定された実行ファイル
-2. fyler と同じ配置に同梱された `nvim/bin/nvim.exe`
-3. `PATH` 上の `nvim`
-
-`FYLER_NVIM_EXE` は開発・診断用の override で、指定された場合はファイルの存在確認をせず使用します。
-
 ## 設定
 
 `config.toml`、キーマップ、leader key、ブックマークなどの設定は [設定リファレンス](docs/CONFIGURATION.md) を参照してください。
 
 ## フィードバック
 
-fyler 内で `:feedback` を実行すると匿名フィードバックを送信できます。送信内容と取り扱いは [プライバシー情報](docs/PRIVACY.md) を参照してください。不具合報告や機能提案は [GitHub Issues](https://github.com/sg004baa/fyler.windows/issues) でも受け付けています。
+fyler 内で `:feedback` を実行すると匿名フィードバックを送信できます。
+感想、機能リクエストなどなんでも送って頂けると嬉しいです。
+送信内容と取り扱いは [プライバシー情報](docs/PRIVACY.md) を参照してください。不具合報告や機能提案は [GitHub Issues](https://github.com/sg004baa/fyler.windows/issues) でも受け付けています。
 
 ## 開発
 
