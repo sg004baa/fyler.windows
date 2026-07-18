@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use eframe::egui;
 use fyler_core::editor::{Cursor, EditorSnapshot, Mode, SearchHighlight};
-use fyler_core::fileinfo::FileInfo;
+use fyler_core::fileinfo::{FileInfo, human_readable_size};
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::EntryId;
@@ -238,6 +238,12 @@ pub fn draw(
                 egui::FontId::monospace(11.0),
                 theme::TEXT_MUTED,
             );
+            let size_text = file_info_for_line(&line.text, file_infos)
+                .and_then(|info| info.size)
+                .map(human_readable_size)
+                .unwrap_or_default();
+            let size_galley =
+                painter.layout_no_wrap(size_text, egui::FontId::monospace(11.0), theme::TEXT_MUTED);
             let icon_width = icon_galley.size().x;
             let text_width = text_galley.size().x;
             let text_offset = TREE_LEFT_PADDING + indent_px + icon_width;
@@ -245,6 +251,7 @@ pub fn draw(
                 text_offset
                     + text_width
                     + modified_galley.size().x
+                    + size_galley.size().x
                     + incomplete_galley.size().x
                     + badge_galley.size().x
                     + 44.0,
@@ -358,6 +365,14 @@ pub fn draw(
                 painter.galley(
                     egui::pos2(right, rect.center().y - modified_galley.size().y / 2.0),
                     modified_galley,
+                    theme::TEXT_MUTED,
+                );
+            }
+            if size_galley.size().x > 0.0 {
+                right -= size_galley.size().x + 12.0;
+                painter.galley(
+                    egui::pos2(right, rect.center().y - size_galley.size().y / 2.0),
+                    size_galley,
                     theme::TEXT_MUTED,
                 );
             }
