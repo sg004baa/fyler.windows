@@ -21,6 +21,8 @@ pub struct DirSizeOutcome {
     pub files: usize,
     /// 列挙できずスキップしたサブディレクトリ数。
     pub unreadable_dirs: usize,
+    /// metadataを取得できず合算から漏れたエントリ数(NotFound raceは含まない)。
+    pub unreadable_files: usize,
 }
 
 /// `dir` 以下を再帰的に列挙し、ファイルサイズを合算する。
@@ -58,6 +60,7 @@ pub fn dir_size_cancellable(
     let mut total: u64 = 0;
     let mut files: usize = 0;
     let mut unreadable_dirs: usize = 0;
+    let mut unreadable_files: usize = 0;
     let mut stack: Vec<PathBuf> = Vec::new();
 
     // ルート自体の列挙失敗はサブディレクトリと違い fail-fast(unreadable_dirsに
@@ -70,6 +73,7 @@ pub fn dir_size_cancellable(
         cancel,
         &mut total,
         &mut files,
+        &mut unreadable_files,
         &mut stack,
     ) {
         return Ok(None);
@@ -82,7 +86,13 @@ pub fn dir_size_cancellable(
         match fs::read_dir(crate::long_path::to_fs(&current)) {
             Ok(entries) => {
                 if !visit_directory(
-                    entries, &current, cancel, &mut total, &mut files, &mut stack,
+                    entries,
+                    &current,
+                    cancel,
+                    &mut total,
+                    &mut files,
+                    &mut unreadable_files,
+                    &mut stack,
                 ) {
                     return Ok(None);
                 }
@@ -99,16 +109,22 @@ pub fn dir_size_cancellable(
         total,
         files,
         unreadable_dirs,
+        unreadable_files,
     }))
 }
 
 /// `entries` の子を合算し、子ディレクトリを`stack`へ積む。`false`はキャンセルされたことを示す。
+///
+/// NotFound以外の理由でentry/metadataを取得できなかった子は`unreadable_files`へ
+/// 数えてスキップする(黙って合算から漏らさない)。
+#[allow(clippy::too_many_arguments)]
 fn visit_directory(
     entries: ReadDir,
     parent: &Path,
     cancel: &AtomicBool,
     total: &mut u64,
     files: &mut usize,
+    unreadable_files: &mut usize,
     stack: &mut Vec<PathBuf>,
 ) -> bool {
     for entry in entries {
@@ -119,7 +135,10 @@ fn visit_directory(
             Ok(entry) => entry,
             // 列挙とmetadata取得の間に消えたraceは次回計算で自然に収束する。
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => continue,
+            Err(_) => {
+                *unreadable_files += 1;
+                continue;
+            }
         };
         // `DirEntry::metadata`は追加のディレクトリ列挙(long_path変換)を伴わず、
         // symlinkを辿らないstat相当の呼び出しなので、OneDriveプレースホルダを
@@ -127,7 +146,10 @@ fn visit_directory(
         let metadata = match entry.metadata() {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => continue,
+            Err(_) => {
+                *unreadable_files += 1;
+                continue;
+            }
         };
         if is_link_or_reparse(&metadata) {
             continue;
@@ -167,6 +189,7 @@ mod tests {
         assert_eq!(outcome.total, 5 + 6 + 3);
         assert_eq!(outcome.files, 3);
         assert_eq!(outcome.unreadable_dirs, 0);
+        assert_eq!(outcome.unreadable_files, 0);
     }
 
     #[test]
@@ -259,5 +282,6 @@ mod tests {
         assert_eq!(outcome.total, 5);
         assert_eq!(outcome.files, 1);
         assert_eq!(outcome.unreadable_dirs, 1);
+        assert_eq!(outcome.unreadable_files, 0);
     }
 }

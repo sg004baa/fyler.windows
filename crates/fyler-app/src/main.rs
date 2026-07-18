@@ -413,18 +413,25 @@ fn sort_key_name(key: SortKey) -> &'static str {
 }
 
 /// カーソル行dirサイズ計算(issue #38フォローアップ、案B)の完了メッセージを整形する。
-/// 列挙できなかったサブディレクトリがある場合は`total`を下限として`≥`を付け、
-/// 件数も添えてsilent fallbackにしない。
+/// 列挙できなかったサブディレクトリ・metadataを取得できなかったエントリがある場合は
+/// `total`を下限として`≥`を付け、件数も添えてsilent fallbackにしない。
 fn dir_size_message(name: &str, outcome: &DirSizeOutcome) -> String {
     let size = fyler_core::fileinfo::human_readable_size(outcome.total);
     let files = outcome.files;
+    let mut skipped = Vec::new();
     if outcome.unreadable_dirs > 0 {
-        format!(
-            "{name}: ≥ {size} ({files} files, {} subdirectories unreadable)",
-            outcome.unreadable_dirs
-        )
-    } else {
+        skipped.push(format!("{} subdirectories", outcome.unreadable_dirs));
+    }
+    if outcome.unreadable_files > 0 {
+        skipped.push(format!("{} entries", outcome.unreadable_files));
+    }
+    if skipped.is_empty() {
         format!("{name}: {size} ({files} files)")
+    } else {
+        format!(
+            "{name}: ≥ {size} ({files} files, {} unreadable)",
+            skipped.join(" and ")
+        )
     }
 }
 
