@@ -2663,6 +2663,24 @@ fn initial_window_geometry(monitor_size: Option<egui::Vec2>) -> Option<(egui::Ve
     Some((size, egui::pos2(margin.x, margin.y)))
 }
 
+/// ウィンドウ/タスクバー/Alt+Tabのアイコン。
+///
+/// build.rsが`assets/fyler.ico`の最大解像度エントリを生RGBAへデコードして埋め込む。
+/// exe自体のファイルアイコン(fyler-app/build.rsのwinresource)とは別系統で、winitの
+/// 暗黙フォールバックに頼らず明示指定することで全表示箇所を確実に揃える。
+fn window_icon() -> egui::IconData {
+    let rgba = include_bytes!(concat!(env!("OUT_DIR"), "/window_icon.rgba")).to_vec();
+    egui::IconData {
+        rgba,
+        width: env!("FYLER_WINDOW_ICON_WIDTH")
+            .parse()
+            .expect("build.rs emits a valid icon width"),
+        height: env!("FYLER_WINDOW_ICON_HEIGHT")
+            .parse()
+            .expect("build.rs emits a valid icon height"),
+    }
+}
+
 fn native_options(window: Option<WindowGeometry>) -> eframe::NativeOptions {
     let viewport = window
         .map_or_else(egui::ViewportBuilder::default, |window| {
@@ -2673,7 +2691,8 @@ fn native_options(window: Option<WindowGeometry>) -> eframe::NativeOptions {
         })
         .with_decorations(false)
         .with_min_inner_size([720.0, 480.0])
-        .with_title("fyler");
+        .with_title("fyler")
+        .with_icon(window_icon());
     eframe::NativeOptions {
         viewport,
         // Geometry is persisted in session.toml so it shares the same normal-shutdown contract
@@ -3655,6 +3674,16 @@ mod tests {
         assert_eq!(options.viewport.position, Some(egui::pos2(30.0, 40.0)));
         assert_eq!(options.viewport.maximized, Some(true));
         assert!(!options.persist_window);
+    }
+
+    #[test]
+    fn native_options_embed_a_non_empty_window_icon() {
+        let icon = window_icon();
+        assert!(icon.width > 0 && icon.height > 0);
+        assert_eq!(icon.rgba.len(), icon.width as usize * icon.height as usize * 4);
+
+        let options = native_options(None);
+        assert!(options.viewport.icon.is_some());
     }
 
     #[test]
