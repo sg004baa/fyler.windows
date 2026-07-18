@@ -2075,15 +2075,29 @@ struct PickerKeys {
     ctrl_enter: bool,
 }
 
+/// 候補選択に使うキーを読み取り、同一フレーム内でイベントキューから消費する。
+///
+/// pickerモーダルは検索クエリの`TextEdit`と候補リストを同時に表示するため、
+/// ここで消費しておかないと同じ矢印キー/Enter/Escapeが`TextEdit`にも渡ってしまい、
+/// カーソル移動・フォーカス解除が候補選択と二重に発生する。この関数は`TextEdit`を
+/// 描画するより前に呼ぶこと(egui はフレーム内で先に消費した側が勝つ)。
 fn read_picker_keys(context: &egui::Context) -> PickerKeys {
-    context.input(|input| PickerKeys {
-        escape: input.key_pressed(egui::Key::Escape),
-        previous: input.key_pressed(egui::Key::ArrowUp)
-            || (input.modifiers.ctrl && input.key_pressed(egui::Key::P)),
-        next: input.key_pressed(egui::Key::ArrowDown)
-            || (input.modifiers.ctrl && input.key_pressed(egui::Key::N)),
-        enter: !input.modifiers.ctrl && input.key_pressed(egui::Key::Enter),
-        ctrl_enter: input.modifiers.ctrl && input.key_pressed(egui::Key::Enter),
+    context.input_mut(|input| {
+        // `||`は短絡評価されるため、両方の`consume_key`呼び出しを必ず走らせて
+        // 片方だけが未消費のままイベントキューに残ることを防ぐ。
+        let arrow_up = input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp);
+        let ctrl_p = input.consume_key(egui::Modifiers::CTRL, egui::Key::P);
+        let previous = arrow_up || ctrl_p;
+        let arrow_down = input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown);
+        let ctrl_n = input.consume_key(egui::Modifiers::CTRL, egui::Key::N);
+        let next = arrow_down || ctrl_n;
+        PickerKeys {
+            escape: input.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+            previous,
+            next,
+            enter: input.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+            ctrl_enter: input.consume_key(egui::Modifiers::CTRL, egui::Key::Enter),
+        }
     })
 }
 
@@ -3567,6 +3581,84 @@ mod tests {
                 query: "read".to_owned(),
             }
         );
+    }
+
+    fn arrow_key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// `read_picker_keys`は候補選択に使うキーをイベントキューから消費し、
+    /// 同一フレームで後から描画される`TextEdit`にArrowUp/ArrowDown等が
+    /// 届かないことを検証する(issue #38: 矢印キーが入力欄と候補選択の
+    /// 両方に効いてしまう問題)。
+    #[test]
+    fn read_picker_keys_consumes_navigation_keys_from_the_event_queue() {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![
+                arrow_key_event(egui::Key::ArrowDown, egui::Modifiers::NONE),
+                arrow_key_event(egui::Key::ArrowUp, egui::Modifiers::NONE),
+                arrow_key_event(egui::Key::P, egui::Modifiers::CTRL),
+                arrow_key_event(egui::Key::N, egui::Modifiers::CTRL),
+                arrow_key_event(egui::Key::Enter, egui::Modifiers::NONE),
+                arrow_key_event(egui::Key::Enter, egui::Modifiers::CTRL),
+                arrow_key_event(egui::Key::Escape, egui::Modifiers::NONE),
+            ],
+            ..Default::default()
+        });
+
+        let keys = read_picker_keys(&ctx);
+        assert!(keys.next, "ArrowDown/Ctrl+N should register as `next`");
+        assert!(
+            keys.previous,
+            "ArrowUp/Ctrl+P should register as `previous`"
+        );
+        assert!(keys.enter, "plain Enter should register as `enter`");
+        assert!(
+            keys.ctrl_enter,
+            "Ctrl+Enter should register as `ctrl_enter`"
+        );
+        assert!(keys.escape, "Escape should register as `escape`");
+
+        // 消費済みなので、この後に同じフレーム内で`TextEdit`が読んでも
+        // 何も残っていない = カーソル移動やフォーカス解除が発生しない。
+        ctx.input(|input| {
+            assert!(
+                input.events.is_empty(),
+                "picker keys must be consumed, but {:?} remained",
+                input.events
+            );
+        });
+
+        let _ = ctx.end_pass();
+    }
+
+    /// query入力用の文字イベントは消費対象外であり、`TextEdit`まで届いて
+    /// 従来どおりクエリ更新に使われることを確認する。
+    #[test]
+    fn read_picker_keys_does_not_consume_unrelated_text_input() {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![
+                egui::Event::Text("a".to_owned()),
+                arrow_key_event(egui::Key::ArrowDown, egui::Modifiers::NONE),
+            ],
+            ..Default::default()
+        });
+
+        let keys = read_picker_keys(&ctx);
+        assert!(keys.next);
+        ctx.input(|input| {
+            assert_eq!(input.events, vec![egui::Event::Text("a".to_owned())]);
+        });
+
+        let _ = ctx.end_pass();
     }
 
     #[test]
