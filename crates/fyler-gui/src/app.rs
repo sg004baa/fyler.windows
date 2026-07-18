@@ -3675,7 +3675,10 @@ mod tests {
     fn native_options_embed_a_non_empty_window_icon() {
         let icon = window_icon();
         assert!(icon.width > 0 && icon.height > 0);
-        assert_eq!(icon.rgba.len(), icon.width as usize * icon.height as usize * 4);
+        assert_eq!(
+            icon.rgba.len(),
+            icon.width as usize * icon.height as usize * 4
+        );
 
         let options = native_options(None);
         assert!(options.viewport.icon.is_some());

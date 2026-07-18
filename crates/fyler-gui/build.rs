@@ -18,7 +18,10 @@ fn main() {
         .expect("Failed to write window icon RGBA");
 
     println!("cargo:rustc-env=FYLER_WINDOW_ICON_WIDTH={}", image.width());
-    println!("cargo:rustc-env=FYLER_WINDOW_ICON_HEIGHT={}", image.height());
+    println!(
+        "cargo:rustc-env=FYLER_WINDOW_ICON_HEIGHT={}",
+        image.height()
+    );
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", icon_path.display());
 }
