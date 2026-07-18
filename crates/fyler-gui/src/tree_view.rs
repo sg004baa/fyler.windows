@@ -15,6 +15,9 @@ use crate::{conceal, icon, theme};
 /// 1階層ぶんの装飾インデント。文字列のタブ幅とは独立したGUI座標。
 const INDENT_UNIT_PX: f32 = 20.0;
 const TREE_LEFT_PADDING: f32 = 12.0;
+/// VisualLine選択矩形の最小幅。名前が空/極小幅の行でも1px程度は塗る
+/// (nvimのV選択が空行でも1セル分ハイライトされるのに合わせる)。
+const MIN_VISUAL_LINE_SELECTION_WIDTH: f32 = 1.0;
 
 /// 前フレームのツリー可視範囲。
 #[derive(Debug, Clone, Copy)]
@@ -336,7 +339,7 @@ pub fn draw(
                     line_index,
                     &font_id,
                     text_offset,
-                    metadata_cluster.cluster_left,
+                    text_width,
                 );
             }
             let icon_y = rect.center().y - icon_galley.size().y / 2.0;
@@ -527,7 +530,7 @@ fn draw_selection(
     line_index: usize,
     font_id: &egui::FontId,
     text_offset: f32,
-    metadata_left: f32,
+    text_width: f32,
 ) {
     let Some((span_start, span_end)) = selection_span(mode, start, cursor, line_index, display)
     else {
@@ -538,11 +541,14 @@ fn draw_selection(
 
     if matches!(mode, Mode::VisualLine) {
         // オリジナルfyler同様、エントリ自身のインデントに関係なくツリー左端から
-        // 塗る。右端は行末ではなく右詰めメタデータクラスタ(size/modified/
-        // incomplete/badge)の開始位置で止める("until last updated section")。
+        // 塗る。右端は右詰めメタデータクラスタの開始位置ではなく、その行の
+        // dir/file名テキストの末尾で止める(nvimのV選択がテキスト末尾までハイ
+        // ライトされるのと同じ見た目)。
+        let (left, right) =
+            visual_line_selection_x_bounds(row_rect.left(), text_offset, text_width);
         let selection_rect = egui::Rect::from_min_max(
-            egui::pos2(row_rect.left() + TREE_LEFT_PADDING, row_rect.top()),
-            egui::pos2(metadata_left, row_rect.bottom()),
+            egui::pos2(left, row_rect.top()),
+            egui::pos2(right, row_rect.bottom()),
         );
         painter.rect_filled(selection_rect, 0.0, fill);
         return;
@@ -575,6 +581,17 @@ fn draw_selection(
         egui::vec2(selected_width, row_rect.height()),
     );
     painter.rect_filled(selection_rect, 0.0, fill);
+}
+
+/// VisualLine選択矩形のx範囲(ツリー左端〜dir/file名テキスト末尾)を計算する
+/// 純関数(egui非依存、unit test対象)。`text_offset`は名前テキストの描画
+/// 開始オフセット(インデント+アイコン込み)、`text_width`は名前テキストの
+/// 実測幅。名前が空/極小幅でも[`MIN_VISUAL_LINE_SELECTION_WIDTH`]分は塗る。
+fn visual_line_selection_x_bounds(row_left: f32, text_offset: f32, text_width: f32) -> (f32, f32) {
+    let left = row_left + TREE_LEFT_PADDING;
+    let name_end = row_left + text_offset + text_width;
+    let right = left + (name_end - left).max(MIN_VISUAL_LINE_SELECTION_WIDTH);
+    (left, right)
 }
 
 /// Visual系モードの各行について、表示文字列内の選択範囲を半開区間で返す。
@@ -669,9 +686,6 @@ struct MetadataClusterLayout {
     incomplete_x: Option<f32>,
     modified_x: Option<f32>,
     size_x: Option<f32>,
-    /// クラスタ全体の左端x座標。要素が一つも無ければ`row_right`をそのまま返す
-    /// (VisualLine選択が行末まで塗られる、という呼び出し側の契約に対応)。
-    cluster_left: f32,
 }
 
 /// 右詰めメタデータクラスタの各要素を row_rect の右端から敷き詰める純関数
@@ -685,26 +699,21 @@ fn layout_metadata_cluster(
     size_width: Option<f32>,
 ) -> MetadataClusterLayout {
     let mut right = row_right - 16.0;
-    let mut any = false;
 
     let badge_x = badge_width.map(|w| {
         right -= w;
-        any = true;
         right
     });
     let incomplete_x = incomplete_width.map(|w| {
         right -= w + 12.0;
-        any = true;
         right
     });
     let modified_x = modified_width.map(|w| {
         right -= w + 12.0;
-        any = true;
         right
     });
     let size_x = size_width.map(|w| {
         right -= w + 12.0;
-        any = true;
         right
     });
 
@@ -713,7 +722,6 @@ fn layout_metadata_cluster(
         incomplete_x,
         modified_x,
         size_x,
-        cluster_left: if any { right } else { row_right },
     }
 }
 
@@ -985,8 +993,6 @@ mod tests {
         assert_eq!(layout.incomplete_x, Some(374.0 - 20.0 - 12.0));
         assert_eq!(layout.modified_x, Some(342.0 - 30.0 - 12.0));
         assert_eq!(layout.size_x, Some(300.0 - 15.0 - 12.0));
-        // クラスタ全体の左端はsizeのさらに左端に一致する。
-        assert_eq!(layout.cluster_left, layout.size_x.unwrap());
     }
 
     #[test]
@@ -997,14 +1003,43 @@ mod tests {
         assert_eq!(layout.incomplete_x, None);
         assert_eq!(layout.modified_x, Some(400.0 - 16.0 - 30.0 - 12.0));
         assert_eq!(layout.size_x, None);
-        assert_eq!(layout.cluster_left, layout.modified_x.unwrap());
     }
 
     #[test]
-    fn metadata_cluster_layout_falls_back_to_row_right_when_nothing_is_shown() {
+    fn metadata_cluster_layout_yields_no_positions_when_nothing_is_shown() {
         let layout = layout_metadata_cluster(400.0, None, None, None, None);
 
-        assert_eq!(layout.cluster_left, 400.0);
+        assert_eq!(layout.badge_x, None);
+        assert_eq!(layout.incomplete_x, None);
+        assert_eq!(layout.modified_x, None);
+        assert_eq!(layout.size_x, None);
+    }
+
+    #[test]
+    fn visual_line_selection_spans_tree_left_to_name_end() {
+        // row_left=100, text_offset=32(indent+icon), text_width=48(名前幅)
+        // -> 左端はTREE_LEFT_PADDING(12)ぶん内側、右端は名前テキストの実測末尾。
+        let (left, right) = visual_line_selection_x_bounds(100.0, 32.0, 48.0);
+
+        assert_eq!(left, 112.0);
+        assert_eq!(right, 180.0);
+    }
+
+    #[test]
+    fn visual_line_selection_ignores_metadata_cluster_and_stops_at_name_end() {
+        // 名前が短くても、右詰めメタデータクラスタの位置に関係なく名前末尾で止まる。
+        let (left, right) = visual_line_selection_x_bounds(0.0, 20.0, 5.0);
+
+        assert_eq!(left, 12.0);
+        assert_eq!(right, 25.0);
+    }
+
+    #[test]
+    fn visual_line_selection_paints_minimum_width_for_degenerate_name_end() {
+        let (left, right) = visual_line_selection_x_bounds(0.0, 0.0, 0.0);
+
+        assert_eq!(left, 12.0);
+        assert_eq!(right - left, MIN_VISUAL_LINE_SELECTION_WIDTH);
     }
 
     #[test]
