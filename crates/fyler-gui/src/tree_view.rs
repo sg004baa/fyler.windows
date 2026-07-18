@@ -258,6 +258,13 @@ pub fn draw(
             );
             let (rect, response) = ui
                 .allocate_exact_size(egui::vec2(width, row_height), egui::Sense::click_and_drag());
+            let metadata_cluster = layout_metadata_cluster(
+                rect.right(),
+                badge.is_some().then(|| badge_galley.size().x),
+                incomplete.then(|| incomplete_galley.size().x),
+                (modified_galley.size().x > 0.0).then(|| modified_galley.size().x),
+                (size_galley.size().x > 0.0).then(|| size_galley.size().x),
+            );
             let has_id = matches!(
                 fyler_core::grammar::split_id_prefix(&line.text),
                 PrefixParse::WithId { .. }
@@ -329,6 +336,7 @@ pub fn draw(
                     line_index,
                     &font_id,
                     text_offset,
+                    metadata_cluster.cluster_left,
                 );
             }
             let icon_y = rect.center().y - icon_galley.size().y / 2.0;
@@ -343,35 +351,30 @@ pub fn draw(
                 text_galley,
                 text_color,
             );
-            let mut right = rect.right() - 16.0;
-            if badge.is_some() {
-                right -= badge_galley.size().x;
+            if let Some(x) = metadata_cluster.badge_x {
                 painter.galley(
-                    egui::pos2(right, rect.center().y - badge_galley.size().y / 2.0),
+                    egui::pos2(x, rect.center().y - badge_galley.size().y / 2.0),
                     badge_galley,
                     badge_color(ui.visuals(), badge),
                 );
             }
-            if incomplete {
-                right -= incomplete_galley.size().x + 12.0;
+            if let Some(x) = metadata_cluster.incomplete_x {
                 painter.galley(
-                    egui::pos2(right, rect.center().y - incomplete_galley.size().y / 2.0),
+                    egui::pos2(x, rect.center().y - incomplete_galley.size().y / 2.0),
                     incomplete_galley,
                     theme::RED,
                 );
             }
-            if modified_galley.size().x > 0.0 {
-                right -= modified_galley.size().x + 12.0;
+            if let Some(x) = metadata_cluster.modified_x {
                 painter.galley(
-                    egui::pos2(right, rect.center().y - modified_galley.size().y / 2.0),
+                    egui::pos2(x, rect.center().y - modified_galley.size().y / 2.0),
                     modified_galley,
                     theme::TEXT_MUTED,
                 );
             }
-            if size_galley.size().x > 0.0 {
-                right -= size_galley.size().x + 12.0;
+            if let Some(x) = metadata_cluster.size_x {
                 painter.galley(
-                    egui::pos2(right, rect.center().y - size_galley.size().y / 2.0),
+                    egui::pos2(x, rect.center().y - size_galley.size().y / 2.0),
                     size_galley,
                     theme::TEXT_MUTED,
                 );
@@ -524,6 +527,7 @@ fn draw_selection(
     line_index: usize,
     font_id: &egui::FontId,
     text_offset: f32,
+    metadata_left: f32,
 ) {
     let Some((span_start, span_end)) = selection_span(mode, start, cursor, line_index, display)
     else {
@@ -533,9 +537,12 @@ fn draw_selection(
     let painter = ui.painter();
 
     if matches!(mode, Mode::VisualLine) {
+        // オリジナルfyler同様、エントリ自身のインデントに関係なくツリー左端から
+        // 塗る。右端は行末ではなく右詰めメタデータクラスタ(size/modified/
+        // incomplete/badge)の開始位置で止める("until last updated section")。
         let selection_rect = egui::Rect::from_min_max(
-            egui::pos2(row_rect.left() + text_offset, row_rect.top()),
-            row_rect.max,
+            egui::pos2(row_rect.left() + TREE_LEFT_PADDING, row_rect.top()),
+            egui::pos2(metadata_left, row_rect.bottom()),
         );
         painter.rect_filled(selection_rect, 0.0, fill);
         return;
@@ -652,6 +659,62 @@ fn incomplete_for_line(raw: &str, incomplete_dirs: &HashSet<EntryId>) -> bool {
         return false;
     };
     incomplete_dirs.contains(&id)
+}
+
+/// 右詰めメタデータクラスタ(badge/incomplete/modified/size)の描画x座標。
+/// [`layout_metadata_cluster`] が算出する。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MetadataClusterLayout {
+    badge_x: Option<f32>,
+    incomplete_x: Option<f32>,
+    modified_x: Option<f32>,
+    size_x: Option<f32>,
+    /// クラスタ全体の左端x座標。要素が一つも無ければ`row_right`をそのまま返す
+    /// (VisualLine選択が行末まで塗られる、という呼び出し側の契約に対応)。
+    cluster_left: f32,
+}
+
+/// 右詰めメタデータクラスタの各要素を row_rect の右端から敷き詰める純関数
+/// (egui非依存、unit test対象)。右から badge → incomplete → modified → size
+/// の順に並べる。各`_width`引数は要素が存在しない行では`None`。
+fn layout_metadata_cluster(
+    row_right: f32,
+    badge_width: Option<f32>,
+    incomplete_width: Option<f32>,
+    modified_width: Option<f32>,
+    size_width: Option<f32>,
+) -> MetadataClusterLayout {
+    let mut right = row_right - 16.0;
+    let mut any = false;
+
+    let badge_x = badge_width.map(|w| {
+        right -= w;
+        any = true;
+        right
+    });
+    let incomplete_x = incomplete_width.map(|w| {
+        right -= w + 12.0;
+        any = true;
+        right
+    });
+    let modified_x = modified_width.map(|w| {
+        right -= w + 12.0;
+        any = true;
+        right
+    });
+    let size_x = size_width.map(|w| {
+        right -= w + 12.0;
+        any = true;
+        right
+    });
+
+    MetadataClusterLayout {
+        badge_x,
+        incomplete_x,
+        modified_x,
+        size_x,
+        cluster_left: if any { right } else { row_right },
+    }
 }
 
 fn badge_character(badge: GitBadge) -> &'static str {
@@ -910,6 +973,38 @@ mod tests {
         assert!(incomplete_for_line("/007 blocked/", &incomplete));
         assert!(!incomplete_for_line("/008 readable/", &incomplete));
         assert!(!incomplete_for_line("new/", &incomplete));
+    }
+
+    #[test]
+    fn metadata_cluster_layout_places_elements_right_to_left_badge_incomplete_modified_size() {
+        let layout = layout_metadata_cluster(400.0, Some(10.0), Some(20.0), Some(30.0), Some(15.0));
+
+        // badgeは行右端16px内側から幅ぶんそのまま。
+        assert_eq!(layout.badge_x, Some(400.0 - 16.0 - 10.0));
+        // 以降は各要素の左に12pxの余白を挟んで並ぶ。
+        assert_eq!(layout.incomplete_x, Some(374.0 - 20.0 - 12.0));
+        assert_eq!(layout.modified_x, Some(342.0 - 30.0 - 12.0));
+        assert_eq!(layout.size_x, Some(300.0 - 15.0 - 12.0));
+        // クラスタ全体の左端はsizeのさらに左端に一致する。
+        assert_eq!(layout.cluster_left, layout.size_x.unwrap());
+    }
+
+    #[test]
+    fn metadata_cluster_layout_skips_absent_elements() {
+        let layout = layout_metadata_cluster(400.0, None, None, Some(30.0), None);
+
+        assert_eq!(layout.badge_x, None);
+        assert_eq!(layout.incomplete_x, None);
+        assert_eq!(layout.modified_x, Some(400.0 - 16.0 - 30.0 - 12.0));
+        assert_eq!(layout.size_x, None);
+        assert_eq!(layout.cluster_left, layout.modified_x.unwrap());
+    }
+
+    #[test]
+    fn metadata_cluster_layout_falls_back_to_row_right_when_nothing_is_shown() {
+        let layout = layout_metadata_cluster(400.0, None, None, None, None);
+
+        assert_eq!(layout.cluster_left, 400.0);
     }
 
     #[test]
