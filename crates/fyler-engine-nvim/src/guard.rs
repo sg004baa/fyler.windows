@@ -6,7 +6,7 @@
 
 use anyhow::Context;
 use fyler_core::editor::{Key, Modifiers};
-use fyler_core::keymap::{EditorAction, KeyBinding};
+use fyler_core::keymap::{BindingTarget, EditorAction, KeyBinding};
 use nvim_rs::compat::tokio::Compat;
 use nvim_rs::{Buffer, Neovim};
 use rmpv::Value;
@@ -102,33 +102,53 @@ struct TrieNode {
     children: std::collections::BTreeMap<String, TrieNode>,
 }
 
-fn binding_values(bindings: &[KeyBinding]) -> (Value, Value) {
+fn binding_values(bindings: &[KeyBinding]) -> (Value, Value, Value) {
     let mut normal = Vec::new();
+    let mut keys = Vec::new();
     let mut ctrl_w = TrieNode::default();
     for binding in bindings {
-        let payload = binding_payload(binding.action);
-        if is_ctrl_w(binding) {
-            let mut node = &mut ctrl_w;
-            for stroke in &binding.sequence.0[1..] {
-                node = node.children.entry(to_nvim_keycodes(stroke)).or_default();
+        match &binding.target {
+            BindingTarget::Action(action) => {
+                let payload = binding_payload(*action);
+                if is_ctrl_w(binding) {
+                    let mut node = &mut ctrl_w;
+                    for stroke in &binding.sequence.0[1..] {
+                        node = node.children.entry(to_nvim_keycodes(stroke)).or_default();
+                    }
+                    debug_assert!(node.leaf.is_none() && node.children.is_empty());
+                    if node.leaf.is_none() && node.children.is_empty() {
+                        node.leaf = Some(payload);
+                    }
+                } else {
+                    let mut value = match payload_value(payload) {
+                        Value::Map(fields) => fields,
+                        _ => unreachable!(),
+                    };
+                    value.push((
+                        Value::from("lhs"),
+                        Value::from(sequence_to_lhs(&binding.sequence)),
+                    ));
+                    normal.push(Value::Map(value));
+                }
             }
-            debug_assert!(node.leaf.is_none() && node.children.is_empty());
-            if node.leaf.is_none() && node.children.is_empty() {
-                node.leaf = Some(payload);
+            BindingTarget::Keys(target_keys) => {
+                // resolve_bindingsがCtrl+W始まりのKeysバインドを既に拒否している
+                // (trieはAction専用)。ここでは前提を裏切っていないことだけ確認する。
+                debug_assert!(!is_ctrl_w(binding));
+                keys.push(Value::Map(vec![
+                    (
+                        Value::from("lhs"),
+                        Value::from(sequence_to_lhs(&binding.sequence)),
+                    ),
+                    (
+                        Value::from("rhs"),
+                        Value::from(sequence_to_lhs(target_keys)),
+                    ),
+                ]));
             }
-        } else {
-            let mut value = match payload_value(payload) {
-                Value::Map(fields) => fields,
-                _ => unreachable!(),
-            };
-            value.push((
-                Value::from("lhs"),
-                Value::from(sequence_to_lhs(&binding.sequence)),
-            ));
-            normal.push(Value::Map(value));
         }
     }
-    (Value::Array(normal), trie_value(ctrl_w))
+    (Value::Array(normal), Value::Array(keys), trie_value(ctrl_w))
 }
 
 fn trie_value(node: TrieNode) -> Value {
@@ -186,11 +206,11 @@ pub(crate) async fn install_guards(
         .iter()
         .map(|event| Value::from(*event))
         .collect();
-    let (binding_values, ctrl_w_trie) = binding_values(bindings);
+    let (binding_values, keys_values, ctrl_w_trie) = binding_values(bindings);
 
     nvim.exec_lua(
         r#"
-local buffer, channel, write_events, bindings, ctrlw_trie = ...
+local buffer, channel, write_events, bindings, keys_bindings, ctrlw_trie = ...
 
 vim.bo[buffer].buftype = "acwrite"
 vim.bo[buffer].bufhidden = "hide"
@@ -367,6 +387,13 @@ for _, binding in ipairs(bindings) do
   vim.keymap.set(binding.modes, binding.lhs, make_callback(binding), { buffer = buffer, silent = true, nowait = true })
 end
 
+-- Keysバインドはsilentを付けない: silentはNeovimの ext_cmdline 通知(cmdline_show)を
+-- 抑制するため、rhsがcmdlineへ入る場合(例: ";" = ":")にGUIがcmdlineバーを
+-- 描画できなくなる(実機検証で判明。msg_showcmdだけが飛びcmdline_showが来ない)。
+for _, binding in ipairs(keys_bindings) do
+  vim.keymap.set("n", binding.lhs, binding.rhs, { buffer = buffer, nowait = true })
+end
+
 vim.keymap.set("n", "<C-w>", function()
   local node = ctrlw_trie
   while true do
@@ -539,6 +566,7 @@ vim.api.nvim_create_autocmd("BufEnter", {
             Value::from(channel_id),
             Value::Array(write_events),
             binding_values,
+            keys_values,
             ctrl_w_trie,
         ],
     )
@@ -619,10 +647,35 @@ mod tests {
     #[test]
     fn defaults_split_into_normal_maps_and_ctrl_w_trie() {
         let bindings = fyler_core::keymap::default_bindings(fyler_core::keymap::default_leader());
-        let (normal, trie) = binding_values(&bindings);
+        let (normal, keys, trie) = binding_values(&bindings);
         assert_eq!(normal.as_array().unwrap().len(), 24);
+        assert!(keys.as_array().unwrap().is_empty());
         let trie = trie.as_map().unwrap();
         assert_eq!(trie.len(), 12);
         assert!(trie.iter().any(|(key, _)| key.as_str() == Some("<C-w>")));
+    }
+
+    #[test]
+    fn keys_target_bindings_carry_lhs_and_rhs_for_noremap_install() {
+        let bindings = [KeyBinding {
+            sequence: fyler_core::keymap::parse_key_sequence(";", None).unwrap(),
+            target: fyler_core::keymap::BindingTarget::Keys(
+                fyler_core::keymap::parse_key_sequence(":", None).unwrap(),
+            ),
+        }];
+        let (normal, keys, trie) = binding_values(&bindings);
+        assert!(normal.as_array().unwrap().is_empty());
+        assert!(trie.as_map().unwrap().is_empty());
+        let keys = keys.as_array().unwrap();
+        assert_eq!(keys.len(), 1);
+        let entry = keys[0].as_map().unwrap();
+        let lookup = |name: &str| {
+            entry
+                .iter()
+                .find(|(key, _)| key.as_str() == Some(name))
+                .map(|(_, value)| value.as_str().unwrap())
+        };
+        assert_eq!(lookup("lhs"), Some(";"));
+        assert_eq!(lookup("rhs"), Some(":"));
     }
 }

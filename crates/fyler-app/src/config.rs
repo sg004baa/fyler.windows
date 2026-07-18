@@ -577,31 +577,32 @@ mod tests {
         let (config, warnings) = load();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(config.bindings.iter().any(|binding| {
-            binding.sequence.to_string() == "x e"
-                && binding.action == keymap::EditorAction::ToggleDockFocus
+            binding.sequence.to_string() == "xe"
+                && binding.target
+                    == keymap::BindingTarget::Action(keymap::EditorAction::ToggleDockFocus)
         }));
 
         fs::write(
             &path,
-            "leader = 'Space'\n[keymap.normal]\n'Leader f' = 'file_picker'\n'g d' = 'none'\n",
+            "leader = '<Space>'\n[keymap.normal]\n'<leader>f' = 'file_picker'\n'gd' = 'none'\n",
         )
         .unwrap();
         let (config, warnings) = load();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(config.bindings.iter().any(|binding| {
-            binding.sequence.to_string() == "Space f"
-                && binding.action == keymap::EditorAction::FilePicker
+            binding.sequence.to_string() == "<Space>f"
+                && binding.target == keymap::BindingTarget::Action(keymap::EditorAction::FilePicker)
         }));
         assert!(
             !config
                 .bindings
                 .iter()
-                .any(|binding| binding.sequence.to_string() == "g d")
+                .any(|binding| binding.sequence.to_string() == "gd")
         );
 
         fs::write(
             &path,
-            "leader = 123\n[keymap.normal]\nx = 1\ny = 'unknown_action'\n[keymap.visual]\nz = 'help'\n",
+            "leader = 123\n[keymap.normal]\nx = 1\ny = 'not a real action'\n[keymap.visual]\nz = 'help'\n",
         )
         .unwrap();
         let (config, warnings) = load();
@@ -618,7 +619,7 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("unknown action"))
+                .any(|warning| warning.contains("not an action name"))
         );
         assert!(
             warnings

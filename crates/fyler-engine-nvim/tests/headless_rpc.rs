@@ -194,8 +194,8 @@ async fn custom_leader_binding_fires_once_and_unmap_removes_default() -> anyhow:
     let (bindings, warnings) = resolve_bindings(
         space,
         &[
-            ("Leader f".into(), "file_picker".into()),
-            ("g .".into(), "none".into()),
+            ("<leader>f".into(), "file_picker".into()),
+            ("g.".into(), "none".into()),
         ],
     );
     assert!(warnings.is_empty(), "{warnings:?}");
@@ -233,7 +233,7 @@ async fn custom_ctrl_w_trie_dispatches_and_blocks_unknown_keys() -> anyhow::Resu
     let root = std::env::current_dir()?;
     let (bindings, warnings) = resolve_bindings(
         default_leader(),
-        &[("Ctrl+W x".into(), "pane_focus_next".into())],
+        &[("<C-w>x".into(), "pane_focus_next".into())],
     );
     assert!(warnings.is_empty(), "{warnings:?}");
     let mut config = NvimConfig::new(nvim_exe, root);
@@ -264,6 +264,48 @@ async fn custom_ctrl_w_trie_dispatches_and_blocks_unknown_keys() -> anyhow::Resu
         )
     })
     .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn keys_target_binding_feeds_keys_without_remap() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    // ";" = ":" (issue #38の例) と、noremap相当であることを確認するための
+    // "a" = "gd" ("gd" 自体もfylerのバインドなので、remapされていれば
+    // NavigateIntoが発火してしまう) を同時に検証する。
+    let (bindings, warnings) = resolve_bindings(
+        default_leader(),
+        &[(";".into(), ":".into()), ("a".into(), "gd".into())],
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let mut config = NvimConfig::new(nvim_exe, root);
+    config.bindings = bindings;
+    let (engine, mut events) = NvimEngine::start(config).await?;
+
+    engine.send(key_command(Key::Char(';')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::CmdlineShow(_))
+    })
+    .await
+    .context("\";\" did not feed \":\" into the cmdline")?;
+    engine.send(key_command(Key::Esc))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::CmdlineHide)
+    })
+    .await?;
+
+    engine.send(key_command(Key::Char('a')))?;
+    assert_no_event(&mut events, |event| {
+        matches!(event, EditorEvent::NavigateInto { .. })
+    })
+    .await
+    .context("Keys bindings must install noremap; \"a\" must not trigger the \"gd\" binding")?;
+
     Ok(())
 }
 
@@ -345,7 +387,7 @@ async fn clipboard_copy_and_cut_keymaps_emit_normal_and_visual_requests() -> any
         |event| matches!(event, EditorEvent::ClipboardCopyRequested { lines } if lines == &[0]),
     )
     .await
-    .context("Ctrl+C did not emit ClipboardCopyRequested")?;
+    .context("<C-c> did not emit ClipboardCopyRequested")?;
 
     engine.send(key_command(Key::Char('V')))?;
     engine.send(key_command(Key::Down))?;
@@ -395,7 +437,7 @@ async fn clipboard_paste_keymap_emits_request_at_cursor_line() -> anyhow::Result
         matches!(event, EditorEvent::ClipboardPasteRequested { line: 1 })
     })
     .await
-    .context("Ctrl+V did not emit ClipboardPasteRequested at the cursor line")?;
+    .context("<C-v> did not emit ClipboardPasteRequested at the cursor line")?;
 
     Ok(())
 }
@@ -639,21 +681,21 @@ async fn history_and_refresh_keymaps_and_commands_emit_expected_events() -> anyh
         matches!(event, EditorEvent::HistoryBack)
     })
     .await
-    .context("Ctrl+P did not emit HistoryBack")?;
+    .context("<C-p> did not emit HistoryBack")?;
 
     engine.send(ctrl_key('n'))?;
     wait_for_event(&mut events, |event| {
         matches!(event, EditorEvent::HistoryForward)
     })
     .await
-    .context("Ctrl+N did not emit HistoryForward")?;
+    .context("<C-n> did not emit HistoryForward")?;
 
     engine.send(ctrl_key('r'))?;
     wait_for_event(&mut events, |event| {
         matches!(event, EditorEvent::RefreshRequested)
     })
     .await
-    .context("Ctrl+R did not emit RefreshRequested")?;
+    .context("<C-r> did not emit RefreshRequested")?;
 
     engine.send(key_command(Key::Char(':')))?;
     engine.send(EditorCommand::Text("FylerBack".to_owned()))?;

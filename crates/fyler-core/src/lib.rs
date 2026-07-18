@@ -36,7 +36,7 @@ pub mod window;
 pub use editor::{EditorCommand, EditorEngine, EditorEvent, EditorLine, EditorSnapshot};
 pub use gitstatus::GitBadge;
 pub use id::{EntryId, IdAllocator};
-pub use keymap::{EditorAction, KeyBinding, KeySequence};
+pub use keymap::{BindingTarget, EditorAction, KeyBinding, KeySequence};
 pub use pane::{FocusDirection, PaneAction, PaneId, PaneLayout, SplitDirection};
 pub use path::TreePath;
 pub use plan::{FsOperation, OperationPlan};
