@@ -939,6 +939,7 @@ pub fn draw_open_with(
             ui.add_space(4.0);
             ui.monospace(file_name);
             ui.add_space(8.0);
+            ui.set_width(ui.ctx().content_rect().width() * 0.3);
 
             let mut clicked_choice = None;
             for (index, choice) in choices.iter().enumerate() {
