@@ -45,4 +45,4 @@ pub use transfer::{TransferKind, TransferOp, TransferPlan};
 pub use tree::{BaselineEntry, BaselineTree, DesiredEntry, DesiredTree, EditContext, EntryKind};
 pub use undo::{UndoStep, UndoTransaction};
 pub use validate::ValidateError;
-pub use window::WindowGeometry;
+pub use window::{StartupWindow, WindowGeometry};
