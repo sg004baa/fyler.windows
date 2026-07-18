@@ -279,6 +279,10 @@ fn encode_window(window: WindowGeometry) -> toml::Value {
         "maximized".to_owned(),
         toml::Value::Boolean(window.maximized),
     );
+    table.insert(
+        "scale".to_owned(),
+        toml::Value::Float(f64::from(window.scale)),
+    );
     toml::Value::Table(table)
 }
 
@@ -292,6 +296,9 @@ fn parse_window(value: &toml::Value) -> anyhow::Result<WindowGeometry> {
         required(table, "maximized")?
             .as_bool()
             .context("window maximized must be a boolean")?,
+        // 後方互換レイヤは持たない: 旧session.toml(scaleなし)はここで失敗し、
+        // 既存の「復元できず警告して新規開始」経路に乗る(既定値を埋めない)。
+        required_number(table, "scale")?,
     )
     .context("window geometry contains invalid values")
 }
@@ -564,10 +571,44 @@ mod tests {
                 (two, pane("//server/share/長い path")),
                 (three, pane(absolute_root("three").to_str().unwrap())),
             ]),
-            window: WindowGeometry::new(1280.0, 720.0, 30.0, 40.0, true),
+            window: WindowGeometry::new(1280.0, 720.0, 30.0, 40.0, true, 1.25),
         };
         let encoded = encode(&state).unwrap().to_string();
         assert_eq!(parse(&encoded).unwrap(), state);
+    }
+
+    #[test]
+    fn window_geometry_without_scale_is_rejected_not_defaulted() {
+        // 旧session.toml(scale導入前)にscaleキーを足す後方互換レイヤは持たない。
+        // parseは失敗し、呼び出し側の「復元できず警告して新規開始」経路に乗る。
+        let root = if cfg!(windows) {
+            "C:/root"
+        } else {
+            "/tmp/root"
+        };
+        let source = format!(
+            r#"
+version = 1
+active = 1
+
+[layout]
+kind = "leaf"
+pane = 1
+
+[window]
+inner_width = 1280.0
+inner_height = 720.0
+outer_x = 30.0
+outer_y = 40.0
+maximized = true
+
+[[panes]]
+id = 1
+root = "{root}"
+"#
+        );
+        let error = parse(&source).unwrap_err().to_string();
+        assert!(error.contains("scale"), "unexpected error: {error}");
     }
 
     #[test]

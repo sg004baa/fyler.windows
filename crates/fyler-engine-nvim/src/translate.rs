@@ -93,11 +93,11 @@ mod tests {
 
     #[test]
     fn sequence_lhs_concatenates_nvim_keycodes() {
-        assert_eq!(sequence_to_lhs(&sequence("g d")), "gd");
-        assert_eq!(sequence_to_lhs(&sequence("Ctrl+W Ctrl+W")), "<C-w><C-w>");
-        assert_eq!(sequence_to_lhs(&sequence("Space f")), " f");
+        assert_eq!(sequence_to_lhs(&sequence("gd")), "gd");
+        assert_eq!(sequence_to_lhs(&sequence("<C-w><C-w>")), "<C-w><C-w>");
+        assert_eq!(sequence_to_lhs(&sequence("<Space>f")), " f");
         assert_eq!(sequence_to_lhs(&sequence("?")), "?");
-        assert_eq!(sequence_to_lhs(&sequence("<")), "<lt>");
+        assert_eq!(sequence_to_lhs(&sequence("<lt>")), "<lt>");
     }
 
     /// 明示的な修飾つきの `KeyInput` を組む。

@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use eframe::egui;
 use fyler_core::editor::{Cursor, EditorSnapshot, Mode, SearchHighlight};
-use fyler_core::fileinfo::FileInfo;
+use fyler_core::fileinfo::{FileInfo, human_readable_size};
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::EntryId;
@@ -15,6 +15,9 @@ use crate::{conceal, icon, theme};
 /// 1階層ぶんの装飾インデント。文字列のタブ幅とは独立したGUI座標。
 const INDENT_UNIT_PX: f32 = 20.0;
 const TREE_LEFT_PADDING: f32 = 12.0;
+/// VisualLine選択矩形の最小幅。名前が空/極小幅の行でも1px程度は塗る
+/// (nvimのV選択が空行でも1セル分ハイライトされるのに合わせる)。
+const MIN_VISUAL_LINE_SELECTION_WIDTH: f32 = 1.0;
 
 /// 前フレームのツリー可視範囲。
 #[derive(Debug, Clone, Copy)]
@@ -238,6 +241,12 @@ pub fn draw(
                 egui::FontId::monospace(11.0),
                 theme::TEXT_MUTED,
             );
+            let size_text = file_info_for_line(&line.text, file_infos)
+                .and_then(|info| info.size)
+                .map(human_readable_size)
+                .unwrap_or_default();
+            let size_galley =
+                painter.layout_no_wrap(size_text, egui::FontId::monospace(11.0), theme::TEXT_MUTED);
             let icon_width = icon_galley.size().x;
             let text_width = text_galley.size().x;
             let text_offset = TREE_LEFT_PADDING + indent_px + icon_width;
@@ -245,12 +254,20 @@ pub fn draw(
                 text_offset
                     + text_width
                     + modified_galley.size().x
+                    + size_galley.size().x
                     + incomplete_galley.size().x
                     + badge_galley.size().x
                     + 44.0,
             );
             let (rect, response) = ui
                 .allocate_exact_size(egui::vec2(width, row_height), egui::Sense::click_and_drag());
+            let metadata_cluster = layout_metadata_cluster(
+                rect.right(),
+                badge.is_some().then(|| badge_galley.size().x),
+                incomplete.then(|| incomplete_galley.size().x),
+                (modified_galley.size().x > 0.0).then(|| modified_galley.size().x),
+                (size_galley.size().x > 0.0).then(|| size_galley.size().x),
+            );
             let has_id = matches!(
                 fyler_core::grammar::split_id_prefix(&line.text),
                 PrefixParse::WithId { .. }
@@ -322,6 +339,7 @@ pub fn draw(
                     line_index,
                     &font_id,
                     text_offset,
+                    text_width,
                 );
             }
             let icon_y = rect.center().y - icon_galley.size().y / 2.0;
@@ -336,28 +354,31 @@ pub fn draw(
                 text_galley,
                 text_color,
             );
-            let mut right = rect.right() - 16.0;
-            if badge.is_some() {
-                right -= badge_galley.size().x;
+            if let Some(x) = metadata_cluster.badge_x {
                 painter.galley(
-                    egui::pos2(right, rect.center().y - badge_galley.size().y / 2.0),
+                    egui::pos2(x, rect.center().y - badge_galley.size().y / 2.0),
                     badge_galley,
                     badge_color(ui.visuals(), badge),
                 );
             }
-            if incomplete {
-                right -= incomplete_galley.size().x + 12.0;
+            if let Some(x) = metadata_cluster.incomplete_x {
                 painter.galley(
-                    egui::pos2(right, rect.center().y - incomplete_galley.size().y / 2.0),
+                    egui::pos2(x, rect.center().y - incomplete_galley.size().y / 2.0),
                     incomplete_galley,
                     theme::RED,
                 );
             }
-            if modified_galley.size().x > 0.0 {
-                right -= modified_galley.size().x + 12.0;
+            if let Some(x) = metadata_cluster.modified_x {
                 painter.galley(
-                    egui::pos2(right, rect.center().y - modified_galley.size().y / 2.0),
+                    egui::pos2(x, rect.center().y - modified_galley.size().y / 2.0),
                     modified_galley,
+                    theme::TEXT_MUTED,
+                );
+            }
+            if let Some(x) = metadata_cluster.size_x {
+                painter.galley(
+                    egui::pos2(x, rect.center().y - size_galley.size().y / 2.0),
+                    size_galley,
                     theme::TEXT_MUTED,
                 );
             }
@@ -509,6 +530,7 @@ fn draw_selection(
     line_index: usize,
     font_id: &egui::FontId,
     text_offset: f32,
+    text_width: f32,
 ) {
     let Some((span_start, span_end)) = selection_span(mode, start, cursor, line_index, display)
     else {
@@ -518,9 +540,15 @@ fn draw_selection(
     let painter = ui.painter();
 
     if matches!(mode, Mode::VisualLine) {
+        // オリジナルfyler同様、エントリ自身のインデントに関係なくツリー左端から
+        // 塗る。右端は右詰めメタデータクラスタの開始位置ではなく、その行の
+        // dir/file名テキストの末尾で止める(nvimのV選択がテキスト末尾までハイ
+        // ライトされるのと同じ見た目)。
+        let (left, right) =
+            visual_line_selection_x_bounds(row_rect.left(), text_offset, text_width);
         let selection_rect = egui::Rect::from_min_max(
-            egui::pos2(row_rect.left() + text_offset, row_rect.top()),
-            row_rect.max,
+            egui::pos2(left, row_rect.top()),
+            egui::pos2(right, row_rect.bottom()),
         );
         painter.rect_filled(selection_rect, 0.0, fill);
         return;
@@ -553,6 +581,17 @@ fn draw_selection(
         egui::vec2(selected_width, row_rect.height()),
     );
     painter.rect_filled(selection_rect, 0.0, fill);
+}
+
+/// VisualLine選択矩形のx範囲(ツリー左端〜dir/file名テキスト末尾)を計算する
+/// 純関数(egui非依存、unit test対象)。`text_offset`は名前テキストの描画
+/// 開始オフセット(インデント+アイコン込み)、`text_width`は名前テキストの
+/// 実測幅。名前が空/極小幅でも[`MIN_VISUAL_LINE_SELECTION_WIDTH`]分は塗る。
+fn visual_line_selection_x_bounds(row_left: f32, text_offset: f32, text_width: f32) -> (f32, f32) {
+    let left = row_left + TREE_LEFT_PADDING;
+    let name_end = row_left + text_offset + text_width;
+    let right = left + (name_end - left).max(MIN_VISUAL_LINE_SELECTION_WIDTH);
+    (left, right)
 }
 
 /// Visual系モードの各行について、表示文字列内の選択範囲を半開区間で返す。
@@ -637,6 +676,53 @@ fn incomplete_for_line(raw: &str, incomplete_dirs: &HashSet<EntryId>) -> bool {
         return false;
     };
     incomplete_dirs.contains(&id)
+}
+
+/// 右詰めメタデータクラスタ(badge/incomplete/modified/size)の描画x座標。
+/// [`layout_metadata_cluster`] が算出する。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MetadataClusterLayout {
+    badge_x: Option<f32>,
+    incomplete_x: Option<f32>,
+    modified_x: Option<f32>,
+    size_x: Option<f32>,
+}
+
+/// 右詰めメタデータクラスタの各要素を row_rect の右端から敷き詰める純関数
+/// (egui非依存、unit test対象)。右から badge → incomplete → modified → size
+/// の順に並べる。各`_width`引数は要素が存在しない行では`None`。
+fn layout_metadata_cluster(
+    row_right: f32,
+    badge_width: Option<f32>,
+    incomplete_width: Option<f32>,
+    modified_width: Option<f32>,
+    size_width: Option<f32>,
+) -> MetadataClusterLayout {
+    let mut right = row_right - 16.0;
+
+    let badge_x = badge_width.map(|w| {
+        right -= w;
+        right
+    });
+    let incomplete_x = incomplete_width.map(|w| {
+        right -= w + 12.0;
+        right
+    });
+    let modified_x = modified_width.map(|w| {
+        right -= w + 12.0;
+        right
+    });
+    let size_x = size_width.map(|w| {
+        right -= w + 12.0;
+        right
+    });
+
+    MetadataClusterLayout {
+        badge_x,
+        incomplete_x,
+        modified_x,
+        size_x,
+    }
 }
 
 fn badge_character(badge: GitBadge) -> &'static str {
@@ -895,6 +981,65 @@ mod tests {
         assert!(incomplete_for_line("/007 blocked/", &incomplete));
         assert!(!incomplete_for_line("/008 readable/", &incomplete));
         assert!(!incomplete_for_line("new/", &incomplete));
+    }
+
+    #[test]
+    fn metadata_cluster_layout_places_elements_right_to_left_badge_incomplete_modified_size() {
+        let layout = layout_metadata_cluster(400.0, Some(10.0), Some(20.0), Some(30.0), Some(15.0));
+
+        // badgeは行右端16px内側から幅ぶんそのまま。
+        assert_eq!(layout.badge_x, Some(400.0 - 16.0 - 10.0));
+        // 以降は各要素の左に12pxの余白を挟んで並ぶ。
+        assert_eq!(layout.incomplete_x, Some(374.0 - 20.0 - 12.0));
+        assert_eq!(layout.modified_x, Some(342.0 - 30.0 - 12.0));
+        assert_eq!(layout.size_x, Some(300.0 - 15.0 - 12.0));
+    }
+
+    #[test]
+    fn metadata_cluster_layout_skips_absent_elements() {
+        let layout = layout_metadata_cluster(400.0, None, None, Some(30.0), None);
+
+        assert_eq!(layout.badge_x, None);
+        assert_eq!(layout.incomplete_x, None);
+        assert_eq!(layout.modified_x, Some(400.0 - 16.0 - 30.0 - 12.0));
+        assert_eq!(layout.size_x, None);
+    }
+
+    #[test]
+    fn metadata_cluster_layout_yields_no_positions_when_nothing_is_shown() {
+        let layout = layout_metadata_cluster(400.0, None, None, None, None);
+
+        assert_eq!(layout.badge_x, None);
+        assert_eq!(layout.incomplete_x, None);
+        assert_eq!(layout.modified_x, None);
+        assert_eq!(layout.size_x, None);
+    }
+
+    #[test]
+    fn visual_line_selection_spans_tree_left_to_name_end() {
+        // row_left=100, text_offset=32(indent+icon), text_width=48(名前幅)
+        // -> 左端はTREE_LEFT_PADDING(12)ぶん内側、右端は名前テキストの実測末尾。
+        let (left, right) = visual_line_selection_x_bounds(100.0, 32.0, 48.0);
+
+        assert_eq!(left, 112.0);
+        assert_eq!(right, 180.0);
+    }
+
+    #[test]
+    fn visual_line_selection_ignores_metadata_cluster_and_stops_at_name_end() {
+        // 名前が短くても、右詰めメタデータクラスタの位置に関係なく名前末尾で止まる。
+        let (left, right) = visual_line_selection_x_bounds(0.0, 20.0, 5.0);
+
+        assert_eq!(left, 12.0);
+        assert_eq!(right, 25.0);
+    }
+
+    #[test]
+    fn visual_line_selection_paints_minimum_width_for_degenerate_name_end() {
+        let (left, right) = visual_line_selection_x_bounds(0.0, 0.0, 0.0);
+
+        assert_eq!(left, 12.0);
+        assert_eq!(right - left, MIN_VISUAL_LINE_SELECTION_WIDTH);
     }
 
     #[test]

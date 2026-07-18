@@ -211,20 +211,33 @@ impl EditorAction {
     }
 }
 
-/// 解決済みバインディング(シーケンス → 操作)。
+/// 解決済みバインディング(シーケンス → 割り当て先)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyBinding {
-    /// 操作を起動する、展開済みのキーシーケンス。
+    /// 起動する、展開済みのキーシーケンス。
     pub sequence: KeySequence,
-    /// シーケンスへ割り当てる操作。
-    pub action: EditorAction,
+    /// シーケンスへ割り当てる先(操作、または別のキーシーケンス)。
+    pub target: BindingTarget,
 }
 
-/// key表記を解釈できない理由。設定警告へそのまま埋め込める日本語を返す。
+/// キーシーケンスの割り当て先。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindingTarget {
+    /// エンジン非依存の操作を起動する。
+    Action(EditorAction),
+    /// 別のキーシーケンスをそのまま送出する(remapなし。任意キーへのバインド用)。
+    Keys(KeySequence),
+}
+
+/// key表記を解釈できない理由。設定警告へそのまま埋め込める文を返す。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum KeymapError {
     #[error("Key sequence is empty")]
     Empty,
+    #[error("Raw whitespace is not allowed; use <Space> instead")]
+    RawWhitespace,
+    #[error("Unclosed key notation: <{0}")]
+    UnclosedBracket(String),
     #[error("Unknown modifier: {0}")]
     UnknownModifier(String),
     #[error("Unknown key name: {0}")]
@@ -233,66 +246,100 @@ pub enum KeymapError {
         "Shift cannot be used with a printable character; write the uppercase character directly: {0}"
     )]
     ShiftCharacter(String),
-    #[error("Leader is not configured")]
+    #[error("leader is not configured")]
     LeaderUnset,
-    #[error("Leader cannot have modifiers")]
+    #[error("leader cannot have modifiers")]
     ModifiedLeader,
     #[error("leader must be a single key")]
     LeaderSequence,
-    #[error("leader cannot have modifiers")]
-    LeaderModified,
-    #[error("leader cannot be Leader")]
+    #[error("leader cannot reference itself")]
     RecursiveLeader,
 }
 
-/// エンジン非依存表記のキーシーケンスを解釈する。
+/// vim風表記(`gd`, `<leader>f`, `<C-r>`)のキーシーケンスを解釈する。
+///
+/// エンジン非依存の自前実装(nvim-rs等のnvim固有語彙には一切触れない。絶対ルール2)。
+///
+/// - 連結した文字はそれぞれ1ストロークになる(`gd` = `g`, `d`)。生の空白は
+///   [`KeymapError::RawWhitespace`](`<Space>` を使う)。
+/// - `<...>` は特殊キー・修飾つきキーを表す。`<` そのものを打つ場合は `<lt>` と書く。
 pub fn parse_key_sequence(
     input: &str,
     leader: Option<KeyInput>,
 ) -> Result<KeySequence, KeymapError> {
-    let tokens = input.split_whitespace().collect::<Vec<_>>();
-    if tokens.is_empty() {
+    if input.is_empty() {
         return Err(KeymapError::Empty);
     }
-    tokens
-        .into_iter()
-        .map(|token| parse_stroke(token, leader))
-        .collect::<Result<Vec<_>, _>>()
-        .map(KeySequence)
+    let mut strokes = Vec::new();
+    let mut chars = input.chars();
+    while let Some(character) = chars.next() {
+        if character == '<' {
+            let mut content = String::new();
+            let mut closed = false;
+            for next in chars.by_ref() {
+                if next == '>' {
+                    closed = true;
+                    break;
+                }
+                content.push(next);
+            }
+            if !closed {
+                return Err(KeymapError::UnclosedBracket(content));
+            }
+            strokes.push(parse_bracket(&content, leader)?);
+        } else if character.is_whitespace() {
+            return Err(KeymapError::RawWhitespace);
+        } else {
+            strokes.push(KeyInput {
+                key: Key::Char(character),
+                mods: Modifiers::default(),
+            });
+        }
+    }
+    if strokes.is_empty() {
+        return Err(KeymapError::Empty);
+    }
+    Ok(KeySequence(strokes))
 }
 
-/// leader指定を単一・無修飾キーとして解釈する。
+/// leader指定を単一・無修飾ストロークとして解釈する。
+///
+/// vimrcの`let mapleader=" "`慣習に合わせ、raw1文字スペースに限り`<Space>`として
+/// 受理する(生の空白は通常エラーだが、leader定義だけの特例)。
 pub fn parse_leader(input: &str) -> Result<KeyInput, KeymapError> {
-    let tokens = input.split_whitespace().collect::<Vec<_>>();
-    if tokens.len() != 1 {
-        return Err(KeymapError::LeaderSequence);
+    if input == " " {
+        return Ok(KeyInput {
+            key: Key::Char(' '),
+            mods: Modifiers::default(),
+        });
     }
-    if tokens[0].eq_ignore_ascii_case("leader") {
-        return Err(KeymapError::RecursiveLeader);
+    let sequence = parse_key_sequence(input, None).map_err(|error| match error {
+        KeymapError::LeaderUnset => KeymapError::RecursiveLeader,
+        other => other,
+    })?;
+    match sequence.0.as_slice() {
+        [stroke] if stroke.mods == Modifiers::default() => Ok(*stroke),
+        [_stroke] => Err(KeymapError::ModifiedLeader),
+        _ => Err(KeymapError::LeaderSequence),
     }
-    let stroke = parse_stroke(tokens[0], None)?;
-    if stroke.mods != Modifiers::default() {
-        return Err(KeymapError::LeaderModified);
-    }
-    Ok(stroke)
 }
 
-fn parse_stroke(token: &str, leader: Option<KeyInput>) -> Result<KeyInput, KeymapError> {
-    let parts = token.split('+').collect::<Vec<_>>();
-    if parts.iter().any(|part| part.is_empty()) {
-        return Err(KeymapError::UnknownKey(token.to_owned()));
+/// `<...>` の中身(前後の`<`/`>`を除いた文字列)を1ストロークへ解釈する。
+fn parse_bracket(content: &str, leader: Option<KeyInput>) -> Result<KeyInput, KeymapError> {
+    if content.is_empty() {
+        return Err(KeymapError::UnknownKey(String::new()));
     }
-    let (key_name, modifier_names) = parts.split_last().expect("split always has one item");
+    let (modifier_names, key_name) = split_modifiers(content);
     let mut mods = Modifiers::default();
     for modifier in modifier_names {
-        if modifier.eq_ignore_ascii_case("ctrl") {
+        if modifier.eq_ignore_ascii_case("c") {
             mods.ctrl = true;
-        } else if modifier.eq_ignore_ascii_case("alt") {
+        } else if modifier.eq_ignore_ascii_case("a") || modifier.eq_ignore_ascii_case("m") {
             mods.alt = true;
-        } else if modifier.eq_ignore_ascii_case("shift") {
+        } else if modifier.eq_ignore_ascii_case("s") {
             mods.shift = true;
         } else {
-            return Err(KeymapError::UnknownModifier((*modifier).to_owned()));
+            return Err(KeymapError::UnknownModifier(modifier.to_owned()));
         }
     }
     if key_name.eq_ignore_ascii_case("leader") {
@@ -304,11 +351,11 @@ fn parse_stroke(token: &str, leader: Option<KeyInput>) -> Result<KeyInput, Keyma
 
     let mut named = true;
     let mut key = match key_name.to_ascii_lowercase().as_str() {
-        "enter" => Key::Enter,
+        "cr" | "enter" => Key::Enter,
         "esc" => Key::Esc,
-        "backspace" => Key::Backspace,
+        "bs" => Key::Backspace,
         "tab" => Key::Tab,
-        "delete" => Key::Delete,
+        "del" => Key::Delete,
         "space" => Key::Char(' '),
         "up" => Key::Up,
         "down" => Key::Down,
@@ -318,24 +365,25 @@ fn parse_stroke(token: &str, leader: Option<KeyInput>) -> Result<KeyInput, Keyma
         "end" => Key::End,
         "pageup" => Key::PageUp,
         "pagedown" => Key::PageDown,
+        "lt" => Key::Char('<'),
         lower if lower.len() >= 2 && lower.starts_with('f') => lower[1..]
             .parse::<u8>()
             .ok()
             .filter(|number| (1..=12).contains(number))
             .map(Key::F)
-            .ok_or_else(|| KeymapError::UnknownKey((*key_name).to_owned()))?,
+            .ok_or_else(|| KeymapError::UnknownKey(key_name.to_owned()))?,
         _ => {
             let mut chars = key_name.chars();
             let character = chars
                 .next()
                 .filter(|character| !character.is_control() && chars.next().is_none())
-                .ok_or_else(|| KeymapError::UnknownKey((*key_name).to_owned()))?;
+                .ok_or_else(|| KeymapError::UnknownKey(key_name.to_owned()))?;
             named = false;
             Key::Char(character)
         }
     };
     if !named && mods.shift {
-        return Err(KeymapError::ShiftCharacter((*key_name).to_owned()));
+        return Err(KeymapError::ShiftCharacter(key_name.to_owned()));
     }
     if (mods.ctrl || mods.alt)
         && let Key::Char(character) = &mut key
@@ -346,12 +394,32 @@ fn parse_stroke(token: &str, leader: Option<KeyInput>) -> Result<KeyInput, Keyma
     Ok(KeyInput { key, mods })
 }
 
+/// `<...>` の中身をmodifierトークン列とキー名へ分割する。
+///
+/// 末尾が単独の`-`ならキー名は`-`自体を指す(例: `<C-->` = Ctrl+ハイフン)。
+fn split_modifiers(content: &str) -> (Vec<&str>, &str) {
+    if content == "-" {
+        return (Vec::new(), "-");
+    }
+    if let Some(head) = content.strip_suffix('-') {
+        let modifiers = head.split('-').filter(|part| !part.is_empty()).collect();
+        return (modifiers, "-");
+    }
+    match content.rfind('-') {
+        Some(index) => {
+            let modifiers = content[..index]
+                .split('-')
+                .filter(|part| !part.is_empty())
+                .collect();
+            (modifiers, &content[index + 1..])
+        }
+        None => (Vec::new(), content),
+    }
+}
+
 impl fmt::Display for KeySequence {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, stroke) in self.0.iter().enumerate() {
-            if index != 0 {
-                formatter.write_str(" ")?;
-            }
+        for stroke in &self.0 {
             write_stroke(formatter, stroke)?;
         }
         Ok(())
@@ -359,33 +427,42 @@ impl fmt::Display for KeySequence {
 }
 
 fn write_stroke(formatter: &mut fmt::Formatter<'_>, stroke: &KeyInput) -> fmt::Result {
+    let bare = stroke.mods == Modifiers::default()
+        && matches!(stroke.key, Key::Char(character) if character != '<' && character != ' ');
+    if let (true, Key::Char(character)) = (bare, stroke.key) {
+        return write!(formatter, "{character}");
+    }
+
+    formatter.write_str("<")?;
     if stroke.mods.ctrl {
-        formatter.write_str("Ctrl+")?;
+        formatter.write_str("C-")?;
     }
     if stroke.mods.alt {
-        formatter.write_str("Alt+")?;
+        formatter.write_str("A-")?;
     }
     if stroke.mods.shift {
-        formatter.write_str("Shift+")?;
+        formatter.write_str("S-")?;
     }
     match stroke.key {
-        Key::Char(' ') => formatter.write_str("Space"),
-        Key::Char(character) => write!(formatter, "{character}"),
-        Key::Enter => formatter.write_str("Enter"),
-        Key::Esc => formatter.write_str("Esc"),
-        Key::Backspace => formatter.write_str("Backspace"),
-        Key::Tab => formatter.write_str("Tab"),
-        Key::Delete => formatter.write_str("Delete"),
-        Key::Up => formatter.write_str("Up"),
-        Key::Down => formatter.write_str("Down"),
-        Key::Left => formatter.write_str("Left"),
-        Key::Right => formatter.write_str("Right"),
-        Key::Home => formatter.write_str("Home"),
-        Key::End => formatter.write_str("End"),
-        Key::PageUp => formatter.write_str("PageUp"),
-        Key::PageDown => formatter.write_str("PageDown"),
-        Key::F(number) => write!(formatter, "F{number}"),
+        Key::Char(' ') => formatter.write_str("Space")?,
+        Key::Char('<') => formatter.write_str("lt")?,
+        Key::Char(character) => write!(formatter, "{character}")?,
+        Key::Enter => formatter.write_str("CR")?,
+        Key::Esc => formatter.write_str("Esc")?,
+        Key::Backspace => formatter.write_str("BS")?,
+        Key::Tab => formatter.write_str("Tab")?,
+        Key::Delete => formatter.write_str("Del")?,
+        Key::Up => formatter.write_str("Up")?,
+        Key::Down => formatter.write_str("Down")?,
+        Key::Left => formatter.write_str("Left")?,
+        Key::Right => formatter.write_str("Right")?,
+        Key::Home => formatter.write_str("Home")?,
+        Key::End => formatter.write_str("End")?,
+        Key::PageUp => formatter.write_str("PageUp")?,
+        Key::PageDown => formatter.write_str("PageDown")?,
+        Key::F(number) => write!(formatter, "F{number}")?,
     }
+    formatter.write_str(">")
 }
 
 /// 組み込みkeymapで使う既定leader。
@@ -399,55 +476,64 @@ pub fn default_leader() -> KeyInput {
 /// 現行の組み込みキー操作と順序が一致する既定バインディングを返す。
 pub fn default_bindings(leader: KeyInput) -> Vec<KeyBinding> {
     let entries = [
-        ("Enter", EditorAction::Activate),
-        ("Backspace", EditorAction::NavigateParent),
-        ("g d", EditorAction::NavigateInto),
-        ("g .", EditorAction::ToggleHidden),
-        ("z c", EditorAction::FoldClose),
-        ("z o", EditorAction::FoldOpen),
-        ("z a", EditorAction::FoldToggle),
-        ("z C", EditorAction::FoldCloseRecursive),
-        ("z O", EditorAction::FoldOpenRecursive),
-        ("z M", EditorAction::FoldCloseAll),
-        ("z R", EditorAction::FoldOpenAll),
-        ("g /", EditorAction::FilePicker),
-        ("g y", EditorAction::YankPath),
-        ("g o", EditorAction::OpenWith),
-        ("g m", EditorAction::TransferMove),
-        ("g c", EditorAction::TransferCopy),
-        ("Ctrl+C", EditorAction::ClipboardCopy),
-        ("Ctrl+X", EditorAction::ClipboardCut),
-        ("Ctrl+V", EditorAction::ClipboardPaste),
-        ("Leader e", EditorAction::ToggleDockFocus),
+        ("<CR>", EditorAction::Activate),
+        ("<BS>", EditorAction::NavigateParent),
+        ("gd", EditorAction::NavigateInto),
+        ("g.", EditorAction::ToggleHidden),
+        ("zc", EditorAction::FoldClose),
+        ("zo", EditorAction::FoldOpen),
+        ("za", EditorAction::FoldToggle),
+        ("zC", EditorAction::FoldCloseRecursive),
+        ("zO", EditorAction::FoldOpenRecursive),
+        ("zM", EditorAction::FoldCloseAll),
+        ("zR", EditorAction::FoldOpenAll),
+        ("g/", EditorAction::FilePicker),
+        ("gy", EditorAction::YankPath),
+        ("go", EditorAction::OpenWith),
+        ("gm", EditorAction::TransferMove),
+        ("gc", EditorAction::TransferCopy),
+        ("gs", EditorAction::DirSize),
+        ("<C-c>", EditorAction::ClipboardCopy),
+        ("<C-x>", EditorAction::ClipboardCut),
+        ("<C-v>", EditorAction::ClipboardPaste),
+        ("<leader>e", EditorAction::ToggleDockFocus),
         ("?", EditorAction::Help),
-        ("Ctrl+W s", EditorAction::PaneSplitHorizontal),
-        ("Ctrl+W S", EditorAction::PaneSplitHorizontal),
-        ("Ctrl+W v", EditorAction::PaneSplitVertical),
-        ("Ctrl+W h", EditorAction::PaneFocusLeft),
-        ("Ctrl+W j", EditorAction::PaneFocusDown),
-        ("Ctrl+W k", EditorAction::PaneFocusUp),
-        ("Ctrl+W l", EditorAction::PaneFocusRight),
-        ("Ctrl+W w", EditorAction::PaneFocusNext),
-        ("Ctrl+W Ctrl+W", EditorAction::PaneFocusNext),
-        ("Ctrl+W p", EditorAction::PaneFocusPrevious),
-        ("Ctrl+W q", EditorAction::PaneClose),
-        ("Ctrl+W c", EditorAction::PaneClose),
-        ("Ctrl+P", EditorAction::HistoryBack),
-        ("Ctrl+N", EditorAction::HistoryForward),
-        ("Ctrl+R", EditorAction::Refresh),
-        ("g s", EditorAction::DirSize),
+        ("<C-w>s", EditorAction::PaneSplitHorizontal),
+        ("<C-w>S", EditorAction::PaneSplitHorizontal),
+        ("<C-w>v", EditorAction::PaneSplitVertical),
+        ("<C-w>h", EditorAction::PaneFocusLeft),
+        ("<C-w>j", EditorAction::PaneFocusDown),
+        ("<C-w>k", EditorAction::PaneFocusUp),
+        ("<C-w>l", EditorAction::PaneFocusRight),
+        ("<C-w>w", EditorAction::PaneFocusNext),
+        ("<C-w><C-w>", EditorAction::PaneFocusNext),
+        ("<C-w>p", EditorAction::PaneFocusPrevious),
+        ("<C-w>q", EditorAction::PaneClose),
+        ("<C-w>c", EditorAction::PaneClose),
+        ("<C-p>", EditorAction::HistoryBack),
+        ("<C-n>", EditorAction::HistoryForward),
+        ("<C-r>", EditorAction::Refresh),
     ];
     entries
         .into_iter()
         .map(|(sequence, action)| KeyBinding {
             sequence: parse_key_sequence(sequence, Some(leader))
                 .expect("built-in keymap must be valid"),
-            action,
+            target: BindingTarget::Action(action),
         })
         .collect()
 }
 
 /// 既定値へユーザー指定を順に適用し、不正な項目だけを警告して無視する。
+///
+/// 各エントリの値は次の優先順位で解釈する:
+/// 1. `"none"`(大文字小文字非依存) — 対応するシーケンスのバインドを解除する。
+/// 2. [`EditorAction::from_config_name`] に一致する名前 — その操作を割り当てる。
+/// 3. それ以外 — vim風表記のキーシーケンスとして解釈し、[`BindingTarget::Keys`]として
+///    割り当てる(remapなし。`vim.keymap.set`の`noremap`相当。任意キーへ任意キーを
+///    バインドできる、例: `";" = ":"`)。
+///
+/// いずれの解釈にも失敗した項目は警告して無視する(既存contract)。
 pub fn resolve_bindings(
     leader: KeyInput,
     user_entries: &[(String, String)],
@@ -455,7 +541,7 @@ pub fn resolve_bindings(
     let mut bindings = default_bindings(leader);
     let mut warnings = Vec::new();
     let mut seen = Vec::<KeySequence>::new();
-    for (source, action_name) in user_entries {
+    for (source, value) in user_entries {
         let sequence = match parse_key_sequence(source, Some(leader)) {
             Ok(sequence) => sequence,
             Err(error) => {
@@ -469,7 +555,7 @@ pub fn resolve_bindings(
             ));
         }
         seen.push(sequence.clone());
-        if action_name.eq_ignore_ascii_case("none") {
+        if value.eq_ignore_ascii_case("none") {
             let before = bindings.len();
             bindings.retain(|binding| binding.sequence != sequence);
             if bindings.len() == before {
@@ -477,12 +563,27 @@ pub fn resolve_bindings(
             }
             continue;
         }
-        let Some(action) = EditorAction::from_config_name(action_name) else {
-            warnings.push(format!("Ignoring unknown action name: {action_name}"));
-            continue;
+        let target = if let Some(action) = EditorAction::from_config_name(value) {
+            BindingTarget::Action(action)
+        } else {
+            match parse_key_sequence(value, Some(leader)) {
+                Ok(keys) => BindingTarget::Keys(keys),
+                Err(error) => {
+                    warnings.push(format!(
+                        "Ignoring key {source:?}: {value:?} is not an action name or a valid key sequence: {error}"
+                    ));
+                    continue;
+                }
+            }
         };
         if is_ctrl_w_only(&sequence) {
-            warnings.push("Ctrl+W cannot be bound by itself".to_owned());
+            warnings.push("<C-w> cannot be bound by itself".to_owned());
+            continue;
+        }
+        if starts_ctrl_w(&sequence) && matches!(target, BindingTarget::Keys(_)) {
+            warnings.push(format!(
+                "Ignoring key {sequence}: <C-w>-prefixed sequences can only be bound to actions"
+            ));
             continue;
         }
         let remaining = bindings
@@ -496,12 +597,12 @@ pub fn resolve_bindings(
             })
         {
             warnings.push(format!(
-                "Ignoring Ctrl+W sequence {sequence} because it has a prefix conflict with an existing sequence"
+                "Ignoring <C-w> sequence {sequence} because it has a prefix conflict with an existing sequence"
             ));
             continue;
         }
         bindings.retain(|binding| binding.sequence != sequence);
-        bindings.push(KeyBinding { sequence, action });
+        bindings.push(KeyBinding { sequence, target });
     }
     (bindings, warnings)
 }
@@ -539,64 +640,72 @@ mod tests {
     #[test]
     fn parses_sequences_named_keys_and_normalization() {
         for input in [
-            "g d",
-            "Ctrl+W v",
-            "Ctrl+Alt+F5",
-            "Enter",
-            "Space",
+            "gd",
+            "<C-w>v",
+            "<C-A-F5>",
+            "<CR>",
+            "<Space>",
             "?",
-            "Esc",
-            "Backspace",
-            "Tab",
-            "Delete",
-            "Up",
-            "Down",
-            "Left",
-            "Right",
-            "Home",
-            "End",
-            "PageUp",
-            "PageDown",
-            "F1",
-            "F12",
+            "<Esc>",
+            "<BS>",
+            "<Tab>",
+            "<Del>",
+            "<Up>",
+            "<Down>",
+            "<Left>",
+            "<Right>",
+            "<Home>",
+            "<End>",
+            "<PageUp>",
+            "<PageDown>",
+            "<F1>",
+            "<F12>",
         ] {
             assert!(parse_key_sequence(input, None).is_ok(), "{input}");
         }
         assert_eq!(
-            parse_key_sequence("ctrl+w", None),
-            parse_key_sequence("Ctrl+W", None)
+            parse_key_sequence("<c-w>", None),
+            parse_key_sequence("<C-W>", None)
         );
         assert_eq!(
             parse_key_sequence("V", None).unwrap().0[0].key,
             Key::Char('V')
         );
+        assert_eq!(
+            parse_key_sequence("<M-x>", None),
+            parse_key_sequence("<A-x>", None)
+        );
     }
 
     #[test]
     fn rejects_invalid_sequences() {
-        for input in ["", "NoSuchKey", "Meta+X", "Shift+v"] {
+        for input in ["", "<NoSuchKey>", "<Meta-x>", "<S-v>", "a b", "<C-w"] {
             assert!(parse_key_sequence(input, None).is_err(), "{input}");
         }
         assert_eq!(
-            parse_key_sequence("Leader", None),
+            parse_key_sequence("<leader>", None),
             Err(KeymapError::LeaderUnset)
         );
         assert_eq!(
-            parse_key_sequence("Ctrl+Leader", Some(space())),
+            parse_key_sequence("<C-leader>", Some(space())),
             Err(KeymapError::ModifiedLeader)
         );
     }
 
     #[test]
     fn leader_is_one_unmodified_key() {
-        assert_eq!(parse_leader("Space"), Ok(space()));
-        assert_eq!(parse_leader("g d"), Err(KeymapError::LeaderSequence));
-        assert_eq!(parse_leader("Ctrl+X"), Err(KeymapError::LeaderModified));
+        assert_eq!(parse_leader("<Space>"), Ok(space()));
+        assert_eq!(parse_leader(" "), Ok(space()));
+        assert_eq!(parse_leader("gd"), Err(KeymapError::LeaderSequence));
+        assert_eq!(parse_leader("<C-x>"), Err(KeymapError::ModifiedLeader));
+        assert_eq!(parse_leader("<leader>"), Err(KeymapError::RecursiveLeader));
     }
 
     #[test]
     fn display_round_trips() {
-        for input in ["g d", "Ctrl+W v", "Ctrl+Alt+F5", "Shift+Enter", "Space f"] {
+        for input in [
+            "gd", "<C-w>v", "<C-A-F5>", "<S-CR>", "<Space>f", ";", "<lt>",
+        ] {
             let sequence = parse_key_sequence(input, None).unwrap();
             assert_eq!(
                 parse_key_sequence(&sequence.to_string(), None),
@@ -609,7 +718,8 @@ mod tests {
     fn default_dock_focus_binding_follows_configured_leader() {
         let leader = parse_leader("x").unwrap();
         assert!(default_bindings(leader).iter().any(|binding| {
-            binding.sequence.to_string() == "x e" && binding.action == EditorAction::ToggleDockFocus
+            binding.sequence.to_string() == "xe"
+                && binding.target == BindingTarget::Action(EditorAction::ToggleDockFocus)
         }));
     }
 
@@ -624,35 +734,32 @@ mod tests {
     #[test]
     fn resolution_supports_override_unmap_leader_and_warnings() {
         let entries = vec![
-            ("g d".into(), "help".into()),
-            ("g .".into(), "none".into()),
-            ("Leader f".into(), "file_picker".into()),
-            ("x".into(), "unknown".into()),
-            ("g d".into(), "activate".into()),
-            ("Ctrl+W".into(), "help".into()),
-            ("Ctrl+W v x".into(), "help".into()),
+            ("gd".into(), "help".into()),
+            ("g.".into(), "none".into()),
+            ("<leader>f".into(), "file_picker".into()),
+            ("x".into(), "not a real action".into()),
+            ("gd".into(), "activate".into()),
+            ("<C-w>".into(), "help".into()),
+            ("<C-w>vx".into(), "help".into()),
         ];
         let (bindings, warnings) = resolve_bindings(space(), &entries);
-        assert!(
-            bindings
-                .iter()
-                .any(|binding| binding.sequence.to_string() == "g d"
-                    && binding.action == EditorAction::Activate)
-        );
+        assert!(bindings.iter().any(|binding| {
+            binding.sequence.to_string() == "gd"
+                && binding.target == BindingTarget::Action(EditorAction::Activate)
+        }));
         assert!(
             !bindings
                 .iter()
-                .any(|binding| binding.sequence.to_string() == "g .")
+                .any(|binding| binding.sequence.to_string() == "g.")
         );
-        assert!(
-            bindings
-                .iter()
-                .any(|binding| binding.sequence.to_string() == "Space f")
-        );
+        assert!(bindings.iter().any(|binding| {
+            binding.sequence.to_string() == "<Space>f"
+                && binding.target == BindingTarget::Action(EditorAction::FilePicker)
+        }));
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("unknown action"))
+                .any(|warning| warning.contains("not an action name"))
         );
         assert!(warnings.iter().any(|warning| warning.contains("Duplicate")));
         assert!(warnings.iter().any(|warning| warning.contains("by itself")));
@@ -664,9 +771,59 @@ mod tests {
     }
 
     #[test]
+    fn resolves_vim_notation_and_arbitrary_key_targets() {
+        let entries = vec![
+            ("gd".into(), "navigate_into".into()),
+            ("<leader>f".into(), "file_picker".into()),
+            ("<C-r>".into(), "refresh".into()),
+            (";".into(), ":".into()),
+        ];
+        let (bindings, warnings) = resolve_bindings(space(), &entries);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(bindings.iter().any(|binding| {
+            binding.sequence.to_string() == "gd"
+                && binding.target == BindingTarget::Action(EditorAction::NavigateInto)
+        }));
+        assert!(bindings.iter().any(|binding| {
+            binding.sequence.to_string() == "<Space>f"
+                && binding.target == BindingTarget::Action(EditorAction::FilePicker)
+        }));
+        assert!(bindings.iter().any(|binding| {
+            binding.sequence.to_string() == "<C-r>"
+                && binding.target == BindingTarget::Action(EditorAction::Refresh)
+        }));
+        let semicolon = bindings
+            .iter()
+            .find(|binding| binding.sequence.to_string() == ";")
+            .expect("semicolon binding must resolve");
+        assert_eq!(
+            semicolon.target,
+            BindingTarget::Keys(parse_key_sequence(":", None).unwrap())
+        );
+    }
+
+    #[test]
+    fn ctrl_w_prefixed_keys_binding_is_rejected() {
+        let entries = vec![("<C-w>x".into(), ":".into())];
+        let (bindings, warnings) = resolve_bindings(space(), &entries);
+        assert!(
+            !bindings
+                .iter()
+                .any(|binding| binding.sequence.to_string() == "<C-w>x")
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("<C-w>-prefixed"))
+        );
+    }
+
+    #[test]
     fn action_config_names_round_trip() {
         for binding in default_bindings(space()) {
-            let action = binding.action;
+            let BindingTarget::Action(action) = binding.target else {
+                panic!("default bindings must all be actions");
+            };
             assert_eq!(
                 EditorAction::from_config_name(action.config_name()),
                 Some(action)
