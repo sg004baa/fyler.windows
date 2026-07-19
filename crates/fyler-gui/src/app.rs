@@ -740,6 +740,7 @@ impl FylerApp {
                     EditorEvent::HistoryBack => {}
                     EditorEvent::HistoryForward => {}
                     EditorEvent::RefreshRequested => {}
+                    EditorEvent::DirSizeRequested { .. } => {}
                     EditorEvent::ChangeDirectory { .. } => {}
                     EditorEvent::ChangeSort { .. } => {}
                     EditorEvent::ToggleHidden => {}

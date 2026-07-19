@@ -69,6 +69,13 @@ async fn spawn_attach_and_edit_updates_snapshot() -> anyhow::Result<()> {
     })
     .await
     .context("go did not emit OpenWith")?;
+    engine.send(key_command(Key::Char('g')))?;
+    engine.send(key_command(Key::Char('s')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::DirSizeRequested { line: 0 })
+    })
+    .await
+    .context("gs did not emit DirSizeRequested")?;
 
     engine.send(EditorCommand::Key(KeyInput {
         key: Key::Char('i'),

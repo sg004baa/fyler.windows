@@ -84,6 +84,8 @@ pub enum EditorAction {
     HistoryForward,
     /// 現在のrootを実FSから明示的に再同期する。
     Refresh,
+    /// カーソル行のディレクトリのサイズを背景スレッドで再帰計算する。
+    DirSize,
 }
 
 impl EditorAction {
@@ -123,6 +125,7 @@ impl EditorAction {
             "history_back" => Self::HistoryBack,
             "history_forward" => Self::HistoryForward,
             "refresh" => Self::Refresh,
+            "dir_size" => Self::DirSize,
             _ => return None,
         })
     }
@@ -163,6 +166,7 @@ impl EditorAction {
             Self::HistoryBack => "history_back",
             Self::HistoryForward => "history_forward",
             Self::Refresh => "refresh",
+            Self::DirSize => "dir_size",
         }
     }
 
@@ -202,6 +206,7 @@ impl EditorAction {
             Self::HistoryBack => "Go back in navigation history",
             Self::HistoryForward => "Go forward in navigation history",
             Self::Refresh => "Reload the current root from disk",
+            Self::DirSize => "Compute directory size",
         }
     }
 }
@@ -487,6 +492,7 @@ pub fn default_bindings(leader: KeyInput) -> Vec<KeyBinding> {
         ("go", EditorAction::OpenWith),
         ("gm", EditorAction::TransferMove),
         ("gc", EditorAction::TransferCopy),
+        ("gs", EditorAction::DirSize),
         ("<C-c>", EditorAction::ClipboardCopy),
         ("<C-x>", EditorAction::ClipboardCut),
         ("<C-v>", EditorAction::ClipboardPaste),

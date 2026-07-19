@@ -312,6 +312,7 @@ Rules and limitations:
 | `open_with` | Choose an application and open the entry | `go` |
 | `transfer_move` | Move entries to another pane | `gm` |
 | `transfer_copy` | Copy entries to another pane | `gc` |
+| `dir_size` | Compute the size of the directory under the cursor | `gs` |
 | `clipboard_copy` | Copy selected entries to the Windows clipboard | `<C-c>` |
 | `clipboard_cut` | Cut selected entries to the Windows clipboard | `<C-x>` |
 | `clipboard_paste` | Paste files from the Windows clipboard | `<C-v>` |
