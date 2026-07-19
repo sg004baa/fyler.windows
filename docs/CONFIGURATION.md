@@ -44,18 +44,19 @@ confirm_detail = "full"
 # TOML literal strings are convenient for Windows paths because backslashes need no escaping
 font = 'C:\Windows\Fonts\meiryo.ttc'
 
-# Leader must be one unmodified key. The default is Space.
-leader = "Space"
+# Leader must be a single vim-notation key. The default is <Space>.
+leader = "<Space>"
 
 [bookmarks]
 home = 'C:\Users\me'
 projects = 'D:\projects'
 
 [keymap.normal]
-"Leader f" = "file_picker"
-"Leader h" = "toggle_hidden"
-"g /" = "none"
-"Ctrl+W x" = "pane_focus_next"
+"<leader>f" = "file_picker"
+"<leader>h" = "toggle_hidden"
+"g/" = "none"
+"<C-w>x" = "pane_focus_next"
+";" = ":"
 ```
 
 ## Settings reference
@@ -70,15 +71,15 @@ projects = 'D:\projects'
 | `terminal` | string | `"auto"` | `"auto"`, `"windows_terminal"`, `"powershell"`, or `"cmd"` |
 | `confirm_detail` | string | `"full"` | `"full"` or `"summary"` |
 | `font` | string | unset | Absolute path to a text font that overrides the built-in default; icons are unaffected |
-| `leader` | string | `"Space"` | One unmodified key used to expand `Leader` bindings |
+| `leader` | string | `"<Space>"` | One unmodified vim-notation key used to expand `<leader>` bindings |
 | `[bookmarks]` | table | empty | Bookmark names mapped to absolute paths |
-| `[keymap.normal]` | table | built-in keymap | Key sequences mapped to action names |
+| `[keymap.normal]` | table | built-in keymap | Key sequences mapped to actions or other key sequences |
 | `[statusline]` | table | see below | `left`/`right` arrays of status item names |
 
 ### Display and sorting
 
 `show_hidden = true` shows dot-prefixed entries and entries with the Windows hidden attribute at
-startup. The `toggle_hidden` action (`g .` by default) can also change this while fyler is running.
+startup. The `toggle_hidden` action (`g.` by default) can also change this while fyler is running.
 
 `sort` controls how directories and files are grouped:
 
@@ -151,9 +152,9 @@ stopped engine, wrong entry kind, and so on).
 | `<CR>` / double-click | Open / Enter directory | Open the entry with the OS default application, or expand/collapse a directory |
 | | Open with... | Choose a Shell-registered application to open the entry with |
 | `:admin` | Open as administrator | Open a file with an elevated (UAC) process. Files only; the OS handles the UAC prompt, so there is no confirmation dialog |
-| `Ctrl+C` | Copy | Copy the selected entries to the Windows clipboard |
-| `Ctrl+X` | Cut | Cut the selected entries to the Windows clipboard |
-| `Ctrl+V` | Paste | Paste the clipboard contents at the cursor, with a confirmation dialog before any file is touched |
+| `<C-c>` | Copy | Copy the selected entries to the Windows clipboard |
+| `<C-x>` | Cut | Cut the selected entries to the Windows clipboard |
+| `<C-v>` | Paste | Paste the clipboard contents at the cursor, with a confirmation dialog before any file is touched |
 | | Rename | Start editing the entry's name in the buffer (no filesystem change until `:w`) |
 | | Mark for deletion | Remove the buffer line (no filesystem change until `:w`) |
 | `:extract` | Extract here | Extract a `.zip` archive into a sibling directory named after the archive, after a confirmation dialog showing the entry count and approximate size. `.zip` files only |
@@ -208,128 +209,150 @@ edited manually.
 
 ## Keymap
 
-Keymaps use engine-independent notation. Neovim notation such as `<C-w>` and `<CR>` is not
-accepted. `[keymap.normal]` is currently the only supported section. Unsupported sections such as
-`[keymap.visual]` are ignored with a warning.
+Keymaps use Vim-style notation (`gd`, `<leader>f`, `<C-r>`). The notation looks like Neovim's own
+key notation, but fyler implements it independently of the embedded Neovim editor — it is not an
+alias for Neovim's mapping syntax. `[keymap.normal]` is currently the only supported section.
+Unsupported sections such as `[keymap.visual]` are ignored with a warning.
 
-User entries are applied on top of the built-in keymap. Assigning an action replaces the binding
-for that sequence. Assigning `"none"` removes it.
+Each entry under `[keymap.normal]` maps a key sequence (the table key) to a value that is resolved
+in this order:
+
+1. `"none"` (case-insensitive) — removes the binding for that key sequence.
+2. An action name (see [Available actions](#available-actions)) — binds the sequence to that
+   action.
+3. Anything else — parsed as a vim-notation key sequence and fed as literal keystrokes when the
+   binding fires, without going through remapping (like `:noremap` / `vim.keymap.set` without
+   `remap = true`). This lets you bind arbitrary keys to other keys, not just to built-in actions.
+   An entry that fails both interpretations produces a warning and is ignored.
 
 ```toml
-leader = "Space"
+leader = "<Space>"
 
 [keymap.normal]
-"Leader f" = "file_picker" # Expands to Space f
-"g d" = "help"             # Reassign an existing sequence
-"g ." = "none"             # Remove an existing binding
+"<leader>f" = "file_picker" # Expands to <Space>f
+"gd" = "help"               # Reassign an existing sequence
+"g." = "none"                # Remove an existing binding
+";" = ":"                    # Feed ":" whenever ";" is pressed — bind to any key, not just an action
 ```
 
 `activate`, `transfer_move`, `transfer_copy`, `clipboard_copy`, `clipboard_cut`, and
-`clipboard_paste` are mapped in both Normal and Visual modes. All other actions are mapped in
-Normal mode.
+`clipboard_paste` are mapped in both Normal and Visual modes. All other actions, and every
+key-to-key binding from rule 3 above, are mapped in Normal mode only.
 
-`clipboard_paste` is bound to `Ctrl+V` by default, which shadows Neovim's built-in Visual Block
-mode (`Ctrl+V` in Normal mode). If you rely on Visual Block selection, rebind or remove
+`clipboard_paste` is bound to `<C-v>` by default, which shadows Neovim's built-in Visual Block
+mode (`Ctrl-V` in Normal mode). If you rely on Visual Block selection, rebind or remove
 `clipboard_paste`:
 
 ```toml
 [keymap.normal]
-"Ctrl+V" = "none"          # Restore native Visual Block mode
+"<C-v>" = "none"           # Restore native Visual Block mode
 ```
 
 ### Key notation
 
-Separate strokes with spaces and join modifiers within a stroke with `+`:
+Strokes are concatenated directly, with no separator: `gd` is the two strokes `g` then `d`. Raw
+whitespace inside a key sequence is rejected; write `<Space>` instead. Angle brackets denote a
+special key, a modified key, or `<leader>`:
 
 ```toml
 [keymap.normal]
-"g d" = "navigate_into"
-"Ctrl+W v" = "pane_split_vertical"
-"Ctrl+Alt+F5" = "file_picker"
-"Leader f" = "file_picker"
+"gd" = "navigate_into"
+"<C-w>v" = "pane_split_vertical"
+"<C-A-F5>" = "file_picker"
+"<leader>f" = "file_picker"
 ```
 
-Modifier and named-key names are case-insensitive. Printable characters are case-sensitive.
+Modifier and named-key names inside `<...>` are case-insensitive. Bare printable characters
+(outside `<...>`) are case-sensitive.
 
-- Modifiers: `Ctrl`, `Alt`, `Shift`
-- Named keys: `Enter`, `Esc`, `Backspace`, `Tab`, `Delete`, `Space`
-- Navigation keys: `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `PageUp`, `PageDown`
-- Function keys: `F1` through `F12`
-- Leader reference: `Leader`
-- Any other single printable character, such as `g`, `?`, or `V`
+- Modifiers: `<C-x>` (Ctrl), `<A-x>` (Alt; `<M-x>` is accepted as a synonym), `<S-x>` (Shift,
+  named keys only — see below). Combine them in a single stroke, e.g. `<C-S-F5>`.
+- Named keys: `<CR>` (or `<Enter>`), `<Esc>`, `<BS>`, `<Tab>`, `<Space>`, `<Del>`
+- Navigation keys: `<Up>`, `<Down>`, `<Left>`, `<Right>`, `<Home>`, `<End>`, `<PageUp>`,
+  `<PageDown>`
+- Function keys: `<F1>` through `<F12>`
+- Leader reference: `<leader>`
+- Escaped `<`: `<lt>`
+- Any other single printable character, such as `g`, `?`, or `V`, written bare (no brackets)
 
 Rules and limitations:
 
 - `V` is an uppercase character and is distinct from `v`.
-- Modified ASCII letters are normalized to lowercase, so `Ctrl+W` and `Ctrl+w` are equivalent.
-- Do not apply `Shift` to a printable character. Write `V`, not `Shift+v`.
-- `leader` itself must be one unmodified key.
-- An invalid `leader` falls back to `Space` when expanding `Leader` bindings.
-- A standalone `Ctrl+W` cannot be bound.
-- Two `Ctrl+W` sequences cannot be configured when either is a true prefix of the other.
-- Invalid keys, unknown actions, duplicates, and `none` entries with no binding to remove produce
-  warnings.
+- Modified ASCII letters are normalized to lowercase, so `<C-w>` and `<c-w>` are equivalent.
+- Do not apply `<S-...>` to a printable character. Write `V`, not `<S-v>`.
+- `leader` itself must be one unmodified vim-notation key (or the special-case literal single
+  space `" "`, matching the vimrc convention of `let mapleader = " "`).
+- An invalid `leader` falls back to `<Space>` when expanding `<leader>` bindings.
+- A standalone `<C-w>` cannot be bound.
+- Two `<C-w>`-prefixed action sequences cannot be configured when either is a true prefix of the
+  other.
+- A key-to-key binding (rule 3 above) cannot start with `<C-w>`; that prefix is reserved for the
+  pane-command dispatcher, which only understands actions.
+- Invalid keys, unknown actions or key sequences, duplicates, and `none` entries with no binding
+  to remove produce warnings.
 - Runtime reload is not supported; restart fyler after changing the keymap.
 
 ### Available actions
 
 | Action | Description | Default key |
 |---|---|---|
-| `activate` | Toggle a directory or open a file | `Enter` |
-| `navigate_parent` | Go to the parent directory | `Backspace` |
-| `navigate_into` | Enter the selected directory | `g d` |
-| `toggle_hidden` | Toggle hidden files | `g .` |
-| `fold_close` | Collapse a directory | `z c` |
-| `fold_open` | Expand a directory | `z o` |
-| `fold_toggle` | Toggle a directory fold | `z a` |
-| `fold_close_recursive` | Recursively collapse descendants | `z C` |
-| `fold_open_recursive` | Recursively expand descendants | `z O` |
-| `fold_close_all` | Collapse all directories | `z M` |
-| `fold_open_all` | Expand all directories | `z R` |
-| `file_picker` | Find a file | `g /` |
-| `yank_path` | Copy the selected path | `g y` |
-| `open_with` | Choose an application and open the entry | `g o` |
-| `transfer_move` | Move entries to another pane | `g m` |
-| `transfer_copy` | Copy entries to another pane | `g c` |
-| `clipboard_copy` | Copy selected entries to the Windows clipboard | `Ctrl+C` |
-| `clipboard_cut` | Cut selected entries to the Windows clipboard | `Ctrl+X` |
-| `clipboard_paste` | Paste files from the Windows clipboard | `Ctrl+V` |
-| `toggle_dock_focus` | Focus the navigation dock or return to the editor | `Leader e` |
+| `activate` | Toggle a directory or open a file | `<CR>` |
+| `navigate_parent` | Go to the parent directory | `<BS>` |
+| `navigate_into` | Enter the selected directory | `gd` |
+| `toggle_hidden` | Toggle hidden files | `g.` |
+| `fold_close` | Collapse a directory | `zc` |
+| `fold_open` | Expand a directory | `zo` |
+| `fold_toggle` | Toggle a directory fold | `za` |
+| `fold_close_recursive` | Recursively collapse descendants | `zC` |
+| `fold_open_recursive` | Recursively expand descendants | `zO` |
+| `fold_close_all` | Collapse all directories | `zM` |
+| `fold_open_all` | Expand all directories | `zR` |
+| `file_picker` | Find a file | `g/` |
+| `yank_path` | Copy the selected path | `gy` |
+| `open_with` | Choose an application and open the entry | `go` |
+| `transfer_move` | Move entries to another pane | `gm` |
+| `transfer_copy` | Copy entries to another pane | `gc` |
+| `dir_size` | Compute the size of the directory under the cursor | `gs` |
+| `clipboard_copy` | Copy selected entries to the Windows clipboard | `<C-c>` |
+| `clipboard_cut` | Cut selected entries to the Windows clipboard | `<C-x>` |
+| `clipboard_paste` | Paste files from the Windows clipboard | `<C-v>` |
+| `toggle_dock_focus` | Focus the navigation dock or return to the editor | `<leader>e` |
 | `help` | Show help | `?` |
-| `pane_split_horizontal` | Split the pane horizontally | `Ctrl+W s`, `Ctrl+W S` |
-| `pane_split_vertical` | Split the pane vertically | `Ctrl+W v` |
-| `pane_focus_left` | Focus the pane to the left | `Ctrl+W h` |
-| `pane_focus_down` | Focus the pane below | `Ctrl+W j` |
-| `pane_focus_up` | Focus the pane above | `Ctrl+W k` |
-| `pane_focus_right` | Focus the pane to the right | `Ctrl+W l` |
-| `pane_focus_next` | Focus the next pane | `Ctrl+W w`, `Ctrl+W Ctrl+W` |
-| `pane_focus_previous` | Focus the previous pane | `Ctrl+W p` |
-| `pane_close` | Close the current pane | `Ctrl+W q`, `Ctrl+W c` |
-| `history_back` | Go back in navigation history | `Ctrl+P` |
-| `history_forward` | Go forward in navigation history | `Ctrl+N` |
-| `refresh` | Reload the current root from disk | `Ctrl+R` |
+| `pane_split_horizontal` | Split the pane horizontally | `<C-w>s`, `<C-w>S` |
+| `pane_split_vertical` | Split the pane vertically | `<C-w>v` |
+| `pane_focus_left` | Focus the pane to the left | `<C-w>h` |
+| `pane_focus_down` | Focus the pane below | `<C-w>j` |
+| `pane_focus_up` | Focus the pane above | `<C-w>k` |
+| `pane_focus_right` | Focus the pane to the right | `<C-w>l` |
+| `pane_focus_next` | Focus the next pane | `<C-w>w`, `<C-w><C-w>` |
+| `pane_focus_previous` | Focus the previous pane | `<C-w>p` |
+| `pane_close` | Close the current pane | `<C-w>q`, `<C-w>c` |
+| `history_back` | Go back in navigation history | `<C-p>` |
+| `history_forward` | Go forward in navigation history | `<C-n>` |
+| `refresh` | Reload the current root from disk | `<C-r>` |
 
 `none` is not an action. It is a special value that removes the binding for the specified key
 sequence.
 
 The help dialog opened with `?` is generated from the resolved built-in and user bindings. It
-omits actions with no remaining bindings and reflects added or reassigned keys.
+omits actions with no remaining bindings, reflects added or reassigned keys, and lists each
+key-to-key binding (rule 3 above) as its own entry, described as "Feed keys: ...".
 
-While the navigation dock has focus, use `j`/`k` or the arrow keys to move and `Enter` to change
-the active pane's root. `Esc` returns keyboard input to the editor without closing the dock.
+While the navigation dock has focus, use `j`/`k` or the arrow keys to move and `<CR>` to change
+the active pane's root. `<Esc>` returns keyboard input to the editor without closing the dock.
 Invoke `toggle_dock_focus` again to hide the dock.
 
 ### Navigation history and manual refresh
 
-Root changes (`^`, `g d`, `:cd`, bookmarks, recent roots, and drive selection) are tracked in a
-per-pane back/forward history, capped at 100 entries per direction. `:back` (`Ctrl+P` by default)
-and `:forward` (`Ctrl+N`) step through it; both are rejected while editing, offline, or during
+Root changes (`^`, `gd`, `:cd`, bookmarks, recent roots, and drive selection) are tracked in a
+per-pane back/forward history, capped at 100 entries per direction. `:back` (`<C-p>` by default)
+and `:forward` (`<C-n>`) step through it; both are rejected while editing, offline, or during
 another operation, and an entry pointing at a since-removed root is discarded with a message
-instead of being retried. `:reload` (`Ctrl+R`) re-scans the current root from disk without writing
+instead of being retried. `:reload` (`<C-r>`) re-scans the current root from disk without writing
 anything; it is also rejected while editing or busy, except on an offline pane, where it retries
 the connection immediately instead of waiting for the periodic retry.
 
-`Ctrl+R` normally performs Neovim's built-in redo, and `Ctrl+P` / `Ctrl+N` normally move the
+`<C-r>` normally performs Neovim's built-in redo, and `<C-p>` / `<C-n>` normally move the
 cursor up/down like `k` / `j`. Fyler's default keymap shadows all three inside fyler buffers;
 rebind or remove `history_back` / `history_forward` / `refresh` (assign `"none"`) if you need the
 native behavior back.

@@ -561,6 +561,21 @@ impl NvimEngine {
                             "fyler_refresh" => {
                                 let _ = event_tx.send(EditorEvent::RefreshRequested);
                             }
+                            "fyler_dir_size" => {
+                                let line = notification.args.first()
+                                    .and_then(value_as_u64)
+                                    .and_then(|line| usize::try_from(line).ok());
+                                match line {
+                                    Some(line) => {
+                                        let _ = event_tx.send(EditorEvent::DirSizeRequested { line });
+                                    }
+                                    None => send_message(
+                                        &event_tx,
+                                        MessageKind::Error,
+                                        "Failed to get the line number for directory size".to_owned(),
+                                    ),
+                                }
+                            }
                             "fyler_transfer" => {
                                 let kind = notification.args.first()
                                     .and_then(Value::as_str)

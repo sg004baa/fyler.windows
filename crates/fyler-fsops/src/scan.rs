@@ -1384,7 +1384,7 @@ fn is_placeholder(metadata: &Metadata) -> bool {
     }
 }
 
-fn is_link_or_reparse(metadata: &Metadata) -> bool {
+pub(crate) fn is_link_or_reparse(metadata: &Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return true;
     }

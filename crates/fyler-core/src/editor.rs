@@ -458,6 +458,12 @@ pub enum EditorEvent {
         op: FoldOp,
         line: usize,
     },
+    /// ユーザーが指定行のディレクトリのサイズを背景スレッドで再帰計算するよう
+    /// 要求した。`line`は0始まり。対象がディレクトリかどうかの判定、実行、
+    /// キャンセル、結果の反映はapp層が行う。
+    DirSizeRequested {
+        line: usize,
+    },
     /// ユーザーがブックマークまたは最近使ったルートへのジャンプ、
     /// あるいは候補一覧の表示を要求した。
     JumpBookmark {

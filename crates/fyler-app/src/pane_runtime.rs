@@ -8,19 +8,19 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use fyler_core::WindowGeometry;
 use fyler_core::editor::{EditorCommand, EditorEngine, EditorEvent, FoldOp, MessageKind};
 use fyler_core::feedback::{FeedbackPayload, validate_body};
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::{EntryId, IdAllocator};
-use fyler_core::keymap::{EditorAction, HelpEntry, KeyBinding, KeySequence};
+use fyler_core::keymap::{BindingTarget, EditorAction, HelpEntry, KeyBinding, KeySequence};
 use fyler_core::pane::{FocusDirection, PaneAction, PaneId, PaneLayout, SplitDirection};
 use fyler_core::path::TreePath;
 use fyler_core::report::{ApplyProgress, CommitReport, OpOutcome, OpResult};
 use fyler_core::transfer::{DragOutcome, DropEffect, ImportPlan, TransferKind};
 use fyler_core::tree::{BaselineTree, EntryKind};
 use fyler_core::undo::UndoTransaction;
+use fyler_core::{StartupWindow, WindowGeometry};
 use fyler_engine_nvim::{NvimConfig, NvimEngine};
 use fyler_fsops::scan::ScanOptions;
 use fyler_fsops::watch::{FsWatcher, WatchEvent};
@@ -44,9 +44,9 @@ use super::transfer_flow::{
 };
 use super::{
     ActivateOutcome, AppEvent, BookmarkResolution, GitRefresher, after_root_change,
-    bookmark_list_message, default_root, format_drive_paths, handle_activate_line,
-    handle_begin_name_edit, handle_clipboard_copy_or_cut, handle_create_shortcut,
-    handle_external_change, handle_mark_for_deletion, handle_open_as_admin,
+    bookmark_list_message, default_root, dir_size_message, format_drive_paths,
+    handle_activate_line, handle_begin_name_edit, handle_clipboard_copy_or_cut,
+    handle_create_shortcut, handle_external_change, handle_mark_for_deletion, handle_open_as_admin,
     handle_open_file_picker, handle_open_terminal, handle_open_with, handle_picker_select,
     handle_yank_path, normalize_root, parse_sort_query, resolve_bookmark_query, resolve_cd_target,
     send_gui_message, send_save_result, send_view_state, sort_state_message, tree_edit_rejection,
@@ -73,6 +73,19 @@ struct PaneSession {
     crashed: bool,
     restoration_warnings: Vec<String>,
     history: NavigationHistory,
+    /// カーソル行dirサイズ計算(issue #38フォローアップ、案B)で完了済みの
+    /// 上書きoverlay。baselineが変わる操作でクリアする(古いサイズを残さない)。
+    computed_dir_sizes: HashMap<EntryId, u64>,
+    /// 実行中のdir sizeジョブ(pane毎に同時1本まで)。再要求・root変更・refresh・
+    /// pane close・shutdownでキャンセルする。
+    dir_size_job: Option<DirSizeJob>,
+}
+
+/// [`PaneSession::dir_size_job`] の1エントリ。完了イベントの`cancel`との
+/// ポインタ一致で「まだ有効な結果か」を判定する(再要求でsupersedeされた
+/// 完了を無視するため)。
+struct DirSizeJob {
+    cancel: Arc<AtomicBool>,
 }
 
 /// pane別navigation historyの1エントリ。root変更前の地点を表す。
@@ -348,19 +361,31 @@ fn create_pane(
         crashed: false,
         restoration_warnings,
         history: NavigationHistory::default(),
+        computed_dir_sizes: HashMap::new(),
+        dir_size_job: None,
     })
 }
 
 fn help_entries(bindings: &[KeyBinding]) -> Vec<HelpEntry> {
     let mut actions = Vec::<(EditorAction, Vec<String>)>::new();
+    let mut keys_entries = Vec::<HelpEntry>::new();
     for binding in bindings {
-        if let Some((_, sequences)) = actions
-            .iter_mut()
-            .find(|(action, _)| *action == binding.action)
-        {
-            sequences.push(binding.sequence.to_string());
-        } else {
-            actions.push((binding.action, vec![binding.sequence.to_string()]));
+        match &binding.target {
+            BindingTarget::Action(action) => {
+                if let Some((_, sequences)) =
+                    actions.iter_mut().find(|(existing, _)| existing == action)
+                {
+                    sequences.push(binding.sequence.to_string());
+                } else {
+                    actions.push((*action, vec![binding.sequence.to_string()]));
+                }
+            }
+            BindingTarget::Keys(keys) => {
+                keys_entries.push(HelpEntry {
+                    command: binding.sequence.to_string(),
+                    description: format!("Feed keys: {keys}"),
+                });
+            }
         }
     }
     let mut entries = actions
@@ -370,6 +395,7 @@ fn help_entries(bindings: &[KeyBinding]) -> Vec<HelpEntry> {
             description: action.description().to_owned(),
         })
         .collect::<Vec<_>>();
+    entries.extend(keys_entries);
     entries.extend([
         HelpEntry {
             command: ":w".to_owned(),
@@ -409,6 +435,37 @@ fn help_entries(bindings: &[KeyBinding]) -> Vec<HelpEntry> {
 
 fn should_restore_session(explicit_root: bool, restore_session: bool) -> bool {
     !explicit_root && restore_session
+}
+
+/// window geometryはpane session復元のゲート([`should_restore_session`])から独立
+/// して常に読み込む。pane復元が無効(明示root起動や`restore_session=false`)でも、
+/// 直前に保存されたwindow位置・サイズ・maximizedはそのまま使う。
+fn resolve_initial_window(loaded_session: Option<&SessionState>) -> Option<WindowGeometry> {
+    loaded_session.and_then(|session| session.window)
+}
+
+/// 保存されたwindow geometryをGUI起動用の[`fyler_core::StartupWindow`]へ変換する。
+/// 保存先モニタが切断されている場合はオフスクリーンガードで位置を捨て、
+/// サイズ・maximizedだけ復元する(DESIGN.md「オフスクリーンガード」)。
+fn resolve_startup_window(geometry: Option<WindowGeometry>) -> Option<StartupWindow> {
+    geometry.map(|geometry| StartupWindow {
+        geometry,
+        apply_position: window_position_is_onscreen(geometry),
+    })
+}
+
+#[cfg(windows)]
+fn window_position_is_onscreen(geometry: WindowGeometry) -> bool {
+    !fyler_fsops::display::is_offscreen(geometry.physical_outer_rect())
+}
+
+#[cfg(not(windows))]
+fn window_position_is_onscreen(_geometry: WindowGeometry) -> bool {
+    // オフスクリーン判定はWindows専用API(`MonitorFromRect`)に依存し、
+    // `fyler_fsops::display`はcfg(windows)限定でしか存在しない。fylerは
+    // Windows専用アプリのため非Windows向けの実行パスは存在せず、常に
+    // 保存位置をそのまま使ってよい。
+    true
 }
 
 fn existing_root_or_ancestor(requested: &Path, fallback: &Path) -> PathBuf {
@@ -459,22 +516,27 @@ pub(super) fn run() -> anyhow::Result<()> {
     let fallback_root = normalize_root(&default_root()?)?;
     let (config, config_warnings) = super::config::load();
     let mut startup_warnings = Vec::new();
+    let loaded_session = match session::load() {
+        Ok(session) => session,
+        Err(error) => {
+            startup_warnings.push(format!(
+                "Could not restore the previous session; starting with one pane: {error:#}"
+            ));
+            None
+        }
+    };
+    // window geometryはpane session復元のゲート(`should_restore_session`)から独立
+    // して常に読み込む(明示root起動や`restore_session=false`でも位置は復元する)。
+    // pane layout/rootの復元だけ従来どおりゲートする。
+    let initial_window = resolve_initial_window(loaded_session.as_ref());
     let restored_session =
         if should_restore_session(explicit_root.is_some(), config.restore_session) {
-            match session::load() {
-                Ok(session) => session,
-                Err(error) => {
-                    startup_warnings.push(format!(
-                        "Could not restore the previous session; starting with one pane: {error:#}"
-                    ));
-                    None
-                }
-            }
+            loaded_session
         } else {
             None
         };
-    let initial_window = restored_session.as_ref().and_then(|session| session.window);
     let window_geometry = Arc::new(Mutex::new(initial_window));
+    let startup_window = resolve_startup_window(initial_window);
     let root = explicit_root
         .as_deref()
         .map(normalize_root)
@@ -498,7 +560,9 @@ pub(super) fn run() -> anyhow::Result<()> {
         help_entries: help_entries(&bindings),
         dock_focus_bindings: bindings
             .iter()
-            .filter(|binding| binding.action == EditorAction::ToggleDockFocus)
+            .filter(|binding| {
+                binding.target == BindingTarget::Action(EditorAction::ToggleDockFocus)
+            })
             .map(|binding| KeySequence(binding.sequence.0.clone()))
             .collect(),
         bookmarks: config.bookmarks.clone(),
@@ -793,7 +857,14 @@ pub(super) fn run() -> anyhow::Result<()> {
             let mut pending_shortcut: Option<(PaneId, PathBuf, PathBuf)> = None;
 
             for (pane_id, pane) in &mut panes {
-                if send_view_state(&gui_event_tx, *pane_id, &mut pane.save_controller).is_err() {
+                if send_view_state(
+                    &gui_event_tx,
+                    *pane_id,
+                    &mut pane.save_controller,
+                    &pane.computed_dir_sizes,
+                )
+                .is_err()
+                {
                     return;
                 }
                 git.request(*pane_id, pane.root.clone());
@@ -1203,10 +1274,14 @@ pub(super) fn run() -> anyhow::Result<()> {
                     }
                     AppEvent::TreeDragCleanupFinished { pane_id, mut errors } => {
                         drag_out.finish_cleanup(pane_id);
-                        if let Some(session) = panes.get_mut(&pane_id)
-                            && let Err(error) = session.save_controller.reconcile_after_transfer()
-                        {
-                            errors.push(format!("pane {pane_id}: {error:#}"));
+                        if let Some(session) = panes.get_mut(&pane_id) {
+                            // dragによるmoveでbaselineが変わり得るため、カーソル行dirサイズの
+                            // overlayを破棄する(issue #38フォローアップ、案B)。
+                            session.computed_dir_sizes.clear();
+                            if let Err(error) = session.save_controller.reconcile_after_transfer()
+                            {
+                                errors.push(format!("pane {pane_id}: {error:#}"));
+                            }
                         }
                         if !errors.is_empty()
                             && send_gui_message(
@@ -1424,6 +1499,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     &session.root,
                                     line,
                                     &gui_event_tx,
+                                    &session.computed_dir_sizes,
                                 ) {
                                     Ok(outcome) => outcome,
                                     Err(_) => return,
@@ -1954,6 +2030,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                                 &gui_event_tx,
                                                 pane_id,
                                                 &mut session.save_controller,
+                                                &session.computed_dir_sizes,
                                             )
                                             .is_err()
                                         {
@@ -1962,6 +2039,9 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         continue;
                                     }
                                 };
+                                // 隠しファイル表示切替はrescanでbaselineが変わり得るため、
+                                // カーソル行dirサイズのoverlayを破棄する(issue #38フォローアップ、案B)。
+                                session.computed_dir_sizes.clear();
                                 if let Err(error) = session.engine.send(EditorCommand::SetLines {
                                     lines,
                                     cursor_line: None,
@@ -1979,6 +2059,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     &gui_event_tx,
                                     pane_id,
                                     &mut session.save_controller,
+                                    &session.computed_dir_sizes,
                                 )
                                 .is_err()
                                 {
@@ -1987,6 +2068,12 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 git.request(pane_id, session.root.clone());
                             }
                             EditorEvent::RefreshRequested => {
+                                // baselineを再同期する操作のため、カーソル行dirサイズの
+                                // overlayと実行中ジョブを破棄する(issue #38フォローアップ、案B)。
+                                invalidate_dir_size_overlay(
+                                    &mut session.dir_size_job,
+                                    &mut session.computed_dir_sizes,
+                                );
                                 let snapshot = session.engine.snapshot();
                                 let cursor_target = session
                                     .save_controller
@@ -2043,6 +2130,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                                 &gui_event_tx,
                                                 pane_id,
                                                 &mut session.save_controller,
+                                                &session.computed_dir_sizes,
                                             )
                                             .is_err()
                                             {
@@ -2084,6 +2172,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                                     &gui_event_tx,
                                                     pane_id,
                                                     &mut session.save_controller,
+                                                    &session.computed_dir_sizes,
                                                 )
                                                 .is_err()
                                                 {
@@ -2105,6 +2194,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                                     &gui_event_tx,
                                                     pane_id,
                                                     &mut session.save_controller,
+                                                    &session.computed_dir_sizes,
                                                 )
                                                 .is_err()
                                                 {
@@ -2113,6 +2203,13 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             }
                                         }
                                     }
+                                }
+                            }
+                            EditorEvent::DirSizeRequested { line } => {
+                                if request_dir_size(pane_id, line, session, &gui_event_tx, &event_tx)
+                                    .is_err()
+                                {
+                                    return;
                                 }
                             }
                             EditorEvent::Fold { op, line } => {
@@ -2157,6 +2254,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             &gui_event_tx,
                                             pane_id,
                                             &mut session.save_controller,
+                                            &session.computed_dir_sizes,
                                         )
                                         .is_err()
                                         {
@@ -2303,6 +2401,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                                     &gui_event_tx,
                                                     pane_id,
                                                     &mut session.save_controller,
+                                                    &session.computed_dir_sizes,
                                                 )
                                                 .is_err()
                                             {
@@ -2311,6 +2410,9 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             continue;
                                         }
                                     };
+                                // 並び替えはrescanでbaselineが変わり得るため、カーソル行dir
+                                // サイズのoverlayを破棄する(issue #38フォローアップ、案B)。
+                                session.computed_dir_sizes.clear();
                                 if let Err(error) = session.engine.send(EditorCommand::SetLines {
                                     lines,
                                     cursor_line: None,
@@ -2331,6 +2433,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     &gui_event_tx,
                                     pane_id,
                                     &mut session.save_controller,
+                                    &session.computed_dir_sizes,
                                 )
                                 .is_err()
                                     || send_gui_message(
@@ -2668,6 +2771,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                             engine.as_ref(),
                             &root,
                             &gui_event_tx,
+                            &session.computed_dir_sizes,
                         )
                         .is_err()
                         {
@@ -3545,6 +3649,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 &gui_event_tx,
                                 &mut git,
                                 &session.root,
+                                &mut session.computed_dir_sizes,
                             )
                             .is_err()
                             {
@@ -3680,11 +3785,15 @@ pub(super) fn run() -> anyhow::Result<()> {
                             eprintln!("Failed to discard undo journal for failed apply: {error:#}");
                         }
                         let result = session.save_controller.on_apply_finished(report);
+                        // applyはReconcileでbaselineが変わり得るため、カーソル行dir
+                        // サイズのoverlayを破棄する(issue #38フォローアップ、案B)。
+                        session.computed_dir_sizes.clear();
                         if send_save_result(&gui_event_tx, pane_id, result).is_err()
                             || send_view_state(
                                 &gui_event_tx,
                                 pane_id,
                                 &mut session.save_controller,
+                                &session.computed_dir_sizes,
                             )
                             .is_err()
                         {
@@ -3709,6 +3818,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 &gui_event_tx,
                                 &mut git,
                                 &deferred.root,
+                                &mut deferred.computed_dir_sizes,
                             )
                             .is_err()
                             {
@@ -3746,11 +3856,15 @@ pub(super) fn run() -> anyhow::Result<()> {
                             .applying_undo_transaction_id()
                             .map(str::to_owned);
                         let result = session.save_controller.on_undo_finished(report);
+                        // undoもbaselineを変え得るため、カーソル行dirサイズの
+                        // overlayを破棄する(issue #38フォローアップ、案B)。
+                        session.computed_dir_sizes.clear();
                         if send_save_result(&gui_event_tx, pane_id, result).is_err()
                             || send_view_state(
                                 &gui_event_tx,
                                 pane_id,
                                 &mut session.save_controller,
+                                &session.computed_dir_sizes,
                             )
                             .is_err()
                         {
@@ -3780,6 +3894,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 &gui_event_tx,
                                 &mut git,
                                 &deferred.root,
+                                &mut deferred.computed_dir_sizes,
                             )
                             .is_err()
                             {
@@ -3813,6 +3928,9 @@ pub(super) fn run() -> anyhow::Result<()> {
                             if let Err(error) = session.save_controller.reconcile_after_transfer() {
                                 reconcile_errors.push(format!("pane {pane_id}: {error:#}"));
                             }
+                            // transferはreconcileでbaselineが変わり得るため、カーソル行dir
+                            // サイズのoverlayを破棄する(issue #38フォローアップ、案B)。
+                            session.computed_dir_sizes.clear();
                             if !session.save_controller.is_offline() {
                                 let _ = session.engine.send(EditorCommand::SetModifiable(true));
                             }
@@ -3820,6 +3938,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 &gui_event_tx,
                                 pane_id,
                                 &mut session.save_controller,
+                                &session.computed_dir_sizes,
                             )
                             .is_err()
                             {
@@ -3863,6 +3982,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 &gui_event_tx,
                                 &mut git,
                                 &deferred.root,
+                                &mut deferred.computed_dir_sizes,
                             )
                             .is_err()
                             {
@@ -3894,12 +4014,20 @@ pub(super) fn run() -> anyhow::Result<()> {
                             {
                                 reconcile_error = Some(format!("pane {pane}: {error:#}"));
                             }
+                            // importはreconcileでbaselineが変わり得るため、カーソル行dir
+                            // サイズのoverlayを破棄する(issue #38フォローアップ、案B)。
+                            session.computed_dir_sizes.clear();
                             if !session.save_controller.is_offline() {
                                 let _ =
                                     session.engine.send(EditorCommand::SetModifiable(true));
                             }
-                            if send_view_state(&gui_event_tx, pane, &mut session.save_controller)
-                                .is_err()
+                            if send_view_state(
+                                &gui_event_tx,
+                                pane,
+                                &mut session.save_controller,
+                                &session.computed_dir_sizes,
+                            )
+                            .is_err()
                             {
                                 return;
                             }
@@ -3940,6 +4068,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 &gui_event_tx,
                                 &mut git,
                                 &deferred.root,
+                                &mut deferred.computed_dir_sizes,
                             )
                             .is_err()
                             {
@@ -3972,12 +4101,20 @@ pub(super) fn run() -> anyhow::Result<()> {
                             {
                                 reconcile_error = Some(format!("pane {pane}: {error:#}"));
                             }
+                            // extractはreconcileでbaselineが変わり得るため、カーソル行dir
+                            // サイズのoverlayを破棄する(issue #38フォローアップ、案B)。
+                            session.computed_dir_sizes.clear();
                             if !session.save_controller.is_offline() {
                                 let _ =
                                     session.engine.send(EditorCommand::SetModifiable(true));
                             }
-                            if send_view_state(&gui_event_tx, pane, &mut session.save_controller)
-                                .is_err()
+                            if send_view_state(
+                                &gui_event_tx,
+                                pane,
+                                &mut session.save_controller,
+                                &session.computed_dir_sizes,
+                            )
+                            .is_err()
                             {
                                 return;
                             }
@@ -4022,6 +4159,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 &gui_event_tx,
                                 &mut git,
                                 &deferred.root,
+                                &mut deferred.computed_dir_sizes,
                             )
                             .is_err()
                             {
@@ -4139,6 +4277,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     &gui_event_tx,
                                     &mut git,
                                     &session.root,
+                                    &mut session.computed_dir_sizes,
                                 ) {
                                     Ok(outcome) => outcome,
                                     Err(_) => return,
@@ -4205,6 +4344,9 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 if !matches!(result, SaveFlowResult::Reconnected(_)) {
                                     continue;
                                 }
+                                // 復帰時のretry_offlineはフル再スキャンするため、カーソル行dir
+                                // サイズのoverlayを破棄する(issue #38フォローアップ、案B)。
+                                session.computed_dir_sizes.clear();
                                 match fyler_fsops::watch::watch(
                                     &session.root,
                                     session.watch_tx.clone(),
@@ -4220,6 +4362,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         &gui_event_tx,
                                         pane_id,
                                         &mut session.save_controller,
+                                        &session.computed_dir_sizes,
                                     )
                                     .is_err()
                                 {
@@ -4242,6 +4385,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     &gui_event_tx,
                                     &mut git,
                                     &session.root,
+                                    &mut session.computed_dir_sizes,
                                 );
                                 if outcome.is_err() {
                                     return;
@@ -4260,6 +4404,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     &gui_event_tx,
                                     &mut git,
                                     &session.root,
+                                    &mut session.computed_dir_sizes,
                                 );
                                 if outcome.is_err() {
                                     return;
@@ -4298,10 +4443,74 @@ pub(super) fn run() -> anyhow::Result<()> {
                             return;
                         }
                     }
+                    AppEvent::DirSizeComputed {
+                        pane_id,
+                        id,
+                        path,
+                        cancel,
+                        result,
+                    } => {
+                        let Some(session) = panes.get_mut(&pane_id) else {
+                            continue;
+                        };
+                        let is_current = session
+                            .dir_size_job
+                            .as_ref()
+                            .is_some_and(|job| Arc::ptr_eq(&job.cancel, &cancel));
+                        if !is_current {
+                            // 再要求やroot変更でsupersedeされた完了。無視する。
+                            continue;
+                        }
+                        session.dir_size_job = None;
+                        match result {
+                            Ok(None) => {
+                                // キャンセル済み。再要求や無効化操作自体が既にユーザーへ
+                                // フィードバックしているため、ここでは何も表示しない。
+                            }
+                            Ok(Some(outcome)) => {
+                                session.computed_dir_sizes.insert(id, outcome.total);
+                                let name = path.name().unwrap_or("(root)");
+                                if send_gui_message(
+                                    &gui_event_tx,
+                                    pane_id,
+                                    MessageKind::Info,
+                                    dir_size_message(name, &outcome),
+                                )
+                                .is_err()
+                                    || send_view_state(
+                                        &gui_event_tx,
+                                        pane_id,
+                                        &mut session.save_controller,
+                                        &session.computed_dir_sizes,
+                                    )
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                if send_gui_message(
+                                    &gui_event_tx,
+                                    pane_id,
+                                    MessageKind::Error,
+                                    format!("Failed to compute directory size: {error:#}"),
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
                     AppEvent::Shutdown {
                         save_session,
                         window,
                     } => {
+                        // 終了時は実行中のdir size計算をすべて打ち切る(issue #38
+                        // フォローアップ、案B)。結果は破棄されるだけなので送信先の有無は問わない。
+                        for session in panes.values_mut() {
+                            cancel_dir_size_job(&mut session.dir_size_job);
+                        }
                         let result = if save_session {
                             session::save(&capture_session(&panes, layout, active, window))
                         } else {
@@ -4321,7 +4530,7 @@ pub(super) fn run() -> anyhow::Result<()> {
         action_tx,
         gui_options,
         Arc::new(move || gui_dequeue_gauge.dequeue()),
-        initial_window,
+        startup_window,
         Arc::clone(&window_geometry),
     );
     let final_window = window_geometry.lock().ok().and_then(|window| *window);
@@ -4433,6 +4642,7 @@ fn handle_pane_action(
                 gui_event_tx,
                 new_session.id,
                 &mut new_session.save_controller,
+                &new_session.computed_dir_sizes,
             )?;
             git.request(new_session.id, new_session.root.clone());
             panes.insert(new_id, new_session);
@@ -4475,6 +4685,7 @@ fn handle_pane_action(
             };
             if let Some(session) = panes.get_mut(&source) {
                 discard_undo_slot(session, journal);
+                cancel_dir_size_job(&mut session.dir_size_job);
             }
             panes.remove(&source);
             catalogs.remove_pane(source);
@@ -5251,6 +5462,119 @@ fn request_session_root_change(
     Ok(RootChangeRequestOutcome::Started)
 }
 
+/// カーソル行dirサイズの背景計算を打ち切る(結果は捨てる)。同一paneでの
+/// 再要求・root変更・refresh・pane close・shutdown時に呼ぶ。
+fn cancel_dir_size_job(job: &mut Option<DirSizeJob>) {
+    if let Some(job) = job.take() {
+        job.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// baselineが変わる操作(refresh・root変更)でoverlayとジョブの両方を破棄する。
+/// 古いサイズを表示に残さないため保守的にクリアする。
+fn invalidate_dir_size_overlay(
+    job: &mut Option<DirSizeJob>,
+    computed_dir_sizes: &mut HashMap<EntryId, u64>,
+) {
+    cancel_dir_size_job(job);
+    computed_dir_sizes.clear();
+}
+
+/// カーソル行のディレクトリのサイズを背景スレッドで再帰計算する
+/// (issue #38フォローアップ、案B)。対象がディレクトリでなければ拒否メッセージを
+/// 出すだけで終了する。同一paneで既に実行中のジョブがあればcancelして置き換える。
+/// [`request_dir_size`]の行解決結果。カーソル行がdirを指しているかどうかの
+/// 判定を`SaveController`だけで単体テストできるよう切り出す。
+enum DirSizeLineResolution {
+    /// dirへ解決できた。
+    Directory(fyler_core::tree::BaselineEntry),
+    /// IDが埋め込まれていない・stale ID等で現在のbaselineへ解決できなかった。
+    LineNotFound,
+    /// 解決はできたがファイル・symlink行だった。
+    NotADirectory,
+}
+
+fn resolve_dir_size_line(
+    save_controller: &SaveController,
+    lines: &[fyler_core::editor::EditorLine],
+    line: usize,
+) -> DirSizeLineResolution {
+    let Some(entry) = save_controller.resolve_line_entry(lines, line) else {
+        return DirSizeLineResolution::LineNotFound;
+    };
+    if entry.kind != EntryKind::Dir {
+        return DirSizeLineResolution::NotADirectory;
+    }
+    DirSizeLineResolution::Directory(entry)
+}
+
+fn request_dir_size(
+    pane_id: PaneId,
+    line: usize,
+    session: &mut PaneSession,
+    gui_event_tx: &CountingSender<GuiEvent>,
+    app_event_tx: &CountingSender<AppEvent>,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    let snapshot = session.engine.snapshot();
+    let entry = match resolve_dir_size_line(&session.save_controller, &snapshot.lines, line) {
+        DirSizeLineResolution::Directory(entry) => entry,
+        DirSizeLineResolution::LineNotFound => {
+            return send_gui_message(
+                gui_event_tx,
+                pane_id,
+                MessageKind::Error,
+                "File for this line was not found in the current tree",
+            );
+        }
+        DirSizeLineResolution::NotADirectory => {
+            return send_gui_message(gui_event_tx, pane_id, MessageKind::Info, "Not a directory");
+        }
+    };
+
+    cancel_dir_size_job(&mut session.dir_size_job);
+    let cancel = Arc::new(AtomicBool::new(false));
+    session.dir_size_job = Some(DirSizeJob {
+        cancel: Arc::clone(&cancel),
+    });
+
+    let name = entry.path.name().unwrap_or("(root)").to_owned();
+    send_gui_message(
+        gui_event_tx,
+        pane_id,
+        MessageKind::Info,
+        format!("Calculating size of {name}\u{2026}"),
+    )?;
+
+    let worker_path = entry.path.to_fs_path(&session.root);
+    let worker_id = entry.id;
+    let worker_tree_path = entry.path.clone();
+    let worker_cancel = Arc::clone(&cancel);
+    let worker_event_tx = app_event_tx.clone();
+    let spawn_result = thread::Builder::new()
+        .name("fyler-dir-size".to_owned())
+        // 深いディレクトリ木の再帰列挙は読めない深さになり得るため既定stackを維持する。
+        .spawn(move || {
+            let result = fyler_fsops::dirsize::dir_size_cancellable(&worker_path, &worker_cancel);
+            let _ = worker_event_tx.send(AppEvent::DirSizeComputed {
+                pane_id,
+                id: worker_id,
+                path: worker_tree_path,
+                cancel: worker_cancel,
+                result,
+            });
+        });
+    if let Err(error) = spawn_result {
+        session.dir_size_job = None;
+        return send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Error,
+            format!("Failed to start directory size worker: {error}"),
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn request_directory_load(
     pane_id: PaneId,
@@ -5616,6 +5940,9 @@ fn finish_session_root_change(
     session.raw_git_statuses.clear();
     session.git_branch = None;
     session.git_badges.clear();
+    // root変更は別ディレクトリのbaselineへ切り替わるため、カーソル行dirサイズの
+    // overlayと実行中ジョブを破棄する(issue #38フォローアップ、案B)。
+    invalidate_dir_size_overlay(&mut session.dir_size_job, &mut session.computed_dir_sizes);
     if let Err(error) = session.engine.send(EditorCommand::SetLines {
         lines: new_lines,
         cursor_line,
@@ -5643,6 +5970,7 @@ fn finish_session_root_change(
         &mut session.save_controller,
         git,
         &session.root,
+        &session.computed_dir_sizes,
     )
 }
 
@@ -5766,7 +6094,12 @@ fn finish_directory_load(
     // ロード直後もキャッシュ済みstatusから即座に再マップし、直後のgit.request
     // (新鮮な結果)が届くまでの展開行のbadge表示ギャップを埋める。
     send_git_badges_from_cache(pane_id, session, gui_event_tx)?;
-    send_view_state(gui_event_tx, pane_id, &mut session.save_controller)
+    send_view_state(
+        gui_event_tx,
+        pane_id,
+        &mut session.save_controller,
+        &session.computed_dir_sizes,
+    )
 }
 
 fn finish_picker_reveal_load(
@@ -5806,6 +6139,7 @@ fn finish_picker_reveal_load(
             engine.as_ref(),
             &root,
             gui_event_tx,
+            &session.computed_dir_sizes,
         )?;
         return Ok(None);
     }
@@ -5886,16 +6220,20 @@ mod tests {
         let defaults = fyler_core::keymap::default_bindings(fyler_core::keymap::default_leader());
         let default_entries = help_entries(&defaults);
         assert!(default_entries.iter().any(|entry| {
-            entry.command == "Enter" && entry.description == EditorAction::Activate.description()
+            entry.command == "<CR>" && entry.description == EditorAction::Activate.description()
         }));
 
         let mut customized = defaults
             .into_iter()
-            .filter(|binding| binding.action != EditorAction::ToggleHidden)
+            .filter(|binding| binding.target != BindingTarget::Action(EditorAction::ToggleHidden))
             .collect::<Vec<_>>();
         customized.push(KeyBinding {
             sequence: fyler_core::keymap::parse_key_sequence("x", None).unwrap(),
-            action: EditorAction::FilePicker,
+            target: BindingTarget::Action(EditorAction::FilePicker),
+        });
+        customized.push(KeyBinding {
+            sequence: fyler_core::keymap::parse_key_sequence(";", None).unwrap(),
+            target: BindingTarget::Keys(fyler_core::keymap::parse_key_sequence(":", None).unwrap()),
         });
         let custom_entries = help_entries(&customized);
         assert!(
@@ -5904,9 +6242,13 @@ mod tests {
                 .any(|entry| { entry.description == EditorAction::ToggleHidden.description() })
         );
         assert!(custom_entries.iter().any(|entry| {
-            entry.command == "g / / x"
-                && entry.description == EditorAction::FilePicker.description()
+            entry.command == "g/ / x" && entry.description == EditorAction::FilePicker.description()
         }));
+        assert!(
+            custom_entries
+                .iter()
+                .any(|entry| { entry.command == ";" && entry.description == "Feed keys: :" })
+        );
     }
 
     #[test]
@@ -6104,6 +6446,61 @@ mod tests {
     }
 
     #[test]
+    fn window_geometry_restores_independent_of_pane_session_restore_gate() {
+        let window = WindowGeometry::new(1280.0, 720.0, 12.0, 34.0, false, 1.5).unwrap();
+        let pane_id = PaneId::new(1);
+        let root = if cfg!(windows) {
+            PathBuf::from(r"C:\root")
+        } else {
+            PathBuf::from("/tmp/root")
+        };
+        let session = SessionState {
+            layout: PaneLayout::leaf(pane_id),
+            active: pane_id,
+            panes: BTreeMap::from([(
+                pane_id,
+                SessionPane {
+                    root,
+                    cursor: None,
+                    collapsed: Vec::new(),
+                    expanded: Vec::new(),
+                    scan_options: ScanOptions::default(),
+                },
+            )]),
+            window: Some(window),
+        };
+        let loaded_session = Some(session);
+        for (explicit_root, restore_session) in [(true, true), (false, false), (true, false)] {
+            assert!(!should_restore_session(explicit_root, restore_session));
+            let restored_session = if should_restore_session(explicit_root, restore_session) {
+                loaded_session.clone()
+            } else {
+                None
+            };
+            assert!(
+                restored_session.is_none(),
+                "pane restore gate must stay disabled here"
+            );
+            assert_eq!(
+                resolve_initial_window(loaded_session.as_ref()),
+                Some(window),
+                "window geometry must restore even when pane session restore is disabled"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_startup_window_carries_geometry_and_position_flag() {
+        let window = WindowGeometry::new(1280.0, 720.0, 12.0, 34.0, false, 1.5).unwrap();
+        assert!(resolve_startup_window(None).is_none());
+        let startup = resolve_startup_window(Some(window)).unwrap();
+        assert_eq!(startup.geometry, window);
+        // 非Windows(このテストの実行環境)にはオフスクリーン判定手段が存在せず、
+        // fyler-fsopsのdisplayモジュール自体がcfg(windows)限定のため常に位置を適用する。
+        assert!(startup.apply_position);
+    }
+
+    #[test]
     fn unavailable_root_falls_back_to_nearest_existing_ancestor() {
         let root = tempfile::tempdir().unwrap();
         let requested = root.path().join("missing").join("nested");
@@ -6238,5 +6635,90 @@ mod tests {
             refresh_gate(false, false, false, true, false),
             RefreshGate::Allow
         );
+    }
+
+    #[test]
+    fn resolve_dir_size_line_accepts_directory_and_rejects_file_or_missing_line() {
+        let root = PathBuf::from("C:/root");
+        let mut baseline = fyler_core::tree::BaselineTree::new(&root);
+        baseline.insert(fyler_core::tree::BaselineEntry {
+            id: EntryId(1),
+            path: TreePath::parse("dir"),
+            kind: EntryKind::Dir,
+        });
+        baseline.insert(fyler_core::tree::BaselineEntry {
+            id: EntryId(2),
+            path: TreePath::parse("file.txt"),
+            kind: EntryKind::File,
+        });
+        let controller =
+            SaveController::new(root, IdAllocator::new(), baseline, Arc::new(ProbeEngine));
+        let lines = controller.visible_lines();
+        let dir_line = lines
+            .iter()
+            .position(|line| {
+                matches!(
+                    fyler_core::grammar::split_id_prefix(&line.text),
+                    PrefixParse::WithId { id, .. } if id == EntryId(1)
+                )
+            })
+            .unwrap();
+        let file_line = lines
+            .iter()
+            .position(|line| {
+                matches!(
+                    fyler_core::grammar::split_id_prefix(&line.text),
+                    PrefixParse::WithId { id, .. } if id == EntryId(2)
+                )
+            })
+            .unwrap();
+
+        match resolve_dir_size_line(&controller, &lines, dir_line) {
+            DirSizeLineResolution::Directory(entry) => {
+                assert_eq!(entry.path, TreePath::parse("dir"));
+            }
+            _ => panic!("expected a directory to resolve"),
+        }
+        assert!(matches!(
+            resolve_dir_size_line(&controller, &lines, file_line),
+            DirSizeLineResolution::NotADirectory
+        ));
+        assert!(matches!(
+            resolve_dir_size_line(&controller, &lines, lines.len()),
+            DirSizeLineResolution::LineNotFound
+        ));
+    }
+
+    #[test]
+    fn cancel_dir_size_job_stops_and_clears_the_job_but_leaves_none_untouched() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut job = Some(DirSizeJob {
+            cancel: Arc::clone(&cancel),
+        });
+
+        cancel_dir_size_job(&mut job);
+
+        assert!(job.is_none());
+        assert!(cancel.load(Ordering::Relaxed));
+
+        // Noneに対する呼び出しはno-op(panicしない)。
+        cancel_dir_size_job(&mut job);
+        assert!(job.is_none());
+    }
+
+    #[test]
+    fn invalidate_dir_size_overlay_cancels_the_job_and_clears_computed_sizes() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut job = Some(DirSizeJob {
+            cancel: Arc::clone(&cancel),
+        });
+        let mut computed_dir_sizes = HashMap::new();
+        computed_dir_sizes.insert(EntryId(1), 42_u64);
+
+        invalidate_dir_size_overlay(&mut job, &mut computed_dir_sizes);
+
+        assert!(job.is_none());
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(computed_dir_sizes.is_empty());
     }
 }
