@@ -132,6 +132,8 @@ jobs:
         run: |
           $setupPath = (Resolve-Path "dist/fyler-${{ github.ref_name }}-windows-x64-setup.exe").Path
           $installDir = Join-Path $env:LOCALAPPDATA "Programs\fyler"
+          $configDataDir = Join-Path $env:APPDATA "fyler"
+          $cacheDataDir = Join-Path $env:LOCALAPPDATA "fyler"
           $install = Start-Process -FilePath $setupPath -ArgumentList '/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES' -Wait -PassThru
           if ($install.ExitCode -ne 0) { throw "Installer exited with code $($install.ExitCode)" }
 
@@ -143,10 +145,14 @@ jobs:
           & $nvimExe --headless +q
           if ($LASTEXITCODE -ne 0) { throw "Installed Neovim headless smoke test failed" }
 
+          # /KEEPDATA opt-out の検証用に、実データを模したファイルを植えておく。
+          New-Item -ItemType File -Path (Join-Path $configDataDir "config.toml") -Force | Out-Null
+          New-Item -ItemType File -Path (Join-Path $cacheDataDir "undo\dummy.bin") -Force | Out-Null
+
           $uninstaller = Join-Path $installDir "unins000.exe"
           if (-not (Test-Path $uninstaller)) { throw "Uninstaller was not found: $uninstaller" }
-          $uninstall = Start-Process -FilePath $uninstaller -ArgumentList '/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES' -Wait -PassThru
-          if ($uninstall.ExitCode -ne 0) { throw "Uninstaller exited with code $($uninstall.ExitCode)" }
+          $keepUninstall = Start-Process -FilePath $uninstaller -ArgumentList '/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES','/KEEPDATA' -Wait -PassThru
+          if ($keepUninstall.ExitCode -ne 0) { throw "Uninstaller exited with code $($keepUninstall.ExitCode)" }
           # unins000.exe は自身のコピーを%TEMP%へspawnして即座に戻るため、
           # 実際のファイル除去完了をポーリングで待つ(最大30秒)。
           $removed = $false
@@ -155,6 +161,33 @@ jobs:
             Start-Sleep -Seconds 1
           }
           if (-not $removed) { throw "Install directory remains after uninstall: $installDir" }
+
+          # /KEEPDATA を付けたアンインストールでは、ユーザーデータは
+          # opt-out の仕様どおり削除されずに残っているはず。
+          if (-not (Test-Path $configDataDir)) { throw "Config directory was unexpectedly removed by uninstall with /KEEPDATA: $configDataDir" }
+          if (-not (Test-Path $cacheDataDir)) { throw "Cache/undo directory was unexpectedly removed by uninstall with /KEEPDATA: $cacheDataDir" }
+
+          # 再インストールし、今度はフラグなし(既定)でアンインストールする。
+          $reinstall = Start-Process -FilePath $setupPath -ArgumentList '/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES' -Wait -PassThru
+          if ($reinstall.ExitCode -ne 0) { throw "Re-installer exited with code $($reinstall.ExitCode)" }
+          if (-not (Test-Path $fylerExe)) { throw "Re-installed fyler.exe was not found: $fylerExe" }
+
+          $defaultUninstaller = Join-Path $installDir "unins000.exe"
+          if (-not (Test-Path $defaultUninstaller)) { throw "Uninstaller was not found after re-install: $defaultUninstaller" }
+          $defaultUninstall = Start-Process -FilePath $defaultUninstaller -ArgumentList '/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES' -Wait -PassThru
+          if ($defaultUninstall.ExitCode -ne 0) { throw "Default uninstaller exited with code $($defaultUninstall.ExitCode)" }
+          # 通常削除と同様、実際のファイル除去完了(インストール先 + 既定で
+          # 削除される両ユーザーデータディレクトリ)をポーリングで待つ(最大30秒)。
+          # これは既定=削除の検証であると同時に CI 後始末も兼ねる。
+          $defaultRemoved = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            if ((-not (Test-Path $installDir)) -and (-not (Test-Path $configDataDir)) -and (-not (Test-Path $cacheDataDir))) {
+              $defaultRemoved = $true
+              break
+            }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $defaultRemoved) { throw "Install directory or user data directories remain after default uninstall: $installDir, $configDataDir, $cacheDataDir" }
 
       - name: Generate artifact checksums
         shell: pwsh
