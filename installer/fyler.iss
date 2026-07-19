@@ -45,20 +45,21 @@ Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\fyler\command";
 
 [Code]
 var
-  // usPostUninstall で参照する、purge を実行するかどうかのフラグ。
-  // Pascal Script のグローバル変数はデフォルトで False に初期化される。
-  PurgeUserData: Boolean;
+  // usPostUninstall で参照する、ユーザーデータ削除を実行するかどうかのフラグ。
+  // Pascal Script のグローバル変数はデフォルトで False に初期化されるが、
+  // InitializeUninstall で必ず明示代入するため、その暗黙初期値には依存しない。
+  DeleteUserData: Boolean;
 
-// コマンドライン引数に /PURGEDATA (大文字小文字無視) があるかを調べる。
+// コマンドライン引数に /KEEPDATA (大文字小文字無視) があるかを調べる。
 // ParamCount / ParamStr は Setup と Uninstall の両方で使える組み込み関数。
-function HasPurgeDataParam: Boolean;
+function HasKeepDataParam: Boolean;
 var
   I: Integer;
 begin
   Result := False;
   for I := 1 to ParamCount do
   begin
-    if CompareText(ParamStr(I), '/PURGEDATA') = 0 then
+    if CompareText(ParamStr(I), '/KEEPDATA') = 0 then
     begin
       Result := True;
       Exit;
@@ -66,32 +67,32 @@ begin
   end;
 end;
 
-// アンインストール開始時に purge するかどうかを一度だけ判定する。
-// デフォルトは常に「削除しない」(opt-in)。
-//   - silent アンインストール (UninstallSilent = True):
-//       コマンドラインに /PURGEDATA がある場合のみ purge。
-//   - 対話アンインストール:
-//       /PURGEDATA が付いていれば確認なしで purge (引数優先)。
-//       付いていなければ MsgBox(MB_YESNO or MB_DEFBUTTON2, デフォルト No) で確認する。
+// アンインストール開始時にユーザーデータを削除するかどうかを一度だけ判定する。
+// デフォルトは常に「削除する」(opt-out)。
+//   - /KEEPDATA が付いていれば確認なしで保持する (引数優先)。
+//   - silent アンインストール (UninstallSilent = True) で /KEEPDATA が
+//     なければ削除する。
+//   - 対話アンインストールで /KEEPDATA がなければ MsgBox(MB_YESNO,
+//     デフォルトボタンは第1ボタン = はい) で確認する。
 function InitializeUninstall: Boolean;
 begin
   Result := True;
-  if HasPurgeDataParam then
+  if HasKeepDataParam then
   begin
-    PurgeUserData := True;
+    DeleteUserData := False;
   end
   else if UninstallSilent then
   begin
-    PurgeUserData := False;
+    DeleteUserData := True;
   end
   else
   begin
-    PurgeUserData :=
+    DeleteUserData :=
       MsgBox(
         'アプリの設定や undo データ (' + ExpandConstant('{userappdata}') + '\fyler, ' +
-        ExpandConstant('{localappdata}') + '\fyler) も削除しますか?' + #13#10 +
+        ExpandConstant('{localappdata}') + '\fyler) も削除しますか? (既定: はい)' + #13#10 +
         '「いいえ」を選ぶとこれらのフォルダーは残ります。',
-        mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES;
+        mbConfirmation, MB_YESNO) = IDYES;
   end;
 end;
 
@@ -99,7 +100,7 @@ end;
 // 失敗時は握りつぶさず Log に記録し、対話時は MsgBox でも通知する。
 // Inno のアンインストーラは任意の終了コードを返せないため、silent 時に
 // 失敗を呼び出し元へ伝える手段は Log のみとなる。
-procedure PurgeDataDir(const Dir: String);
+procedure DeleteDataDir(const Dir: String);
 begin
   if not DirExists(Dir) then
     Exit;
@@ -117,13 +118,13 @@ begin
   end;
 end;
 
-// ファイル本体の削除が終わった後 (usPostUninstall) に purge を実行する。
+// ファイル本体の削除が終わった後 (usPostUninstall) にユーザーデータを削除する。
 // %LOCALAPPDATA%\Programs\fyler (インストール先) には一切触れない。
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
-  if (CurUninstallStep = usPostUninstall) and PurgeUserData then
+  if (CurUninstallStep = usPostUninstall) and DeleteUserData then
   begin
-    PurgeDataDir(ExpandConstant('{userappdata}\fyler'));
-    PurgeDataDir(ExpandConstant('{localappdata}\fyler'));
+    DeleteDataDir(ExpandConstant('{userappdata}\fyler'));
+    DeleteDataDir(ExpandConstant('{localappdata}\fyler'));
   end;
 end;
