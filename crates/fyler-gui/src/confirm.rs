@@ -178,6 +178,7 @@ pub fn draw_plan(
                     };
                     let approve_clicked = ui
                         .horizontal(|ui| {
+                            let badge = key_badge(ui, "↵").clicked();
                             let button = ui
                                 .add(
                                     egui::Button::new(
@@ -185,19 +186,18 @@ pub fn draw_plan(
                                             .strong()
                                             .color(theme::CANVAS),
                                     )
-                                    .fill(theme::ACCENT)
                                     .stroke(egui::Stroke::new(1.0, theme::ACCENT)),
                                 )
                                 .clicked();
-                            let badge = key_badge(ui, "↵").clicked();
                             button || badge
                         })
                         .inner;
+                    ui.add_space(8.0);
                     let cancel_clicked = ui
                         .horizontal(|ui| {
+                            let badge = key_badge(ui, "esc").clicked();
                             let label =
                                 ui.add(egui::Button::new("Cancel").frame(false)).clicked();
-                            let badge = key_badge(ui, "esc").clicked();
                             label || badge
                         })
                         .inner;
