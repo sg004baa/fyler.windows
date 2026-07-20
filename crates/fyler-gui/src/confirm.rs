@@ -15,6 +15,7 @@ use fyler_core::transfer::{
 use fyler_core::validate::ValidateError;
 
 use crate::theme;
+use crate::widgets::{key_badge, summary_badge};
 
 /// ユーザーの選択。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,28 +62,6 @@ impl From<&OperationPlan> for PlanCounts {
     }
 }
 
-fn count_badge(ui: &mut egui::Ui, count: usize, noun: &str, color: egui::Color32) {
-    egui::Frame::NONE
-        .fill(theme::SURFACE_RAISED)
-        .stroke(egui::Stroke::new(1.0, theme::BORDER))
-        .corner_radius(egui::CornerRadius::same(4))
-        .inner_margin(egui::Margin::symmetric(7, 3))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(format!("{count} {noun}"))
-                    .monospace()
-                    .size(11.0)
-                    .color(color),
-            );
-        });
-}
-
-fn summary_badge(ui: &mut egui::Ui, count: usize, noun: &str, color: egui::Color32) {
-    if count > 0 {
-        count_badge(ui, count, noun, color);
-    }
-}
-
 /// OperationPlanをモーダルで表示し、選択があれば返す。
 ///
 /// 実装契約:
@@ -116,7 +95,6 @@ pub fn draw_plan(
             ui.set_min_width(520.0);
             ui.horizontal(|ui| {
                 ui.heading("Review changes");
-                count_badge(ui, plan.ops.len(), "operations", theme::TEXT_SECONDARY);
             });
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
@@ -145,13 +123,6 @@ pub fn draw_plan(
                                     .strong()
                                     .color(group.kind.color()),
                             );
-                            if group.kind == OpKind::Delete {
-                                ui.label(
-                                    egui::RichText::new("·  recoverable from recycle bin")
-                                        .size(10.0)
-                                        .color(theme::TEXT_FAINT),
-                                );
-                            }
                         });
                         ui.add_space(2.0);
                         for entry in &group.entries {
@@ -201,24 +172,35 @@ pub fn draw_plan(
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let approve_label = if overwrites.is_empty() {
-                        format!("Apply {} changes  ↵", plan.ops.len())
+                        "Apply"
                     } else {
-                        format!("Overwrite + apply {}  ↵", plan.ops.len())
+                        "Overwrite + apply"
                     };
                     let approve_clicked = ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(approve_label)
-                                    .strong()
-                                    .color(theme::CANVAS),
-                            )
-                            .fill(theme::ACCENT)
-                            .stroke(egui::Stroke::new(1.0, theme::ACCENT)),
-                        )
-                        .clicked();
+                        .horizontal(|ui| {
+                            let button = ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(approve_label)
+                                            .strong()
+                                            .color(theme::CANVAS),
+                                    )
+                                    .fill(theme::ACCENT)
+                                    .stroke(egui::Stroke::new(1.0, theme::ACCENT)),
+                                )
+                                .clicked();
+                            let badge = key_badge(ui, "↵").clicked();
+                            button || badge
+                        })
+                        .inner;
                     let cancel_clicked = ui
-                        .add(egui::Button::new("Cancel  esc").frame(false))
-                        .clicked();
+                        .horizontal(|ui| {
+                            let label =
+                                ui.add(egui::Button::new("Cancel").frame(false)).clicked();
+                            let badge = key_badge(ui, "esc").clicked();
+                            label || badge
+                        })
+                        .inner;
                     confirm_choice_from_buttons(approve_clicked, cancel_clicked, key_choice)
                 })
                 .inner
