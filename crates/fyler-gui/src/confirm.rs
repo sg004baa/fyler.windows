@@ -179,17 +179,9 @@ pub fn draw_plan(
                     let approve_clicked = ui
                         .horizontal(|ui| {
                             let badge = key_badge(ui, "↵").clicked();
-                            let button = ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new(approve_label)
-                                            .strong()
-                                            .color(theme::CANVAS),
-                                    )
-                                    .stroke(egui::Stroke::new(1.0, theme::ACCENT)),
-                                )
-                                .clicked();
-                            button || badge
+                            let label =
+                                ui.add(egui::Button::new(approve_label).frame(false)).clicked();
+                            label || badge
                         })
                         .inner;
                     ui.add_space(8.0);
