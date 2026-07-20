@@ -118,13 +118,6 @@ pub fn draw_plan(
                 ui.heading("Review changes");
                 count_badge(ui, plan.ops.len(), "operations", theme::TEXT_SECONDARY);
             });
-            ui.label(
-                egui::RichText::new(
-                    "These will be applied to disk. Deletions go to the recycle bin.",
-                )
-                .size(11.0)
-                .color(theme::TEXT_MUTED),
-            );
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 summary_badge(ui, counts.create, "create", theme::GREEN);

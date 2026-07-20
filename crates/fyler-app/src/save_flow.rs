@@ -26,7 +26,6 @@ use fyler_gui::confirm::ConfirmChoice;
 /// 保存フローから配線層へ返す結果。
 #[derive(Debug, Clone)]
 pub enum SaveFlowResult {
-    /// 確認対象のplanと、実行時に発生し得るクラウド取得等の警告を表示する。
     ShowPlan {
         plan: OperationPlan,
         warnings: Vec<String>,
@@ -1088,7 +1087,6 @@ impl SaveController {
         let display_plan = plan.clone();
         let warnings = plan_warnings(
             &self.root,
-            &self.baseline,
             &display_plan,
             &overwrites,
             fyler_fsops::onedrive::is_cloud_placeholder,
@@ -1609,7 +1607,6 @@ fn git_badge_rank(badge: GitBadge) -> u8 {
 /// 失敗した場合は保存計画を妨げず、サイズを取得できない場合だけサイズ表記を省略する。
 fn plan_warnings(
     root: &Path,
-    baseline: &BaselineTree,
     plan: &OperationPlan,
     overwrites: &[TreePath],
     is_placeholder: impl Fn(&Path) -> anyhow::Result<bool>,
@@ -1632,58 +1629,8 @@ fn plan_warnings(
         warnings.push(hydration_warning(from, size));
     }
 
-    append_delete_backup_warnings(&mut warnings, baseline, plan);
     append_overwrite_backup_warnings(&mut warnings, root, overwrites, is_placeholder);
     warnings
-}
-
-fn append_delete_backup_warnings(
-    warnings: &mut Vec<String>,
-    baseline: &BaselineTree,
-    plan: &OperationPlan,
-) {
-    let mut saw_delete = false;
-    let mut total_size = 0_u64;
-    let mut has_unknown_size = false;
-
-    for operation in &plan.ops {
-        let fyler_core::plan::FsOperation::Delete { path, .. } = operation else {
-            continue;
-        };
-        saw_delete = true;
-
-        let mut matched = false;
-        for entry in baseline
-            .entries()
-            .iter()
-            .filter(|entry| &entry.path == path || path.is_strict_ancestor_of(&entry.path))
-        {
-            matched = true;
-            let Some(meta) = baseline.meta(entry.id) else {
-                has_unknown_size = true;
-                continue;
-            };
-            if let Some(size) = meta.size {
-                total_size = total_size.saturating_add(size);
-            } else if entry.kind != EntryKind::Dir {
-                has_unknown_size = true;
-            }
-            if meta.is_placeholder {
-                warnings.push(hydration_warning(&entry.path, meta.size));
-            }
-        }
-        if !matched {
-            has_unknown_size = true;
-        }
-    }
-
-    if saw_delete {
-        warnings.push(backup_warning(
-            "A backup will be created before deletion",
-            total_size,
-            has_unknown_size,
-        ));
-    }
 }
 
 fn append_overwrite_backup_warnings(
@@ -2358,7 +2305,6 @@ mod tests {
 
         let warnings = plan_warnings(
             root.path(),
-            &BaselineTree::new(root.path()),
             &plan,
             &[],
             |path| Ok(path == root.path().join("cloud.bin")),
@@ -2383,73 +2329,12 @@ mod tests {
 
         let warnings = plan_warnings(
             root.path(),
-            &BaselineTree::new(root.path()),
             &plan,
             &[],
             |_| Ok(true),
         );
 
         assert_eq!(warnings, ["Will download from the cloud: missing.bin"]);
-    }
-
-    #[test]
-    fn plan_warnings_include_delete_backup_estimate_and_unknown_size() {
-        let root = tempdir().unwrap();
-        let mut baseline = BaselineTree::new(root.path());
-        baseline.insert_with_meta(
-            BaselineEntry {
-                id: EntryId(1),
-                path: TreePath::parse("old"),
-                kind: EntryKind::Dir,
-            },
-            EntryMeta {
-                size: None,
-                modified: None,
-                is_placeholder: false,
-            },
-        );
-        baseline.insert_with_meta(
-            BaselineEntry {
-                id: EntryId(2),
-                path: TreePath::parse("old/a.bin"),
-                kind: EntryKind::File,
-            },
-            EntryMeta {
-                size: Some(1024 * 1024),
-                modified: None,
-                is_placeholder: false,
-            },
-        );
-        baseline.insert_with_meta(
-            BaselineEntry {
-                id: EntryId(3),
-                path: TreePath::parse("old/b.bin"),
-                kind: EntryKind::File,
-            },
-            EntryMeta {
-                size: Some(512 * 1024),
-                modified: None,
-                is_placeholder: false,
-            },
-        );
-        baseline.insert(BaselineEntry {
-            id: EntryId(4),
-            path: TreePath::parse("old/unknown.bin"),
-            kind: EntryKind::File,
-        });
-        let plan = OperationPlan {
-            ops: vec![FsOperation::Delete {
-                id: EntryId(1),
-                path: TreePath::parse("old"),
-            }],
-        };
-
-        let warnings = plan_warnings(root.path(), &baseline, &plan, &[], |_| Ok(false));
-
-        assert_eq!(
-            warnings,
-            ["A backup will be created before deletion: approximately 1.5 MB (some sizes unknown)"]
-        );
     }
 
     #[test]
@@ -2460,7 +2345,6 @@ mod tests {
 
         let warnings = plan_warnings(
             root.path(),
-            &BaselineTree::new(root.path()),
             &plan,
             &[TreePath::parse("existing.bin")],
             |_| Ok(false),
@@ -2498,7 +2382,6 @@ mod tests {
 
         let warnings = plan_warnings(
             root.path(),
-            &baseline,
             &plan,
             &[TreePath::parse("overwrite.bin")],
             |path| Ok(path == root.path().join("overwrite.bin")),
@@ -2508,7 +2391,6 @@ mod tests {
             warnings,
             [
                 "Will download from the cloud: cloud.bin(4.0 KB)",
-                "A backup will be created before deletion: approximately 4.0 KB",
                 "Will download from the cloud: overwrite.bin(1.0 KB)",
                 "A backup will be created before overwrite: approximately 1.0 KB",
             ]
