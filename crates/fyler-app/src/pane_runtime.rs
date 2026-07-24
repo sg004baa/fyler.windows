@@ -79,6 +79,10 @@ struct PaneSession {
     /// 実行中のdir sizeジョブ(pane毎に同時1本まで)。再要求・root変更・refresh・
     /// pane close・shutdownでキャンセルする。
     dir_size_job: Option<DirSizeJob>,
+    /// 現在のrootが、dirを指すsymlinkをEnter/gdで追従して入った場所かどうか。
+    /// `NavigateParent`の意味論をhistory backへ切り替える判定に使う
+    /// (`finish_session_root_change`が`RootChangeIntent`に応じて更新する)。
+    root_entered_via_link: bool,
 }
 
 /// [`PaneSession::dir_size_job`] の1エントリ。完了イベントの`cancel`との
@@ -100,6 +104,10 @@ struct HistoryEntry {
     cursor_target: Option<OsString>,
     /// このrootへ戻った時に復元するcollapsed dir(root相対path基準)。
     collapsed: Vec<TreePath>,
+    /// このentryを離れた時点で、そのrootがsymlink追従で入った場所だったか。
+    /// history back/forwardで戻る際、`PaneSession::root_entered_via_link`へ
+    /// そのまま復元する(link先rootへの往復で`<BS>`=戻る挙動を保持するため)。
+    entered_via_link: bool,
 }
 
 /// pane毎のback/forward navigation history(純粋ロジック)。
@@ -185,10 +193,19 @@ struct LoaderOwner {
 enum RootChangeIntent {
     /// gd/^/:cd/bookmark/recent/drive等の通常のroot変更。
     Normal,
+    /// dirを指すsymlinkをEnter/gdで追従して入った(`Normal`と同じhistory記録だが、
+    /// 到達先で`PaneSession::root_entered_via_link`を立てる)。
+    FollowLink,
     /// `:back` / `Ctrl+P`によるhistory back navigation。
-    HistoryBack { collapsed: Vec<TreePath> },
+    HistoryBack {
+        collapsed: Vec<TreePath>,
+        entered_via_link: bool,
+    },
     /// `:forward` / `Ctrl+N`によるhistory forward navigation。
-    HistoryForward { collapsed: Vec<TreePath> },
+    HistoryForward {
+        collapsed: Vec<TreePath>,
+        entered_via_link: bool,
+    },
 }
 
 enum LoaderKind {
@@ -363,6 +380,7 @@ fn create_pane(
         history: NavigationHistory::default(),
         computed_dir_sizes: HashMap::new(),
         dir_size_job: None,
+        root_entered_via_link: false,
     })
 }
 
@@ -1539,7 +1557,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             pane_id,
                                             new_root,
                                             None,
-                                            RootChangeIntent::Normal,
+                                            RootChangeIntent::FollowLink,
                                             session,
                                             &shared_ids,
                                             &event_tx,
@@ -1594,17 +1612,18 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     }
                                     continue;
                                 }
-                                let new_root = match session
+                                let (new_root, root_change_intent) = match session
                                     .save_controller
                                     .resolve_line(&snapshot.lines, line)
                                 {
-                                    Some((path, EntryKind::Dir)) => {
-                                        path.to_fs_path(&session.root)
-                                    }
+                                    Some((path, EntryKind::Dir)) => (
+                                        path.to_fs_path(&session.root),
+                                        RootChangeIntent::Normal,
+                                    ),
                                     Some((path, EntryKind::Symlink)) => {
                                         let fs_path = path.to_fs_path(&session.root);
                                         match fyler_fsops::link::resolve_link_dir(&fs_path) {
-                                            Ok(Some(dir)) => dir,
+                                            Ok(Some(dir)) => (dir, RootChangeIntent::FollowLink),
                                             Ok(None) => {
                                                 if send_gui_message(
                                                     &gui_event_tx,
@@ -1653,7 +1672,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     pane_id,
                                     new_root,
                                     None,
-                                    RootChangeIntent::Normal,
+                                    root_change_intent,
                                     session,
                                     &shared_ids,
                                     &event_tx,
@@ -1785,6 +1804,29 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 }
                             }
                             EditorEvent::NavigateParent => {
+                                if session.root_entered_via_link {
+                                    if perform_history_back(
+                                        pane_id,
+                                        session,
+                                        &shared_ids,
+                                        &event_tx,
+                                        &gui_event_tx,
+                                        &mut loader_owner,
+                                        &mut dialog_owner,
+                                        feedback_open
+                                            || apply_owner.is_some()
+                                            || transfer.is_awaiting()
+                                            || transfer.is_running()
+                                            || import.is_awaiting() || extract.is_awaiting()
+                                            || import.is_running() || extract.is_running()
+                                            || drag_out.is_busy(),
+                                    )
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
                                 let cursor_target = session.root.file_name().map(OsStr::to_owned);
                                 let Some(new_root) = session.root.parent().map(Path::to_path_buf)
                                 else {
@@ -1834,28 +1876,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 }
                             }
                             EditorEvent::HistoryBack => {
-                                if !session.history.can_go_back() {
-                                    if send_gui_message(
-                                        &gui_event_tx,
-                                        pane_id,
-                                        MessageKind::Info,
-                                        "No earlier location in history",
-                                    )
-                                    .is_err()
-                                    {
-                                        return;
-                                    }
-                                    continue;
-                                }
-                                let entry = session.history.pop_back().expect("checked can_go_back");
-                                let restore = entry.clone();
-                                let outcome = request_session_root_change(
+                                if perform_history_back(
                                     pane_id,
-                                    entry.root,
-                                    entry.cursor_target,
-                                    RootChangeIntent::HistoryBack {
-                                        collapsed: entry.collapsed,
-                                    },
                                     session,
                                     &shared_ids,
                                     &event_tx,
@@ -1866,15 +1888,9 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         || apply_owner.is_some()
                                         || transfer.is_awaiting()
                                         || transfer.is_running(),
-                                );
-                                match outcome {
-                                    Ok(RootChangeRequestOutcome::Started) => {}
-                                    Ok(RootChangeRequestOutcome::Rejected) => {
-                                        session.history.restore_back(restore);
-                                    }
-                                    Err(_) => return,
-                                }
-                                if send_history_state(&gui_event_tx, pane_id, session).is_err() {
+                                )
+                                .is_err()
+                                {
                                     return;
                                 }
                             }
@@ -1903,6 +1919,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     entry.cursor_target,
                                     RootChangeIntent::HistoryForward {
                                         collapsed: entry.collapsed,
+                                        entered_via_link: entry.entered_via_link,
                                     },
                                     session,
                                     &shared_ids,
@@ -5528,6 +5545,56 @@ fn request_session_root_change(
     Ok(RootChangeRequestOutcome::Started)
 }
 
+/// `NavigateParent`がlink追従で入ったrootにいる時に代わりに呼ばれる、および
+/// `EditorEvent::HistoryBack`本体。history entryをpopしてroot変更を要求し、
+/// gateで拒否されたらpopしたentryを戻し、最後にhistory状態をGUIへ送る。
+#[allow(clippy::too_many_arguments)]
+fn perform_history_back(
+    pane_id: PaneId,
+    session: &mut PaneSession,
+    shared_ids: &Arc<Mutex<IdAllocator>>,
+    app_event_tx: &CountingSender<AppEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
+    loader_owner: &mut Option<LoaderOwner>,
+    dialog_owner: &mut Option<PaneId>,
+    globally_busy: bool,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    if !session.history.can_go_back() {
+        send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Info,
+            "No earlier location in history",
+        )?;
+        return Ok(());
+    }
+    let entry = session.history.pop_back().expect("checked can_go_back");
+    let restore = entry.clone();
+    let outcome = request_session_root_change(
+        pane_id,
+        entry.root,
+        entry.cursor_target,
+        RootChangeIntent::HistoryBack {
+            collapsed: entry.collapsed,
+            entered_via_link: entry.entered_via_link,
+        },
+        session,
+        shared_ids,
+        app_event_tx,
+        gui_event_tx,
+        loader_owner,
+        dialog_owner,
+        globally_busy,
+    )?;
+    match outcome {
+        RootChangeRequestOutcome::Started => {}
+        RootChangeRequestOutcome::Rejected => {
+            session.history.restore_back(restore);
+        }
+    }
+    send_history_state(gui_event_tx, pane_id, session)
+}
+
 /// カーソル行dirサイズの背景計算を打ち切る(結果は捨てる)。同一paneでの
 /// 再要求・root変更・refresh・pane close・shutdown時に呼ぶ。
 fn cancel_dir_size_job(job: &mut Option<DirSizeJob>) {
@@ -5987,14 +6054,28 @@ fn finish_session_root_change(
         RootChangeIntent::Normal => {
             session.save_controller.collapse_all_dirs();
             session.history.record_normal(from);
+            session.root_entered_via_link = false;
         }
-        RootChangeIntent::HistoryBack { collapsed } => {
+        RootChangeIntent::FollowLink => {
+            session.save_controller.collapse_all_dirs();
+            session.history.record_normal(from);
+            session.root_entered_via_link = true;
+        }
+        RootChangeIntent::HistoryBack {
+            collapsed,
+            entered_via_link,
+        } => {
             session.save_controller.restore_collapsed_paths(&collapsed);
             session.history.record_history_back(from);
+            session.root_entered_via_link = entered_via_link;
         }
-        RootChangeIntent::HistoryForward { collapsed } => {
+        RootChangeIntent::HistoryForward {
+            collapsed,
+            entered_via_link,
+        } => {
             session.save_controller.restore_collapsed_paths(&collapsed);
             session.history.record_history_forward(from);
+            session.root_entered_via_link = entered_via_link;
         }
     }
     let cursor_line =
@@ -6057,6 +6138,7 @@ fn capture_history_entry(session: &PaneSession) -> HistoryEntry {
         root: session.root.clone(),
         cursor_target,
         collapsed,
+        entered_via_link: session.root_entered_via_link,
     }
 }
 
@@ -6593,6 +6675,7 @@ mod tests {
             root: PathBuf::from(root),
             cursor_target: None,
             collapsed: Vec::new(),
+            entered_via_link: false,
         }
     }
 
