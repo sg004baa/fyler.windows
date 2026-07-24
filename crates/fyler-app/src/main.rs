@@ -502,6 +502,9 @@ enum ActivateOutcome {
     Toggled,
     /// 未ロードディレクトリの展開にはロードが必要。
     Load(TreePath),
+    /// dirを指すsymlink/junctionを追従した。呼び出し側(pane_runtime)は
+    /// リンク実体パスへのroot変更(Normal intent、history自動記録)が必要。
+    FollowLink(PathBuf),
 }
 
 fn handle_activate_line(
@@ -557,7 +560,7 @@ fn handle_activate_line(
     };
 
     match kind {
-        EntryKind::File | EntryKind::Symlink => {
+        EntryKind::File => {
             let path = path.to_fs_path(root);
             if let Err(error) = fyler_fsops::open::open_with_default_app(&path) {
                 send_gui_message(
@@ -566,6 +569,30 @@ fn handle_activate_line(
                     MessageKind::Error,
                     format!("Failed to open file: {error:#}"),
                 )?;
+            }
+        }
+        EntryKind::Symlink => {
+            let path = path.to_fs_path(root);
+            match fyler_fsops::link::resolve_link_dir(&path) {
+                Ok(Some(dir)) => return Ok(ActivateOutcome::FollowLink(dir)),
+                Ok(None) => {
+                    if let Err(error) = fyler_fsops::open::open_with_default_app(&path) {
+                        send_gui_message(
+                            gui_event_tx,
+                            pane_id,
+                            MessageKind::Error,
+                            format!("Failed to open file: {error:#}"),
+                        )?;
+                    }
+                }
+                Err(error) => {
+                    send_gui_message(
+                        gui_event_tx,
+                        pane_id,
+                        MessageKind::Error,
+                        format!("Failed to resolve link: {error:#}"),
+                    )?;
+                }
             }
         }
         EntryKind::Dir => {

@@ -1534,6 +1534,33 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             return;
                                         }
                                     }
+                                    ActivateOutcome::FollowLink(new_root) => {
+                                        if request_session_root_change(
+                                            pane_id,
+                                            new_root,
+                                            None,
+                                            RootChangeIntent::Normal,
+                                            session,
+                                            &shared_ids,
+                                            &event_tx,
+                                            &gui_event_tx,
+                                            &mut loader_owner,
+                                            &mut dialog_owner,
+                                            feedback_open
+                                                || apply_owner.is_some()
+                                                || transfer.is_awaiting()
+                                                || transfer.is_running()
+                                                || import.is_awaiting()
+                                                || extract.is_awaiting()
+                                                || import.is_running()
+                                                || extract.is_running()
+                                                || drag_out.is_busy(),
+                                        )
+                                        .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
                                 }
                             }
                             EditorEvent::NavigateInto { line } => {
@@ -1567,22 +1594,61 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     }
                                     continue;
                                 }
-                                let Some((path, EntryKind::Dir)) =
-                                    session.save_controller.resolve_line(&snapshot.lines, line)
-                                else {
-                                    if send_gui_message(
-                                        &gui_event_tx,
-                                        pane_id,
-                                        MessageKind::Info,
-                                        "This is not a directory line",
-                                    )
-                                    .is_err()
-                                    {
-                                        return;
+                                let new_root = match session
+                                    .save_controller
+                                    .resolve_line(&snapshot.lines, line)
+                                {
+                                    Some((path, EntryKind::Dir)) => {
+                                        path.to_fs_path(&session.root)
                                     }
-                                    continue;
+                                    Some((path, EntryKind::Symlink)) => {
+                                        let fs_path = path.to_fs_path(&session.root);
+                                        match fyler_fsops::link::resolve_link_dir(&fs_path) {
+                                            Ok(Some(dir)) => dir,
+                                            Ok(None) => {
+                                                if send_gui_message(
+                                                    &gui_event_tx,
+                                                    pane_id,
+                                                    MessageKind::Info,
+                                                    "Link does not point to a directory",
+                                                )
+                                                .is_err()
+                                                {
+                                                    return;
+                                                }
+                                                continue;
+                                            }
+                                            Err(error) => {
+                                                if send_gui_message(
+                                                    &gui_event_tx,
+                                                    pane_id,
+                                                    MessageKind::Error,
+                                                    format!(
+                                                        "Failed to resolve link: {error:#}"
+                                                    ),
+                                                )
+                                                .is_err()
+                                                {
+                                                    return;
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    Some((_, EntryKind::File)) | None => {
+                                        if send_gui_message(
+                                            &gui_event_tx,
+                                            pane_id,
+                                            MessageKind::Info,
+                                            "This is not a directory line",
+                                        )
+                                        .is_err()
+                                        {
+                                            return;
+                                        }
+                                        continue;
+                                    }
                                 };
-                                let new_root = path.to_fs_path(&session.root);
                                 if request_session_root_change(
                                     pane_id,
                                     new_root,
