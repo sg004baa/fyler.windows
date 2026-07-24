@@ -477,7 +477,15 @@ fn validate_restore(
         }
     })?;
     let actual_kind = crate::scan::kind_from_metadata(&metadata);
-    if actual_kind == backup.kind {
+    // symlinkのpayloadは実リンクではなく記述子(通常ファイル)として保存される
+    // (crate::backup::write_symlink_descriptor)。特権不要化がbackupの契約なので、
+    // ここでもpayload種別としてFileを期待する(backup.kind自体はSymlinkのまま)。
+    let expected_payload_kind = if backup.kind == EntryKind::Symlink {
+        EntryKind::File
+    } else {
+        backup.kind
+    };
+    if actual_kind == expected_payload_kind {
         Ok(())
     } else {
         Err("Backup payload type does not match the record".to_owned())

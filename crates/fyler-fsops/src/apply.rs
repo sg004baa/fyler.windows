@@ -1144,7 +1144,8 @@ fn copy_progress(copied: usize, total: usize) -> String {
 fn copy_symlink(source: &Path, target: &Path) -> anyhow::Result<()> {
     let link_target = fs::read_link(crate::long_path::to_fs(source))
         .with_context(|| format!("Failed to read symlink: {}", source.display()))?;
-    create_symlink_like(source, &link_target, target).with_context(|| {
+    let flavor = link_flavor(source)?;
+    create_link(flavor, &link_target, target).with_context(|| {
         format!(
             "Failed to copy symlink: {} → {}",
             source.display(),
@@ -1153,20 +1154,91 @@ fn copy_symlink(source: &Path, target: &Path) -> anyhow::Result<()> {
     })
 }
 
+/// symlink/junctionが指す先の種別。Windowsの`symlink_dir`/`symlink_file`
+/// どちらのWin32 APIを呼ぶかを決める(unixでは無視される)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkFlavor {
+    Dir,
+    File,
+}
+
+impl std::fmt::Display for LinkFlavor {
+    /// backup payload記述子(`{flavor}\n{target}`)の1行目としての表記。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            LinkFlavor::Dir => "dir",
+            LinkFlavor::File => "file",
+        })
+    }
+}
+
+impl LinkFlavor {
+    /// backup payload記述子の1行目をパースする。旧形式(実リンクpayload)を
+    /// 誤って読んだ場合もここでfail fastする。
+    pub(crate) fn parse(text: &str) -> anyhow::Result<Self> {
+        match text {
+            "dir" => Ok(LinkFlavor::Dir),
+            "file" => Ok(LinkFlavor::File),
+            other => bail!("Unknown link flavor in backup payload descriptor: {other:?}"),
+        }
+    }
+}
+
+/// `source`(symlink/junction自体)が指す先の種別を判定する。
+///
+/// Windows: リンク自体のfile typeから判定する(junctionも`is_symlink_dir`が
+/// trueになるため`Dir`扱いになる。復元は`symlink_dir`で行われ、junctionと
+/// しての忠実な復元にはならない)。
+/// unix: symlink自体に種別は無いため、追従先メタデータでdir判定する。
+/// broken linkを含め判定不能な場合は`File`とする(unixの`create_link`は
+/// flavorを無視するため実害はない)。
+#[cfg(windows)]
+pub(crate) fn link_flavor(source: &Path) -> anyhow::Result<LinkFlavor> {
+    use std::os::windows::fs::FileTypeExt;
+
+    let file_type = fs::symlink_metadata(crate::long_path::to_fs(source))
+        .with_context(|| format!("Failed to get symlink metadata: {}", source.display()))?
+        .file_type();
+    Ok(if file_type.is_symlink_dir() {
+        LinkFlavor::Dir
+    } else {
+        LinkFlavor::File
+    })
+}
+
 #[cfg(unix)]
-fn create_symlink_like(_source: &Path, link_target: &Path, target: &Path) -> std::io::Result<()> {
+pub(crate) fn link_flavor(source: &Path) -> anyhow::Result<LinkFlavor> {
+    let is_dir = fs::metadata(crate::long_path::to_fs(source))
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false);
+    Ok(if is_dir {
+        LinkFlavor::Dir
+    } else {
+        LinkFlavor::File
+    })
+}
+
+/// `flavor`に従いsymlinkを作成する(実リンク作成API呼び出しはここに閉じる)。
+#[cfg(unix)]
+pub(crate) fn create_link(
+    _flavor: LinkFlavor,
+    link_target: &Path,
+    target: &Path,
+) -> std::io::Result<()> {
     std::os::unix::fs::symlink(link_target, crate::long_path::to_fs(target))
 }
 
 #[cfg(windows)]
-fn create_symlink_like(source: &Path, link_target: &Path, target: &Path) -> std::io::Result<()> {
-    use std::os::windows::fs::{FileTypeExt, symlink_dir, symlink_file};
+pub(crate) fn create_link(
+    flavor: LinkFlavor,
+    link_target: &Path,
+    target: &Path,
+) -> std::io::Result<()> {
+    use std::os::windows::fs::{symlink_dir, symlink_file};
 
-    let file_type = fs::symlink_metadata(crate::long_path::to_fs(source))?.file_type();
-    if file_type.is_symlink_dir() {
-        symlink_dir(link_target, crate::long_path::to_fs(target))
-    } else {
-        symlink_file(link_target, crate::long_path::to_fs(target))
+    match flavor {
+        LinkFlavor::Dir => symlink_dir(link_target, crate::long_path::to_fs(target)),
+        LinkFlavor::File => symlink_file(link_target, crate::long_path::to_fs(target)),
     }
 }
 

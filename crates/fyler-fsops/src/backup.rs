@@ -41,7 +41,10 @@ pub fn backup_entry(
                 step_dir.display()
             )
         })?;
-        copy_entry(source, &payload, kind)
+        match kind {
+            EntryKind::Symlink => write_symlink_descriptor(source, &payload),
+            EntryKind::File | EntryKind::Dir => copy_entry(source, &payload, kind),
+        }
     })();
 
     match copy_result {
@@ -53,13 +56,42 @@ pub fn backup_entry(
     }
 }
 
+/// symlinkのbackup payloadとして、実リンクではなくリンク記述子テキストを書く。
+///
+/// `create_symlink_like`/`symlink_dir`/`symlink_file`等の実リンク作成APIを
+/// 一切呼ばないことで、SeCreateSymbolicLinkPrivilege(Developer Mode)が
+/// 無い環境でもsymlinkのdeleteをbackupできる。payload形式は
+/// `"{flavor}\n{link_target}"`(flavorは`dir`/`file`)の1ファイル。
+/// 復元(`restore_symlink_descriptor`)でのみ実リンクを作成する。
+fn write_symlink_descriptor(source: &Path, payload: &Path) -> anyhow::Result<()> {
+    let link_target = fs::read_link(crate::long_path::to_fs(source))
+        .with_context(|| format!("Failed to read symlink: {}", source.display()))?;
+    let link_target_text = link_target
+        .to_str()
+        .with_context(|| format!("Symlink target is not UTF-8: {}", source.display()))?;
+    let flavor = crate::apply::link_flavor(source)?;
+    fs::write(
+        crate::long_path::to_fs(payload),
+        format!("{flavor}\n{link_target_text}"),
+    )
+    .with_context(|| {
+        format!(
+            "Failed to write symlink backup descriptor: {}",
+            payload.display()
+        )
+    })
+}
+
 /// [`BackupRef`] の payload を target へ復元コピーする。target の親は存在前提。
 ///
 /// target が既に存在する場合はErrを返し、上書きしない。
 pub fn restore_entry(backup_dir: &Path, backup: &BackupRef, target: &Path) -> anyhow::Result<()> {
     ensure_restore_target_vacant(target)?;
     let source = payload_path(backup_dir, backup)?;
-    let restore_result = copy_entry(&source, target, backup.kind);
+    let restore_result = match backup.kind {
+        EntryKind::Symlink => restore_symlink_descriptor(&source, target),
+        EntryKind::File | EntryKind::Dir => copy_entry(&source, target, backup.kind),
+    };
     match restore_result {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -67,6 +99,26 @@ pub fn restore_entry(backup_dir: &Path, backup: &BackupRef, target: &Path) -> an
             Err(error)
         }
     }
+}
+
+/// symlinkのbackup記述子payloadを読み、実リンクを`target`へ作成する。
+///
+/// 旧形式(実リンクpayload)を読んだ場合、1行目が`dir`/`file`のいずれとも
+/// 一致せずfail fastする(互換レイヤは作らない)。
+fn restore_symlink_descriptor(payload: &Path, target: &Path) -> anyhow::Result<()> {
+    let descriptor = fs::read_to_string(crate::long_path::to_fs(payload)).with_context(|| {
+        format!(
+            "Failed to read symlink backup descriptor: {}",
+            payload.display()
+        )
+    })?;
+    let (flavor_text, link_target_text) = descriptor
+        .split_once('\n')
+        .with_context(|| format!("Malformed symlink backup descriptor: {}", payload.display()))?;
+    let flavor = crate::apply::LinkFlavor::parse(flavor_text)
+        .with_context(|| format!("Malformed symlink backup descriptor: {}", payload.display()))?;
+    crate::apply::create_link(flavor, Path::new(link_target_text), target)
+        .with_context(|| format!("Failed to restore symlink: {}", target.display()))
 }
 
 pub(crate) fn discard_backup_payload(backup_dir: &Path, backup: &BackupRef) {
@@ -83,9 +135,10 @@ fn copy_entry(source: &Path, target: &Path, kind: EntryKind) -> anyhow::Result<(
         EntryKind::Dir => crate::apply::copy_tree(source, target)
             .map(|_| ())
             .map_err(|failure| anyhow!(failure.error)),
-        EntryKind::File | EntryKind::Symlink => {
-            crate::apply::copy_single_entry(source, target, kind)
-        }
+        EntryKind::File => crate::apply::copy_single_entry(source, target, kind),
+        EntryKind::Symlink => bail!(
+            "copy_entry does not support Symlink; use the descriptor-based payload path instead"
+        ),
     }
 }
 
@@ -186,12 +239,42 @@ mod tests {
         std::os::unix::fs::symlink("target.txt", &source).unwrap();
 
         let reference = backup_entry(&source, backup.path(), 2).unwrap();
+
+        // 契約: symlinkのbackup payloadは実リンクではなく通常ファイル(記述子)
+        // であること。これがWindowsのSeCreateSymbolicLinkPrivilege問題を防ぐ。
+        let payload = payload_path(backup.path(), &reference).unwrap();
+        assert!(
+            fs::symlink_metadata(&payload)
+                .unwrap()
+                .file_type()
+                .is_file()
+        );
+
         restore_entry(backup.path(), &reference, &restored).unwrap();
 
         assert_eq!(reference.kind, EntryKind::Symlink);
         assert_eq!(
             fs::read_link(&restored).unwrap(),
             PathBuf::from("target.txt")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backs_up_and_restores_broken_symlink_roundtrip() {
+        let root = tempdir().unwrap();
+        let backup = tempdir().unwrap();
+        let source = root.path().join("broken.txt");
+        let restored = root.path().join("restored-broken.txt");
+        std::os::unix::fs::symlink("missing-target.txt", &source).unwrap();
+
+        let reference = backup_entry(&source, backup.path(), 3).unwrap();
+        restore_entry(backup.path(), &reference, &restored).unwrap();
+
+        assert_eq!(reference.kind, EntryKind::Symlink);
+        assert_eq!(
+            fs::read_link(&restored).unwrap(),
+            PathBuf::from("missing-target.txt")
         );
     }
 
