@@ -20,7 +20,7 @@ pub fn resolve_link_dir(path: &Path) -> anyhow::Result<Option<PathBuf>> {
     Ok(Some(crate::long_path::from_fs(&canonical)))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use tempfile::tempdir;
 

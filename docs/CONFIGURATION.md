@@ -297,7 +297,7 @@ Rules and limitations:
 | Action | Description | Default key |
 |---|---|---|
 | `activate` | Toggle a directory or open a file | `<CR>` |
-| `navigate_parent` | Go to the parent directory | `-` |
+| `navigate_parent` | Go to the parent directory | `<BS>` |
 | `navigate_into` | Enter the selected directory | `gd` |
 | `toggle_hidden` | Toggle hidden files | `g.` |
 | `fold_close` | Collapse a directory | `zc` |
@@ -327,7 +327,7 @@ Rules and limitations:
 | `pane_focus_next` | Focus the next pane | `<C-w>w`, `<C-w><C-w>` |
 | `pane_focus_previous` | Focus the previous pane | `<C-w>p` |
 | `pane_close` | Close the current pane | `<C-w>q`, `<C-w>c` |
-| `history_back` | Go back in navigation history | `<C-p>`, `<BS>` |
+| `history_back` | Go back in navigation history | `<C-p>` |
 | `history_forward` | Go forward in navigation history | `<C-n>` |
 | `refresh` | Reload the current root from disk | `<C-r>` |
 
@@ -345,15 +345,21 @@ Invoke `toggle_dock_focus` again to hide the dock.
 ### Navigation history and manual refresh
 
 Root changes (`^`, `gd`, `:cd`, bookmarks, recent roots, and drive selection) are tracked in a
-per-pane back/forward history, capped at 100 entries per direction. `:back` (`<C-p>` / `<BS>` by default)
+per-pane back/forward history, capped at 100 entries per direction. `:back` (`<C-p>` by default)
 and `:forward` (`<C-n>`) step through it; both are rejected while editing, offline, or during
 another operation, and an entry pointing at a since-removed root is discarded with a message
 instead of being retried. `:reload` (`<C-r>`) re-scans the current root from disk without writing
 anything; it is also rejected while editing or busy, except on an offline pane, where it retries
 the connection immediately instead of waiting for the periodic retry.
 
-`<C-r>` normally performs Neovim's built-in redo, `<C-p>` / `<C-n>` normally move the
-cursor up/down like `k` / `j`, `<BS>` normally moves the cursor left, and `-` normally moves to
-the first non-blank of the line above. Fyler's default keymap shadows all of these inside fyler
-buffers; rebind or remove `history_back` / `history_forward` / `refresh` / `navigate_parent`
-(assign `"none"`) if you need the native behavior back.
+`<C-r>` normally performs Neovim's built-in redo, and `<C-p>` / `<C-n>` normally move the
+cursor up/down like `k` / `j`. Fyler's default keymap shadows all three inside fyler buffers;
+rebind or remove `history_back` / `history_forward` / `refresh` (assign `"none"`) if you need the
+native behavior back.
+
+When the current root was entered by following a symlink to a directory (via `activate` on
+`<CR>` or `navigate_into`/`gd`), `navigate_parent` (`<BS>` by default) steps back to the
+previous location instead of moving to the filesystem parent of the link target — effectively
+behaving like `history_back` for that one root. Any other root change (`navigate_into`, `:cd`,
+a drive switch, etc.) clears this and restores the normal parent-directory behavior. Entering or
+leaving that root via `history_back` / `history_forward` (`<C-p>` / `<C-n>`) preserves it.

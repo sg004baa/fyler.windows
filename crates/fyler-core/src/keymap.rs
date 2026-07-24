@@ -477,9 +477,8 @@ pub fn default_leader() -> KeyInput {
 pub fn default_bindings(leader: KeyInput) -> Vec<KeyBinding> {
     let entries = [
         ("<CR>", EditorAction::Activate),
-        ("<BS>", EditorAction::HistoryBack),
+        ("<BS>", EditorAction::NavigateParent),
         ("gd", EditorAction::NavigateInto),
-        ("-", EditorAction::NavigateParent),
         ("g.", EditorAction::ToggleHidden),
         ("zc", EditorAction::FoldClose),
         ("zo", EditorAction::FoldOpen),
