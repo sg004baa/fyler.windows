@@ -58,7 +58,7 @@ pub fn backup_entry(
 
 /// symlinkのbackup payloadとして、実リンクではなくリンク記述子テキストを書く。
 ///
-/// `create_symlink_like`/`symlink_dir`/`symlink_file`等の実リンク作成APIを
+/// `create_link`(`symlink_dir`/`symlink_file`)等の実リンク作成APIを
 /// 一切呼ばないことで、SeCreateSymbolicLinkPrivilege(Developer Mode)が
 /// 無い環境でもsymlinkのdeleteをbackupできる。payload形式は
 /// `"{flavor}\n{link_target}"`(flavorは`dir`/`file`)の1ファイル。
