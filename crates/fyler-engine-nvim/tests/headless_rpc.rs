@@ -45,9 +45,16 @@ async fn spawn_attach_and_edit_updates_snapshot() -> anyhow::Result<()> {
     .await?;
     engine.send(key_command(Key::Backspace))?;
     wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::HistoryBack)
+    })
+    .await
+    .context("<BS> did not emit HistoryBack")?;
+    engine.send(key_command(Key::Char('-')))?;
+    wait_for_event(&mut events, |event| {
         matches!(event, EditorEvent::NavigateParent)
     })
-    .await?;
+    .await
+    .context("- did not emit NavigateParent")?;
     engine.send(key_command(Key::Char('g')))?;
     engine.send(key_command(Key::Char('.')))?;
     wait_for_event(&mut events, |event| {
