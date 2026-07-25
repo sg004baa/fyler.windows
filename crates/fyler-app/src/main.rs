@@ -503,7 +503,7 @@ enum ActivateOutcome {
     /// 未ロードディレクトリの展開にはロードが必要。
     Load(TreePath),
     /// dirを指すsymlink/junctionを追従した。呼び出し側(pane_runtime)は
-    /// リンク実体パスへのroot変更(Normal intent、history自動記録)が必要。
+    /// リンク実体パスへのroot変更(FollowLink intent、history自動記録)が必要。
     FollowLink(PathBuf),
 }
 
