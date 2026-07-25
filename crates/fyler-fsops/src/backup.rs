@@ -62,7 +62,12 @@ pub fn backup_entry(
 /// 一切呼ばないことで、SeCreateSymbolicLinkPrivilege(Developer Mode)が
 /// 無い環境でもsymlinkのdeleteをbackupできる。payload形式は
 /// `"{flavor}\n{link_target}"`(flavorは`dir`/`file`)の1ファイル。
-/// 復元(`restore_symlink_descriptor`)でのみ実リンクを作成する。
+///
+/// この記述子は二役を持つ: (a) [`RestoreOverwritten`](fyler_core::undo::UndoStep::RestoreOverwritten)
+/// の復元材料(`restore_symlink_descriptor`が実リンクを作成する)、
+/// (b) Delete undo([`RestoreDeleted`](fyler_core::undo::UndoStep::RestoreDeleted))の
+/// ごみ箱復元([`crate::recycle::restore_from_recycle_bin`])後、復元されたリンクが
+/// 記録どおりかを照合する記録。
 fn write_symlink_descriptor(source: &Path, payload: &Path) -> anyhow::Result<()> {
     let link_target = fs::read_link(crate::long_path::to_fs(source))
         .with_context(|| format!("Failed to read symlink: {}", source.display()))?;
@@ -87,10 +92,12 @@ fn write_symlink_descriptor(source: &Path, payload: &Path) -> anyhow::Result<()>
 /// target が既に存在する場合はErrを返し、上書きしない。
 pub fn restore_entry(backup_dir: &Path, backup: &BackupRef, target: &Path) -> anyhow::Result<()> {
     ensure_restore_target_vacant(target)?;
-    let source = payload_path(backup_dir, backup)?;
     let restore_result = match backup.kind {
-        EntryKind::Symlink => restore_symlink_descriptor(&source, target),
-        EntryKind::File | EntryKind::Dir => copy_entry(&source, target, backup.kind),
+        EntryKind::Symlink => restore_symlink_descriptor(backup_dir, backup, target),
+        EntryKind::File | EntryKind::Dir => {
+            let source = payload_path(backup_dir, backup)?;
+            copy_entry(&source, target, backup.kind)
+        }
     };
     match restore_result {
         Ok(()) => Ok(()),
@@ -101,12 +108,17 @@ pub fn restore_entry(backup_dir: &Path, backup: &BackupRef, target: &Path) -> an
     }
 }
 
-/// symlinkのbackup記述子payloadを読み、実リンクを`target`へ作成する。
+/// symlinkのbackup記述子payloadを読み、`(flavor, link_target)` を返す。
 ///
 /// 旧形式(実リンクpayload)を読んだ場合、1行目が`dir`/`file`のいずれとも
-/// 一致せずfail fastする(互換レイヤは作らない)。
-fn restore_symlink_descriptor(payload: &Path, target: &Path) -> anyhow::Result<()> {
-    let descriptor = fs::read_to_string(crate::long_path::to_fs(payload)).with_context(|| {
+/// 一致せずfail fastする(互換レイヤは作らない)。[`restore_symlink_descriptor`]と
+/// undo.rsのごみ箱復元後照合の両方から共有される。
+pub(crate) fn read_symlink_descriptor(
+    backup_dir: &Path,
+    backup: &BackupRef,
+) -> anyhow::Result<(crate::apply::LinkFlavor, PathBuf)> {
+    let payload = payload_path(backup_dir, backup)?;
+    let descriptor = fs::read_to_string(crate::long_path::to_fs(&payload)).with_context(|| {
         format!(
             "Failed to read symlink backup descriptor: {}",
             payload.display()
@@ -117,7 +129,18 @@ fn restore_symlink_descriptor(payload: &Path, target: &Path) -> anyhow::Result<(
         .with_context(|| format!("Malformed symlink backup descriptor: {}", payload.display()))?;
     let flavor = crate::apply::LinkFlavor::parse(flavor_text)
         .with_context(|| format!("Malformed symlink backup descriptor: {}", payload.display()))?;
-    crate::apply::create_link(flavor, Path::new(link_target_text), target)
+    Ok((flavor, PathBuf::from(link_target_text)))
+}
+
+/// [`read_symlink_descriptor`] の記録から実リンクを`target`へ作成する
+/// ([`RestoreOverwritten`](fyler_core::undo::UndoStep::RestoreOverwritten)専用)。
+fn restore_symlink_descriptor(
+    backup_dir: &Path,
+    backup: &BackupRef,
+    target: &Path,
+) -> anyhow::Result<()> {
+    let (flavor, link_target) = read_symlink_descriptor(backup_dir, backup)?;
+    crate::apply::create_link(flavor, &link_target, target)
         .with_context(|| format!("Failed to restore symlink: {}", target.display()))
 }
 

@@ -153,7 +153,9 @@ pub fn preflight_undo(transaction: &UndoTransaction) -> Vec<UndoStepStatus> {
 /// 各stepは実行直前に stale検証を再実施し、拒否時は該当実体へ触れず
 /// [`OpOutcome::Failed`] として報告する。キャンセルはstep間でのみ反映し、残りは
 /// [`OpOutcome::Skipped`] とする。ごみ箱送りは [`crate::recycle`]、復元は
-/// [`crate::backup::restore_entry`] を経由し、FS API直前のパス変換は
+/// 非symlinkの `RestoreDeleted`/`RestoreOverwritten` が [`crate::backup::restore_entry`]
+/// を、symlinkの `RestoreDeleted` は [`crate::recycle::restore_from_recycle_bin`]
+/// (ごみ箱からの移動。特権不要)を経由する。FS API直前のパス変換は
 /// [`crate::long_path::to_fs`] に閉じ込める。
 pub fn apply_undo_cancellable(
     transaction: &UndoTransaction,
@@ -220,6 +222,9 @@ fn execute_undo_step(transaction: &UndoTransaction, step: &UndoStep) -> Result<(
             case_only,
             ..
         } => execute_move_back(from, to, post.kind, *case_only),
+        UndoStep::RestoreDeleted { path, backup } if backup.kind == EntryKind::Symlink => {
+            execute_restore_deleted_symlink(transaction, path, backup)
+        }
         UndoStep::RestoreDeleted { path, backup }
         | UndoStep::RestoreOverwritten { path, backup } => {
             let backup_dir = transaction
@@ -303,6 +308,9 @@ fn validate_undo_step(transaction: &UndoTransaction, step: &UndoStep) -> Result<
             post,
             case_only,
         } => validate_move_back(from, to, identity.as_ref(), post, *case_only),
+        UndoStep::RestoreDeleted { path, backup } if backup.kind == EntryKind::Symlink => {
+            validate_restore_deleted_symlink(transaction, path)
+        }
         UndoStep::RestoreDeleted { path, backup }
         | UndoStep::RestoreOverwritten { path, backup } => {
             validate_restore(transaction, path, backup)
@@ -489,6 +497,91 @@ fn validate_restore(
         Ok(())
     } else {
         Err("Backup payload type does not match the record".to_owned())
+    }
+}
+
+/// symlinkの `RestoreDeleted` 専用の実行前検証。
+///
+/// backup payload(記述子)の存在チェックではなく、復元先の空き確認と
+/// ごみ箱に該当itemがまだ存在するかの確認を行う([`validate_restore`]とは
+/// 別経路。復元が`backup::restore_entry`ではなくごみ箱からの移動のため)。
+fn validate_restore_deleted_symlink(
+    transaction: &UndoTransaction,
+    path: &Path,
+) -> Result<(), String> {
+    ensure_path_vacant(path, "Another entry exists at the restore destination")?;
+    if transaction.backup_dir.is_none() {
+        return Err("Backup directory was not recorded".to_owned());
+    }
+    match crate::recycle::has_restore_candidate(path) {
+        Ok(false) => Err("The deleted link is no longer in the recycle bin".to_owned()),
+        Ok(true) | Err(_) => Ok(()),
+    }
+}
+
+/// symlinkの `RestoreDeleted` を実行する: ごみ箱からの移動で復元し、
+/// 復元されたリンクがbackup記述子の記録と一致するか照合する。
+///
+/// 復元自体は特権を要しない(ごみ箱item = 既存reparse pointの移動)。
+/// 成功時のbackup payload破棄は呼び出し側(discardフロー)に任せ、
+/// この関数では行わない。
+fn execute_restore_deleted_symlink(
+    transaction: &UndoTransaction,
+    path: &Path,
+    backup: &BackupRef,
+) -> Result<(), String> {
+    crate::recycle::restore_from_recycle_bin(path)
+        .map_err(|error| format!("Failed to restore link from the recycle bin: {error:#}"))?;
+    let backup_dir = transaction
+        .backup_dir
+        .as_deref()
+        .ok_or_else(|| "Backup directory was not recorded".to_owned())?;
+    verify_restored_symlink_matches_backup(backup_dir, backup, path)
+}
+
+/// ごみ箱から復元されたリンクが、backup記述子に記録されたリンク先と一致するかを検証する。
+///
+/// 不一致(種別がsymlinkでない、またはlink targetが異なる)は、復元先で外部に
+/// 同名パスが作り直されていた可能性を示す明確なErrとする。復元自体は既に完了して
+/// いるため、この関数はロールバックしない(復元物は`path`に残る)。
+fn verify_restored_symlink_matches_backup(
+    backup_dir: &Path,
+    backup: &BackupRef,
+    path: &Path,
+) -> Result<(), String> {
+    let mismatch = || {
+        format!(
+            "The restored link at {} does not match the recorded backup (a different entry may have been created at the same path outside fyler.windows); the restored item remains at {}",
+            path.display(),
+            path.display()
+        )
+    };
+    let metadata = fs::symlink_metadata(crate::long_path::to_fs(path)).map_err(|error| {
+        format!(
+            "Failed to verify the restored link at {}: {error}",
+            path.display()
+        )
+    })?;
+    if crate::scan::kind_from_metadata(&metadata) != EntryKind::Symlink {
+        return Err(mismatch());
+    }
+    let (_, expected_target) =
+        crate::backup::read_symlink_descriptor(backup_dir, backup).map_err(|error| {
+            format!(
+                "Failed to verify the restored link at {}: {error:#}",
+                path.display()
+            )
+        })?;
+    let actual_target = fs::read_link(crate::long_path::to_fs(path)).map_err(|error| {
+        format!(
+            "Failed to read the restored link target at {}: {error}",
+            path.display()
+        )
+    })?;
+    if actual_target == expected_target {
+        Ok(())
+    } else {
+        Err(mismatch())
     }
 }
 
