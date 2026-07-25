@@ -49,8 +49,9 @@ pub fn restore_from_recycle_bin(original_path: &Path) -> anyhow::Result<()> {
 
 /// `original_path` に一致するitemがごみ箱に存在するかを確認する(preflight用)。
 ///
-/// `list()` 自体が失敗した場合は「未確認」として `Ok(true)` を返し、判定を
-/// 実行時([`restore_from_recycle_bin`])のエラーに委ねる。
+/// `list()` 自体が失敗した場合はErrを返す。検証を助言に留めたい呼び出し側
+/// (undoのvalidate)がErrを「未確認」として扱い、実行時
+/// ([`restore_from_recycle_bin`])のfail fastに委ねる。
 pub(crate) fn has_restore_candidate(original_path: &Path) -> anyhow::Result<bool> {
     let items = trash::os_limited::list().context("Failed to list the recycle bin")?;
     Ok(select_restore_candidate(&items, original_path).is_some())
