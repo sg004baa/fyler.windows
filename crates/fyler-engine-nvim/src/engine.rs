@@ -1017,8 +1017,11 @@ async fn replace_buffer_lines(
 local buf, lines = ...
 local ul = vim.bo[buf].undolevels
 vim.bo[buf].undolevels = -1
-vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+local ok, err = pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, lines)
 vim.bo[buf].undolevels = ul
+if not ok then
+  error(err)
+end
 vim.bo[buf].modified = false
 "#,
         vec![Value::from(buffer_number), lines_value],
