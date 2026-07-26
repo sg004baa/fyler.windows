@@ -330,7 +330,7 @@ Rules and limitations:
 | `history_back` | Go back in navigation history | `<C-p>` |
 | `history_forward` | Go forward in navigation history | `<C-n>` |
 | `refresh` | Reload the current root from disk | `<C-r>` |
-| `undo` | Undo the last file operation | `u` |
+| `undo` | Undo text edits in modified buffers; undo the last file operation in clean buffers | `u` |
 
 `none` is not an action. It is a special value that removes the binding for the specified key
 sequence.
