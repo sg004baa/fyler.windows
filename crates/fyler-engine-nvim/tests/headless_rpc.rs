@@ -1808,8 +1808,10 @@ async fn reconcile_redraw_does_not_pollute_undo_history() -> anyhow::Result<()> 
     .await?;
 
     // 過剰修正でないことの確認: ユーザー自身の編集は従来どおりundoできる。
-    // (redoの`<C-r>`は既定keymapでrefreshへシャドウされているため検証に使えない)
-    engine.send(key_command(Key::Char('u')))?;
+    // `u` キーはクリーンなバッファではファイル操作undoへ分岐するため、この
+    // テストではネイティブundoを直接実行する `EditorCommand::Undo` を使う
+    // (キー側の分岐は u_key_* テストで別途検証している)。
+    engine.send(EditorCommand::Undo)?;
     wait_for_lines(&engine, |lines| {
         lines.len() == 1 && lines[0].text.as_ref() == "/001 alpha.txt"
     })
@@ -1830,9 +1832,9 @@ async fn reconcile_redraw_does_not_pollute_undo_history() -> anyhow::Result<()> 
     })
     .await?;
 
-    // 旧バグ: このreconcileがundo履歴に記録され、`u`でビューCが消えて
+    // 旧バグ: このreconcileがundo履歴に記録され、undoでビューCが消えて
     // 空バッファ(またはビューA/B)へ飛んでいた。
-    engine.send(key_command(Key::Char('u')))?;
+    engine.send(EditorCommand::Undo)?;
 
     // 変化しないことを確認するため、十分な時間待ってから固定して検証する。
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1845,6 +1847,25 @@ async fn reconcile_redraw_does_not_pollute_undo_history() -> anyhow::Result<()> 
     );
     assert_eq!(snapshot.lines[0].text.as_ref(), "/001 beta.txt");
     assert_eq!(snapshot.lines[1].text.as_ref(), "/002 new.txt");
+
+    // 再描画後もundoが有効に戻っていること(= `undolevels` が復元されている)。
+    // 復元漏れがあればこの編集自体がundo不能になり、下のundoでビューCへ戻らない。
+    engine.send(key_command(Key::Char('i')))?;
+    wait_for_mode(&engine, Mode::Insert).await?;
+    engine.send(EditorCommand::Text("gamma".to_owned()))?;
+    engine.send(key_command(Key::Esc))?;
+    wait_for_mode(&engine, Mode::Normal).await?;
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 2 && lines[0].text.as_ref() == "/001 gammabeta.txt"
+    })
+    .await?;
+    engine.send(EditorCommand::Undo)?;
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 2
+            && lines[0].text.as_ref() == "/001 beta.txt"
+            && lines[1].text.as_ref() == "/002 new.txt"
+    })
+    .await?;
 
     Ok(())
 }
