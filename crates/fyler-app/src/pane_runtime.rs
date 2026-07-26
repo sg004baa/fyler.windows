@@ -742,9 +742,8 @@ pub(super) fn run() -> anyhow::Result<()> {
         let pane_options = restored.map_or(scan_options, |pane| pane.scan_options);
         // 復元値がconfig既定と異なる場合のみ明示指定扱い(復元値が勝つ)。config既定と
         // 同じなら`:sort`されていないので、Downloadsの自動既定を適用する。
-        let sort_explicit = restored.is_some_and(|pane| {
-            (pane.scan_options.key, pane.scan_options.reverse) != config_sort
-        });
+        let sort_explicit = restored
+            .is_some_and(|pane| (pane.scan_options.key, pane.scan_options.reverse) != config_sort);
         let created = create_pane(
             &runtime,
             id,

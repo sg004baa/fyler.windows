@@ -1332,84 +1332,125 @@ pub(crate) fn explorer_name_cmp(left: &str, right: &str) -> Ordering {
 
 /// `StrCmpLogicalW` に近い意味論の純Rust複製。
 ///
-/// 全体構造(数字ラン検出・数値比較で先頭ゼロを無視)は Wine
-/// `dlls/shlwapi/string.c` / `dlls/kernelbase/string.c` の `StrCmpLogicalW` を
-/// 参考にしつつ、比較順序は**実 Windows Explorer の観測結果**に合わせてある。
+/// 比較順序は**実 Windows の観測結果**に合わせてある(実 Explorer の表示順と、
+/// Windows CI 上で実 `StrCmpLogicalW` と突き合わせたパリティテストの結果)。
+/// 実 `StrCmpLogicalW` は Windows の word sort(`CompareStringW` 系のロケール照合)を
+/// 数字ラン数値比較付きで行うもので、Wine の素朴な実装とは複数の点で異なる。
 ///
 /// 満たす意味論:
 /// 1. 大文字小文字を区別しない(ASCII)。
-/// 2. 数値比較は**両側が数字ランのときだけ**行う(先頭ゼロは値に影響しない。
-///    値が等しければ次の文字へ進む)。
+/// 2. 数値比較は**両側が数字ランのときだけ**行う。値が等しければ次の文字へ進み、
+///    先頭ゼロの数は遅延タイブレークとして**多い方が先**になる(実測: `a01` < `a1`)。
 /// 3. それ以外(数字と非数字の混在を含む)はすべて [`collation_rank`] の照合順
-///    (記号 < 数字 < 英字 < 非ASCII)で1文字ずつ比較する。
-/// 4. 一方が他方のプレフィックスなら短い方が先。
+///    (記号 < 数字 < 英字 < 非ASCII)で1文字ずつ比較する。実 Explorer の
+///    `.amr` < `3D オブジェクト` < `AppData` がこれで成り立つ。Wine 実装にある
+///    「数字を必ず先にする」digit-first 分岐は実挙動と矛盾するので持たない。
+/// 4. `-` と `'` は word sort の**無視句読点**。主比較では読み飛ばし、他がすべて
+///    等しいときの最終レベルでだけ「無視句読点を持つ側が後」として効く
+///    (実測: `ab` < `a-b`)。
+/// 5. 一方が他方のプレフィックスなら短い方が先。
 ///
-/// **Wine 実装との差分**: Wine の `StrCmpLogicalW` には「片方が数字・もう片方が
-/// 非数字なら数字側を必ず先にする」digit-first 分岐があるが、これは実 Explorer の
-/// 挙動と矛盾する。実 Explorer(`C:\Users\{user}` 名前昇順)では
-/// `.amr` < `3D オブジェクト` < `AppData`、すなわち **記号 < 数字 < 英字** であり、
-/// 数字が記号より先に来ることはない。したがってこの複製は digit-first 分岐を持たず、
-/// 数字と非数字の混在も `collation_rank` の1文字比較に落とす。
-///
-/// 近似の限界: 実 Windows は非数字どうしの比較を `CompareStringW`(ロケール照合)で
-/// 行うため、アクセント付きラテン文字・かな・漢字の重み付けや、`+ = < >` のような
-/// 数学記号グループ(照合表では句読点より後ろ)までは再現しない。これらは Windows
-/// パリティテストのコーパス外であり、複製が使われるのは非Windowsの開発/CIビルド
-/// だけなので製品挙動には影響しない。
+/// 近似の限界: 実 Windows のロケール照合そのもの(アクセント付きラテン文字・かな・
+/// 漢字の重み付け、`+ = < >` のような数学記号グループ)までは再現しない。これらは
+/// Windows パリティテストのコーパス外であり、複製が使われるのは非Windowsの
+/// 開発/CIビルドだけなので製品挙動には影響しない。
 ///
 /// 非Windowsでは常に、Windowsではパリティテスト(`cfg(test)`)からのみ使うので、
 /// その両方でコンパイルされるよう `any(not(windows), test)` でゲートする。
 #[cfg(any(not(windows), test))]
 pub(crate) fn logical_cmp(left: &str, right: &str) -> Ordering {
-    let mut left = left;
-    let mut right = right;
-    // 値は等しいが先頭ゼロ数が違う数字ランの最終タイブレーク。Explorer は値が同じなら
-    // 先頭ゼロの少ない方(= "1" < "01")を先にする。最初に現れた差だけを覚え、
-    // 他が全て等しいときにのみ適用する(遅延タイブレーク)。
+    let (primary, zeros) = compare_primary(left, right);
+    primary
+        .then(zeros)
+        .then_with(|| compare_ignorable_level(left, right))
+}
+
+/// word sort で無視される句読点。
+#[cfg(any(not(windows), test))]
+fn is_ignorable(character: char) -> bool {
+    matches!(character, '-' | '\'')
+}
+
+/// 無視句読点を読み飛ばした主比較。戻り値は (順序, 先頭ゼロの遅延タイブレーク)。
+#[cfg(any(not(windows), test))]
+fn compare_primary(mut left: &str, mut right: &str) -> (Ordering, Ordering) {
     let mut zero_tiebreak = Ordering::Equal;
 
-    while let (Some(left_char), Some(right_char)) = (left.chars().next(), right.chars().next()) {
-        match (left_char.is_ascii_digit(), right_char.is_ascii_digit()) {
-            (true, true) => {
-                let left_run = digit_run_len(left);
-                let right_run = digit_run_len(right);
-                let (left_sig, left_zeros) = split_leading_zeros(&left[..left_run]);
-                let (right_sig, right_zeros) = split_leading_zeros(&right[..right_run]);
-                // 有効桁が長い方が数値として大きい。桁数が同じなら辞書順=数値順。
-                let ordering = left_sig
-                    .len()
-                    .cmp(&right_sig.len())
-                    .then_with(|| left_sig.cmp(right_sig));
-                if ordering != Ordering::Equal {
-                    return ordering;
-                }
-                if zero_tiebreak == Ordering::Equal {
-                    zero_tiebreak = left_zeros.cmp(&right_zeros);
-                }
-                left = &left[left_run..];
-                right = &right[right_run..];
+    loop {
+        left = left.trim_start_matches(is_ignorable);
+        right = right.trim_start_matches(is_ignorable);
+        let (Some(left_char), Some(right_char)) = (left.chars().next(), right.chars().next())
+        else {
+            // 規則5: プレフィックスは短い方が先。
+            let ordering = match (left.is_empty(), right.is_empty()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                (false, false) => unreachable!("loop only exits when a side is exhausted"),
+            };
+            return (ordering, zero_tiebreak);
+        };
+
+        if left_char.is_ascii_digit() && right_char.is_ascii_digit() {
+            let left_run = digit_run_len(left);
+            let right_run = digit_run_len(right);
+            let (left_sig, left_zeros) = split_leading_zeros(&left[..left_run]);
+            let (right_sig, right_zeros) = split_leading_zeros(&right[..right_run]);
+            // 有効桁が長い方が数値として大きい。桁数が同じなら辞書順=数値順。
+            let ordering = left_sig
+                .len()
+                .cmp(&right_sig.len())
+                .then_with(|| left_sig.cmp(right_sig));
+            if ordering != Ordering::Equal {
+                return (ordering, zero_tiebreak);
             }
-            // 数値比較は両側が数字ランのときだけ。数字と非数字の混在を含む
-            // それ以外はすべて collation_rank の照合順で1文字ずつ比較する
-            // (記号 < 数字 < 英字)。これにより実 Explorer の観測順
-            // `.amr` < `3D オブジェクト` < `AppData` が成り立つ。
-            _ => {
-                let ordering = collation_rank(left_char).cmp(&collation_rank(right_char));
+            if zero_tiebreak == Ordering::Equal {
+                // 実測: 先頭ゼロが多い方が先(`a01` < `a1`)。
+                zero_tiebreak = right_zeros.cmp(&left_zeros);
+            }
+            left = &left[left_run..];
+            right = &right[right_run..];
+            continue;
+        }
+
+        let ordering = collation_rank(left_char).cmp(&collation_rank(right_char));
+        if ordering != Ordering::Equal {
+            return (ordering, zero_tiebreak);
+        }
+        left = &left[left_char.len_utf8()..];
+        right = &right[right_char.len_utf8()..];
+    }
+}
+
+/// 主比較が同値のときだけ効く最終レベル。無視句読点も含めて1文字ずつ走査し、
+/// 無視句読点を持つ側を後ろにする(実測: `ab` < `a-b`、`its` < `it's`)。
+/// 非無視文字は主比較で既に決着しているのでこのレベルでは同値として扱う。
+#[cfg(any(not(windows), test))]
+fn compare_ignorable_level(left: &str, right: &str) -> Ordering {
+    let mut left = left.chars();
+    let mut right = right.chars();
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(left_char), Some(right_char)) => {
+                let ordering = ignorable_rank(left_char).cmp(&ignorable_rank(right_char));
                 if ordering != Ordering::Equal {
                     return ordering;
                 }
-                left = &left[left_char.len_utf8()..];
-                right = &right[right_char.len_utf8()..];
             }
         }
     }
+}
 
-    // 規則5: プレフィックスは短い方が先。長さが同じなら先頭ゼロのタイブレーク。
-    match (left.is_empty(), right.is_empty()) {
-        (true, true) => zero_tiebreak,
-        (true, false) => Ordering::Less,
-        (false, true) => Ordering::Greater,
-        (false, false) => unreachable!("loop only exits when a side is exhausted"),
+/// [`compare_ignorable_level`] 用の1文字ランク。無視句読点だけが重みを持つ。
+#[cfg(any(not(windows), test))]
+fn ignorable_rank(character: char) -> (u8, u32) {
+    if is_ignorable(character) {
+        (1, character as u32)
+    } else {
+        (0, 0)
     }
 }
 
@@ -2373,8 +2414,10 @@ mod tests {
             names_only(&["alpha.txt", "~temp.txt"]),
             ["~temp.txt", "alpha.txt"]
         );
-        // 先頭ゼロ: 値が同じなら先頭ゼロの少ない方が先(安定した順序)。
-        assert_eq!(names_only(&["a01", "a1"]), ["a1", "a01"]);
+        // 先頭ゼロ: 値が同じなら先頭ゼロの多い方が先(Windows CI で実 StrCmpLogicalW と照合)。
+        assert_eq!(names_only(&["a1", "a01"]), ["a01", "a1"]);
+        // 無視句読点: `-` は word sort で無視され、持つ側が後ろ(実測 "ab" < "a-b")。
+        assert_eq!(names_only(&["a-b", "ab"]), ["ab", "a-b"]);
         // 大小混在: 大小無視で a < B。
         assert_eq!(names_only(&["B.txt", "a.txt"]), ["a.txt", "B.txt"]);
         // C:\Users\{user} 相当の実例(実 Windows Explorer 名前昇順の観測)。

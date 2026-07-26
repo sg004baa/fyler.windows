@@ -92,7 +92,8 @@ startup. The `toggle_hidden` action (`g.` by default) can also change this while
   `StrCmpLogicalW`, the very function Explorer sorts with; other platforms use a reproduction of
   it for development builds. The order is case-insensitive, compares numeric segments by value
   (`file2` before `file10`), and otherwise sorts symbols before digits, and digits before letters
-  (`.ssh` → `3D Objects` → `AppData`; `~temp` before `alpha`).
+  (`.ssh` → `3D Objects` → `AppData`; `~temp` before `alpha`). Like Explorer's word sort, `-` and
+  `'` are ignored except as a final tiebreaker, so `ab` sorts before `a-b`.
 - `date`: modification time
 - `size`: file size
 - `ext`: file extension
