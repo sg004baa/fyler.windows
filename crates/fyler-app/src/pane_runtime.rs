@@ -1887,7 +1887,10 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     feedback_open
                                         || apply_owner.is_some()
                                         || transfer.is_awaiting()
-                                        || transfer.is_running(),
+                                        || transfer.is_running()
+                                        || import.is_awaiting() || extract.is_awaiting()
+                                        || import.is_running() || extract.is_running()
+                                        || drag_out.is_busy(),
                                 )
                                 .is_err()
                                 {
@@ -1930,7 +1933,10 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     feedback_open
                                         || apply_owner.is_some()
                                         || transfer.is_awaiting()
-                                        || transfer.is_running(),
+                                        || transfer.is_running()
+                                        || import.is_awaiting() || extract.is_awaiting()
+                                        || import.is_running() || extract.is_running()
+                                        || drag_out.is_busy(),
                                 );
                                 match outcome {
                                     Ok(RootChangeRequestOutcome::Started) => {}
