@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -271,18 +271,37 @@ fn default_sort_for_root(
     }
 }
 
-/// [`default_sort_for_root`]専用のルートパス比較。Windowsは大小無視(NTFS/既定の
+/// [`default_sort_for_root`]専用のルートパス比較。Windowsは大小無視(NTFSの既定の
 /// 大小無視挙動に合わせる)、非Windowsは厳密一致。
-#[cfg(windows)]
+///
+/// `normalize_root`は[`std::path::absolute`]なので末尾の区切りや重複区切りが残り得る
+/// (`C:\Users\me\Downloads\`)。文字列比較ではこれを取り逃すため、component単位で比較する。
 fn root_paths_equal(a: &Path, b: &Path) -> bool {
-    a.as_os_str()
+    let mut left = a.components();
+    let mut right = b.components();
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return true,
+            (Some(left), Some(right)) => {
+                if !components_equal(left, right) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn components_equal(left: Component<'_>, right: Component<'_>) -> bool {
+    left.as_os_str()
         .to_string_lossy()
-        .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
 }
 
 #[cfg(not(windows))]
-fn root_paths_equal(a: &Path, b: &Path) -> bool {
-    a == b
+fn components_equal(left: Component<'_>, right: Component<'_>) -> bool {
+    left == right
 }
 
 /// pane作成・root変更で使う、最終的な[`ScanOptions`]を決める配線用ヘルパ。
@@ -6478,6 +6497,17 @@ mod tests {
         let config = (SortKey::Name, false);
         assert_eq!(
             default_sort_for_root(downloads, Some(downloads), config),
+            (SortKey::Date, true)
+        );
+    }
+
+    #[test]
+    fn downloads_root_matches_despite_trailing_separator() {
+        // normalize_root は std::path::absolute なので末尾区切りが残り得る。
+        let downloads = Path::new("/home/u/Downloads");
+        let config = (SortKey::Name, false);
+        assert_eq!(
+            default_sort_for_root(Path::new("/home/u/Downloads/"), Some(downloads), config),
             (SortKey::Date, true)
         );
     }
