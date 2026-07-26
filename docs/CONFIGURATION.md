@@ -88,13 +88,25 @@ startup. The `toggle_hidden` action (`g.` by default) can also change this while
 
 `sort_key` controls comparison within those groups:
 
-- `name`: case-insensitive natural order with numeric segments compared numerically
+- `name`: the same logical ordering as Windows Explorer. On Windows this calls the shell's
+  `StrCmpLogicalW`, the very function Explorer sorts with; other platforms use a reproduction of
+  it for development builds. The order is case-insensitive, compares numeric segments by value
+  (`file2` before `file10`), and otherwise sorts symbols before digits, and digits before letters
+  (`.ssh` → `3D Objects` → `AppData`; `~temp` before `alpha`). Like Explorer's word sort, `-` and
+  `'` are ignored except as a final tiebreaker, so `ab` sorts before `a-b`.
 - `date`: modification time
 - `size`: file size
 - `ext`: file extension
 
 `sort_reverse = true` reverses the selected key. Directory grouping remains controlled separately
 by `sort`. At runtime, use `:sort name|date|size|ext`; add `!` to the command for descending order.
+
+When a pane's root is your Windows **Downloads** known folder, fyler matches Explorer and defaults
+that pane to date order, newest first, instead of `sort_key`/`sort_reverse`. This applies only to
+the Downloads folder. Once you run `:sort` in a pane, your explicit choice wins for the rest of the
+session and the Downloads default is no longer applied there, even after navigating away and back.
+On non-Windows platforms there is no Downloads known folder, so this default never applies.
+
 ### Statusline
 
 The bottom statusline is built from two ordered clusters. `[statusline].left` fills from the left

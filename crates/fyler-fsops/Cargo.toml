@@ -30,6 +30,7 @@ windows = { workspace = true, features = [
     "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_Graphics_Gdi",
+    "Win32_UI_Shell",
 ] }
 # #[implement]マクロの展開が`::windows_core`を直接参照するため必要
 # (windowsクレートと同じファミリ。バージョンはwindows 0.62内部と揃える)。
