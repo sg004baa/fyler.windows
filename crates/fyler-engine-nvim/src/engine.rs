@@ -968,6 +968,12 @@ async fn delete_line(
 /// ものではない。保存フロー中の`SetLines`も成功するよう、差し替え前に必ず
 /// `modifiable=true`へ戻す。状態機械がreconcile完了後に改めて有効化するため、
 /// この関数内では元の値へ復元しない。
+///
+/// fylerのビュー再描画(reconcile/初期化による全行差し替え)はユーザーの
+/// undo履歴に載せない。`set_lines`と`modified=false`を1回の`nvim_exec_lua`で
+/// アトミックに実行し、その間だけ`undolevels`を`-1`にして無効化する
+/// (RPCを分けるとその間のユーザー入力がundo不能になりかねないため)。
+/// ユーザー自身の編集のundo/redoは従来どおり動く。
 async fn replace_buffer_lines(
     nvim: &Nvim,
     buffer: &Buffer<NvimWriter>,
@@ -992,14 +998,31 @@ async fn replace_buffer_lines(
         .get(target_line)
         .map(|line| fyler_core::grammar::id_prefix_len(line))
         .unwrap_or_default();
-    buffer
-        .set_lines(0, -1, false, new_lines)
-        .await
-        .map_err(|error| anyhow::anyhow!("Failed to set buffer lines for {purpose}: {error}"))?;
-    buffer
-        .set_option("modified", Value::Boolean(false))
-        .await
-        .map_err(|error| anyhow::anyhow!("Failed to mark buffer clean after {purpose}: {error}"))?;
+
+    let buffer_number = buffer.get_number().await.map_err(|error| {
+        anyhow::anyhow!("Failed to get fyler buffer number for {purpose}: {error}")
+    })?;
+    let lines_value = Value::Array(
+        new_lines
+            .iter()
+            .map(|line| Value::from(line.as_str()))
+            .collect(),
+    );
+    nvim.exec_lua(
+        r#"
+local buf, lines = ...
+local ul = vim.bo[buf].undolevels
+vim.bo[buf].undolevels = -1
+vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+vim.bo[buf].undolevels = ul
+vim.bo[buf].modified = false
+"#,
+        vec![Value::from(buffer_number), lines_value],
+    )
+    .await
+    .map_err(|error| {
+        anyhow::anyhow!("Failed to set buffer lines without polluting undo for {purpose}: {error}")
+    })?;
 
     // 折りたたみトグル等では操作した行へカーソルを戻す。行数を超える指定は
     // 最終行へクランプする(nvimのset_cursorは範囲外でエラーになるため)。
