@@ -330,6 +330,7 @@ Rules and limitations:
 | `history_back` | Go back in navigation history | `<C-p>` |
 | `history_forward` | Go forward in navigation history | `<C-n>` |
 | `refresh` | Reload the current root from disk | `<C-r>` |
+| `undo` | Undo text edits in modified buffers; undo the last file operation in clean buffers | `u` |
 
 `none` is not an action. It is a special value that removes the binding for the specified key
 sequence.
@@ -363,3 +364,10 @@ previous location instead of moving to the filesystem parent of the link target 
 behaving like `history_back` for that one root. Any other root change (`navigate_into`, `:cd`,
 a drive switch, etc.) clears this and restores the normal parent-directory behavior. Entering or
 leaving that root via `history_back` / `history_forward` (`<C-p>` / `<C-n>`) preserves it.
+
+`u` splits on buffer state: while the buffer has unsaved text edits (`'modified'` is set), `u`
+performs Neovim's built-in text undo, so in-progress typos can still be reverted. Once the buffer
+is clean, `u` instead requests fyler's file-operation undo (the `:FylerUndo` behavior), which
+prompts a confirmation dialog before restoring from the Recycle Bin or a backup. `<C-r>` is
+unaffected and stays bound to `refresh` as described above; a text redo remains available via the
+`:redo` ex command. `u` is the only key remapped here, so `:undo`/`:redo` always work directly.
