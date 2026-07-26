@@ -619,6 +619,78 @@ async fn undo_command_emits_undo_request() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a compatible nvim executable"]
+async fn u_key_emits_undo_request_when_buffer_is_clean() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+
+    engine.set_initial_lines(vec![EditorLine::new("/001 alpha.txt")])?;
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 1 && lines[0].text.as_ref() == "/001 alpha.txt"
+    })
+    .await?;
+
+    engine.send(key_command(Key::Char('u')))?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, EditorEvent::UndoRequested)
+    })
+    .await
+    .context("`u` on a clean buffer did not emit UndoRequested")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn u_key_performs_text_undo_without_undo_request_when_buffer_is_dirty() -> anyhow::Result<()>
+{
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+
+    engine.set_initial_lines(vec![EditorLine::new("/001 alpha.txt")])?;
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 1 && lines[0].text.as_ref() == "/001 alpha.txt"
+    })
+    .await?;
+
+    // 実キー入力でバッファをdirtyにする(プログラム的な再描画ではなく、
+    // ユーザー編集としてundo履歴に載る)。
+    engine.send(key_command(Key::Char('i')))?;
+    wait_for_mode(&engine, Mode::Insert).await?;
+    engine.send(EditorCommand::Text("beta".to_owned()))?;
+    engine.send(key_command(Key::Esc))?;
+    wait_for_mode(&engine, Mode::Normal).await?;
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 1 && lines[0].text.as_ref() == "/001 betaalpha.txt"
+    })
+    .await?;
+
+    // dirty中の`u`はテキストundoとして行を編集前へ戻す。
+    engine.send(key_command(Key::Char('u')))?;
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 1 && lines[0].text.as_ref() == "/001 alpha.txt"
+    })
+    .await?;
+
+    // ファイル操作undoへは流れない: 拒否メッセージすら出さず、テキストundoのみ効く。
+    assert_no_event(&mut events, |event| {
+        matches!(event, EditorEvent::UndoRequested)
+    })
+    .await
+    .context("`u` on a dirty buffer must not emit UndoRequested")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
 async fn navigate_into_and_cd_commands_emit_root_change_requests() -> anyhow::Result<()> {
     let _serial = NVIM_TEST_SERIAL.lock().await;
     let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
