@@ -23,6 +23,7 @@ pub mod extract;
 pub mod gitstatus;
 pub mod identity;
 pub mod info;
+pub mod link;
 pub mod long_path;
 pub mod onedrive;
 pub mod open;

@@ -358,6 +358,13 @@ cursor up/down like `k` / `j`. Fyler's default keymap shadows all three inside f
 rebind or remove `history_back` / `history_forward` / `refresh` (assign `"none"`) if you need the
 native behavior back.
 
+When the current root was entered by following a symlink to a directory (via `activate` on
+`<CR>` or `navigate_into`/`gd`), `navigate_parent` (`<BS>` by default) steps back to the
+previous location instead of moving to the filesystem parent of the link target — effectively
+behaving like `history_back` for that one root. Any other root change (`navigate_into`, `:cd`,
+a drive switch, etc.) clears this and restores the normal parent-directory behavior. Entering or
+leaving that root via `history_back` / `history_forward` (`<C-p>` / `<C-n>`) preserves it.
+
 `u` splits on buffer state: while the buffer has unsaved text edits (`'modified'` is set), `u`
 performs Neovim's built-in text undo, so in-progress typos can still be reverted. Once the buffer
 is clean, `u` instead requests fyler's file-operation undo (the `:FylerUndo` behavior), which
