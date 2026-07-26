@@ -798,7 +798,11 @@ async fn handle_command(
                 .map_err(|error| anyhow::anyhow!("Save request RPC failed: {error}"))?;
         }
         EngineCommand::Editor(EditorCommand::Undo) => {
-            nvim.input("u")
+            // `nvim_input("u")` はバッファローカルmapを経由するため、`u` を
+            // ファイル操作undoへ条件分岐させた後は再帰して意図しない
+            // `fyler_undo` 発火になり得る。ex command経由でmappingを迂回し、
+            // このコマンドの意味(テキストundo)を保つ。
+            nvim.command("silent! undo")
                 .await
                 .map_err(|error| anyhow::anyhow!("Undo RPC failed: {error}"))?;
         }
