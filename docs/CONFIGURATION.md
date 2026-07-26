@@ -91,8 +91,8 @@ startup. The `toggle_hidden` action (`g.` by default) can also change this while
 - `name`: the same logical ordering as Windows Explorer. On Windows this calls the shell's
   `StrCmpLogicalW`, the very function Explorer sorts with; other platforms use a reproduction of
   it for development builds. The order is case-insensitive, compares numeric segments by value
-  (`file2` before `file10`), places a numeric segment before a non-numeric one (`3D Objects`
-  before `.ssh`), and sorts symbols before letters (`~temp` before `alpha`).
+  (`file2` before `file10`), and otherwise sorts symbols before digits, and digits before letters
+  (`.ssh` → `3D Objects` → `AppData`; `~temp` before `alpha`).
 - `date`: modification time
 - `size`: file size
 - `ext`: file extension

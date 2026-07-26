@@ -1330,25 +1330,32 @@ pub(crate) fn explorer_name_cmp(left: &str, right: &str) -> Ordering {
     logical_cmp(left, right)
 }
 
-/// `StrCmpLogicalW` と同じ意味論の純Rust複製。
+/// `StrCmpLogicalW` に近い意味論の純Rust複製。
 ///
-/// 正典は Wine `dlls/shlwapi/string.c` の `StrCmpLogicalW`(Wine のテストは実Windowsに対して
-/// 検証されている)。全体構造(数字ラン検出・数字が非数字より先・数値比較で先頭ゼロを無視)は
-/// Wine を踏襲しつつ、非数字文字の比較だけは Wine の単純なコードポイント比較ではなく
-/// Explorer の照合順を近似した [`collation_rank`] を用いる(Wine の `ChrCmpIW` は
-/// `~` などを英字の後ろに置いてしまい実Explorerと食い違うため)。
+/// 全体構造(数字ラン検出・数値比較で先頭ゼロを無視)は Wine
+/// `dlls/shlwapi/string.c` / `dlls/kernelbase/string.c` の `StrCmpLogicalW` を
+/// 参考にしつつ、比較順序は**実 Windows Explorer の観測結果**に合わせてある。
 ///
 /// 満たす意味論:
 /// 1. 大文字小文字を区別しない(ASCII)。
-/// 2. 数字ランは数値として比較(先頭ゼロは値に影響しない。値が等しければ次の文字へ進む)。
-/// 3. 片方が数字・もう片方が非数字なら、数字側が必ず先。
-/// 4. 非数字文字は [`collation_rank`] の照合順(記号 < 数字 < 英字 < 非ASCII)で1文字ずつ比較。
-/// 5. 一方が他方のプレフィックスなら短い方が先。
+/// 2. 数値比較は**両側が数字ランのときだけ**行う(先頭ゼロは値に影響しない。
+///    値が等しければ次の文字へ進む)。
+/// 3. それ以外(数字と非数字の混在を含む)はすべて [`collation_rank`] の照合順
+///    (記号 < 数字 < 英字 < 非ASCII)で1文字ずつ比較する。
+/// 4. 一方が他方のプレフィックスなら短い方が先。
 ///
-/// 近似の限界: 実 `ChrCmpIW` はロケール照合(`CompareStringW`)なので、アクセント付き
-/// ラテン文字・かな・漢字の重み付けや、`+ = < >` のような数学記号グループ(照合表では
-/// 句読点より後ろ)までは再現しない。これらは Windows パリティテストのコーパス外であり、
-/// 複製が使われるのは非Windowsの開発/CIビルドだけなので製品挙動には影響しない。
+/// **Wine 実装との差分**: Wine の `StrCmpLogicalW` には「片方が数字・もう片方が
+/// 非数字なら数字側を必ず先にする」digit-first 分岐があるが、これは実 Explorer の
+/// 挙動と矛盾する。実 Explorer(`C:\Users\{user}` 名前昇順)では
+/// `.amr` < `3D オブジェクト` < `AppData`、すなわち **記号 < 数字 < 英字** であり、
+/// 数字が記号より先に来ることはない。したがってこの複製は digit-first 分岐を持たず、
+/// 数字と非数字の混在も `collation_rank` の1文字比較に落とす。
+///
+/// 近似の限界: 実 Windows は非数字どうしの比較を `CompareStringW`(ロケール照合)で
+/// 行うため、アクセント付きラテン文字・かな・漢字の重み付けや、`+ = < >` のような
+/// 数学記号グループ(照合表では句読点より後ろ)までは再現しない。これらは Windows
+/// パリティテストのコーパス外であり、複製が使われるのは非Windowsの開発/CIビルド
+/// だけなので製品挙動には影響しない。
 ///
 /// 非Windowsでは常に、Windowsではパリティテスト(`cfg(test)`)からのみ使うので、
 /// その両方でコンパイルされるよう `any(not(windows), test)` でゲートする。
@@ -1382,10 +1389,11 @@ pub(crate) fn logical_cmp(left: &str, right: &str) -> Ordering {
                 left = &left[left_run..];
                 right = &right[right_run..];
             }
-            // 規則3: 数字側が必ず先。
-            (true, false) => return Ordering::Less,
-            (false, true) => return Ordering::Greater,
-            (false, false) => {
+            // 数値比較は両側が数字ランのときだけ。数字と非数字の混在を含む
+            // それ以外はすべて collation_rank の照合順で1文字ずつ比較する
+            // (記号 < 数字 < 英字)。これにより実 Explorer の観測順
+            // `.amr` < `3D オブジェクト` < `AppData` が成り立つ。
+            _ => {
                 let ordering = collation_rank(left_char).cmp(&collation_rank(right_char));
                 if ordering != Ordering::Equal {
                     return ordering;
@@ -1424,8 +1432,9 @@ fn split_leading_zeros(digits: &str) -> (&str, usize) {
 /// - `0` 空白・記号・句読点(ASCII 非英数字): Windows の word sort では記号類が英数字より
 ///   前に来る。これにより `'{' '|' '}' '~'`(0x7B-0x7E)のように英字より大きい
 ///   コードポイントの記号も英字の前へ移り、`"~temp" < "alpha"` が成り立つ。
-/// - `1` ASCII 数字: 記号より後・英字より前。実際には数字ランは数値比較され、
-///   数字vs非数字は規則3で決まるためこの枝は到達しないが、全順序の一貫性のため定義する。
+/// - `1` ASCII 数字: 記号より後・英字より前。両側が数字ランのときは数値比較されるが、
+///   数字と非数字が混在する位置ではこのランクで比較され(記号 < 数字 < 英字)、
+///   実 Explorer の `.amr` < `3D オブジェクト` < `AppData` を再現する。
 /// - `2` ASCII 英字: 大小無視で小文字コードポイント順。記号・数字より後。
 /// - `3` 非ASCII: 全順序を満たせばよいのでコードポイント順。英字の後ろに置く。
 #[cfg(any(not(windows), test))]
@@ -2357,8 +2366,8 @@ mod tests {
             names_only(&["file10.txt", "file2.txt"]),
             ["file2.txt", "file10.txt"]
         );
-        // 規則3: 数字は非数字より先(旧バイト列比較はこの規則が無く落ちる)。
-        assert_eq!(names_only(&["!.txt", "1.txt"]), ["1.txt", "!.txt"]);
+        // 記号 < 数字: '!'(0x21) は数字より前(実 Explorer 準拠)。
+        assert_eq!(names_only(&["1.txt", "!.txt"]), ["!.txt", "1.txt"]);
         // 照合順: '~'(0x7E) は英字より先(旧実装は生コードポイント順で英字の後ろに置き落ちる)。
         assert_eq!(
             names_only(&["alpha.txt", "~temp.txt"]),
@@ -2368,9 +2377,9 @@ mod tests {
         assert_eq!(names_only(&["a01", "a1"]), ["a1", "a01"]);
         // 大小混在: 大小無視で a < B。
         assert_eq!(names_only(&["B.txt", "a.txt"]), ["a.txt", "B.txt"]);
-        // C:\Users\{user} 相当の実例。規則3(数字 < 非数字)により数字始まりの
-        // "3D Objects" が記号始まりより前に来て、記号どうしは照合ランク('.'<'_')で
-        // 決まり、残りは英字。数字始まり → 記号 → 英字 の並びは logical_cmp が唯一に決める。
+        // C:\Users\{user} 相当の実例(実 Windows Explorer 名前昇順の観測)。
+        // 照合順は 記号 < 数字 < 英字。記号どうしは照合ランク('.'(0x2E) < '_'(0x5F))で
+        // 決まるので ".ssh" < "_scratch" < "3D Objects"(数字始まり) < 英字 の順になる。
         assert_eq!(
             names_only(&[
                 "Videos",
@@ -2383,9 +2392,9 @@ mod tests {
                 "Desktop",
             ]),
             [
-                "3D Objects",
                 ".ssh",
                 "_scratch",
+                "3D Objects",
                 "AppData",
                 "Desktop",
                 "Documents",
@@ -2393,6 +2402,11 @@ mod tests {
                 "Videos",
             ]
         );
+        // 実データ準拠を固定: 記号 < 数字 < 英字(`.amr` < `3D Objects` < `AppData`)。
+        // 旧バイト列比較でも '.'(0x2E) < '3'(0x33) なので順序自体は同じ → 回帰ではないが、
+        // digit-first 分岐を撤回した後もこの実データ順が保たれることを固定する。
+        assert_eq!(logical_cmp(".amr", "3D Objects"), Ordering::Less);
+        assert_eq!(logical_cmp("3D Objects", "AppData"), Ordering::Less);
     }
 
     #[test]
@@ -2448,9 +2462,6 @@ mod tests {
             )
         }
 
-        // 旧ロジックでは '!'(0x21) < '1'(0x31) なので "!.txt" < "1.txt"(Explorerと逆)。
-        assert_eq!(legacy_cmp("1.txt", "!.txt"), Ordering::Greater);
-        assert_eq!(logical_cmp("1.txt", "!.txt"), Ordering::Less);
         // 旧ロジックでは '~'(0x7E) > 'a'(0x61) なので "~temp" > "alpha"(Explorerと逆)。
         assert_eq!(legacy_cmp("~temp.txt", "alpha.txt"), Ordering::Greater);
         assert_eq!(logical_cmp("~temp.txt", "alpha.txt"), Ordering::Less);
@@ -2459,6 +2470,10 @@ mod tests {
     /// Windows CI が審判: 純Rust複製 `logical_cmp` が実 `StrCmpLogicalW` と
     /// 全ペアで符号一致することを確認する。Linux では走らないため、ここが食い違えば
     /// 実データでランク表を直す前提。
+    ///
+    /// コーパスは変更せず維持。加えて digit-first 分岐撤回後の比較順は、実 Windows
+    /// Explorer(`C:\Users\{user}` 名前昇順)の観測(`.amr` < `3D オブジェクト` <
+    /// `AppData`、すなわち 記号 < 数字 < 英字)とも突き合わせ済みである。
     ///
     /// コーパスは複製が再現を主張する範囲、すなわち ASCII の英数字・空白・句読点に絞る。
     /// 実 `StrCmpLogicalW` は 1文字ずつ `ChrCmpIW`(= `CompareStringW` のロケール照合)を
