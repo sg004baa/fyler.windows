@@ -89,9 +89,10 @@ startup. The `toggle_hidden` action (`g.` by default) can also change this while
 `sort_key` controls comparison within those groups:
 
 - `name`: the same logical ordering as Windows Explorer. On Windows this calls the shell's
-  `StrCmpLogicalW`; on other platforms a byte-for-byte reproduction of it is used. The order is
-  case-insensitive, compares numeric segments by value (`file2` before `file10`), and follows
-  Explorer's collation where symbols sort before digits and digits before letters.
+  `StrCmpLogicalW`, the very function Explorer sorts with; other platforms use a reproduction of
+  it for development builds. The order is case-insensitive, compares numeric segments by value
+  (`file2` before `file10`), places a numeric segment before a non-numeric one (`3D Objects`
+  before `.ssh`), and sorts symbols before letters (`~temp` before `alpha`).
 - `date`: modification time
 - `size`: file size
 - `ext`: file extension
