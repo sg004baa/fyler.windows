@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -14,6 +14,7 @@ use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::{EntryId, IdAllocator};
 use fyler_core::keymap::{BindingTarget, EditorAction, HelpEntry, KeyBinding, KeySequence};
+use fyler_core::options::SortKey;
 use fyler_core::pane::{FocusDirection, PaneAction, PaneId, PaneLayout, SplitDirection};
 use fyler_core::path::TreePath;
 use fyler_core::report::{ApplyProgress, CommitReport, OpOutcome, OpResult};
@@ -79,6 +80,16 @@ struct PaneSession {
     /// 実行中のdir sizeジョブ(pane毎に同時1本まで)。再要求・root変更・refresh・
     /// pane close・shutdownでキャンセルする。
     dir_size_job: Option<DirSizeJob>,
+    /// 現在のrootが、dirを指すsymlinkをEnter/gdで追従して入った場所かどうか。
+    /// `NavigateParent`の意味論をhistory backへ切り替える判定に使う
+    /// (`finish_session_root_change`が`RootChangeIntent`に応じて更新する)。
+    root_entered_via_link: bool,
+    /// config由来の既定ソート`(key, reverse)`。pane作成時に渡され、Downloads既知
+    /// フォルダの自動既定を適用しないルートで使う基準値(root変更時も参照する)。
+    config_sort: (SortKey, bool),
+    /// このpaneで`:sort`が明示実行されたか。`true`のときはDownloadsの自動既定を
+    /// 適用しない(ユーザー指定が勝つ)。セッション中はsticky(root変更でクリアしない)。
+    sort_explicit: bool,
 }
 
 /// [`PaneSession::dir_size_job`] の1エントリ。完了イベントの`cancel`との
@@ -100,6 +111,10 @@ struct HistoryEntry {
     cursor_target: Option<OsString>,
     /// このrootへ戻った時に復元するcollapsed dir(root相対path基準)。
     collapsed: Vec<TreePath>,
+    /// このentryを離れた時点で、そのrootがsymlink追従で入った場所だったか。
+    /// history back/forwardで戻る際、`PaneSession::root_entered_via_link`へ
+    /// そのまま復元する(link先rootへの往復で`<BS>`=戻る挙動を保持するため)。
+    entered_via_link: bool,
 }
 
 /// pane毎のback/forward navigation history(純粋ロジック)。
@@ -185,16 +200,28 @@ struct LoaderOwner {
 enum RootChangeIntent {
     /// gd/^/:cd/bookmark/recent/drive等の通常のroot変更。
     Normal,
+    /// dirを指すsymlinkをEnter/gdで追従して入った(`Normal`と同じhistory記録だが、
+    /// 到達先で`PaneSession::root_entered_via_link`を立てる)。
+    FollowLink,
     /// `:back` / `Ctrl+P`によるhistory back navigation。
-    HistoryBack { collapsed: Vec<TreePath> },
+    HistoryBack {
+        collapsed: Vec<TreePath>,
+        entered_via_link: bool,
+    },
     /// `:forward` / `Ctrl+N`によるhistory forward navigation。
-    HistoryForward { collapsed: Vec<TreePath> },
+    HistoryForward {
+        collapsed: Vec<TreePath>,
+        entered_via_link: bool,
+    },
 }
 
 enum LoaderKind {
     Root {
         cursor_target: Option<OsString>,
         intent: RootChangeIntent,
+        /// scanに使ったソート設定。ルート確定時に同じ値をSaveControllerへ適用し、
+        /// scan時と表示時のずれ(二重計算)を防ぐ。
+        scan_options: ScanOptions,
     },
     Directory {
         dir: TreePath,
@@ -225,6 +252,82 @@ impl LoaderOwner {
     }
 }
 
+/// Explorerは`Downloads`既知フォルダを更新日時の降順で既定表示する。ルートがその
+/// 既知フォルダなら既定ソートを`date`降順`(SortKey::Date, true)`にし、それ以外は
+/// `config_default`をそのまま使う。
+///
+/// `root`・`downloads`はいずれも[`normalize_root`]済みの絶対パス前提。既知フォルダ解決
+/// だけがプラットフォーム依存で、`downloads`が`None`(非Windows / 解決失敗)なら常に
+/// `config_default`を返す。パス比較はWindowsで大小無視、非Windowsで厳密一致とし、
+/// 比較ロジックはこの関数(と補助の[`root_paths_equal`])に閉じ込める。
+fn default_sort_for_root(
+    root: &Path,
+    downloads: Option<&Path>,
+    config_default: (SortKey, bool),
+) -> (SortKey, bool) {
+    match downloads {
+        Some(downloads) if root_paths_equal(root, downloads) => (SortKey::Date, true),
+        _ => config_default,
+    }
+}
+
+/// [`default_sort_for_root`]専用のルートパス比較。Windowsは大小無視(NTFSの既定の
+/// 大小無視挙動に合わせる)、非Windowsは厳密一致。
+///
+/// `normalize_root`は[`std::path::absolute`]なので末尾の区切りや重複区切りが残り得る
+/// (`C:\Users\me\Downloads\`)。文字列比較ではこれを取り逃すため、component単位で比較する。
+fn root_paths_equal(a: &Path, b: &Path) -> bool {
+    let mut left = a.components();
+    let mut right = b.components();
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return true,
+            (Some(left), Some(right)) => {
+                if !components_equal(left, right) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn components_equal(left: Component<'_>, right: Component<'_>) -> bool {
+    left.as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn components_equal(left: Component<'_>, right: Component<'_>) -> bool {
+    left == right
+}
+
+/// pane作成・root変更で使う、最終的な[`ScanOptions`]を決める配線用ヘルパ。
+///
+/// `sort_explicit`(このpaneで`:sort`が明示実行された)なら`base`をそのまま使い、
+/// そうでなければ[`default_sort_for_root`]でDownloadsの自動既定を適用して`key`/`reverse`
+/// だけ差し替える(`show_hidden`/`sort`は維持)。scan時と表示確定時で同じ結果を得るため、
+/// この関数を単一の決定点として両者から呼ぶ。
+fn resolve_scan_options(
+    sort_explicit: bool,
+    base: ScanOptions,
+    root: &Path,
+    downloads: Option<&Path>,
+    config_sort: (SortKey, bool),
+) -> ScanOptions {
+    if sort_explicit {
+        return base;
+    }
+    let (key, reverse) = default_sort_for_root(root, downloads, config_sort);
+    ScanOptions {
+        key,
+        reverse,
+        ..base
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_pane(
     runtime: &tokio::runtime::Runtime,
@@ -233,11 +336,22 @@ fn create_pane(
     nvim_exe: &Path,
     bindings: &[KeyBinding],
     scan_options: ScanOptions,
+    config_sort: (SortKey, bool),
+    sort_explicit: bool,
     shared_ids: Arc<Mutex<IdAllocator>>,
     app_event_tx: &CountingSender<AppEvent>,
     nvim_diagnostics: Option<&[String]>,
     restored: Option<&SessionPane>,
 ) -> anyhow::Result<PaneSession> {
+    // Downloads既知フォルダの自動既定を適用する(明示`:sort`されていないpaneのみ)。
+    // 以降のscanとSaveControllerの両方でこの同一値を使い、二重計算を避ける。
+    let scan_options = resolve_scan_options(
+        sort_explicit,
+        scan_options,
+        &root,
+        fyler_fsops::known_folders::downloads_dir(),
+        config_sort,
+    );
     // nvim起動はflaky回避のため呼び出し元イベントループで必ず直列に行う。
     let (engine, mut engine_events) = runtime
         .block_on(NvimEngine::start(NvimConfig {
@@ -363,6 +477,9 @@ fn create_pane(
         history: NavigationHistory::default(),
         computed_dir_sizes: HashMap::new(),
         dir_size_job: None,
+        root_entered_via_link: false,
+        config_sort,
+        sort_explicit,
     })
 }
 
@@ -553,6 +670,8 @@ pub(super) fn run() -> anyhow::Result<()> {
         key: config.sort_key,
         reverse: config.sort_reverse,
     };
+    // config由来のソート既定。Downloads自動既定を適用しないpane/rootで使う基準値。
+    let config_sort = (config.sort_key, config.sort_reverse);
     let bindings = Arc::new(config.bindings);
     let gui_options = GuiOptions {
         confirm_detail: config.confirm_detail,
@@ -621,6 +740,10 @@ pub(super) fn run() -> anyhow::Result<()> {
         }
         let restored_hint = restored.filter(|pane| pane.root == candidate);
         let pane_options = restored.map_or(scan_options, |pane| pane.scan_options);
+        // 復元値がconfig既定と異なる場合のみ明示指定扱い(復元値が勝つ)。config既定と
+        // 同じなら`:sort`されていないので、Downloadsの自動既定を適用する。
+        let sort_explicit = restored
+            .is_some_and(|pane| (pane.scan_options.key, pane.scan_options.reverse) != config_sort);
         let created = create_pane(
             &runtime,
             id,
@@ -628,6 +751,8 @@ pub(super) fn run() -> anyhow::Result<()> {
             &nvim_exe,
             &bindings,
             pane_options,
+            config_sort,
+            sort_explicit,
             Arc::clone(&shared_ids),
             &app_event_tx,
             Some(&resolved_nvim.diagnostics),
@@ -649,6 +774,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                 &nvim_exe,
                 &bindings,
                 pane_options,
+                config_sort,
+                false,
                 Arc::clone(&shared_ids),
                 &app_event_tx,
                 Some(&resolved_nvim.diagnostics),
@@ -676,6 +803,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                 &nvim_exe,
                 &bindings,
                 scan_options,
+                config_sort,
+                false,
                 Arc::clone(&shared_ids),
                 &app_event_tx,
                 Some(&resolved_nvim.diagnostics),
@@ -945,6 +1074,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                             &nvim_exe,
                             &bindings,
                             scan_options,
+                            config_sort,
                             &shared_ids,
                             &event_tx,
                             &gui_event_tx,
@@ -1534,6 +1664,33 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             return;
                                         }
                                     }
+                                    ActivateOutcome::FollowLink(new_root) => {
+                                        if request_session_root_change(
+                                            pane_id,
+                                            new_root,
+                                            None,
+                                            RootChangeIntent::FollowLink,
+                                            session,
+                                            &shared_ids,
+                                            &event_tx,
+                                            &gui_event_tx,
+                                            &mut loader_owner,
+                                            &mut dialog_owner,
+                                            feedback_open
+                                                || apply_owner.is_some()
+                                                || transfer.is_awaiting()
+                                                || transfer.is_running()
+                                                || import.is_awaiting()
+                                                || extract.is_awaiting()
+                                                || import.is_running()
+                                                || extract.is_running()
+                                                || drag_out.is_busy(),
+                                        )
+                                        .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
                                 }
                             }
                             EditorEvent::NavigateInto { line } => {
@@ -1567,27 +1724,67 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     }
                                     continue;
                                 }
-                                let Some((path, EntryKind::Dir)) =
-                                    session.save_controller.resolve_line(&snapshot.lines, line)
-                                else {
-                                    if send_gui_message(
-                                        &gui_event_tx,
-                                        pane_id,
-                                        MessageKind::Info,
-                                        "This is not a directory line",
-                                    )
-                                    .is_err()
-                                    {
-                                        return;
+                                let (new_root, root_change_intent) = match session
+                                    .save_controller
+                                    .resolve_line(&snapshot.lines, line)
+                                {
+                                    Some((path, EntryKind::Dir)) => (
+                                        path.to_fs_path(&session.root),
+                                        RootChangeIntent::Normal,
+                                    ),
+                                    Some((path, EntryKind::Symlink)) => {
+                                        let fs_path = path.to_fs_path(&session.root);
+                                        match fyler_fsops::link::resolve_link_dir(&fs_path) {
+                                            Ok(Some(dir)) => (dir, RootChangeIntent::FollowLink),
+                                            Ok(None) => {
+                                                if send_gui_message(
+                                                    &gui_event_tx,
+                                                    pane_id,
+                                                    MessageKind::Info,
+                                                    "Link does not point to a directory",
+                                                )
+                                                .is_err()
+                                                {
+                                                    return;
+                                                }
+                                                continue;
+                                            }
+                                            Err(error) => {
+                                                if send_gui_message(
+                                                    &gui_event_tx,
+                                                    pane_id,
+                                                    MessageKind::Error,
+                                                    format!(
+                                                        "Failed to resolve link: {error:#}"
+                                                    ),
+                                                )
+                                                .is_err()
+                                                {
+                                                    return;
+                                                }
+                                                continue;
+                                            }
+                                        }
                                     }
-                                    continue;
+                                    Some((_, EntryKind::File)) | None => {
+                                        if send_gui_message(
+                                            &gui_event_tx,
+                                            pane_id,
+                                            MessageKind::Info,
+                                            "This is not a directory line",
+                                        )
+                                        .is_err()
+                                        {
+                                            return;
+                                        }
+                                        continue;
+                                    }
                                 };
-                                let new_root = path.to_fs_path(&session.root);
                                 if request_session_root_change(
                                     pane_id,
                                     new_root,
                                     None,
-                                    RootChangeIntent::Normal,
+                                    root_change_intent,
                                     session,
                                     &shared_ids,
                                     &event_tx,
@@ -1719,6 +1916,29 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 }
                             }
                             EditorEvent::NavigateParent => {
+                                if session.root_entered_via_link {
+                                    if perform_history_back(
+                                        pane_id,
+                                        session,
+                                        &shared_ids,
+                                        &event_tx,
+                                        &gui_event_tx,
+                                        &mut loader_owner,
+                                        &mut dialog_owner,
+                                        feedback_open
+                                            || apply_owner.is_some()
+                                            || transfer.is_awaiting()
+                                            || transfer.is_running()
+                                            || import.is_awaiting() || extract.is_awaiting()
+                                            || import.is_running() || extract.is_running()
+                                            || drag_out.is_busy(),
+                                    )
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
                                 let cursor_target = session.root.file_name().map(OsStr::to_owned);
                                 let Some(new_root) = session.root.parent().map(Path::to_path_buf)
                                 else {
@@ -1768,28 +1988,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                                 }
                             }
                             EditorEvent::HistoryBack => {
-                                if !session.history.can_go_back() {
-                                    if send_gui_message(
-                                        &gui_event_tx,
-                                        pane_id,
-                                        MessageKind::Info,
-                                        "No earlier location in history",
-                                    )
-                                    .is_err()
-                                    {
-                                        return;
-                                    }
-                                    continue;
-                                }
-                                let entry = session.history.pop_back().expect("checked can_go_back");
-                                let restore = entry.clone();
-                                let outcome = request_session_root_change(
+                                if perform_history_back(
                                     pane_id,
-                                    entry.root,
-                                    entry.cursor_target,
-                                    RootChangeIntent::HistoryBack {
-                                        collapsed: entry.collapsed,
-                                    },
                                     session,
                                     &shared_ids,
                                     &event_tx,
@@ -1799,16 +1999,13 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     feedback_open
                                         || apply_owner.is_some()
                                         || transfer.is_awaiting()
-                                        || transfer.is_running(),
-                                );
-                                match outcome {
-                                    Ok(RootChangeRequestOutcome::Started) => {}
-                                    Ok(RootChangeRequestOutcome::Rejected) => {
-                                        session.history.restore_back(restore);
-                                    }
-                                    Err(_) => return,
-                                }
-                                if send_history_state(&gui_event_tx, pane_id, session).is_err() {
+                                        || transfer.is_running()
+                                        || import.is_awaiting() || extract.is_awaiting()
+                                        || import.is_running() || extract.is_running()
+                                        || drag_out.is_busy(),
+                                )
+                                .is_err()
+                                {
                                     return;
                                 }
                             }
@@ -1837,6 +2034,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     entry.cursor_target,
                                     RootChangeIntent::HistoryForward {
                                         collapsed: entry.collapsed,
+                                        entered_via_link: entry.entered_via_link,
                                     },
                                     session,
                                     &shared_ids,
@@ -1847,7 +2045,10 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     feedback_open
                                         || apply_owner.is_some()
                                         || transfer.is_awaiting()
-                                        || transfer.is_running(),
+                                        || transfer.is_running()
+                                        || import.is_awaiting() || extract.is_awaiting()
+                                        || import.is_running() || extract.is_running()
+                                        || drag_out.is_busy(),
                                 );
                                 match outcome {
                                     Ok(RootChangeRequestOutcome::Started) => {}
@@ -2410,6 +2611,9 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             continue;
                                         }
                                     };
+                                // 明示`:sort`が成立したのでDownloadsの自動既定を以後適用しない
+                                // (セッション中はsticky。root変更でもクリアしない)。
+                                session.sort_explicit = true;
                                 // 並び替えはrescanでbaselineが変わり得るため、カーソル行dir
                                 // サイズのoverlayを破棄する(issue #38フォローアップ、案B)。
                                 session.computed_dir_sizes.clear();
@@ -3517,6 +3721,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         LoaderKind::Root {
                                             cursor_target,
                                             intent,
+                                            scan_options,
                                         } => {
                                             finish_session_root_change(
                                                 pane_id,
@@ -3524,6 +3729,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                                 cursor_target.as_deref(),
                                                 intent,
                                                 baseline,
+                                                scan_options,
                                                 session,
                                                 &gui_event_tx,
                                                 &mut git,
@@ -4562,6 +4768,7 @@ fn handle_pane_action(
     nvim_exe: &Path,
     bindings: &[KeyBinding],
     scan_options: ScanOptions,
+    config_sort: (SortKey, bool),
     shared_ids: &Arc<Mutex<IdAllocator>>,
     app_event_tx: &CountingSender<AppEvent>,
     gui_event_tx: &CountingSender<GuiEvent>,
@@ -4608,6 +4815,8 @@ fn handle_pane_action(
                 nvim_exe,
                 bindings,
                 scan_options,
+                config_sort,
+                false,
                 Arc::clone(shared_ids),
                 app_event_tx,
                 None,
@@ -5412,6 +5621,15 @@ fn request_session_root_change(
         title: "Loading folder".to_owned(),
         path: new_root.clone(),
     })?;
+    // sort_explicitでなければDownloadsの自動既定を適用する。scan時とルート確定後の
+    // SaveControllerへ同一値を運ぶため、ここで一度だけ決めてLoaderKind::Rootに載せる。
+    let scan_options = resolve_scan_options(
+        session.sort_explicit,
+        session.save_controller.scan_options(),
+        &new_root,
+        fyler_fsops::known_folders::downloads_dir(),
+        session.config_sort,
+    );
     *dialog_owner = Some(pane_id);
     *loader_owner = Some(LoaderOwner {
         pane_id,
@@ -5419,11 +5637,11 @@ fn request_session_root_change(
         kind: LoaderKind::Root {
             cursor_target,
             intent,
+            scan_options,
         },
         cancel: Arc::clone(&cancel),
     });
 
-    let scan_options = session.save_controller.scan_options();
     let worker_ids = Arc::clone(shared_ids);
     let worker_event_tx = app_event_tx.clone();
     let worker_root = new_root.clone();
@@ -5460,6 +5678,56 @@ fn request_session_root_change(
         });
     }
     Ok(RootChangeRequestOutcome::Started)
+}
+
+/// `NavigateParent`がlink追従で入ったrootにいる時に代わりに呼ばれる、および
+/// `EditorEvent::HistoryBack`本体。history entryをpopしてroot変更を要求し、
+/// gateで拒否されたらpopしたentryを戻し、最後にhistory状態をGUIへ送る。
+#[allow(clippy::too_many_arguments)]
+fn perform_history_back(
+    pane_id: PaneId,
+    session: &mut PaneSession,
+    shared_ids: &Arc<Mutex<IdAllocator>>,
+    app_event_tx: &CountingSender<AppEvent>,
+    gui_event_tx: &CountingSender<GuiEvent>,
+    loader_owner: &mut Option<LoaderOwner>,
+    dialog_owner: &mut Option<PaneId>,
+    globally_busy: bool,
+) -> Result<(), mpsc::SendError<GuiEvent>> {
+    if !session.history.can_go_back() {
+        send_gui_message(
+            gui_event_tx,
+            pane_id,
+            MessageKind::Info,
+            "No earlier location in history",
+        )?;
+        return Ok(());
+    }
+    let entry = session.history.pop_back().expect("checked can_go_back");
+    let restore = entry.clone();
+    let outcome = request_session_root_change(
+        pane_id,
+        entry.root,
+        entry.cursor_target,
+        RootChangeIntent::HistoryBack {
+            collapsed: entry.collapsed,
+            entered_via_link: entry.entered_via_link,
+        },
+        session,
+        shared_ids,
+        app_event_tx,
+        gui_event_tx,
+        loader_owner,
+        dialog_owner,
+        globally_busy,
+    )?;
+    match outcome {
+        RootChangeRequestOutcome::Started => {}
+        RootChangeRequestOutcome::Rejected => {
+            session.history.restore_back(restore);
+        }
+    }
+    send_history_state(gui_event_tx, pane_id, session)
 }
 
 /// カーソル行dirサイズの背景計算を打ち切る(結果は捨てる)。同一paneでの
@@ -5884,6 +6152,7 @@ fn finish_session_root_change(
     cursor_target: Option<&OsStr>,
     intent: RootChangeIntent,
     new_baseline: BaselineTree,
+    scan_options: ScanOptions,
     session: &mut PaneSession,
     gui_event_tx: &CountingSender<GuiEvent>,
     git: &mut GitRefresher,
@@ -5917,18 +6186,35 @@ fn finish_session_root_change(
         )?;
         return Ok(());
     }
+    // scan時に使ったソート設定をそのまま適用し、scanと表示のずれを防ぐ
+    // (sort_explicitのpaneでは現状値と同一なので実質no-op)。
+    session.save_controller.set_scan_options(scan_options);
     match intent {
         RootChangeIntent::Normal => {
             session.save_controller.collapse_all_dirs();
             session.history.record_normal(from);
+            session.root_entered_via_link = false;
         }
-        RootChangeIntent::HistoryBack { collapsed } => {
+        RootChangeIntent::FollowLink => {
+            session.save_controller.collapse_all_dirs();
+            session.history.record_normal(from);
+            session.root_entered_via_link = true;
+        }
+        RootChangeIntent::HistoryBack {
+            collapsed,
+            entered_via_link,
+        } => {
             session.save_controller.restore_collapsed_paths(&collapsed);
             session.history.record_history_back(from);
+            session.root_entered_via_link = entered_via_link;
         }
-        RootChangeIntent::HistoryForward { collapsed } => {
+        RootChangeIntent::HistoryForward {
+            collapsed,
+            entered_via_link,
+        } => {
             session.save_controller.restore_collapsed_paths(&collapsed);
             session.history.record_history_forward(from);
+            session.root_entered_via_link = entered_via_link;
         }
     }
     let cursor_line =
@@ -5991,6 +6277,7 @@ fn capture_history_entry(session: &PaneSession) -> HistoryEntry {
         root: session.root.clone(),
         cursor_target,
         collapsed,
+        entered_via_link: session.root_entered_via_link,
     }
 }
 
@@ -6202,6 +6489,108 @@ fn should_defer_external_change(applying: bool, transferring: bool, loading: boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use fyler_core::options::SortOrder;
+
+    #[test]
+    fn downloads_root_defaults_to_date_descending() {
+        let downloads = Path::new("/home/u/Downloads");
+        let config = (SortKey::Name, false);
+        assert_eq!(
+            default_sort_for_root(downloads, Some(downloads), config),
+            (SortKey::Date, true)
+        );
+    }
+
+    #[test]
+    fn downloads_root_matches_despite_trailing_separator() {
+        // normalize_root は std::path::absolute なので末尾区切りが残り得る。
+        let downloads = Path::new("/home/u/Downloads");
+        let config = (SortKey::Name, false);
+        assert_eq!(
+            default_sort_for_root(Path::new("/home/u/Downloads/"), Some(downloads), config),
+            (SortKey::Date, true)
+        );
+    }
+
+    #[test]
+    fn non_downloads_root_uses_config_default() {
+        let downloads = Path::new("/home/u/Downloads");
+        let other = Path::new("/home/u/Documents");
+        let config = (SortKey::Size, true);
+        assert_eq!(
+            default_sort_for_root(other, Some(downloads), config),
+            config
+        );
+    }
+
+    #[test]
+    fn unresolved_downloads_uses_config_default() {
+        let root = Path::new("/home/u/Downloads");
+        let config = (SortKey::Name, false);
+        assert_eq!(default_sort_for_root(root, None, config), config);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn downloads_root_matches_case_insensitively_on_windows() {
+        let downloads = Path::new(r"C:\Users\u\Downloads");
+        let root = Path::new(r"c:\users\u\downloads");
+        let config = (SortKey::Name, false);
+        assert_eq!(
+            default_sort_for_root(root, Some(downloads), config),
+            (SortKey::Date, true)
+        );
+    }
+
+    #[test]
+    fn explicit_sort_keeps_base_even_in_downloads() {
+        let downloads = Path::new("/home/u/Downloads");
+        let base = ScanOptions {
+            show_hidden: true,
+            sort: SortOrder::Mixed,
+            key: SortKey::Name,
+            reverse: false,
+        };
+        let config = (SortKey::Name, false);
+        assert_eq!(
+            resolve_scan_options(true, base, downloads, Some(downloads), config),
+            base
+        );
+    }
+
+    #[test]
+    fn implicit_sort_applies_downloads_default_preserving_hidden_and_order() {
+        let downloads = Path::new("/home/u/Downloads");
+        let base = ScanOptions {
+            show_hidden: true,
+            sort: SortOrder::Mixed,
+            key: SortKey::Name,
+            reverse: false,
+        };
+        let config = (SortKey::Name, false);
+        let resolved = resolve_scan_options(false, base, downloads, Some(downloads), config);
+        assert_eq!(resolved.key, SortKey::Date);
+        assert!(resolved.reverse);
+        assert!(resolved.show_hidden);
+        assert_eq!(resolved.sort, SortOrder::Mixed);
+    }
+
+    #[test]
+    fn implicit_sort_outside_downloads_uses_config() {
+        let downloads = Path::new("/home/u/Downloads");
+        let root = Path::new("/home/u/Documents");
+        let base = ScanOptions {
+            show_hidden: false,
+            sort: SortOrder::DirsFirst,
+            key: SortKey::Name,
+            reverse: false,
+        };
+        let config = (SortKey::Size, true);
+        let resolved = resolve_scan_options(false, base, root, Some(downloads), config);
+        assert_eq!(resolved.key, SortKey::Size);
+        assert!(resolved.reverse);
+    }
 
     struct ProbeEngine;
 
@@ -6527,6 +6916,7 @@ mod tests {
             root: PathBuf::from(root),
             cursor_target: None,
             collapsed: Vec::new(),
+            entered_via_link: false,
         }
     }
 

@@ -64,6 +64,27 @@ pub fn to_extended(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(normalized))
 }
 
+/// `canonicalize`等が返す拡張形式(`\\?\`)を表示用のパスへ戻す。
+///
+/// - `\\?\C:\x` → `C:\x`
+/// - `\\?\UNC\server\share\x` → `\\server\share\x`
+/// - `\\?\` プレフィックスが無い場合はそのまま返す
+///
+/// 文字列ベースの純粋変換であり、[`to_extended`]と対になる。非UTF-8パスは
+/// 変換対象がないためそのまま返す。
+pub fn from_fs(path: &Path) -> PathBuf {
+    let Some(raw) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if let Some(rest) = raw.strip_prefix(EXTENDED_UNC_PREFIX) {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = raw.strip_prefix(EXTENDED_PREFIX) {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 fn is_drive_absolute(path: &str) -> bool {
     let bytes = path.as_bytes();
     bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
@@ -174,5 +195,37 @@ mod tests {
     fn to_fs_is_identity_off_windows() {
         let path = Path::new("/tmp/fyler/../file.txt");
         assert_eq!(to_fs(path), path);
+    }
+
+    #[test]
+    fn from_fs_strips_extended_drive_prefix() {
+        assert_eq!(
+            from_fs(Path::new(r"\\?\C:\foo\bar.txt")),
+            PathBuf::from(r"C:\foo\bar.txt")
+        );
+    }
+
+    #[test]
+    fn from_fs_strips_extended_unc_prefix() {
+        assert_eq!(
+            from_fs(Path::new(r"\\?\UNC\server\share\foo")),
+            PathBuf::from(r"\\server\share\foo")
+        );
+    }
+
+    #[test]
+    fn from_fs_is_identity_without_extended_prefix() {
+        assert_eq!(
+            from_fs(Path::new(r"C:\foo\bar.txt")),
+            PathBuf::from(r"C:\foo\bar.txt")
+        );
+    }
+
+    #[test]
+    fn from_fs_round_trips_to_extended() {
+        let extended = to_extended(Path::new(r"C:\foo\bar.txt")).unwrap();
+        assert_eq!(from_fs(&extended), PathBuf::from(r"C:\foo\bar.txt"));
+        let extended_unc = to_extended(Path::new(r"\\server\share\foo")).unwrap();
+        assert_eq!(from_fs(&extended_unc), PathBuf::from(r"\\server\share\foo"));
     }
 }

@@ -88,13 +88,25 @@ startup. The `toggle_hidden` action (`g.` by default) can also change this while
 
 `sort_key` controls comparison within those groups:
 
-- `name`: case-insensitive natural order with numeric segments compared numerically
+- `name`: the same logical ordering as Windows Explorer. On Windows this calls the shell's
+  `StrCmpLogicalW`, the very function Explorer sorts with; other platforms use a reproduction of
+  it for development builds. The order is case-insensitive, compares numeric segments by value
+  (`file2` before `file10`), and otherwise sorts symbols before digits, and digits before letters
+  (`.ssh` → `3D Objects` → `AppData`; `~temp` before `alpha`). Like Explorer's word sort, `-` and
+  `'` are ignored except as a final tiebreaker, so `ab` sorts before `a-b`.
 - `date`: modification time
 - `size`: file size
 - `ext`: file extension
 
 `sort_reverse = true` reverses the selected key. Directory grouping remains controlled separately
 by `sort`. At runtime, use `:sort name|date|size|ext`; add `!` to the command for descending order.
+
+When a pane's root is your Windows **Downloads** known folder, fyler matches Explorer and defaults
+that pane to date order, newest first, instead of `sort_key`/`sort_reverse`. This applies only to
+the Downloads folder. Once you run `:sort` in a pane, your explicit choice wins for the rest of the
+session and the Downloads default is no longer applied there, even after navigating away and back.
+On non-Windows platforms there is no Downloads known folder, so this default never applies.
+
 ### Statusline
 
 The bottom statusline is built from two ordered clusters. `[statusline].left` fills from the left
@@ -330,6 +342,7 @@ Rules and limitations:
 | `history_back` | Go back in navigation history | `<C-p>` |
 | `history_forward` | Go forward in navigation history | `<C-n>` |
 | `refresh` | Reload the current root from disk | `<C-r>` |
+| `undo` | Undo text edits in modified buffers; undo the last file operation in clean buffers | `u` |
 
 `none` is not an action. It is a special value that removes the binding for the specified key
 sequence.
@@ -356,3 +369,17 @@ the connection immediately instead of waiting for the periodic retry.
 cursor up/down like `k` / `j`. Fyler's default keymap shadows all three inside fyler buffers;
 rebind or remove `history_back` / `history_forward` / `refresh` (assign `"none"`) if you need the
 native behavior back.
+
+When the current root was entered by following a symlink to a directory (via `activate` on
+`<CR>` or `navigate_into`/`gd`), `navigate_parent` (`<BS>` by default) steps back to the
+previous location instead of moving to the filesystem parent of the link target — effectively
+behaving like `history_back` for that one root. Any other root change (`navigate_into`, `:cd`,
+a drive switch, etc.) clears this and restores the normal parent-directory behavior. Entering or
+leaving that root via `history_back` / `history_forward` (`<C-p>` / `<C-n>`) preserves it.
+
+`u` splits on buffer state: while the buffer has unsaved text edits (`'modified'` is set), `u`
+performs Neovim's built-in text undo, so in-progress typos can still be reverted. Once the buffer
+is clean, `u` instead requests fyler's file-operation undo (the `:FylerUndo` behavior), which
+prompts a confirmation dialog before restoring from the Recycle Bin or a backup. `<C-r>` is
+unaffected and stays bound to `refresh` as described above; a text redo remains available via the
+`:redo` ex command. `u` is the only key remapped here, so `:undo`/`:redo` always work directly.

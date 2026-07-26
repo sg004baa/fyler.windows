@@ -12,4 +12,4 @@ anyhow.workspace = true
 eframe.workspace = true
 
 [build-dependencies]
-ico = "0.4"
+ico = "0.5"

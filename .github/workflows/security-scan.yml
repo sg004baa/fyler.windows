@@ -1,0 +1,109 @@
+name: Security scan
+
+on:
+  schedule:
+    # 毎週月曜 06:00 JST (= 日曜 21:00 UTC)。dependabot.yml と同じ月曜朝JST帯に合わせる。
+    - cron: "0 21 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # syft: Cargo.lock ベースでリポジトリの SBOM (CycloneDX JSON) を生成し、workflow artifact としてアップロード
+      - name: Generate SBOM (syft)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+
+      # grype: 生成した SBOM を脆弱性スキャン。ビルド自体は落とさず(fail-build: false)、
+      # 起票するかどうかの判断は次のステップで行う。severity-cutoff は設定せず全件レポート。
+      - name: Scan SBOM (grype)
+        id: grype
+        uses: anchore/scan-action@v7
+        with:
+          sbom: sbom.cdx.json
+          fail-build: false
+          output-format: json
+
+      # grype JSON を集計し、security-scan ラベルの issue を起票・更新・クローズする
+      - name: 脆弱性スキャン結果から issue を起票・更新
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GRYPE_JSON: ${{ steps.grype.outputs.json }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GRYPE_JSON:-}" ] || [ ! -f "${GRYPE_JSON}" ]; then
+            echo "::error::grype の結果ファイルが見つかりません: ${GRYPE_JSON:-<empty>}"
+            exit 1
+          fi
+
+          match_count=$(jq '.matches | length' "${GRYPE_JSON}")
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          # 初回実行に備えてラベルを作成(既存の場合は --force で更新扱い・冪等)
+          gh label create security-scan \
+            --color d73a4a \
+            --description "syft + grype による自動脆弱性スキャン結果" \
+            --force
+
+          existing_issue=$(gh issue list --label security-scan --state open --json number --jq '.[0].number // empty')
+
+          if [ "${match_count}" -gt 0 ]; then
+            title="Security scan: ${match_count} vulnerabilities found"
+            body_file=$(mktemp)
+
+            {
+              echo "# ${title}"
+              echo
+              echo "syft (SBOM) + grype による週次脆弱性スキャンで ${match_count} 件の一致が見つかりました。"
+              echo
+
+              for sev in Critical High Medium Low Negligible Unknown; do
+                rows=$(jq -r --arg sev "${sev}" '
+                  [.matches[] | select((.vulnerability.severity // "Unknown") == $sev)]
+                  | sort_by(.artifact.name)
+                  | .[]
+                  | "| \(.artifact.name) | \(.artifact.version) | \(.vulnerability.id) | \(if ((.vulnerability.fix.versions // []) | length) > 0 then (.vulnerability.fix.versions | join(", ")) else "-" end) |"
+                ' "${GRYPE_JSON}")
+
+                if [ -n "${rows}" ]; then
+                  echo "## ${sev}"
+                  echo
+                  echo "| パッケージ | インストール版 | 脆弱性ID | 修正版 |"
+                  echo "| --- | --- | --- | --- |"
+                  echo "${rows}"
+                  echo
+                fi
+              done
+
+              echo "---"
+              echo "[Workflow run](${run_url})"
+            } > "${body_file}"
+
+            if [ -n "${existing_issue}" ]; then
+              gh issue edit "${existing_issue}" --title "${title}" --body-file "${body_file}"
+              gh issue comment "${existing_issue}" --body "スキャン結果を更新しました($(date -u +%Y-%m-%dT%H:%M:%SZ) UTC)。[workflow run](${run_url})"
+              echo "既存 issue #${existing_issue} を更新しました"
+            else
+              gh issue create --title "${title}" --body-file "${body_file}" --label security-scan
+              echo "新規 issue を作成しました"
+            fi
+          else
+            if [ -n "${existing_issue}" ]; then
+              gh issue comment "${existing_issue}" --body "スキャンクリーン: 既知の脆弱性は見つかりませんでした。[workflow run](${run_url})"
+              gh issue close "${existing_issue}" --reason completed
+              echo "既存 issue #${existing_issue} をクローズしました(スキャンクリーン)"
+            else
+              echo "脆弱性なし。対応する open issue もないため何もしません"
+            fi
+          fi

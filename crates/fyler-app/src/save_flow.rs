@@ -596,6 +596,15 @@ impl SaveController {
         self.scan_options
     }
 
+    /// スキャンオプションを差し替える。
+    ///
+    /// 別ルートを先にスキャンしてから [`Self::change_root_preserving_allocator`] する配線で、
+    /// scan時に使った設定を確定後の表示へ引き継ぐために使う(scanと表示のソートがずれると
+    /// 再スキャン時に不整合になる)。`show_hidden`/`sort` を含む全項目を上書きする点に注意。
+    pub fn set_scan_options(&mut self, scan_options: ScanOptions) {
+        self.scan_options = scan_options;
+    }
+
     /// 現在のソート条件を返す。
     ///
     /// `:sort`引数なしの表示で使う。第1要素がソートキー、第2要素が降順フラグである。
