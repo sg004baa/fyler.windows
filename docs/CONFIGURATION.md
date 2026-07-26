@@ -330,6 +330,7 @@ Rules and limitations:
 | `history_back` | Go back in navigation history | `<C-p>` |
 | `history_forward` | Go forward in navigation history | `<C-n>` |
 | `refresh` | Reload the current root from disk | `<C-r>` |
+| `undo` | Undo the last file operation | `u` |
 
 `none` is not an action. It is a special value that removes the binding for the specified key
 sequence.
@@ -356,3 +357,10 @@ the connection immediately instead of waiting for the periodic retry.
 cursor up/down like `k` / `j`. Fyler's default keymap shadows all three inside fyler buffers;
 rebind or remove `history_back` / `history_forward` / `refresh` (assign `"none"`) if you need the
 native behavior back.
+
+`u` splits on buffer state: while the buffer has unsaved text edits (`'modified'` is set), `u`
+performs Neovim's built-in text undo, so in-progress typos can still be reverted. Once the buffer
+is clean, `u` instead requests fyler's file-operation undo (the `:FylerUndo` behavior), which
+prompts a confirmation dialog before restoring from the Recycle Bin or a backup. `<C-r>` is
+unaffected and stays bound to `refresh` as described above; a text redo remains available via the
+`:redo` ex command. `u` is the only key remapped here, so `:undo`/`:redo` always work directly.
