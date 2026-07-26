@@ -1706,3 +1706,83 @@ async fn delete_line_removes_only_the_target_line() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn reconcile_redraw_does_not_pollute_undo_history() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, _events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+
+    // ビューA: 初回描画(プログラム的な書き込み)。
+    engine.set_initial_lines(vec![EditorLine::new("/001 alpha.txt")])?;
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 1 && lines[0].text.as_ref() == "/001 alpha.txt"
+    })
+    .await?;
+
+    // ユーザー編集を模して実際にキー入力を送り、バッファをビューBへ変える。
+    engine.send(key_command(Key::Char('i')))?;
+    wait_for_mode(&engine, Mode::Insert).await?;
+    engine.send(EditorCommand::Text("beta".to_owned()))?;
+    engine.send(key_command(Key::Esc))?;
+    wait_for_mode(&engine, Mode::Normal).await?;
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 1 && lines[0].text.as_ref() == "/001 betaalpha.txt"
+    })
+    .await?;
+
+    // 過剰修正でないことの確認: ユーザー自身の編集は従来どおりundo/redoできる。
+    engine.send(key_command(Key::Char('u')))?;
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 1 && lines[0].text.as_ref() == "/001 alpha.txt"
+    })
+    .await?;
+    engine.send(EditorCommand::Key(KeyInput {
+        key: Key::Char('r'),
+        mods: Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        },
+    }))?;
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 1 && lines[0].text.as_ref() == "/001 betaalpha.txt"
+    })
+    .await?;
+
+    // 再びプログラム的な全行差し替え(reconcile)でビューCへ。
+    engine.send(EditorCommand::SetLines {
+        lines: vec![
+            EditorLine::new("/001 beta.txt"),
+            EditorLine::new("/002 new.txt"),
+        ],
+        cursor_line: None,
+    })?;
+    wait_for_lines(&engine, |lines| {
+        lines.len() == 2
+            && lines[0].text.as_ref() == "/001 beta.txt"
+            && lines[1].text.as_ref() == "/002 new.txt"
+    })
+    .await?;
+
+    // 旧バグ: このreconcileがundo履歴に記録され、`u`でビューCが消えて
+    // 空バッファ(またはビューA/B)へ飛んでいた。
+    engine.send(key_command(Key::Char('u')))?;
+
+    // 変化しないことを確認するため、十分な時間待ってから固定して検証する。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let snapshot = engine.snapshot();
+    assert_eq!(
+        snapshot.lines.len(),
+        2,
+        "reconcile redraw must not be undoable: expected 2 lines, got {:?}",
+        snapshot.lines
+    );
+    assert_eq!(snapshot.lines[0].text.as_ref(), "/001 beta.txt");
+    assert_eq!(snapshot.lines[1].text.as_ref(), "/002 new.txt");
+
+    Ok(())
+}
