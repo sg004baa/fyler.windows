@@ -14,6 +14,7 @@ use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
 use fyler_core::id::{EntryId, IdAllocator};
 use fyler_core::keymap::{BindingTarget, EditorAction, HelpEntry, KeyBinding, KeySequence};
+use fyler_core::options::SortKey;
 use fyler_core::pane::{FocusDirection, PaneAction, PaneId, PaneLayout, SplitDirection};
 use fyler_core::path::TreePath;
 use fyler_core::report::{ApplyProgress, CommitReport, OpOutcome, OpResult};
@@ -83,6 +84,12 @@ struct PaneSession {
     /// `NavigateParent`の意味論をhistory backへ切り替える判定に使う
     /// (`finish_session_root_change`が`RootChangeIntent`に応じて更新する)。
     root_entered_via_link: bool,
+    /// config由来の既定ソート`(key, reverse)`。pane作成時に渡され、Downloads既知
+    /// フォルダの自動既定を適用しないルートで使う基準値(root変更時も参照する)。
+    config_sort: (SortKey, bool),
+    /// このpaneで`:sort`が明示実行されたか。`true`のときはDownloadsの自動既定を
+    /// 適用しない(ユーザー指定が勝つ)。セッション中はsticky(root変更でクリアしない)。
+    sort_explicit: bool,
 }
 
 /// [`PaneSession::dir_size_job`] の1エントリ。完了イベントの`cancel`との
@@ -212,6 +219,9 @@ enum LoaderKind {
     Root {
         cursor_target: Option<OsString>,
         intent: RootChangeIntent,
+        /// scanに使ったソート設定。ルート確定時に同じ値をSaveControllerへ適用し、
+        /// scan時と表示時のずれ(二重計算)を防ぐ。
+        scan_options: ScanOptions,
     },
     Directory {
         dir: TreePath,
@@ -242,6 +252,63 @@ impl LoaderOwner {
     }
 }
 
+/// Explorerは`Downloads`既知フォルダを更新日時の降順で既定表示する。ルートがその
+/// 既知フォルダなら既定ソートを`date`降順`(SortKey::Date, true)`にし、それ以外は
+/// `config_default`をそのまま使う。
+///
+/// `root`・`downloads`はいずれも[`normalize_root`]済みの絶対パス前提。既知フォルダ解決
+/// だけがプラットフォーム依存で、`downloads`が`None`(非Windows / 解決失敗)なら常に
+/// `config_default`を返す。パス比較はWindowsで大小無視、非Windowsで厳密一致とし、
+/// 比較ロジックはこの関数(と補助の[`root_paths_equal`])に閉じ込める。
+fn default_sort_for_root(
+    root: &Path,
+    downloads: Option<&Path>,
+    config_default: (SortKey, bool),
+) -> (SortKey, bool) {
+    match downloads {
+        Some(downloads) if root_paths_equal(root, downloads) => (SortKey::Date, true),
+        _ => config_default,
+    }
+}
+
+/// [`default_sort_for_root`]専用のルートパス比較。Windowsは大小無視(NTFS/既定の
+/// 大小無視挙動に合わせる)、非Windowsは厳密一致。
+#[cfg(windows)]
+fn root_paths_equal(a: &Path, b: &Path) -> bool {
+    a.as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn root_paths_equal(a: &Path, b: &Path) -> bool {
+    a == b
+}
+
+/// pane作成・root変更で使う、最終的な[`ScanOptions`]を決める配線用ヘルパ。
+///
+/// `sort_explicit`(このpaneで`:sort`が明示実行された)なら`base`をそのまま使い、
+/// そうでなければ[`default_sort_for_root`]でDownloadsの自動既定を適用して`key`/`reverse`
+/// だけ差し替える(`show_hidden`/`sort`は維持)。scan時と表示確定時で同じ結果を得るため、
+/// この関数を単一の決定点として両者から呼ぶ。
+fn resolve_scan_options(
+    sort_explicit: bool,
+    base: ScanOptions,
+    root: &Path,
+    downloads: Option<&Path>,
+    config_sort: (SortKey, bool),
+) -> ScanOptions {
+    if sort_explicit {
+        return base;
+    }
+    let (key, reverse) = default_sort_for_root(root, downloads, config_sort);
+    ScanOptions {
+        key,
+        reverse,
+        ..base
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_pane(
     runtime: &tokio::runtime::Runtime,
@@ -250,11 +317,22 @@ fn create_pane(
     nvim_exe: &Path,
     bindings: &[KeyBinding],
     scan_options: ScanOptions,
+    config_sort: (SortKey, bool),
+    sort_explicit: bool,
     shared_ids: Arc<Mutex<IdAllocator>>,
     app_event_tx: &CountingSender<AppEvent>,
     nvim_diagnostics: Option<&[String]>,
     restored: Option<&SessionPane>,
 ) -> anyhow::Result<PaneSession> {
+    // Downloads既知フォルダの自動既定を適用する(明示`:sort`されていないpaneのみ)。
+    // 以降のscanとSaveControllerの両方でこの同一値を使い、二重計算を避ける。
+    let scan_options = resolve_scan_options(
+        sort_explicit,
+        scan_options,
+        &root,
+        fyler_fsops::known_folders::downloads_dir(),
+        config_sort,
+    );
     // nvim起動はflaky回避のため呼び出し元イベントループで必ず直列に行う。
     let (engine, mut engine_events) = runtime
         .block_on(NvimEngine::start(NvimConfig {
@@ -381,6 +459,8 @@ fn create_pane(
         computed_dir_sizes: HashMap::new(),
         dir_size_job: None,
         root_entered_via_link: false,
+        config_sort,
+        sort_explicit,
     })
 }
 
@@ -571,6 +651,8 @@ pub(super) fn run() -> anyhow::Result<()> {
         key: config.sort_key,
         reverse: config.sort_reverse,
     };
+    // config由来のソート既定。Downloads自動既定を適用しないpane/rootで使う基準値。
+    let config_sort = (config.sort_key, config.sort_reverse);
     let bindings = Arc::new(config.bindings);
     let gui_options = GuiOptions {
         confirm_detail: config.confirm_detail,
@@ -639,6 +721,9 @@ pub(super) fn run() -> anyhow::Result<()> {
         }
         let restored_hint = restored.filter(|pane| pane.root == candidate);
         let pane_options = restored.map_or(scan_options, |pane| pane.scan_options);
+        // 復元pane別scan_optionsを使う場合は明示指定扱い(復元値が勝つ)。それ以外は
+        // Downloadsの自動既定を適用する。
+        let sort_explicit = restored.is_some();
         let created = create_pane(
             &runtime,
             id,
@@ -646,6 +731,8 @@ pub(super) fn run() -> anyhow::Result<()> {
             &nvim_exe,
             &bindings,
             pane_options,
+            config_sort,
+            sort_explicit,
             Arc::clone(&shared_ids),
             &app_event_tx,
             Some(&resolved_nvim.diagnostics),
@@ -667,6 +754,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                 &nvim_exe,
                 &bindings,
                 pane_options,
+                config_sort,
+                false,
                 Arc::clone(&shared_ids),
                 &app_event_tx,
                 Some(&resolved_nvim.diagnostics),
@@ -694,6 +783,8 @@ pub(super) fn run() -> anyhow::Result<()> {
                 &nvim_exe,
                 &bindings,
                 scan_options,
+                config_sort,
+                false,
                 Arc::clone(&shared_ids),
                 &app_event_tx,
                 Some(&resolved_nvim.diagnostics),
@@ -963,6 +1054,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                             &nvim_exe,
                             &bindings,
                             scan_options,
+                            config_sort,
                             &shared_ids,
                             &event_tx,
                             &gui_event_tx,
@@ -2499,6 +2591,9 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             continue;
                                         }
                                     };
+                                // 明示`:sort`が成立したのでDownloadsの自動既定を以後適用しない
+                                // (セッション中はsticky。root変更でもクリアしない)。
+                                session.sort_explicit = true;
                                 // 並び替えはrescanでbaselineが変わり得るため、カーソル行dir
                                 // サイズのoverlayを破棄する(issue #38フォローアップ、案B)。
                                 session.computed_dir_sizes.clear();
@@ -3606,6 +3701,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                         LoaderKind::Root {
                                             cursor_target,
                                             intent,
+                                            scan_options,
                                         } => {
                                             finish_session_root_change(
                                                 pane_id,
@@ -3613,6 +3709,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                                 cursor_target.as_deref(),
                                                 intent,
                                                 baseline,
+                                                scan_options,
                                                 session,
                                                 &gui_event_tx,
                                                 &mut git,
@@ -4651,6 +4748,7 @@ fn handle_pane_action(
     nvim_exe: &Path,
     bindings: &[KeyBinding],
     scan_options: ScanOptions,
+    config_sort: (SortKey, bool),
     shared_ids: &Arc<Mutex<IdAllocator>>,
     app_event_tx: &CountingSender<AppEvent>,
     gui_event_tx: &CountingSender<GuiEvent>,
@@ -4697,6 +4795,8 @@ fn handle_pane_action(
                 nvim_exe,
                 bindings,
                 scan_options,
+                config_sort,
+                false,
                 Arc::clone(shared_ids),
                 app_event_tx,
                 None,
@@ -5501,6 +5601,15 @@ fn request_session_root_change(
         title: "Loading folder".to_owned(),
         path: new_root.clone(),
     })?;
+    // sort_explicitでなければDownloadsの自動既定を適用する。scan時とルート確定後の
+    // SaveControllerへ同一値を運ぶため、ここで一度だけ決めてLoaderKind::Rootに載せる。
+    let scan_options = resolve_scan_options(
+        session.sort_explicit,
+        session.save_controller.scan_options(),
+        &new_root,
+        fyler_fsops::known_folders::downloads_dir(),
+        session.config_sort,
+    );
     *dialog_owner = Some(pane_id);
     *loader_owner = Some(LoaderOwner {
         pane_id,
@@ -5508,11 +5617,11 @@ fn request_session_root_change(
         kind: LoaderKind::Root {
             cursor_target,
             intent,
+            scan_options,
         },
         cancel: Arc::clone(&cancel),
     });
 
-    let scan_options = session.save_controller.scan_options();
     let worker_ids = Arc::clone(shared_ids);
     let worker_event_tx = app_event_tx.clone();
     let worker_root = new_root.clone();
@@ -6023,6 +6132,7 @@ fn finish_session_root_change(
     cursor_target: Option<&OsStr>,
     intent: RootChangeIntent,
     new_baseline: BaselineTree,
+    scan_options: ScanOptions,
     session: &mut PaneSession,
     gui_event_tx: &CountingSender<GuiEvent>,
     git: &mut GitRefresher,
@@ -6056,6 +6166,9 @@ fn finish_session_root_change(
         )?;
         return Ok(());
     }
+    // scan時に使ったソート設定をそのまま適用し、scanと表示のずれを防ぐ
+    // (sort_explicitのpaneでは現状値と同一なので実質no-op)。
+    session.save_controller.set_scan_options(scan_options);
     match intent {
         RootChangeIntent::Normal => {
             session.save_controller.collapse_all_dirs();
@@ -6356,6 +6469,97 @@ fn should_defer_external_change(applying: bool, transferring: bool, loading: boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use fyler_core::options::SortOrder;
+
+    #[test]
+    fn downloads_root_defaults_to_date_descending() {
+        let downloads = Path::new("/home/u/Downloads");
+        let config = (SortKey::Name, false);
+        assert_eq!(
+            default_sort_for_root(downloads, Some(downloads), config),
+            (SortKey::Date, true)
+        );
+    }
+
+    #[test]
+    fn non_downloads_root_uses_config_default() {
+        let downloads = Path::new("/home/u/Downloads");
+        let other = Path::new("/home/u/Documents");
+        let config = (SortKey::Size, true);
+        assert_eq!(
+            default_sort_for_root(other, Some(downloads), config),
+            config
+        );
+    }
+
+    #[test]
+    fn unresolved_downloads_uses_config_default() {
+        let root = Path::new("/home/u/Downloads");
+        let config = (SortKey::Name, false);
+        assert_eq!(default_sort_for_root(root, None, config), config);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn downloads_root_matches_case_insensitively_on_windows() {
+        let downloads = Path::new(r"C:\Users\u\Downloads");
+        let root = Path::new(r"c:\users\u\downloads");
+        let config = (SortKey::Name, false);
+        assert_eq!(
+            default_sort_for_root(root, Some(downloads), config),
+            (SortKey::Date, true)
+        );
+    }
+
+    #[test]
+    fn explicit_sort_keeps_base_even_in_downloads() {
+        let downloads = Path::new("/home/u/Downloads");
+        let base = ScanOptions {
+            show_hidden: true,
+            sort: SortOrder::Mixed,
+            key: SortKey::Name,
+            reverse: false,
+        };
+        let config = (SortKey::Name, false);
+        assert_eq!(
+            resolve_scan_options(true, base, downloads, Some(downloads), config),
+            base
+        );
+    }
+
+    #[test]
+    fn implicit_sort_applies_downloads_default_preserving_hidden_and_order() {
+        let downloads = Path::new("/home/u/Downloads");
+        let base = ScanOptions {
+            show_hidden: true,
+            sort: SortOrder::Mixed,
+            key: SortKey::Name,
+            reverse: false,
+        };
+        let config = (SortKey::Name, false);
+        let resolved = resolve_scan_options(false, base, downloads, Some(downloads), config);
+        assert_eq!(resolved.key, SortKey::Date);
+        assert!(resolved.reverse);
+        assert!(resolved.show_hidden);
+        assert_eq!(resolved.sort, SortOrder::Mixed);
+    }
+
+    #[test]
+    fn implicit_sort_outside_downloads_uses_config() {
+        let downloads = Path::new("/home/u/Downloads");
+        let root = Path::new("/home/u/Documents");
+        let base = ScanOptions {
+            show_hidden: false,
+            sort: SortOrder::DirsFirst,
+            key: SortKey::Name,
+            reverse: false,
+        };
+        let config = (SortKey::Size, true);
+        let resolved = resolve_scan_options(false, base, root, Some(downloads), config);
+        assert_eq!(resolved.key, SortKey::Size);
+        assert!(resolved.reverse);
+    }
 
     struct ProbeEngine;
 

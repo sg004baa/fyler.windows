@@ -99,6 +99,13 @@ startup. The `toggle_hidden` action (`g.` by default) can also change this while
 
 `sort_reverse = true` reverses the selected key. Directory grouping remains controlled separately
 by `sort`. At runtime, use `:sort name|date|size|ext`; add `!` to the command for descending order.
+
+When a pane's root is your Windows **Downloads** known folder, fyler matches Explorer and defaults
+that pane to date order, newest first, instead of `sort_key`/`sort_reverse`. This applies only to
+the Downloads folder. Once you run `:sort` in a pane, your explicit choice wins for the rest of the
+session and the Downloads default is no longer applied there, even after navigating away and back.
+On non-Windows platforms there is no Downloads known folder, so this default never applies.
+
 ### Statusline
 
 The bottom statusline is built from two ordered clusters. `[statusline].left` fills from the left
