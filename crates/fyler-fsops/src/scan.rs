@@ -931,7 +931,6 @@ struct ScannedEntry {
     path: PathBuf,
     file_name: OsString,
     name: String,
-    sort_key: String,
     extension_key: String,
     kind: EntryKind,
     meta: EntryMeta,
@@ -1187,15 +1186,13 @@ fn read_sorted_entries_impl(
             continue;
         };
         let name = name.to_owned();
-        let sort_key = name.to_lowercase();
-        let extension_key = extension_sort_key(&sort_key).to_owned();
+        let extension_key = extension_sort_key(&name).to_owned();
         let kind = kind_from_metadata(&metadata);
         let meta = meta_from_metadata(&metadata);
         entries.push(ScannedEntry {
             path,
             file_name,
             name,
-            sort_key,
             extension_key,
             kind,
             meta,
@@ -1223,7 +1220,7 @@ fn read_sorted_entries_impl(
 fn compare_scanned(left: &ScannedEntry, right: &ScannedEntry, options: &ScanOptions) -> Ordering {
     kind_order(left, right, options)
         .then_with(|| compare_sort_key(left, right, options))
-        .then_with(|| natural_cmp_bytes(left.sort_key.as_bytes(), right.sort_key.as_bytes()))
+        .then_with(|| explorer_name_cmp(&left.name, &right.name))
         .then_with(|| left.file_name.cmp(&right.file_name))
 }
 
@@ -1240,14 +1237,14 @@ fn kind_order(left: &ScannedEntry, right: &ScannedEntry, options: &ScanOptions) 
 
 fn compare_sort_key(left: &ScannedEntry, right: &ScannedEntry, options: &ScanOptions) -> Ordering {
     let ordering = match options.key {
-        SortKey::Name => natural_cmp_bytes(left.sort_key.as_bytes(), right.sort_key.as_bytes()),
+        SortKey::Name => explorer_name_cmp(&left.name, &right.name),
         SortKey::Date => {
             return compare_optional_last(left.meta.modified, right.meta.modified, options.reverse);
         }
         SortKey::Size => {
             return compare_optional_last(left.meta.size, right.meta.size, options.reverse);
         }
-        SortKey::Extension => left.extension_key.cmp(&right.extension_key),
+        SortKey::Extension => explorer_name_cmp(&left.extension_key, &right.extension_key),
     };
 
     if options.reverse {
@@ -1273,9 +1270,12 @@ fn compare_optional_last<T: Ord>(left: Option<T>, right: Option<T>, reverse: boo
     }
 }
 
-fn extension_sort_key(lowercase_name: &str) -> &str {
-    match lowercase_name.rfind('.') {
-        Some(index) if index > 0 => &lowercase_name[index + 1..],
+/// 表示名から拡張子(最後の`.`以降)を取り出す。先頭の`.`はdotfileであって
+/// 拡張子ではないので空を返す。大小は比較側(`explorer_name_cmp`)で無視するため、
+/// ここでは元の名前のまま切り出す(小文字化しない)。
+fn extension_sort_key(name: &str) -> &str {
+    match name.rfind('.') {
+        Some(index) if index > 0 => &name[index + 1..],
         _ => "",
     }
 }
@@ -1298,65 +1298,142 @@ pub(crate) fn is_hidden(file_name: &OsStr, metadata: &Metadata) -> bool {
     }
 }
 
-#[cfg(test)]
-fn natural_cmp_case_insensitive(left: &OsStr, right: &OsStr) -> Ordering {
-    let left = left.to_string_lossy().to_lowercase();
-    let right = right.to_string_lossy().to_lowercase();
-    natural_cmp_bytes(left.as_bytes(), right.as_bytes())
+/// Windows Explorer と同じ表示順で名前を比較する(唯一の名前比較入口)。
+///
+/// Windows では Explorer 自身が使う `StrCmpLogicalW`(shlwapi の logical ordering)を
+/// 直接呼ぶ。これが「Explorer と同じ順」であることの根拠なので独自ロジックで上書きしない。
+/// それ以外のプラットフォーム(Linux 開発 / CI)では同じ意味論の純Rust複製 [`logical_cmp`]
+/// を使う。両者が一致することは `#[cfg(windows)]` のパリティテストで担保する。
+#[cfg(windows)]
+pub(crate) fn explorer_name_cmp(left: &str, right: &str) -> Ordering {
+    use std::iter::once;
+
+    use windows::Win32::UI::Shell::StrCmpLogicalW;
+    use windows::core::PCWSTR;
+
+    // UTF-16 + NUL 終端に変換して渡す。ローカル変数が生存する間だけポインタを使う。
+    let left: Vec<u16> = left.encode_utf16().chain(once(0)).collect();
+    let right: Vec<u16> = right.encode_utf16().chain(once(0)).collect();
+    // SAFETY: 両バッファは NUL 終端済みで、呼び出し中は生存している。
+    let diff = unsafe {
+        StrCmpLogicalW(
+            PCWSTR::from_raw(left.as_ptr()),
+            PCWSTR::from_raw(right.as_ptr()),
+        )
+    };
+    diff.cmp(&0)
 }
 
-fn natural_cmp_bytes(mut left: &[u8], mut right: &[u8]) -> Ordering {
-    while !left.is_empty() && !right.is_empty() {
-        let left_is_digit = left[0].is_ascii_digit();
-        let right_is_digit = right[0].is_ascii_digit();
-        if left_is_digit && right_is_digit {
-            let left_end = left
-                .iter()
-                .position(|byte| !byte.is_ascii_digit())
-                .unwrap_or(left.len());
-            let right_end = right
-                .iter()
-                .position(|byte| !byte.is_ascii_digit())
-                .unwrap_or(right.len());
-            let left_digits = &left[..left_end];
-            let right_digits = &right[..right_end];
-            let left_significant =
-                &left_digits[left_digits.iter().take_while(|byte| **byte == b'0').count()..];
-            let right_significant = &right_digits[right_digits
-                .iter()
-                .take_while(|byte| **byte == b'0')
-                .count()..];
-            let ordering = left_significant
-                .len()
-                .cmp(&right_significant.len())
-                .then_with(|| left_significant.cmp(right_significant));
-            if ordering != Ordering::Equal {
-                return ordering;
-            }
-            left = &left[left_end..];
-            right = &right[right_end..];
-            continue;
-        }
+/// [`explorer_name_cmp`] を参照。非Windowsでは純Rust複製を使う。
+#[cfg(not(windows))]
+pub(crate) fn explorer_name_cmp(left: &str, right: &str) -> Ordering {
+    logical_cmp(left, right)
+}
 
-        let left_end = left
-            .iter()
-            .position(|byte| byte.is_ascii_digit())
-            .unwrap_or(left.len());
-        let right_end = right
-            .iter()
-            .position(|byte| byte.is_ascii_digit())
-            .unwrap_or(right.len());
-        let left_end = left_end.max(1);
-        let right_end = right_end.max(1);
-        let ordering = left[..left_end].cmp(&right[..right_end]);
-        if ordering != Ordering::Equal {
-            return ordering;
+/// `StrCmpLogicalW` と同じ意味論の純Rust複製。
+///
+/// 正典は Wine `dlls/shlwapi/string.c` の `StrCmpLogicalW`(Wine のテストは実Windowsに対して
+/// 検証されている)。全体構造(数字ラン検出・数字が非数字より先・数値比較で先頭ゼロを無視)は
+/// Wine を踏襲しつつ、非数字文字の比較だけは Wine の単純なコードポイント比較ではなく
+/// Explorer の照合順を近似した [`collation_rank`] を用いる(Wine の `ChrCmpIW` は
+/// `~` などを英字の後ろに置いてしまい実Explorerと食い違うため)。
+///
+/// 満たす意味論:
+/// 1. 大文字小文字を区別しない(ASCII)。
+/// 2. 数字ランは数値として比較(先頭ゼロは値に影響しない。値が等しければ次の文字へ進む)。
+/// 3. 片方が数字・もう片方が非数字なら、数字側が必ず先。
+/// 4. 非数字文字は [`collation_rank`] の照合順(記号 < 数字 < 英字 < 非ASCII)で1文字ずつ比較。
+/// 5. 一方が他方のプレフィックスなら短い方が先。
+///
+/// 非Windowsでは常に、Windowsではパリティテスト(`cfg(test)`)からのみ使うので、
+/// その両方でコンパイルされるよう `any(not(windows), test)` でゲートする。
+#[cfg(any(not(windows), test))]
+pub(crate) fn logical_cmp(left: &str, right: &str) -> Ordering {
+    let mut left = left;
+    let mut right = right;
+    // 値は等しいが先頭ゼロ数が違う数字ランの最終タイブレーク。Explorer は値が同じなら
+    // 先頭ゼロの少ない方(= "1" < "01")を先にする。最初に現れた差だけを覚え、
+    // 他が全て等しいときにのみ適用する(遅延タイブレーク)。
+    let mut zero_tiebreak = Ordering::Equal;
+
+    while let (Some(left_char), Some(right_char)) = (left.chars().next(), right.chars().next()) {
+        match (left_char.is_ascii_digit(), right_char.is_ascii_digit()) {
+            (true, true) => {
+                let left_run = digit_run_len(left);
+                let right_run = digit_run_len(right);
+                let (left_sig, left_zeros) = split_leading_zeros(&left[..left_run]);
+                let (right_sig, right_zeros) = split_leading_zeros(&right[..right_run]);
+                // 有効桁が長い方が数値として大きい。桁数が同じなら辞書順=数値順。
+                let ordering = left_sig
+                    .len()
+                    .cmp(&right_sig.len())
+                    .then_with(|| left_sig.cmp(right_sig));
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+                if zero_tiebreak == Ordering::Equal {
+                    zero_tiebreak = left_zeros.cmp(&right_zeros);
+                }
+                left = &left[left_run..];
+                right = &right[right_run..];
+            }
+            // 規則3: 数字側が必ず先。
+            (true, false) => return Ordering::Less,
+            (false, true) => return Ordering::Greater,
+            (false, false) => {
+                let ordering = collation_rank(left_char).cmp(&collation_rank(right_char));
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+                left = &left[left_char.len_utf8()..];
+                right = &right[right_char.len_utf8()..];
+            }
         }
-        left = &left[left_end..];
-        right = &right[right_end..];
     }
 
-    left.len().cmp(&right.len())
+    // 規則5: プレフィックスは短い方が先。長さが同じなら先頭ゼロのタイブレーク。
+    match (left.is_empty(), right.is_empty()) {
+        (true, true) => zero_tiebreak,
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => unreachable!("loop only exits when a side is exhausted"),
+    }
+}
+
+/// 先頭から連続する ASCII 数字(1バイト文字)のバイト長を返す。
+#[cfg(any(not(windows), test))]
+fn digit_run_len(text: &str) -> usize {
+    text.bytes().take_while(u8::is_ascii_digit).count()
+}
+
+/// 数字ランを (有効桁, 先頭ゼロ数) に分ける。全桁ゼロなら有効桁は空(値0)。
+#[cfg(any(not(windows), test))]
+fn split_leading_zeros(digits: &str) -> (&str, usize) {
+    let zeros = digits.bytes().take_while(|byte| *byte == b'0').count();
+    (&digits[zeros..], zeros)
+}
+
+/// Explorer の照合順を近似した1文字ランク。小さいほど先に並ぶ。
+///
+/// カテゴリを主キー、コードポイント(英字は小文字畳み込み)を副キーにする表駆動:
+/// - `0` 空白・記号・句読点(ASCII 非英数字): Windows の word sort では記号類が英数字より
+///   前に来る。これにより `'{' '|' '}' '~'`(0x7B-0x7E)のように英字より大きい
+///   コードポイントの記号も英字の前へ移り、`"~temp" < "alpha"` が成り立つ。
+/// - `1` ASCII 数字: 記号より後・英字より前。実際には数字ランは数値比較され、
+///   数字vs非数字は規則3で決まるためこの枝は到達しないが、全順序の一貫性のため定義する。
+/// - `2` ASCII 英字: 大小無視で小文字コードポイント順。記号・数字より後。
+/// - `3` 非ASCII: 全順序を満たせばよいのでコードポイント順。英字の後ろに置く。
+#[cfg(any(not(windows), test))]
+fn collation_rank(character: char) -> (u8, u32) {
+    if character.is_ascii_digit() {
+        (1, character as u32)
+    } else if character.is_ascii_alphabetic() {
+        (2, character.to_ascii_lowercase() as u32)
+    } else if character.is_ascii() {
+        (0, character as u32)
+    } else {
+        (3, character as u32)
+    }
 }
 
 fn meta_from_metadata(metadata: &Metadata) -> EntryMeta {
@@ -1456,13 +1533,11 @@ mod tests {
         size: Option<u64>,
         modified_seconds: Option<u64>,
     ) -> ScannedEntry {
-        let sort_key = name.to_lowercase();
-        let extension_key = extension_sort_key(&sort_key).to_owned();
+        let extension_key = extension_sort_key(name).to_owned();
         ScannedEntry {
             path: PathBuf::from(name),
             file_name: OsString::from(name),
             name: name.to_owned(),
-            sort_key,
             extension_key,
             kind,
             meta: EntryMeta {
@@ -2248,15 +2323,229 @@ mod tests {
     }
 
     #[test]
-    fn natural_sort_is_case_insensitive_and_numeric_aware() {
+    fn explorer_name_cmp_is_case_insensitive_and_numeric_aware() {
+        assert_eq!(explorer_name_cmp("FILE2.txt", "file10.TXT"), Ordering::Less);
+        assert_eq!(explorer_name_cmp("b.txt", "A.txt"), Ordering::Greater);
+    }
+
+    #[test]
+    fn explorer_name_order_matches_windows_logical_ordering() {
+        // 純Rust複製 (logical_cmp) を経由する非Windows側の回帰。Windows では
+        // explorer_name_cmp は StrCmpLogicalW を直接呼び、両者一致はパリティテストが担保する。
+        let names_only = |names: &[&str]| {
+            let entries = names
+                .iter()
+                .map(|name| scanned_entry(name, EntryKind::File, Some(1), Some(1)))
+                .collect::<Vec<_>>();
+            sorted_names(
+                entries,
+                ScanOptions {
+                    sort: SortOrder::Mixed,
+                    key: SortKey::Name,
+                    ..ScanOptions::default()
+                },
+            )
+        };
+
+        // 数値比較: file2 < file10。
         assert_eq!(
-            natural_cmp_case_insensitive(OsStr::new("FILE2.txt"), OsStr::new("file10.TXT")),
-            Ordering::Less
+            names_only(&["file10.txt", "file2.txt"]),
+            ["file2.txt", "file10.txt"]
         );
+        // 規則3: 数字は非数字より先(旧バイト列比較はこの規則が無く落ちる)。
+        assert_eq!(names_only(&["!.txt", "1.txt"]), ["1.txt", "!.txt"]);
+        // 照合順: '~'(0x7E) は英字より先(旧実装は生コードポイント順で英字の後ろに置き落ちる)。
         assert_eq!(
-            natural_cmp_case_insensitive(OsStr::new("b.txt"), OsStr::new("A.txt")),
-            Ordering::Greater
+            names_only(&["alpha.txt", "~temp.txt"]),
+            ["~temp.txt", "alpha.txt"]
         );
+        // 先頭ゼロ: 値が同じなら先頭ゼロの少ない方が先(安定した順序)。
+        assert_eq!(names_only(&["a01", "a1"]), ["a1", "a01"]);
+        // 大小混在: 大小無視で a < B。
+        assert_eq!(names_only(&["B.txt", "a.txt"]), ["a.txt", "B.txt"]);
+        // C:\Users\{user} 相当の実例。規則3(数字 < 非数字)により数字始まりの
+        // "3D Objects" が記号始まりより前に来て、記号どうしは照合ランク('.'<'_')で
+        // 決まり、残りは英字。数字始まり → 記号 → 英字 の並びは logical_cmp が唯一に決める。
+        assert_eq!(
+            names_only(&[
+                "Videos",
+                "AppData",
+                "3D Objects",
+                ".ssh",
+                "OneDrive - Contoso",
+                "_scratch",
+                "Documents",
+                "Desktop",
+            ]),
+            [
+                "3D Objects",
+                ".ssh",
+                "_scratch",
+                "AppData",
+                "Desktop",
+                "Documents",
+                "OneDrive - Contoso",
+                "Videos",
+            ]
+        );
+    }
+
+    #[test]
+    fn logical_cmp_regressions_fail_under_legacy_byte_order() {
+        // これらのケースは旧バイト列比較(小文字化バイト列 + 数字ラン数値比較、
+        // ただし「数字 < 非数字」ルールと照合ランクが無い)では逆順になることを、
+        // 旧ロジックを局所再現した legacy_cmp との対比で自分で確認する。
+        fn legacy_cmp(left: &str, right: &str) -> Ordering {
+            fn bytes_cmp(mut left: &[u8], mut right: &[u8]) -> Ordering {
+                while !left.is_empty() && !right.is_empty() {
+                    let both_digits = left[0].is_ascii_digit() && right[0].is_ascii_digit();
+                    if both_digits {
+                        let le = left
+                            .iter()
+                            .position(|b| !b.is_ascii_digit())
+                            .unwrap_or(left.len());
+                        let re = right
+                            .iter()
+                            .position(|b| !b.is_ascii_digit())
+                            .unwrap_or(right.len());
+                        let ls = &left[left[..le].iter().take_while(|b| **b == b'0').count()..le];
+                        let rs = &right[right[..re].iter().take_while(|b| **b == b'0').count()..re];
+                        let ord = ls.len().cmp(&rs.len()).then_with(|| ls.cmp(rs));
+                        if ord != Ordering::Equal {
+                            return ord;
+                        }
+                        left = &left[le..];
+                        right = &right[re..];
+                        continue;
+                    }
+                    let le = left
+                        .iter()
+                        .position(u8::is_ascii_digit)
+                        .unwrap_or(left.len())
+                        .max(1);
+                    let re = right
+                        .iter()
+                        .position(u8::is_ascii_digit)
+                        .unwrap_or(right.len())
+                        .max(1);
+                    let ord = left[..le].cmp(&right[..re]);
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                    left = &left[le..];
+                    right = &right[re..];
+                }
+                left.len().cmp(&right.len())
+            }
+            bytes_cmp(
+                left.to_lowercase().as_bytes(),
+                right.to_lowercase().as_bytes(),
+            )
+        }
+
+        // 旧ロジックでは '!'(0x21) < '1'(0x31) なので "!.txt" < "1.txt"(Explorerと逆)。
+        assert_eq!(legacy_cmp("1.txt", "!.txt"), Ordering::Greater);
+        assert_eq!(logical_cmp("1.txt", "!.txt"), Ordering::Less);
+        // 旧ロジックでは '~'(0x7E) > 'a'(0x61) なので "~temp" > "alpha"(Explorerと逆)。
+        assert_eq!(legacy_cmp("~temp.txt", "alpha.txt"), Ordering::Greater);
+        assert_eq!(logical_cmp("~temp.txt", "alpha.txt"), Ordering::Less);
+    }
+
+    /// Windows CI が審判: 純Rust複製 `logical_cmp` が実 `StrCmpLogicalW` と
+    /// 全ペアで符号一致することを確認する。Linux では走らないため、ここが食い違えば
+    /// 実データでランク表を直す前提。コーパスは実ファイル名で現れる文字に絞る
+    /// (制御文字・サロゲートは入れない)。
+    #[cfg(windows)]
+    #[test]
+    fn logical_cmp_matches_strcmplogicalw_for_corpus() {
+        const CORPUS: &[&str] = &[
+            "a",
+            "A",
+            "b",
+            "B",
+            "z",
+            "Z",
+            "ab",
+            "aB",
+            "Ab",
+            "abc",
+            "0",
+            "1",
+            "2",
+            "9",
+            "10",
+            "20",
+            "100",
+            "01",
+            "001",
+            "010",
+            "a1",
+            "a2",
+            "a10",
+            "a01",
+            "a1b",
+            "a2b",
+            "file1",
+            "file2",
+            "file10",
+            "file10.txt",
+            "file2.txt",
+            "File2.txt",
+            "1.txt",
+            "!.txt",
+            "10.txt",
+            " ",
+            " a",
+            "a b",
+            "a  b",
+            ".",
+            ".ssh",
+            ".profile",
+            "_scratch",
+            "__init__",
+            "-",
+            "- a",
+            "a-b",
+            "a_b",
+            "a.b",
+            "(x)",
+            "[y]",
+            "{z}",
+            "~temp",
+            "#tag",
+            "@home",
+            "a+b",
+            "a=b",
+            "it's",
+            "a&b",
+            "3D Objects",
+            "AppData",
+            "Desktop",
+            "Documents",
+            "OneDrive - Contoso",
+            "Videos",
+            "archive.tar",
+            "archive.tar.gz",
+            "あ",
+            "い",
+            "ア",
+            "日本語",
+            "café",
+            "naïve",
+            "a あ",
+            "テスト1",
+            "テスト10",
+        ];
+        for &left in CORPUS {
+            for &right in CORPUS {
+                let ours = logical_cmp(left, right);
+                let native = explorer_name_cmp(left, right);
+                assert_eq!(
+                    ours, native,
+                    "logical_cmp({left:?}, {right:?}) = {ours:?} but StrCmpLogicalW = {native:?}"
+                );
+            }
+        }
     }
 
     #[test]
