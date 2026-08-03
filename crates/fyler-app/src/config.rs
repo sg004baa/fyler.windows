@@ -1,10 +1,12 @@
-//! fyler自身の設定・状態ファイル。
+//! fyler自身の設定・状態ファイルと、その置き場所の決定。
 //!
 //! - `config.toml`: ユーザー所有。読み取り専用(fylerは書かない)
 //! - `recent.toml`: fylerが書く唯一の永続ファイル(最近使ったルート)
-//! - 置き場所: Windows `%APPDATA%\fyler\`、それ以外
-//!   `$XDG_CONFIG_HOME/fyler/` または `~/.config/fyler/`
-//! - 環境変数`FYLER_CONFIG_DIR`があれば最優先する(テスト用)
+//! - 設定ディレクトリ: `$XDG_CONFIG_HOME/fyler/`。未設定ならWindows `%APPDATA%\fyler\`、
+//!   それ以外は `~/.config/fyler/`
+//! - 状態ディレクトリ(undoジャーナル・起動エラーログ): `$XDG_STATE_HOME/fyler/`。
+//!   未設定ならWindows `%LOCALAPPDATA%\fyler\`、それ以外は `~/.local/state/fyler/`
+//! - 環境変数`FYLER_CONFIG_DIR`があれば設定ディレクトリに最優先で使う(テスト用)
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -410,27 +412,66 @@ pub fn record_recent_root(root: &Path) -> anyhow::Result<()> {
 }
 
 pub(crate) fn config_dir() -> anyhow::Result<PathBuf> {
-    if let Some(path) = nonempty_env("FYLER_CONFIG_DIR") {
+    resolve_config_dir(nonempty_env)
+}
+
+/// 設定ディレクトリを環境変数から決める。
+///
+/// 優先順は `FYLER_CONFIG_DIR` → `XDG_CONFIG_HOME/fyler` → プラットフォーム既定
+/// (Windowsは `%APPDATA%\fyler`、それ以外は `$HOME/.config/fyler`)。
+fn resolve_config_dir(lookup: impl Fn(&str) -> Option<OsString>) -> anyhow::Result<PathBuf> {
+    if let Some(path) = lookup("FYLER_CONFIG_DIR") {
         return Ok(PathBuf::from(path));
+    }
+    if let Some(path) = lookup("XDG_CONFIG_HOME") {
+        return Ok(PathBuf::from(path).join("fyler"));
     }
 
     #[cfg(windows)]
     {
-        nonempty_env("APPDATA")
+        lookup("APPDATA")
             .map(PathBuf::from)
             .map(|path| path.join("fyler"))
-            .context("APPDATA is not set")
+            .context("Neither XDG_CONFIG_HOME nor APPDATA is set")
     }
 
     #[cfg(not(windows))]
     {
-        if let Some(path) = nonempty_env("XDG_CONFIG_HOME") {
-            return Ok(PathBuf::from(path).join("fyler"));
-        }
-        nonempty_env("HOME")
+        lookup("HOME")
             .map(PathBuf::from)
             .map(|path| path.join(".config").join("fyler"))
             .context("Neither XDG_CONFIG_HOME nor HOME is set")
+    }
+}
+
+/// undoジャーナルや起動エラーログを置く状態ディレクトリ。
+pub(crate) fn state_dir() -> anyhow::Result<PathBuf> {
+    resolve_state_dir(nonempty_env)
+}
+
+/// 状態ディレクトリを環境変数から決める。
+///
+/// 優先順は `XDG_STATE_HOME/fyler` → プラットフォーム既定
+/// (Windowsは `%LOCALAPPDATA%\fyler`、それ以外は `$HOME/.local/state/fyler`)。
+fn resolve_state_dir(lookup: impl Fn(&str) -> Option<OsString>) -> anyhow::Result<PathBuf> {
+    if let Some(path) = lookup("XDG_STATE_HOME") {
+        return Ok(PathBuf::from(path).join("fyler"));
+    }
+
+    #[cfg(windows)]
+    {
+        lookup("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .map(|path| path.join("fyler"))
+            .context("Neither XDG_STATE_HOME nor LOCALAPPDATA is set")
+    }
+
+    #[cfg(not(windows))]
+    {
+        lookup("HOME")
+            .map(PathBuf::from)
+            .map(|path| path.join(".local").join("state").join("fyler"))
+            .context("Neither XDG_STATE_HOME nor HOME is set")
     }
 }
 
@@ -467,6 +508,74 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn config_directory_prefers_the_override_then_xdg_then_the_platform_default() {
+        let lookup = |entries: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                entries
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(*value))
+            }
+        };
+        #[cfg(windows)]
+        let (home_key, home_value, platform_default) = (
+            "APPDATA",
+            r"C:\Users\u\AppData\Roaming",
+            r"C:\Users\u\AppData\Roaming\fyler",
+        );
+        #[cfg(not(windows))]
+        let (home_key, home_value, platform_default) = ("HOME", "/home/u", "/home/u/.config/fyler");
+
+        assert_eq!(
+            resolve_config_dir(lookup(&[
+                ("FYLER_CONFIG_DIR", "/override"),
+                ("XDG_CONFIG_HOME", "/xdg"),
+            ]))
+            .unwrap(),
+            PathBuf::from("/override")
+        );
+        assert_eq!(
+            resolve_config_dir(lookup(&[("XDG_CONFIG_HOME", "/xdg")])).unwrap(),
+            PathBuf::from("/xdg").join("fyler")
+        );
+        assert_eq!(
+            resolve_config_dir(|name: &str| (name == home_key).then(|| OsString::from(home_value)))
+                .unwrap(),
+            PathBuf::from(platform_default)
+        );
+        assert!(resolve_config_dir(|_: &str| None).is_err());
+    }
+
+    #[test]
+    fn state_directory_prefers_xdg_then_the_platform_default() {
+        #[cfg(windows)]
+        let (base_key, base_value, platform_default) = (
+            "LOCALAPPDATA",
+            r"C:\Users\u\AppData\Local",
+            r"C:\Users\u\AppData\Local\fyler",
+        );
+        #[cfg(not(windows))]
+        let (base_key, base_value, platform_default) =
+            ("HOME", "/home/u", "/home/u/.local/state/fyler");
+
+        assert_eq!(
+            resolve_state_dir(|name: &str| match name {
+                "XDG_STATE_HOME" => Some(OsString::from("/xdg-state")),
+                key if key == base_key => Some(OsString::from(base_value)),
+                _ => None,
+            })
+            .unwrap(),
+            PathBuf::from("/xdg-state").join("fyler")
+        );
+        assert_eq!(
+            resolve_state_dir(|name: &str| (name == base_key).then(|| OsString::from(base_value)))
+                .unwrap(),
+            PathBuf::from(platform_default)
+        );
+        assert!(resolve_state_dir(|_: &str| None).is_err());
+    }
 
     struct ConfigDirEnv {
         previous: Option<OsString>,
