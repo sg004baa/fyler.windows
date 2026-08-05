@@ -224,25 +224,7 @@ fn undo_dir() -> anyhow::Result<PathBuf> {
     if let Some(path) = nonempty_env("FYLER_UNDO_DIR") {
         return Ok(PathBuf::from(path));
     }
-
-    #[cfg(windows)]
-    {
-        nonempty_env("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .map(|path| path.join("fyler").join("undo"))
-            .context("LOCALAPPDATA is not set")
-    }
-
-    #[cfg(not(windows))]
-    {
-        if let Some(path) = nonempty_env("XDG_STATE_HOME") {
-            return Ok(PathBuf::from(path).join("fyler").join("undo"));
-        }
-        nonempty_env("HOME")
-            .map(PathBuf::from)
-            .map(|path| path.join(".local").join("state").join("fyler").join("undo"))
-            .context("Neither XDG_STATE_HOME nor HOME is set")
-    }
+    Ok(crate::config::state_dir()?.join("undo"))
 }
 
 fn nonempty_env(name: &str) -> Option<OsString> {

@@ -269,11 +269,10 @@ fn report_startup_error(error: &anyhow::Error) {
 
 /// 早期起動エラーをログファイルへ書き出し、そのパスを返す。書けなければ`None`。
 ///
-/// 保存先は `%LOCALAPPDATA%\fyler`(無ければOSの一時ディレクトリ)。
+/// 保存先は状態ディレクトリ(`$XDG_STATE_HOME\fyler` または `%LOCALAPPDATA%\fyler`)。
+/// 解決できなければOSの一時ディレクトリ。
 fn write_startup_error_log(error: &anyhow::Error) -> Option<PathBuf> {
-    let dir = std::env::var_os("LOCALAPPDATA")
-        .map(|base| PathBuf::from(base).join("fyler"))
-        .unwrap_or_else(std::env::temp_dir);
+    let dir = config::state_dir().unwrap_or_else(|_| std::env::temp_dir());
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join("fyler-startup-error.log");
     std::fs::write(&path, format!("fyler startup error:\n{error:#}\n")).ok()?;

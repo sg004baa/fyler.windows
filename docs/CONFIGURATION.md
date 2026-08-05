@@ -7,9 +7,9 @@ fyler after changing the file.
 
 | Environment | Path |
 |---|---|
+| Any platform, when `XDG_CONFIG_HOME` is set | `$XDG_CONFIG_HOME/fyler/config.toml` |
 | Windows | `%APPDATA%\fyler\config.toml` |
-| Linux and other platforms | `$XDG_CONFIG_HOME/fyler/config.toml` |
-| When `XDG_CONFIG_HOME` is unset | `~/.config/fyler/config.toml` |
+| Linux and other platforms | `~/.config/fyler/config.toml` |
 
 If the file does not exist, fyler starts with the defaults. fyler only reads `config.toml`; it
 does not create or rewrite it.
@@ -19,6 +19,18 @@ For development and testing, `FYLER_CONFIG_DIR` overrides the configuration dire
 
 When a value has the wrong type or is otherwise invalid, fyler falls back where possible and
 ignores only the affected setting. Warnings are shown as in-app messages.
+
+## State directory
+
+The undo journal and the startup error log live in the state directory.
+
+| Environment | Path |
+|---|---|
+| Any platform, when `XDG_STATE_HOME` is set | `$XDG_STATE_HOME/fyler/` |
+| Windows | `%LOCALAPPDATA%\fyler\` |
+| Linux and other platforms | `~/.local/state/fyler/` |
+
+`FYLER_UNDO_DIR` overrides the undo journal directory for development and testing.
 
 ## Complete example
 
