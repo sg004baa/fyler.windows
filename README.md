@@ -15,6 +15,17 @@ fyler.windows は、[fyler.nvim](https://github.com/FylerOrg/fyler.nvim) にイ�
 
 ## インストール
 
+### Scoop
+
+```pwsh
+scoop bucket add sg004baa https://github.com/sg004baa/scoop-bucket
+scoop install sg004baa/fyler
+```
+
+Scoop 版は portable zip をそのまま展開したものです(Neovim 同梱)。`scoop uninstall fyler` ではユーザーデータ(`%APPDATA%\fyler`, `%LOCALAPPDATA%\fyler`)は削除されないため、完全に消す場合は手動で削除してください。
+
+### installer / portable
+
 [GitHub Releases](https://github.com/sg004baa/fyler.windows/releases) から、installer の `fyler-vX.Y.Z-windows-x64-setup.exe`、または portable zip をダウンロードしてください。
 
 アンインストールは Windows の「インストールされているアプリ」から行えます。既定では設定や undo データなどのユーザーデータ(`%APPDATA%\fyler`, `%LOCALAPPDATA%\fyler`)も削除されます。対話アンインストール時は削除確認ダイアログが表示されます(既定は「はい」)。サイレントアンインストール(`/VERYSILENT` 等)ではダイアログは出ず既定で削除されますが、コマンドラインに `/KEEPDATA` を付けた場合はユーザーデータを保持します。確認ダイアログで「はい」を選んだ場合や `/KEEPDATA` を付けなかった場合、これらのフォルダーは自動的に削除されます。
