@@ -16,6 +16,7 @@ pub mod icon;
 pub mod input;
 pub mod modeline;
 pub(crate) mod theme;
+pub mod widgets;
 pub mod tree_view;
 
 pub use app::FylerApp;
