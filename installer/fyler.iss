@@ -10,6 +10,7 @@
 AppId={{93358674-85C3-456A-81DC-DB8BB2EE9A09}
 AppName=fyler
 AppVersion={#AppVersion}
+AppVerName=fyler
 AppPublisher=sg004baa
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
