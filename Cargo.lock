@@ -1362,7 +1362,7 @@ dependencies = [
 
 [[package]]
 name = "fyler-app"
-version = "0.1.11"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "embed-manifest",
@@ -1381,7 +1381,7 @@ dependencies = [
 
 [[package]]
 name = "fyler-core"
-version = "0.1.11"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "thiserror 2.0.21",
@@ -1389,7 +1389,7 @@ dependencies = [
 
 [[package]]
 name = "fyler-engine-nvim"
-version = "0.1.11"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1402,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "fyler-fsops"
-version = "0.1.11"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "fyler-core",
@@ -1417,7 +1417,7 @@ dependencies = [
 
 [[package]]
 name = "fyler-gui"
-version = "0.1.11"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -1428,7 +1428,7 @@ dependencies = [
 
 [[package]]
 name = "fyler-pipeline"
-version = "0.1.11"
+version = "0.2.0"
 dependencies = [
  "fyler-core",
 ]
