@@ -46,13 +46,13 @@ Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\fyler\command";
 
 [Code]
 var
-  // usPostUninstall で参照する、ユーザーデータ削除を実行するかどうかのフラグ。
-  // Pascal Script のグローバル変数はデフォルトで False に初期化されるが、
-  // InitializeUninstall で必ず明示代入するため、その暗黙初期値には依存しない。
+  // Flag controlling whether user data is deleted in usPostUninstall.
+  // Pascal Script globals default to False, but InitializeUninstall always
+  // assigns this explicitly, so that implicit default is not relied upon.
   DeleteUserData: Boolean;
 
-// コマンドライン引数に /KEEPDATA (大文字小文字無視) があるかを調べる。
-// ParamCount / ParamStr は Setup と Uninstall の両方で使える組み込み関数。
+// Check whether /KEEPDATA (case-insensitive) is present on the command line.
+// ParamCount / ParamStr are built-in functions available to Setup and Uninstall.
 function HasKeepDataParam: Boolean;
 var
   I: Integer;
@@ -68,13 +68,12 @@ begin
   end;
 end;
 
-// アンインストール開始時にユーザーデータを削除するかどうかを一度だけ判定する。
-// デフォルトは常に「削除する」(opt-out)。
-//   - /KEEPDATA が付いていれば確認なしで保持する (引数優先)。
-//   - silent アンインストール (UninstallSilent = True) で /KEEPDATA が
-//     なければ削除する。
-//   - 対話アンインストールで /KEEPDATA がなければ MsgBox(MB_YESNO,
-//     デフォルトボタンは第1ボタン = はい) で確認する。
+// Decide once, at uninstall start, whether user data should be deleted.
+// The default is always to delete (opt-out).
+//   - /KEEPDATA keeps data without prompting (argument takes precedence).
+//   - Silent uninstall without /KEEPDATA deletes data.
+//   - Interactive uninstall without /KEEPDATA prompts via MsgBox(MB_YESNO),
+//     with the first button (Yes) as the default.
 function InitializeUninstall: Boolean;
 begin
   Result := True;
@@ -90,17 +89,17 @@ begin
   begin
     DeleteUserData :=
       MsgBox(
-        'アプリの設定や undo データ (' + ExpandConstant('{userappdata}') + '\fyler, ' +
-        ExpandConstant('{localappdata}') + '\fyler) も削除しますか? (既定: はい)' + #13#10 +
-        '「いいえ」を選ぶとこれらのフォルダーは残ります。',
+        'Also delete fyler settings and undo data (' + ExpandConstant('{userappdata}') + '\fyler, ' +
+        ExpandConstant('{localappdata}') + '\fyler)? (Default: Yes)' + #13#10 +
+        'Choose No to keep these folders.',
         mbConfirmation, MB_YESNO) = IDYES;
   end;
 end;
 
-// 指定ディレクトリを再帰削除する。存在しなければ何もしない (正常系)。
-// 失敗時は握りつぶさず Log に記録し、対話時は MsgBox でも通知する。
-// Inno のアンインストーラは任意の終了コードを返せないため、silent 時に
-// 失敗を呼び出し元へ伝える手段は Log のみとなる。
+// Recursively delete the specified directory. Missing directories are normal.
+// On failure, record it in the log and notify interactive users with a message.
+// Inno Setup's uninstaller cannot return an arbitrary exit code, so in silent
+// mode the log is the only way to report failure to the caller.
 procedure DeleteDataDir(const Dir: String);
 begin
   if not DirExists(Dir) then
@@ -112,15 +111,15 @@ begin
     if not UninstallSilent then
     begin
       MsgBox(
-        'ユーザーデータの削除に失敗しました: ' + Dir + #13#10 +
-        '手動で削除してください。',
+        'Failed to delete user data: ' + Dir + #13#10 +
+        'Please delete it manually.',
         mbError, MB_OK);
     end;
   end;
 end;
 
-// ファイル本体の削除が終わった後 (usPostUninstall) にユーザーデータを削除する。
-// %LOCALAPPDATA%\Programs\fyler (インストール先) には一切触れない。
+// Delete user data after application files have been removed (usPostUninstall).
+// Never touch %LOCALAPPDATA%\Programs\fyler (the installation directory).
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if (CurUninstallStep = usPostUninstall) and DeleteUserData then
