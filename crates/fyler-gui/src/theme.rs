@@ -23,7 +23,9 @@ pub const BLUE: egui::Color32 = egui::Color32::from_rgb(90, 143, 174);
 pub const GREEN: egui::Color32 = egui::Color32::from_rgb(111, 174, 90);
 pub const YELLOW: egui::Color32 = egui::Color32::from_rgb(217, 169, 58);
 pub const RED: egui::Color32 = egui::Color32::from_rgb(216, 93, 93);
-
+/// Opaque hover fill used by toolbar controls.
+pub const TOOLBAR_HOVER: egui::Color32 = egui::Color32::from_rgb(31, 31, 34);
+pub const CAPTION_CLOSE_HOVER: egui::Color32 = egui::Color32::from_rgb(232, 17, 35);
 pub const TOOLBAR_HEIGHT: f32 = 34.0;
 pub const STATUSBAR_HEIGHT: f32 = 26.0;
 pub const TREE_ROW_HEIGHT: f32 = 24.0;

@@ -795,13 +795,13 @@ async fn history_and_refresh_keymaps_and_commands_emit_expected_events() -> anyh
     .context(":FylerForward did not emit HistoryForward")?;
 
     engine.send(key_command(Key::Char(':')))?;
-    engine.send(EditorCommand::Text("FylerReload".to_owned()))?;
+    engine.send(EditorCommand::Text("FylerRefresh".to_owned()))?;
     engine.send(key_command(Key::Enter))?;
     wait_for_event(&mut events, |event| {
         matches!(event, EditorEvent::RefreshRequested)
     })
     .await
-    .context(":FylerReload did not emit RefreshRequested")?;
+    .context(":FylerRefresh did not emit RefreshRequested")?;
 
     // command_aliases: :back / :forward / :reload の書き換え(<CR>直前のrewrite_command_alias)。
     engine.send(key_command(Key::Char(':')))?;
@@ -826,11 +826,214 @@ async fn history_and_refresh_keymaps_and_commands_emit_expected_events() -> anyh
     engine.send(EditorCommand::Text("reload".to_owned()))?;
     engine.send(key_command(Key::Enter))?;
     wait_for_event(&mut events, |event| {
-        matches!(event, EditorEvent::RefreshRequested)
+        matches!(event, EditorEvent::ReloadConfigRequested)
     })
     .await
-    .context(":reload alias did not emit RefreshRequested")?;
+    .context(":reload alias did not emit ReloadConfigRequested")?;
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn new_command_aliases_emit_events_and_q_keeps_engine_alive() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+
+    for (command, expected) in [
+        ("config", "config"),
+        ("reload", "reload"),
+        ("refresh", "refresh"),
+        ("max", "max"),
+        ("min", "min"),
+        ("q", "q"),
+    ] {
+        engine.send(key_command(Key::Char(':')))?;
+        engine.send(EditorCommand::Text(command.to_owned()))?;
+        engine.send(key_command(Key::Enter))?;
+        match expected {
+            "config" => {
+                wait_for_event(&mut events, |e| {
+                    matches!(e, EditorEvent::OpenConfigRequested)
+                })
+                .await?
+            }
+            "reload" => {
+                wait_for_event(&mut events, |e| {
+                    matches!(e, EditorEvent::ReloadConfigRequested)
+                })
+                .await?
+            }
+            "refresh" => {
+                wait_for_event(&mut events, |e| matches!(e, EditorEvent::RefreshRequested)).await?
+            }
+            "max" => {
+                wait_for_event(&mut events, |e| {
+                    matches!(e, EditorEvent::WindowMaximizeRequested)
+                })
+                .await?
+            }
+            "min" => {
+                wait_for_event(&mut events, |e| {
+                    matches!(e, EditorEvent::WindowMinimizeRequested)
+                })
+                .await?
+            }
+            "q" => {
+                wait_for_event(&mut events, |e| {
+                    matches!(e, EditorEvent::WindowCloseRequested)
+                })
+                .await?
+            }
+            _ => unreachable!(),
+        }
+        assert!(engine.snapshot().revision > 0);
+    }
+    engine.set_initial_lines(vec![EditorLine::new("/001 still alive")])?;
+    wait_for(&engine, |line| line == "/001 still alive").await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn reconfiguring_bindings_removes_stale_maps_and_preserves_fixed_defaults()
+-> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (first, warnings) = resolve_bindings(
+        default_leader(),
+        &[
+            ("<leader>f".into(), "file_picker".into()),
+            ("o".into(), "file_picker".into()),
+            ("n".into(), "toggle_hidden".into()),
+        ],
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let mut config = NvimConfig::new(nvim_exe, root);
+    config.bindings = first;
+    let (engine, mut events) = NvimEngine::start(config).await?;
+    engine.send(key_command(Key::Char(' ')))?;
+    engine.send(key_command(Key::Char('f')))?;
+    wait_for_event(&mut events, |e| matches!(e, EditorEvent::OpenFilePicker)).await?;
+
+    let (second, warnings) = resolve_bindings(
+        default_leader(),
+        &[("<leader>g".into(), "toggle_hidden".into())],
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+    engine.send(EditorCommand::ConfigureBindings(second))?;
+    engine.send(key_command(Key::Char(' ')))?;
+    engine.send(key_command(Key::Char('f')))?;
+    assert_no_event(&mut events, |e| matches!(e, EditorEvent::OpenFilePicker)).await?;
+    // The unmapped `f` is now native find-character input; cancel that pending command.
+    engine.send(key_command(Key::Esc))?;
+    engine.send(key_command(Key::Char(' ')))?;
+    engine.send(key_command(Key::Char('g')))?;
+    wait_for_event(&mut events, |e| matches!(e, EditorEvent::ToggleHidden))
+        .await
+        .context("replacement binding did not fire")?;
+
+    // Reconfiguration removes the custom `o`/`n` overrides and restores their
+    // built-in behavior: `o` opens a line, and `n` repeats the last search.
+    engine.set_initial_lines(vec![
+        EditorLine::new("/001 one"),
+        EditorLine::new("/002 two"),
+    ])?;
+    engine.send(key_command(Key::Char('o')))?;
+    wait_for_mode(&engine, Mode::Insert).await?;
+    engine.send(key_command(Key::Esc))?;
+    wait_for_mode(&engine, Mode::Normal).await?;
+    engine.send(key_command(Key::Char('k')))?;
+    wait_for_cursor(&engine, |line, _| line == 0).await?;
+    engine.send(key_command(Key::Char('/')))?;
+    engine.send(EditorCommand::Text("two".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_cursor(&engine, |line, _| line == 2).await?;
+    wait_for_event(&mut events, |e| {
+        matches!(e, EditorEvent::CenterCursor { line: 2 })
+    })
+    .await
+    .context("search after guard reinstall did not center")?;
+    engine.send(key_command(Key::Char('n')))?;
+    wait_for_event(&mut events, |e| {
+        matches!(e, EditorEvent::CenterCursor { line: 2 })
+    })
+    .await
+    .context("restored n mapping did not center")?;
+    assert_eq!(engine.snapshot().cursor.line, 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn successful_search_emits_center_cursor_for_final_match_only() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let root = std::env::current_dir()?;
+    let (engine, mut events) = NvimEngine::start(NvimConfig::new(nvim_exe, root)).await?;
+    engine.set_initial_lines(vec![
+        EditorLine::new("/001 alpha alpha"),
+        EditorLine::new("/002 beta"),
+        EditorLine::new("/003 alpha"),
+    ])?;
+    wait_for_lines(&engine, |lines| lines.len() == 3).await?;
+
+    // Start below the first match so the wrapped search's final target is known.
+    engine.send(key_command(Key::Char('j')))?;
+    engine.send(key_command(Key::Char('j')))?;
+    wait_for_cursor(&engine, |line, _| line == 2).await?;
+    engine.send(key_command(Key::Char('/')))?;
+    engine.send(EditorCommand::Text("alpha".to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_cursor(&engine, |line, _| line == 0).await?;
+    wait_for_event(&mut events, |e| {
+        matches!(e, EditorEvent::CenterCursor { line: 0 })
+    })
+    .await?;
+    assert_eq!(engine.snapshot().cursor.line, 0);
+
+    // `n` selects the second same-line hit; a count then walks remaining
+    // matches and wraps back to the first same-line hit.
+    engine.send(key_command(Key::Char('n')))?;
+    wait_for_event(&mut events, |e| {
+        matches!(e, EditorEvent::CenterCursor { line: 0 })
+    })
+    .await?;
+    assert_eq!(engine.snapshot().cursor.line, 0);
+    assert!(engine.snapshot().cursor.col > 5);
+    engine.send(key_command(Key::Char('2')))?;
+    engine.send(key_command(Key::Char('n')))?;
+    wait_for_event(&mut events, |e| {
+        matches!(e, EditorEvent::CenterCursor { line: 0 })
+    })
+    .await?;
+    assert_eq!(engine.snapshot().cursor.line, 0);
+    assert_eq!(engine.snapshot().cursor.col, 5);
+
+    // Canceling a search and ordinary movement must never emit center events.
+    engine.send(key_command(Key::Char('/')))?;
+    engine.send(EditorCommand::Text("beta".to_owned()))?;
+    engine.send(key_command(Key::Esc))?;
+    wait_for_mode(&engine, Mode::Normal).await?;
+    assert_no_event(&mut events, |e| {
+        matches!(e, EditorEvent::CenterCursor { .. })
+    })
+    .await?;
+    engine.send(key_command(Key::Char('j')))?;
+    wait_for_cursor(&engine, |line, _| line == 1).await?;
+    assert_no_event(&mut events, |e| {
+        matches!(e, EditorEvent::CenterCursor { .. })
+    })
+    .await?;
     Ok(())
 }
 
@@ -1500,6 +1703,30 @@ async fn failed_search_keeps_engine_responsive() -> anyhow::Result<()> {
     })
     .await
     .context("failed search did not report E486")?;
+    assert_no_event(&mut events, |event| {
+        matches!(event, EditorEvent::CenterCursor { .. })
+    })
+    .await?;
+    engine.send(key_command(Key::Char('/')))?;
+    for ch in ['z', 'z', 'q', 'x'] {
+        engine.send(key_command(Key::Char(ch)))?;
+    }
+    engine.send(key_command(Key::Enter))?;
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            EditorEvent::Message(EditorMessage {
+                kind: MessageKind::Error,
+                ..
+            })
+        )
+    })
+    .await
+    .context("repeated failed search did not report E486")?;
+    assert_no_event(&mut events, |event| {
+        matches!(event, EditorEvent::CenterCursor { .. })
+    })
+    .await?;
 
     // フリーズしていなければ後続のカーソル移動がそのまま反映される。
     engine.send(key_command(Key::Char('j')))?;

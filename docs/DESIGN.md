@@ -197,6 +197,8 @@ Idle
 - ツリー描画・ファイルアイコン・git status・インデントガイドはRust側で実装（バッファ文字列には含めない）
 - モードライン（NORMAL / INSERT / VISUAL）・カーソル・cmdline・messagesの描画も自前
 - IDプレフィックスの隠蔽とカーソル列オフセット補正を描画層で行う
+- Windowsの右上3ボタンはDWMの非クライアント入力処理へ委譲し、独自ツールバーと統合する。GUIは予約領域を不透明なsurfaceで塗り、3つのcaption cell中央へ白いglyphを描画する。34論理pxのツールバーを基本とし、native geometryがより高い場合のみ拡張する。hover背景は全高で左右ボタンがRGB(31,31,34)、CloseがWindows標準赤(RGB(232,17,35))。クリックはOSが処理し、GUIのクリックhandlerやシステムコマンドは追加しない。ナビゲーションボタン幅はnative cellの2/3、間隔は1論理px。モーダル暗転は予約caption stripを避ける。Win32 APIは`fyler-fsops::window_caption`に集約し、`fyler-core::window`のエンジン非依存インターフェースでGUIへ接続する。
+- Windows surfaceはcaption予約領域も含めGUIが不透明に描画する。非Windowsの開発用ビルドはOS標準のウィンドウ装飾を使い、navigation幅はfallback cellの2/3とする。
 
 ## 実装上の絶対ルール
 

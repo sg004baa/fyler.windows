@@ -226,6 +226,9 @@ vim.bo[buffer].cindent = false
 vim.bo[buffer].indentexpr = ""
 
 local group = vim.api.nvim_create_augroup("fyler_guards", { clear = true })
+for _, name in ipairs({ "FylerConfig", "FylerRefresh", "FylerReload", "FylerQuit", "FylerMax", "FylerMin", "FylerBookmark", "FylerUndo", "FylerFeedback", "FylerCd", "FylerBack", "FylerForward", "FylerSort", "FylerTerminal", "FylerAdmin", "FylerShortcut", "FylerExtract" }) do
+  pcall(vim.api.nvim_buf_del_user_command, buffer, name)
+end
 
 local function line_depth(line)
   local prefix = line:match("^/%d+ ") or ""
@@ -251,6 +254,12 @@ local function continue_line_with_current_depth()
   local cr = vim.api.nvim_replace_termcodes("<CR>", true, false, true)
   return cr .. string.rep("\t", line_depth(line))
 end
+local installed = _G.__fyler_installed_maps or {}
+_G.__fyler_installed_maps = installed
+for _, map in ipairs(installed[buffer] or {}) do
+  pcall(vim.keymap.del, map.mode, map.lhs, { buffer = buffer })
+end
+installed[buffer] = {}
 
 -- o/O の dot-repeat は expr map の展開結果が再生されるため、別depthの行では
 -- 初回実行時のタブ数が残る。現状は複雑な operator 化を避け、直接操作と
@@ -393,8 +402,18 @@ local function make_callback(binding)
   end
 end
 
+local function repeat_search(key)
+  local count = vim.v.count1
+  local ok, err = pcall(vim.cmd, "normal! " .. count .. key)
+  if not ok then error(err) end
+  vim.rpcnotify(channel, "fyler_search_post", vim.api.nvim_win_get_cursor(0)[1] - 1)
+end
+for _, key in ipairs({ "n", "N" }) do
+  vim.keymap.set("n", key, function() repeat_search(key) end, { buffer = buffer, silent = true })
+end
 for _, binding in ipairs(bindings) do
   vim.keymap.set(binding.modes, binding.lhs, make_callback(binding), { buffer = buffer, silent = true, nowait = true })
+  for _, mode in ipairs(binding.modes) do table.insert(installed[buffer], { mode = mode, lhs = binding.lhs }) end
 end
 
 -- Keysバインドはsilentを付けない: silentはNeovimの ext_cmdline 通知(cmdline_show)を
@@ -402,6 +421,7 @@ end
 -- 描画できなくなる(実機検証で判明。msg_showcmdだけが飛びcmdline_showが来ない)。
 for _, binding in ipairs(keys_bindings) do
   vim.keymap.set("n", binding.lhs, binding.rhs, { buffer = buffer, nowait = true })
+  table.insert(installed[buffer], { mode = "n", lhs = binding.lhs })
 end
 
 vim.keymap.set("n", "<C-w>", function()
@@ -451,8 +471,23 @@ vim.api.nvim_buf_create_user_command(buffer, "FylerForward", function()
   vim.rpcnotify(channel, "fyler_history", "forward")
 end, {})
 
-vim.api.nvim_buf_create_user_command(buffer, "FylerReload", function()
+vim.api.nvim_buf_create_user_command(buffer, "FylerConfig", function()
+  vim.rpcnotify(channel, "fyler_open_config")
+end, {})
+vim.api.nvim_buf_create_user_command(buffer, "FylerRefresh", function()
   vim.rpcnotify(channel, "fyler_refresh")
+end, {})
+vim.api.nvim_buf_create_user_command(buffer, "FylerReload", function()
+  vim.rpcnotify(channel, "fyler_reload_config")
+end, {})
+vim.api.nvim_buf_create_user_command(buffer, "FylerQuit", function()
+  vim.rpcnotify(channel, "fyler_close")
+end, {})
+vim.api.nvim_buf_create_user_command(buffer, "FylerMax", function()
+  vim.rpcnotify(channel, "fyler_maximize")
+end, {})
+vim.api.nvim_buf_create_user_command(buffer, "FylerMin", function()
+  vim.rpcnotify(channel, "fyler_minimize")
 end, {})
 
 local sort_keys = { "name", "date", "size", "ext" }
@@ -491,7 +526,7 @@ vim.api.nvim_buf_create_user_command(buffer, "FylerExtract", function()
 end, {})
 
 vim.o.wildcharm = 26
-local command_aliases = { b = "FylerBookmark", cd = "FylerCd", feedback = "FylerFeedback", sort = "FylerSort", terminal = "FylerTerminal", back = "FylerBack", forward = "FylerForward", reload = "FylerReload", admin = "FylerAdmin", shortcut = "FylerShortcut", extract = "FylerExtract" }
+local command_aliases = { b = "FylerBookmark", cd = "FylerCd", feedback = "FylerFeedback", sort = "FylerSort", terminal = "FylerTerminal", back = "FylerBack", forward = "FylerForward", config = "FylerConfig", refresh = "FylerRefresh", reload = "FylerReload", q = "FylerQuit", max = "FylerMax", min = "FylerMin", admin = "FylerAdmin", shortcut = "FylerShortcut", extract = "FylerExtract" }
 -- nvim_paste経由ではcnoreabbrevが展開されないため、実行/補完直前に先頭語を正式コマンドへ書き換える。
 local function rewrite_command_alias()
   if vim.fn.getcmdtype() ~= ":" then return end
@@ -534,6 +569,30 @@ for _, event in ipairs(write_events) do
     end,
   })
 end
+
+local search_cmdline = false
+vim.api.nvim_create_autocmd("CmdlineEnter", {
+  group = group,
+  callback = function()
+    search_cmdline = vim.api.nvim_get_current_buf() == buffer
+      and (vim.fn.getcmdtype() == "/" or vim.fn.getcmdtype() == "?")
+    if search_cmdline then vim.v.errmsg = "" end
+  end,
+})
+vim.api.nvim_create_autocmd("CmdlineLeave", {
+  group = group,
+  callback = function()
+    if not search_cmdline then return end
+    search_cmdline = false
+    if vim.v.event.abort then return end
+    vim.schedule(function()
+      if vim.v.errmsg ~= "" then return end
+      if vim.api.nvim_buf_is_valid(buffer) and vim.api.nvim_get_current_buf() == buffer then
+        vim.rpcnotify(channel, "fyler_search_post", vim.api.nvim_win_get_cursor(0)[1] - 1)
+      end
+    end)
+  end,
+})
 
 vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
   group = group,

@@ -65,11 +65,10 @@ impl WindowGeometry {
     }
 }
 
-/// window位置・サイズを物理px(仮想デスクトップ座標系)で表した矩形。
+/// Physical-pixel rectangle. Coordinate origin is specified by the API using the rectangle.
 ///
-/// [`WindowGeometry::physical_outer_rect`] の出力型。`fyler-fsops`のオフスクリーン
-/// 判定はWin32 APIに直接触れる唯一のクレートなので、この型はプリミティブだけで
-/// 構成し、windowsクレートの型を露出させない。
+/// Window geometry uses virtual-desktop coordinates; native client layouts use client-local
+/// coordinates. The primitive-only representation keeps Win32 types out of `fyler-core`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhysicalRect {
     pub x: i32,
@@ -77,6 +76,31 @@ pub struct PhysicalRect {
     pub width: i32,
     pub height: i32,
 }
+/// App-painted caption controls in physical client coordinates, retaining the native DWM union's
+/// width while right-anchoring it to the client right edge. `buttons` starts at client y=0 and
+/// spans the full toolbar height; its width is partitioned into three contiguous integer thirds
+/// (minimize, maximize/restore, close). `hovered_button`, when present, is exactly one such
+/// full-height cell. Native nonclient input remains OS-owned; this layout does not describe app-issued window commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeCaptionLayout {
+    pub buttons: PhysicalRect,
+    pub hovered_button: Option<PhysicalRect>,
+    pub toolbar_height: u32,
+}
+
+/// Integrates app-painted caption glyphs with genuine OS nonclient input.
+pub trait NativeWindowCaption {
+    fn update(&mut self, toolbar_height: u32) -> anyhow::Result<Option<NativeCaptionLayout>>;
+    fn set_drag_region(&mut self, region: Option<PhysicalRect>);
+}
+
+pub type NativeWindowCaptionFactory = Box<
+    dyn FnOnce(
+        isize,
+        std::sync::Arc<dyn Fn() + Send + Sync>,
+        [u8; 3],
+    ) -> anyhow::Result<Box<dyn NativeWindowCaption>>,
+>;
 
 /// GUI起動時に適用するwindow geometry。
 ///

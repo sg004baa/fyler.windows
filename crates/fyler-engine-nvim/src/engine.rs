@@ -257,7 +257,7 @@ impl NvimEngine {
                             return;
                         };
 
-                        if let Err(error) = handle_command(&nvim, &buffer, command).await {
+                        if let Err(error) = handle_command(&nvim, &buffer, channel_id, command).await {
                             send_message(
                                 &event_tx,
                                 MessageKind::Error,
@@ -558,8 +558,50 @@ impl NvimEngine {
                                     ),
                                 }
                             }
+                            "fyler_search_post" => {
+                                let line = notification.args.first()
+                                    .and_then(value_as_u64)
+                                    .and_then(|line| usize::try_from(line).ok());
+                                snapshot_pending = true;
+                                match publish_pending_snapshot(
+                                    &nvim,
+                                    &lines_arc,
+                                    &mut revision,
+                                    &task_snapshot,
+                                    (&event_tx, &task_snapshot_notice),
+                                    &mut snapshot_pending,
+                                    cmdline_state.as_ref(),
+                                ).await {
+                                    Ok(Some(_)) => {
+                                        if let Some(line) = line {
+                                            let _ = event_tx.send(EditorEvent::CenterCursor { line });
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => send_message(
+                                        &event_tx,
+                                        MessageKind::Error,
+                                        format!("Failed to update editor state: {error}"),
+                                    ),
+                                }
+                            }
                             "fyler_refresh" => {
                                 let _ = event_tx.send(EditorEvent::RefreshRequested);
+                            }
+                            "fyler_open_config" => {
+                                let _ = event_tx.send(EditorEvent::OpenConfigRequested);
+                            }
+                            "fyler_reload_config" => {
+                                let _ = event_tx.send(EditorEvent::ReloadConfigRequested);
+                            }
+                            "fyler_close" => {
+                                let _ = event_tx.send(EditorEvent::WindowCloseRequested);
+                            }
+                            "fyler_maximize" => {
+                                let _ = event_tx.send(EditorEvent::WindowMaximizeRequested);
+                            }
+                            "fyler_minimize" => {
+                                let _ = event_tx.send(EditorEvent::WindowMinimizeRequested);
                             }
                             "fyler_dir_size" => {
                                 let line = notification.args.first()
@@ -768,9 +810,13 @@ impl NvimEngine {
 async fn handle_command(
     nvim: &Nvim,
     buffer: &Buffer<NvimWriter>,
+    channel_id: i64,
     command: EngineCommand,
 ) -> anyhow::Result<()> {
     match command {
+        EngineCommand::Editor(EditorCommand::ConfigureBindings(bindings)) => {
+            guard::install_guards(nvim, buffer, channel_id, &bindings).await?;
+        }
         EngineCommand::Editor(EditorCommand::Key(key)) => {
             let keycodes = translate::to_nvim_keycodes(&key);
             nvim.input(&keycodes)
@@ -798,10 +844,6 @@ async fn handle_command(
                 .map_err(|error| anyhow::anyhow!("Save request RPC failed: {error}"))?;
         }
         EngineCommand::Editor(EditorCommand::Undo) => {
-            // `nvim_input("u")` はバッファローカルmapを経由するため、`u` を
-            // ファイル操作undoへ条件分岐させた後は再帰して意図しない
-            // `fyler_undo` 発火になり得る。ex command経由でmappingを迂回し、
-            // このコマンドの意味(テキストundo)を保つ。
             nvim.command("silent! undo")
                 .await
                 .map_err(|error| anyhow::anyhow!("Undo RPC failed: {error}"))?;
@@ -824,7 +866,6 @@ async fn handle_command(
             replace_buffer_lines(nvim, buffer, editor_lines, None, "initialization").await?;
         }
     }
-
     Ok(())
 }
 

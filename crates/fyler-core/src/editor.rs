@@ -80,8 +80,9 @@ pub enum EditorCommand {
     DeleteLine {
         line: usize,
     },
+    /// Replace the configured buffer-local key bindings.
+    ConfigureBindings(Vec<crate::keymap::KeyBinding>),
 }
-
 /// エンジン状態の整合スナップショット。GUIはこれだけを描画する。
 #[derive(Debug, Clone)]
 pub struct EditorSnapshot {
@@ -450,9 +451,22 @@ pub enum EditorEvent {
     },
     /// ユーザーが隠しファイル表示の切り替えを要求した。
     ToggleHidden,
-    /// ユーザーが現在のrootの明示的な再同期(manual refresh)を要求した。
+    /// Open the configuration file.
+    OpenConfigRequested,
+    /// Reload configuration from disk.
+    ReloadConfigRequested,
+    /// Request normal application shutdown.
+    WindowCloseRequested,
+    /// Maximize the application window.
+    WindowMaximizeRequested,
+    /// Minimize the application window.
+    WindowMinimizeRequested,
+    /// Center the view on the current cursor line after a successful search.
+    CenterCursor {
+        line: usize,
+    },
+    /// User requested a filesystem refresh.
     RefreshRequested,
-    /// ユーザーが指定行を基準に折りたたみ操作を要求した。
     /// `line`は0始まり。
     Fold {
         op: FoldOp,

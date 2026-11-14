@@ -14,8 +14,8 @@ use fyler_core::grammar::PrefixParse;
 use fyler_core::id::{EntryId, IdAllocator};
 use fyler_core::options::SortKey;
 use fyler_core::path::TreePath;
-use fyler_core::plan::OperationPlan;
-use fyler_core::report::CommitReport;
+use fyler_core::plan::{FsOperation, OperationPlan};
+use fyler_core::report::{CommitReport, OpOutcome};
 use fyler_core::save::{self, SaveEffect, SaveEvent, SaveState};
 use fyler_core::tree::{BaselineEntry, BaselineTree, EditContext, EntryKind};
 use fyler_core::undo::{UndoStep, UndoStepStatus, UndoTransaction};
@@ -278,6 +278,7 @@ pub struct SaveController {
     baseline: BaselineTree,
     context: EditContext,
     scan_options: ScanOptions,
+    pending_cursor: Option<(TreePath, usize, u64)>,
     pending_overwrites: HashSet<TreePath>,
     apply_cancel: Option<Arc<AtomicBool>>,
     offline: Option<String>,
@@ -311,6 +312,7 @@ impl SaveController {
             baseline,
             context,
             scan_options: ScanOptions::default(),
+            pending_cursor: None,
             pending_overwrites: HashSet::new(),
             apply_cancel: None,
             offline: None,
@@ -603,6 +605,12 @@ impl SaveController {
     /// 再スキャン時に不整合になる)。`show_hidden`/`sort` を含む全項目を上書きする点に注意。
     pub fn set_scan_options(&mut self, scan_options: ScanOptions) {
         self.scan_options = scan_options;
+    }
+
+    /// Update scan options and immediately reconcile the current root.
+    pub fn reload_scan_options(&mut self, scan_options: ScanOptions) -> anyhow::Result<()> {
+        self.scan_options = scan_options;
+        self.reconcile_from_fs_preserving_state(None)
     }
 
     /// 現在のソート条件を返す。
@@ -1042,6 +1050,7 @@ impl SaveController {
         let was_offline = self.is_offline();
         self.root = root;
         self.baseline = baseline;
+        self.pending_cursor = None;
         self.context = context_with_unloaded_dirs(EditContext::default(), &self.baseline);
         self.offline = None;
         self.reported_incomplete.clear();
@@ -1096,6 +1105,7 @@ impl SaveController {
         let display_plan = plan.clone();
         let warnings = plan_warnings(
             &self.root,
+            &self.baseline,
             &display_plan,
             &overwrites,
             fyler_fsops::onedrive::is_cloud_placeholder,
@@ -1230,7 +1240,8 @@ impl SaveController {
             .iter()
             .any(|effect| matches!(effect, SaveEffect::ReconcileFromFs))
         {
-            match self.reconcile_from_fs() {
+            let moved_cursor = self.successful_move_target(&report);
+            match self.reconcile_from_fs_with_target(moved_cursor.as_ref()) {
                 Ok(()) => SaveFlowResult::ShowReport(report),
                 Err(error) => SaveFlowResult::ReconcileFailed {
                     report,
@@ -1264,10 +1275,11 @@ impl SaveController {
                 .any(|effect| matches!(effect, SaveEffect::ShowUndoReport(_)))
         );
 
+        let undo_target = self.successful_undo_target(&report);
         if effects
             .iter()
             .any(|effect| matches!(effect, SaveEffect::ReconcileFromFs))
-            && let Err(error) = self.reconcile_from_fs()
+            && let Err(error) = self.reconcile_from_fs_with_target(undo_target.as_ref())
         {
             self.apply_cancel = None;
             return SaveFlowResult::UndoReconcileFailed {
@@ -1333,26 +1345,47 @@ impl SaveController {
             );
         }
 
-        if self.engine.snapshot().dirty {
+        let snapshot = self.engine.snapshot();
+        if snapshot.dirty {
             return SaveFlowResult::ExternalChangeNotified(
                 "Files changed externally. The view was not updated because you are editing."
                     .to_owned(),
             );
         }
 
+        let (selected_id, snapshot_line) = self.snapshot_selection(&snapshot);
+        if selected_id.is_some()
+            || self
+                .pending_cursor
+                .as_ref()
+                .is_some_and(|(_, _, revision)| snapshot.revision > *revision)
+        {
+            self.pending_cursor = None;
+        }
+        let pending = if selected_id.is_none() {
+            self.pending_cursor.clone()
+        } else {
+            None
+        };
+        let cursor_target = pending.as_ref().map(|(path, _, _)| path);
+        let fallback_line = pending.as_ref().map_or(snapshot_line, |(_, line, _)| *line);
         let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
+        let cursor_line = self.cursor_line_for(
+            &baseline,
+            &context,
+            cursor_target,
+            selected_id,
+            fallback_line,
+        );
         let lines = baseline_to_lines(&baseline, &context);
         if let Err(error) = self
             .engine
-            .send(EditorCommand::SetLines {
-                lines,
-                cursor_line: None,
-            })
+            .send(EditorCommand::SetLines { lines, cursor_line })
             .context("Failed to send buffer lines to the engine after external change")
         {
             return SaveFlowResult::ExternalChangeFailed(error.to_string());
         }
-
+        self.remember_pending_cursor(&baseline, &context, cursor_line, snapshot.revision);
         self.baseline = baseline;
         self.context = context;
         SaveFlowResult::ExternalChanged
@@ -1385,14 +1418,39 @@ impl SaveController {
         };
         drop(ids);
 
-        let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
-        if !self.engine.snapshot().dirty
-            && let Err(error) = self.engine.send(EditorCommand::SetLines {
-                lines: baseline_to_lines(&baseline, &context),
-                cursor_line: None,
-            })
+        let snapshot = self.engine.snapshot();
+        let (selected_id, snapshot_line) = self.snapshot_selection(&snapshot);
+        if selected_id.is_some()
+            || self
+                .pending_cursor
+                .as_ref()
+                .is_some_and(|(_, _, revision)| snapshot.revision > *revision)
         {
-            return SaveFlowResult::ExternalChangeFailed(error.to_string());
+            self.pending_cursor = None;
+        }
+        let pending = if selected_id.is_none() {
+            self.pending_cursor.clone()
+        } else {
+            None
+        };
+        let cursor_target = pending.as_ref().map(|(path, _, _)| path);
+        let fallback_line = pending.as_ref().map_or(snapshot_line, |(_, line, _)| *line);
+        let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
+        if !snapshot.dirty {
+            let cursor_line = self.cursor_line_for(
+                &baseline,
+                &context,
+                cursor_target,
+                selected_id,
+                fallback_line,
+            );
+            if let Err(error) = self.engine.send(EditorCommand::SetLines {
+                lines: baseline_to_lines(&baseline, &context),
+                cursor_line,
+            }) {
+                return SaveFlowResult::ExternalChangeFailed(error.to_string());
+            }
+            self.remember_pending_cursor(&baseline, &context, cursor_line, snapshot.revision);
         }
         self.baseline = baseline;
         self.context = context;
@@ -1466,8 +1524,8 @@ impl SaveController {
         }
     }
 
-    fn reconcile_from_fs(&mut self) -> anyhow::Result<()> {
-        let result = self.reconcile_from_fs_preserving_state(None);
+    fn reconcile_from_fs_with_target(&mut self, target: Option<&TreePath>) -> anyhow::Result<()> {
+        let result = self.reconcile_from_fs_preserving_state(target);
         let effects = self.apply_event(SaveEvent::ReconcileFinished);
         debug_assert!(matches!(self.state, SaveState::Idle));
         debug_assert!(
@@ -1490,7 +1548,7 @@ impl SaveController {
         self.reconcile_from_fs_preserving_state(None)
     }
 
-    /// `:reload`(manual refresh)向けに、rootを再スキャンして表示を更新する。
+    /// `:refresh`(manual refresh)向けに、rootを再スキャンして表示を更新する。
     ///
     /// 呼び出し元app層は、クリーン(dirtyでない)かつIdle・オフラインでないことを
     /// 事前に保証すること(refresh gateの契約。[`refresh_gate`](super::pane_runtime)相当)。
@@ -1526,21 +1584,196 @@ impl SaveController {
                 return Err(error);
             }
         };
+        let snapshot = self.engine.snapshot();
+        let (selected_id, snapshot_line) = self.snapshot_selection(&snapshot);
+        if selected_id.is_some()
+            || self
+                .pending_cursor
+                .as_ref()
+                .is_some_and(|(_, _, revision)| snapshot.revision > *revision)
+        {
+            self.pending_cursor = None;
+        }
+        let pending = if selected_id.is_none() {
+            self.pending_cursor.clone()
+        } else {
+            None
+        };
+        let cursor_target = cursor_hint.or(pending.as_ref().map(|(path, _, _)| path));
+        let fallback_line = pending.as_ref().map_or(snapshot_line, |(_, line, _)| *line);
         let context = carry_collapsed_dirs(&self.context, &self.baseline, &baseline);
-        let cursor_line = cursor_hint.and_then(|path| {
-            let id = baseline.get_by_path(path)?.id;
-            visible_entries(&baseline, &context)
-                .iter()
-                .position(|entry| entry.id == id)
-        });
+        let cursor_line = self.cursor_line_for(
+            &baseline,
+            &context,
+            cursor_target,
+            selected_id,
+            fallback_line,
+        );
         let lines = baseline_to_lines(&baseline, &context);
         self.engine
             .send(EditorCommand::SetLines { lines, cursor_line })
             .context("Failed to send buffer lines to the engine after reconcile")?;
+        self.remember_pending_cursor(&baseline, &context, cursor_line, snapshot.revision);
 
         self.baseline = baseline;
         self.context = context;
         Ok(())
+    }
+
+    fn snapshot_selection(
+        &self,
+        snapshot: &fyler_core::editor::EditorSnapshot,
+    ) -> (Option<EntryId>, usize) {
+        let line = snapshot.cursor.line;
+        let selected_id = snapshot.lines.get(line).and_then(|line| {
+            match fyler_core::grammar::split_id_prefix(&line.text) {
+                PrefixParse::WithId { id, .. } if self.baseline.get(id).is_some() => Some(id),
+                _ => None,
+            }
+        });
+        (selected_id, line)
+    }
+
+    fn cursor_line_for(
+        &self,
+        baseline: &BaselineTree,
+        context: &EditContext,
+        target_path: Option<&TreePath>,
+        selected_id: Option<EntryId>,
+        fallback_line: usize,
+    ) -> Option<usize> {
+        let visible = visible_entries(baseline, context);
+        if visible.is_empty() {
+            return None;
+        }
+        target_path
+            .and_then(|path| baseline.get_by_path(path).map(|entry| entry.id))
+            .and_then(|id| visible.iter().position(|entry| entry.id == id))
+            .or_else(|| selected_id.and_then(|id| visible.iter().position(|entry| entry.id == id)))
+            .or_else(|| Some(fallback_line.min(visible.len() - 1)))
+    }
+    fn remember_pending_cursor(
+        &mut self,
+        baseline: &BaselineTree,
+        context: &EditContext,
+        cursor_line: Option<usize>,
+        revision: u64,
+    ) {
+        self.pending_cursor = cursor_line.and_then(|line| {
+            visible_entries(baseline, context)
+                .get(line)
+                .map(|entry| (entry.path.clone(), line, revision))
+        });
+    }
+
+    fn successful_move_target(&self, report: &CommitReport) -> Option<TreePath> {
+        let snapshot = self.engine.snapshot();
+        let (selected_id, _) = self.snapshot_selection(&snapshot);
+        let selected_id = selected_id?;
+        let selected_path = &self.baseline.get(selected_id)?.path;
+        let mut direct: Option<(usize, EntryId, &TreePath, &TreePath, usize)> = None;
+        let mut ancestor: Option<(usize, EntryId, &TreePath, &TreePath, usize)> = None;
+        for (index, result) in report.results.iter().enumerate() {
+            if !matches!(&result.outcome, OpOutcome::Success) {
+                continue;
+            }
+            let FsOperation::Move { id, from, to } = &result.op else {
+                continue;
+            };
+            if !selected_path.components().starts_with(from.components()) {
+                continue;
+            }
+            let candidate = (index, *id, from, to, from.depth());
+            let best = if *id == selected_id {
+                &mut direct
+            } else {
+                &mut ancestor
+            };
+            if best.as_ref().is_none_or(|current| candidate.4 > current.4) {
+                *best = Some(candidate);
+            }
+        }
+        let (index, mover_id, from, mut to, _) = direct.or(ancestor)?;
+        for result in report.results.iter().skip(index + 1) {
+            if !matches!(&result.outcome, OpOutcome::Success) {
+                continue;
+            }
+            if let FsOperation::Move {
+                id,
+                from: next_from,
+                to: next_to,
+            } = &result.op
+                && *id == mover_id
+                && next_from == to
+            {
+                to = next_to;
+            }
+        }
+        Some(remap_descendant_path(selected_path, from, to))
+    }
+
+    fn successful_undo_target(&self, report: &CommitReport<UndoStep>) -> Option<TreePath> {
+        let snapshot = self.engine.snapshot();
+        let (selected_id, _) = self.snapshot_selection(&snapshot);
+        let selected_path = &self.baseline.get(selected_id?)?.path;
+        let selected_absolute = selected_path.to_fs_path(&self.root);
+        let mut best: Option<(
+            usize,
+            &Path,
+            &Path,
+            Option<&fyler_core::undo::FileIdentity>,
+            usize,
+        )> = None;
+        for (index, result) in report.results.iter().enumerate() {
+            if !matches!(&result.outcome, OpOutcome::Success) {
+                continue;
+            }
+            let UndoStep::MoveBack {
+                from, to, identity, ..
+            } = &result.op
+            else {
+                continue;
+            };
+            if !selected_absolute.starts_with(to) {
+                continue;
+            }
+            let depth = to.components().count();
+            if best.as_ref().is_none_or(|current| depth > current.4) {
+                best = Some((
+                    index,
+                    from.as_path(),
+                    to.as_path(),
+                    identity.as_ref(),
+                    depth,
+                ));
+            }
+        }
+        let (index, mut from, to, identity, _) = best?;
+        if let Some(identity) = identity {
+            for result in report.results.iter().skip(index + 1) {
+                if !matches!(&result.outcome, OpOutcome::Success) {
+                    continue;
+                }
+                if let UndoStep::MoveBack {
+                    from: next_from,
+                    to: next_to,
+                    identity: Some(next_identity),
+                    ..
+                } = &result.op
+                    && next_identity == identity
+                    && next_to.as_path() == from
+                {
+                    from = next_from;
+                }
+            }
+        }
+        let current_prefix = absolute_tree_path(&self.root, to)?;
+        let target_prefix = absolute_tree_path(&self.root, from)?;
+        Some(remap_descendant_path(
+            selected_path,
+            &current_prefix,
+            &target_prefix,
+        ))
     }
 
     fn apply_event(&mut self, event: SaveEvent) -> Vec<SaveEffect> {
@@ -1582,6 +1815,23 @@ impl SaveController {
         }
     }
 }
+fn remap_descendant_path(path: &TreePath, from: &TreePath, to: &TreePath) -> TreePath {
+    let path_components = path.components();
+    let from_components = from.components();
+    if !path_components.starts_with(from_components) {
+        return path.clone();
+    }
+    TreePath::from_components(
+        to.components()
+            .iter()
+            .cloned()
+            .chain(path_components[from_components.len()..].iter().cloned()),
+    )
+}
+
+fn absolute_tree_path(root: &Path, path: &Path) -> Option<TreePath> {
+    tree_path_from_relative(path.strip_prefix(root).ok()?)
+}
 
 /// 表示ルート相対のOSパスをエンジン非依存のツリーパスへ変換する。
 ///
@@ -1616,26 +1866,38 @@ fn git_badge_rank(badge: GitBadge) -> u8 {
 /// 失敗した場合は保存計画を妨げず、サイズを取得できない場合だけサイズ表記を省略する。
 fn plan_warnings(
     root: &Path,
+    baseline: &BaselineTree,
     plan: &OperationPlan,
     overwrites: &[TreePath],
     is_placeholder: impl Fn(&Path) -> anyhow::Result<bool>,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
+    let mut warned_deletes = HashSet::new();
 
     for operation in &plan.ops {
-        let from = match operation {
+        match operation {
+            fyler_core::plan::FsOperation::Delete { path, .. } => {
+                for entry in baseline.entries() {
+                    if !entry.path.components().starts_with(path.components()) {
+                        continue;
+                    }
+                    if let Some(meta) = baseline.meta(entry.id).filter(|meta| meta.is_placeholder)
+                        && warned_deletes.insert(entry.id)
+                    {
+                        warnings.push(hydration_warning(&entry.path, meta.size));
+                    }
+                }
+            }
             fyler_core::plan::FsOperation::Move { from, .. }
-            | fyler_core::plan::FsOperation::Copy { from, .. } => from,
-            fyler_core::plan::FsOperation::Create { .. }
-            | fyler_core::plan::FsOperation::Delete { .. } => continue,
-        };
-        let source = from.to_fs_path(root);
-        if !is_placeholder(&source).unwrap_or(false) {
-            continue;
+            | fyler_core::plan::FsOperation::Copy { from, .. } => {
+                let source = from.to_fs_path(root);
+                if is_placeholder(&source).unwrap_or(false) {
+                    let size = fs::metadata(&source).ok().map(|metadata| metadata.len());
+                    warnings.push(hydration_warning(from, size));
+                }
+            }
+            fyler_core::plan::FsOperation::Create { .. } => {}
         }
-
-        let size = fs::metadata(&source).ok().map(|metadata| metadata.len());
-        warnings.push(hydration_warning(from, size));
     }
 
     append_overwrite_backup_warnings(&mut warnings, root, overwrites, is_placeholder);
@@ -1864,10 +2126,10 @@ mod tests {
     use std::fs;
     use std::rc::Rc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::time::Instant;
 
-    use fyler_core::editor::{EditorSnapshot, FoldOp};
+    use fyler_core::editor::{Cursor, EditorSnapshot, FoldOp};
     use fyler_core::fileinfo::EntryMeta;
     use fyler_core::options::{SortKey, SortOrder};
     use fyler_core::path::TreePath;
@@ -1883,14 +2145,24 @@ mod tests {
     struct RecordingEngine {
         commands: Mutex<Vec<EditorCommand>>,
         dirty: AtomicBool,
+        cursor_line: AtomicUsize,
+        revision: AtomicU64,
+        lines: Mutex<Vec<EditorLine>>,
     }
 
     impl RecordingEngine {
         fn set_dirty(&self, dirty: bool) {
             self.dirty.store(dirty, Ordering::Relaxed);
         }
-    }
 
+        fn set_view(&self, lines: Vec<EditorLine>, cursor_line: usize) {
+            *self.lines.lock().unwrap() = lines;
+            self.cursor_line.store(cursor_line, Ordering::Relaxed);
+        }
+        fn set_revision(&self, revision: u64) {
+            self.revision.store(revision, Ordering::Relaxed);
+        }
+    }
     impl EditorEngine for RecordingEngine {
         fn send(&self, command: EditorCommand) -> anyhow::Result<()> {
             self.commands.lock().unwrap().push(command);
@@ -1899,7 +2171,13 @@ mod tests {
 
         fn snapshot(&self) -> Arc<EditorSnapshot> {
             let mut snapshot = EditorSnapshot::empty();
+            snapshot.revision = self.revision.load(Ordering::Relaxed);
             snapshot.dirty = self.dirty.load(Ordering::Relaxed);
+            snapshot.lines = Arc::from(self.lines.lock().unwrap().clone());
+            snapshot.cursor = Cursor {
+                line: self.cursor_line.load(Ordering::Relaxed),
+                col: 0,
+            };
             Arc::new(snapshot)
         }
     }
@@ -2151,6 +2429,349 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_cursor_tracks_stable_id_and_clamps_deleted_selection() {
+        let (controller, _) = controller("C:/test-root");
+        let selected_id = controller.baseline.entries()[0].id;
+        let mut reordered = BaselineTree::new("C:/test-root");
+        reordered.insert(BaselineEntry {
+            id: EntryId(999),
+            path: TreePath::parse("b.txt"),
+            kind: EntryKind::File,
+        });
+        reordered.insert(BaselineEntry {
+            id: selected_id,
+            path: TreePath::parse("a.txt"),
+            kind: EntryKind::File,
+        });
+
+        assert_eq!(
+            controller.cursor_line_for(
+                &reordered,
+                &EditContext::default(),
+                None,
+                Some(selected_id),
+                0,
+            ),
+            Some(1),
+        );
+        assert_eq!(
+            controller.cursor_line_for(
+                &reordered,
+                &EditContext::default(),
+                None,
+                Some(EntryId(12345)),
+                50,
+            ),
+            Some(1),
+        );
+        assert_eq!(
+            controller.cursor_line_for(
+                &reordered,
+                &EditContext::default(),
+                Some(&TreePath::parse("missing.txt")),
+                Some(selected_id),
+                0,
+            ),
+            Some(1),
+        );
+        assert_eq!(
+            controller.cursor_line_for(
+                &BaselineTree::new("C:/test-root"),
+                &EditContext::default(),
+                None,
+                Some(selected_id),
+                50,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn watcher_reconcile_preserves_selection_across_reorder_and_later_events() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("a.txt"), b"a").unwrap();
+        fs::write(root.path().join("z.txt"), b"z").unwrap();
+        let (mut controller, engine) = scanned_controller(root.path(), ScanOptions::default());
+        engine.set_view(controller.visible_lines(), 1);
+
+        fs::write(root.path().join("m.txt"), b"m").unwrap();
+        assert_eq!(
+            controller.on_external_change(&BTreeSet::new()),
+            SaveFlowResult::ExternalChanged
+        );
+        let cursor =
+            engine
+                .commands
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find_map(|command| match command {
+                    EditorCommand::SetLines { cursor_line, .. } => *cursor_line,
+                    _ => None,
+                });
+        assert_eq!(cursor, Some(2));
+
+        engine.set_view(controller.visible_lines(), cursor.unwrap());
+        fs::write(root.path().join("b.txt"), b"b").unwrap();
+        assert_eq!(
+            controller.on_external_change(&BTreeSet::new()),
+            SaveFlowResult::ExternalChanged
+        );
+        let cursor =
+            engine
+                .commands
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find_map(|command| match command {
+                    EditorCommand::SetLines { cursor_line, .. } => *cursor_line,
+                    _ => None,
+                });
+        assert_eq!(cursor, Some(3));
+    }
+
+    #[test]
+    fn delayed_watcher_uses_pending_path_when_snapshot_still_has_pre_rename_id() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("b.txt"), b"b").unwrap();
+        fs::write(root.path().join("z.txt"), b"z").unwrap();
+        let (mut controller, engine) = scanned_controller(root.path(), ScanOptions::default());
+        let selected_line = controller
+            .visible_lines()
+            .iter()
+            .position(|line| line.text.ends_with("b.txt"))
+            .unwrap();
+        engine.set_view(controller.visible_lines(), selected_line);
+        fs::rename(root.path().join("b.txt"), root.path().join("zz.txt")).unwrap();
+        let rescanned = {
+            let mut ids = controller.ids.lock().unwrap();
+            fyler_fsops::scan::rescan_preserving_ids_with(
+                &controller.root,
+                &mut ids,
+                &controller.baseline,
+                &controller.scan_options,
+            )
+            .unwrap()
+        };
+        let mut baseline = BaselineTree::new(&controller.root);
+        for mut entry in rescanned.entries().iter().cloned() {
+            if entry.path == TreePath::parse("zz.txt") {
+                entry.id = EntryId(9999);
+            }
+            baseline.insert(entry);
+        }
+        let context = carry_collapsed_dirs(&controller.context, &controller.baseline, &baseline);
+        let renamed_line = visible_entries(&baseline, &context)
+            .iter()
+            .position(|entry| entry.path == TreePath::parse("zz.txt"))
+            .unwrap();
+        controller.baseline = baseline;
+        controller.context = context;
+        controller.pending_cursor = Some((TreePath::parse("zz.txt"), renamed_line, 0));
+
+        fs::write(root.path().join("a.txt"), b"a").unwrap();
+        assert_eq!(
+            controller.on_external_change(&BTreeSet::new()),
+            SaveFlowResult::ExternalChanged
+        );
+        let cursor =
+            engine
+                .commands
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find_map(|command| match command {
+                    EditorCommand::SetLines { cursor_line, .. } => *cursor_line,
+                    _ => None,
+                });
+        assert_eq!(cursor, Some(2));
+        engine.set_view(vec![EditorLine::new("unsaved-row")], 0);
+        engine.set_revision(1);
+        fs::write(root.path().join("c.txt"), b"c").unwrap();
+        assert_eq!(
+            controller.on_external_change(&BTreeSet::new()),
+            SaveFlowResult::ExternalChanged
+        );
+        let cursor =
+            engine
+                .commands
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find_map(|command| match command {
+                    EditorCommand::SetLines { cursor_line, .. } => *cursor_line,
+                    _ => None,
+                });
+        assert_eq!(cursor, Some(0));
+    }
+
+    #[test]
+
+    fn successful_move_cursor_target_uses_operation_result() {
+        let (controller, engine) = controller("C:/test-root");
+        let selected_id = controller.baseline.entries()[0].id;
+        engine.set_view(controller.visible_lines(), 0);
+        let report = CommitReport {
+            results: vec![
+                OpResult {
+                    op: FsOperation::Move {
+                        id: selected_id,
+                        from: TreePath::parse("a.txt"),
+                        to: TreePath::parse("b.txt"),
+                    },
+                    outcome: OpOutcome::Success,
+                },
+                OpResult {
+                    op: FsOperation::Move {
+                        id: EntryId(999),
+                        from: TreePath::parse("b.txt"),
+                        to: TreePath::parse("a.txt"),
+                    },
+                    outcome: OpOutcome::Success,
+                },
+            ],
+        };
+
+        assert_eq!(
+            controller.successful_move_target(&report),
+            Some(TreePath::parse("b.txt")),
+        );
+    }
+
+    #[test]
+    fn successful_move_and_undo_targets_follow_selected_descendants() {
+        let root = PathBuf::from("C:/test-root");
+        let mut ids = IdAllocator::new();
+        let dir_id = ids.allocate();
+        let child_id = ids.allocate();
+        let mut baseline = BaselineTree::new(&root);
+        baseline.insert(BaselineEntry {
+            id: dir_id,
+            path: TreePath::parse("parent"),
+            kind: EntryKind::Dir,
+        });
+        baseline.insert(BaselineEntry {
+            id: child_id,
+            path: TreePath::parse("parent/child.txt"),
+            kind: EntryKind::File,
+        });
+        let engine = Arc::new(RecordingEngine::default());
+        let controller =
+            SaveController::new(root, ids, baseline, Arc::<RecordingEngine>::clone(&engine));
+        engine.set_view(controller.visible_lines(), 1);
+        let apply_report = CommitReport {
+            results: vec![
+                OpResult {
+                    op: FsOperation::Move {
+                        id: dir_id,
+                        from: TreePath::parse("parent"),
+                        to: TreePath::parse("temporary"),
+                    },
+                    outcome: OpOutcome::Success,
+                },
+                OpResult {
+                    op: FsOperation::Move {
+                        id: EntryId(900),
+                        from: TreePath::parse("other"),
+                        to: TreePath::parse("parent"),
+                    },
+                    outcome: OpOutcome::Success,
+                },
+                OpResult {
+                    op: FsOperation::Move {
+                        id: dir_id,
+                        from: TreePath::parse("temporary"),
+                        to: TreePath::parse("moved"),
+                    },
+                    outcome: OpOutcome::Success,
+                },
+            ],
+        };
+        assert_eq!(
+            controller.successful_move_target(&apply_report),
+            Some(TreePath::parse("moved/child.txt")),
+        );
+
+        let root = tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+        let selected_id = EntryId(42);
+        let mut baseline = BaselineTree::new(&root_path);
+        baseline.insert(BaselineEntry {
+            id: selected_id,
+            path: TreePath::parse("moved/child.txt"),
+            kind: EntryKind::File,
+        });
+        let engine = Arc::new(RecordingEngine::default());
+        let controller = SaveController::new(
+            root_path.clone(),
+            IdAllocator::new(),
+            baseline,
+            Arc::<RecordingEngine>::clone(&engine),
+        );
+        engine.set_view(controller.visible_lines(), 0);
+        let identity = fyler_core::undo::FileIdentity { volume: 1, file: 2 };
+        let other_identity = fyler_core::undo::FileIdentity { volume: 1, file: 3 };
+        let undo_report = CommitReport {
+            results: vec![
+                OpResult {
+                    op: UndoStep::MoveBack {
+                        from: root_path.join("temporary"),
+                        to: root_path.join("moved"),
+                        identity: Some(identity.clone()),
+                        post: Fingerprint {
+                            kind: EntryKind::Dir,
+                            size: None,
+                            mtime: None,
+                            link_target: None,
+                        },
+                        case_only: false,
+                    },
+                    outcome: OpOutcome::Success,
+                },
+                OpResult {
+                    op: UndoStep::MoveBack {
+                        from: root_path.join("parent"),
+                        to: root_path.join("temporary"),
+                        identity: Some(identity),
+                        post: Fingerprint {
+                            kind: EntryKind::Dir,
+                            size: None,
+                            mtime: None,
+                            link_target: None,
+                        },
+                        case_only: false,
+                    },
+                    outcome: OpOutcome::Success,
+                },
+                OpResult {
+                    op: UndoStep::MoveBack {
+                        from: root_path.join("other"),
+                        to: root_path.join("parent"),
+                        identity: Some(other_identity),
+                        post: Fingerprint {
+                            kind: EntryKind::Dir,
+                            size: None,
+                            mtime: None,
+                            link_target: None,
+                        },
+                        case_only: false,
+                    },
+                    outcome: OpOutcome::Success,
+                },
+            ],
+        };
+        assert_eq!(
+            controller.successful_undo_target(&undo_report),
+            Some(TreePath::parse("parent/child.txt")),
+        );
+    }
+
+    #[test]
+
     fn map_git_badges_matches_exact_root_relative_paths_only() {
         let (controller, _) = controller("C:/test-root");
         let entry_id = controller.baseline.entries()[0].id;
@@ -2314,6 +2935,7 @@ mod tests {
 
         let warnings = plan_warnings(
             root.path(),
+            &BaselineTree::new(root.path()),
             &plan,
             &[],
             |path| Ok(path == root.path().join("cloud.bin")),
@@ -2338,6 +2960,7 @@ mod tests {
 
         let warnings = plan_warnings(
             root.path(),
+            &BaselineTree::new(root.path()),
             &plan,
             &[],
             |_| Ok(true),
@@ -2354,6 +2977,7 @@ mod tests {
 
         let warnings = plan_warnings(
             root.path(),
+            &BaselineTree::new(root.path()),
             &plan,
             &[TreePath::parse("existing.bin")],
             |_| Ok(false),
@@ -2391,6 +3015,7 @@ mod tests {
 
         let warnings = plan_warnings(
             root.path(),
+            &baseline,
             &plan,
             &[TreePath::parse("overwrite.bin")],
             |path| Ok(path == root.path().join("overwrite.bin")),

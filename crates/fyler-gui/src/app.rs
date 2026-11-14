@@ -23,7 +23,12 @@ use fyler_core::plan::OperationPlan;
 use fyler_core::report::{ApplyProgress, CommitReport};
 use fyler_core::transfer::{DropEffect, ImportOp, ImportPlan, TransferOp, TransferPlan};
 use fyler_core::validate::ValidateError;
+use fyler_core::window::{
+    NativeCaptionLayout, NativeWindowCaption, NativeWindowCaptionFactory, PhysicalRect,
+};
 use fyler_core::{StartupWindow, WindowGeometry};
+#[cfg(windows)]
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::confirm::{ConfirmChoice, ConfirmDetail};
 use crate::{chrome, cmdline, confirm, icon, input, modeline, theme, tree_view};
@@ -209,11 +214,11 @@ pub enum GuiEvent {
         layout: PaneLayout,
         active: PaneId,
     },
+    ReloadOptions(Box<GuiOptions>),
     Editor {
         pane_id: PaneId,
         event: EditorEvent,
     },
-    /// app層で表示ルートが切り替わったことをモードラインへ反映する。
     RootChanged {
         pane_id: PaneId,
         root: PathBuf,
@@ -443,7 +448,10 @@ enum DialogState {
         body: String,
         stage: FeedbackStage,
     },
-    Help,
+    Help {
+        query: String,
+        searching: bool,
+    },
     /// ツリーの右click context menu(GUI local。app層の往復を待たず即表示する)。
     TreeContext {
         pane_id: PaneId,
@@ -594,6 +602,12 @@ pub struct FylerApp {
     /// GUI window内で進行中のtree行drag(pane間dragを含む)。
     /// windowの境界を離れたら`GuiAction::TreeDragOut`を送って`None`へ戻す。
     tree_drag: Option<TreeDragSession>,
+    pending_font: Option<Option<PathBuf>>,
+    viewport_close_requested: bool,
+    viewport_maximize_requested: bool,
+    viewport_minimize_requested: bool,
+    native_caption: Option<Box<dyn NativeWindowCaption>>,
+    native_caption_layout: Option<NativeCaptionLayout>,
 }
 
 struct PaneViewState {
@@ -608,6 +622,7 @@ struct PaneViewState {
     collapsed_dirs: HashSet<EntryId>,
     engine_error: Option<String>,
     tree_viewport: Option<tree_view::TreeViewport>,
+    center_line: Option<usize>,
     can_go_back: bool,
     can_go_forward: bool,
 }
@@ -619,6 +634,7 @@ impl FylerApp {
         options: AppOptions,
         repaint_context: egui::Context,
         event_dequeued: Arc<dyn Fn() + Send + Sync>,
+        native_caption: Option<Box<dyn NativeWindowCaption>>,
     ) -> anyhow::Result<Self> {
         let AppOptions {
             confirm_detail,
@@ -679,6 +695,12 @@ impl FylerApp {
             window_geometry: Arc::new(Mutex::new(None)),
             position_correction: None,
             tree_drag: None,
+            pending_font: None,
+            viewport_close_requested: false,
+            viewport_maximize_requested: false,
+            viewport_minimize_requested: false,
+            native_caption,
+            native_caption_layout: None,
         })
     }
 
@@ -705,6 +727,7 @@ impl FylerApp {
                             collapsed_dirs: HashSet::new(),
                             engine_error: None,
                             tree_viewport: None,
+                            center_line: None,
                             can_go_back: false,
                             can_go_forward: false,
                         },
@@ -725,6 +748,27 @@ impl FylerApp {
                     self.layout = Some(layout);
                     self.active = Some(active);
                 }
+                GuiEvent::ReloadOptions(options) => {
+                    let GuiOptions {
+                        confirm_detail,
+                        font_path,
+                        help_entries,
+                        dock_focus_bindings,
+                        bookmarks,
+                        recent_roots: _,
+                        drives,
+                        statusline_left,
+                        statusline_right,
+                    } = *options;
+                    self.confirm_detail = confirm_detail;
+                    self.help_entries = help_entries;
+                    self.dock_focus_bindings = dock_focus_bindings;
+                    self.bookmarks = bookmarks;
+                    self.drives = drives;
+                    self.statusline_left = statusline_left;
+                    self.statusline_right = statusline_right;
+                    self.pending_font = Some(font_path);
+                }
                 GuiEvent::Editor { pane_id, event } => match event {
                     EditorEvent::SnapshotUpdated => {
                         if let Some(pane) = self.panes.get(&pane_id) {
@@ -732,6 +776,15 @@ impl FylerApp {
                         }
                     }
                     EditorEvent::ActivateLine { .. } => {}
+                    EditorEvent::OpenConfigRequested | EditorEvent::ReloadConfigRequested => {}
+                    EditorEvent::WindowCloseRequested => self.viewport_close_requested = true,
+                    EditorEvent::WindowMaximizeRequested => self.viewport_maximize_requested = true,
+                    EditorEvent::WindowMinimizeRequested => self.viewport_minimize_requested = true,
+                    EditorEvent::CenterCursor { line } => {
+                        if let Some(pane) = self.panes.get_mut(&pane_id) {
+                            pane.center_line = Some(line);
+                        }
+                    }
                     EditorEvent::OpenWith { .. } => {}
                     EditorEvent::YankPath { .. } => {}
                     EditorEvent::NavigateInto { .. } => {}
@@ -749,7 +802,12 @@ impl FylerApp {
                     EditorEvent::JumpBookmark { .. } => {}
                     EditorEvent::OpenFilePicker => {}
                     EditorEvent::FeedbackRequested => {}
-                    EditorEvent::ShowHelp => self.dialog = Some(DialogState::Help),
+                    EditorEvent::ShowHelp => {
+                        self.dialog = Some(DialogState::Help {
+                            query: String::new(),
+                            searching: false,
+                        })
+                    }
                     EditorEvent::PaneAction(_) => {}
                     EditorEvent::TransferRequested { .. } => {}
                     EditorEvent::ClipboardCopyRequested { .. } => {}
@@ -1114,6 +1172,29 @@ impl FylerApp {
 impl eframe::App for FylerApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_events();
+        if let Some(font) = self.pending_font.take() {
+            if let Some(path) = font.as_deref() {
+                if let Err(error) = fs::read(path) {
+                    self.message = Some(EditorMessage {
+                        kind: fyler_core::editor::MessageKind::Error,
+                        text: format!("Failed to load font {}: {error}", path.display()),
+                    });
+                }
+            }
+            install_fallback_font(ctx, font.as_deref());
+        }
+        if self.viewport_close_requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.viewport_close_requested = false;
+        }
+        if self.viewport_maximize_requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            self.viewport_maximize_requested = false;
+        }
+        if self.viewport_minimize_requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            self.viewport_minimize_requested = false;
+        }
         if self.resize_to_monitor_on_first_frame
             && let Some((size, position)) =
                 initial_window_geometry(ctx.input(|input| input.viewport().monitor_size))
@@ -1130,6 +1211,17 @@ impl eframe::App for FylerApp {
             self.position_correction = next;
             if should_correct {
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(state.target));
+            }
+        }
+        if let Some(caption) = self.native_caption.as_mut() {
+            let toolbar_height = (theme::TOOLBAR_HEIGHT * ctx.pixels_per_point()).round() as u32;
+            match caption.update(toolbar_height) {
+                Ok(layout) => self.native_caption_layout = layout,
+                Err(error) => {
+                    self.fatal_error =
+                        Some(format!("Failed to update native window caption: {error:#}"));
+                    self.native_caption_layout = None;
+                }
             }
         }
         if let Some(geometry) = current_window_geometry(ctx)
@@ -1164,15 +1256,60 @@ impl eframe::App for FylerApp {
             ))
         });
         let mut chrome_action = None;
+        let mut drag_rect = None;
+        let native_path = self.native_caption.is_some();
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("fyler-native-caption"),
+                (native_path, self.native_caption_layout),
+            );
+        });
+        let ppp = ui.ctx().pixels_per_point();
+        let caption_left = self
+            .native_caption_layout
+            .map(|layout| layout.buttons.x as f32 / ppp);
+        let caption_cell_size = self.native_caption_layout.map_or_else(
+            || egui::vec2(46.0, 32.0),
+            |layout| {
+                egui::vec2(
+                    layout.buttons.width as f32 / (3.0 * ppp),
+                    layout.buttons.height as f32 / ppp,
+                )
+            },
+        );
+        let render_toolbar_height = self
+            .native_caption_layout
+            .map_or(theme::TOOLBAR_HEIGHT, |layout| {
+                theme::TOOLBAR_HEIGHT.max(layout.toolbar_height as f32 / ppp)
+            })
+            .max(caption_cell_size.y);
+        let panel_frame = if native_path {
+            egui::Frame::NONE
+        } else {
+            egui::Frame::NONE.fill(theme::CANVAS)
+        };
         egui::Panel::top("fyler-toolbar")
-            .exact_size(theme::TOOLBAR_HEIGHT)
+            .frame(panel_frame)
+            .exact_size(render_toolbar_height)
             .show(ui, |ui| {
-                let (can_go_back, can_go_forward) = chrome_state
-                    .as_ref()
-                    .map(|(_, _, back, forward)| (*back, *forward))
-                    .unwrap_or((false, false));
-                chrome_action = chrome::draw_toolbar(ui, can_go_back, can_go_forward);
+                if !native_path || self.native_caption_layout.is_some() {
+                    let (can_go_back, can_go_forward) = chrome_state
+                        .as_ref()
+                        .map(|(_, _, back, forward)| (*back, *forward))
+                        .unwrap_or((false, false));
+                    (chrome_action, drag_rect) = chrome::draw_toolbar(
+                        ui,
+                        can_go_back,
+                        can_go_forward,
+                        caption_cell_size,
+                        caption_left,
+                    );
+                }
             });
+        if let Some(caption) = self.native_caption.as_mut() {
+            let region = drag_rect.and_then(|rect| physical_drag_region(rect, ppp));
+            caption.set_drag_region(region);
+        }
         let navigation_entries = chrome_state
             .as_ref()
             .map(|(_, root, ..)| {
@@ -1215,18 +1352,23 @@ impl eframe::App for FylerApp {
         {
             pane.engine_error = Some(format!("Failed to send input to editor engine: {error}"));
         }
-
         if self.cmdline.is_some() || self.popupmenu.is_some() {
-            egui::Panel::bottom("global-command-area").show(ui, |ui| {
-                if let Some(state) = &self.popupmenu {
-                    cmdline::draw_popupmenu(ui, state);
-                }
-                if let Some(state) = &self.cmdline {
-                    cmdline::draw_cmdline(ui, state);
-                }
-            });
+            let command_frame = egui::Frame::NONE
+                .fill(theme::SURFACE)
+                .inner_margin(egui::Margin::symmetric(8, 2));
+            egui::Panel::bottom("global-command-area")
+                .frame(command_frame)
+                .show(ui, |ui| {
+                    if let Some(state) = &self.popupmenu {
+                        cmdline::draw_popupmenu(ui, state);
+                    }
+                    if let Some(state) = &self.cmdline {
+                        cmdline::draw_cmdline(ui, state);
+                    }
+                });
         } else if let Some(message) = &self.message {
             egui::Panel::top("global-message-area")
+                .frame(panel_frame)
                 .exact_size(34.0)
                 .show(ui, |ui| cmdline::draw_message(ui, message));
         }
@@ -1239,6 +1381,7 @@ impl eframe::App for FylerApp {
         let internal_drag_active = self.tree_drag.is_some();
         let mut drag_collect = DragCollect::default();
         let (ime, navigation_clicked, tree_click, drop_target_line) = egui::CentralPanel::default()
+            .frame(panel_frame)
             .show(ui, |ui| {
                 if let Some(error) = fatal_error {
                     ui.colored_label(ui.visuals().error_fg_color, error);
@@ -1546,14 +1689,14 @@ impl eframe::App for FylerApp {
                 cancel_loader =
                     confirm::draw_loader_progress(ui, title, path, *entries, *cancel_requested);
             }
-            Some(DialogState::Help) => {
-                dismiss_errors = draw_help(ui, &self.help_entries);
+            Some(DialogState::Help { query, searching }) => {
+                dismiss_errors = draw_help(ui, &self.help_entries, query, searching).0;
             }
             Some(DialogState::ValidationErrors(errors)) => {
                 let dismiss_from_keyboard = ui.ctx().input(|input| {
                     input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape)
                 });
-                dismiss_errors = egui::Modal::new(egui::Id::new("save-validation-errors"))
+                dismiss_errors = caption_modal(ui.ctx(), egui::Id::new("save-validation-errors"))
                     .show(ui.ctx(), |ui| {
                         ui.heading("Cannot save");
                         ui.add_space(8.0);
@@ -1705,11 +1848,155 @@ impl eframe::App for FylerApp {
                 TreeContextOutcome::Pending => {}
             }
         }
+        if let Some(layout) = self.native_caption_layout {
+            paint_native_caption(ui.ctx(), layout);
+        }
+    }
+    #[cfg(windows)]
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
     }
 }
 
 fn should_forward_input(dialog_absent: bool, fatal_absent: bool, engine_healthy: bool) -> bool {
     dialog_absent && fatal_absent && engine_healthy
+}
+
+fn physical_drag_region(rect: egui::Rect, pixels_per_point: f32) -> Option<PhysicalRect> {
+    if !rect.is_positive()
+        || !pixels_per_point.is_finite()
+        || pixels_per_point <= 0.0
+        || ![rect.left(), rect.top(), rect.right(), rect.bottom()]
+            .into_iter()
+            .all(f32::is_finite)
+    {
+        return None;
+    }
+    let scale = f64::from(pixels_per_point);
+    let left = (f64::from(rect.left()) * scale).ceil();
+    let top = (f64::from(rect.top()) * scale).ceil();
+    let right = (f64::from(rect.right()) * scale).floor();
+    let bottom = (f64::from(rect.bottom()) * scale).floor();
+    if left < f64::from(i32::MIN)
+        || top < f64::from(i32::MIN)
+        || right > f64::from(i32::MAX)
+        || bottom > f64::from(i32::MAX)
+        || right - left > f64::from(i32::MAX)
+        || bottom - top > f64::from(i32::MAX)
+        || right <= left
+        || bottom <= top
+    {
+        return None;
+    }
+    Some(PhysicalRect {
+        x: left as i32,
+        y: top as i32,
+        width: (right - left) as i32,
+        height: (bottom - top) as i32,
+    })
+}
+fn paint_native_caption(ctx: &egui::Context, layout: NativeCaptionLayout) {
+    let ppp = ctx.pixels_per_point();
+    let viewport = ctx.content_rect();
+    if !ppp.is_finite() || ppp <= 0.0 || !viewport.is_finite() {
+        return;
+    }
+    let caption = layout.buttons;
+    if caption.width <= 0 || caption.height <= 0 || layout.toolbar_height == 0 {
+        return;
+    }
+    let origin = egui::pos2(viewport.left(), viewport.top());
+    let painter = ctx
+        .layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("native-caption"),
+        ))
+        .with_clip_rect(viewport);
+    let caption_right = i64::from(caption.x) + i64::from(caption.width);
+    let px = |physical: i64| physical as f32 / ppp;
+    let strip = egui::Rect::from_min_max(
+        origin + egui::vec2(px(i64::from(caption.x)), 0.0),
+        origin + egui::vec2(px(caption_right), px(i64::from(layout.toolbar_height))),
+    )
+    .intersect(viewport);
+    if !strip.is_positive() || !strip.is_finite() {
+        return;
+    }
+    let painter = painter.with_clip_rect(strip);
+    painter.rect_filled(strip, 0.0, theme::SURFACE);
+    let edge = |index: i64| i64::from(caption.x) + i64::from(caption.width) * index / 3;
+    let snap = |point: egui::Pos2| {
+        egui::pos2((point.x * ppp).round() / ppp, (point.y * ppp).round() / ppp)
+    };
+    let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+    let stroke = egui::Stroke::new(1.0 / ppp, egui::Color32::WHITE);
+    for index in 0..3 {
+        let left = edge(index);
+        let right = edge(index + 1);
+        if right <= left {
+            continue;
+        }
+        let full_cell = egui::Rect::from_min_max(
+            origin + egui::vec2(px(left), 0.0),
+            origin + egui::vec2(px(right), px(i64::from(layout.toolbar_height))),
+        );
+        let cell = full_cell.intersect(viewport);
+        if !cell.is_positive() {
+            continue;
+        }
+        let hot = layout.hovered_button.is_some_and(|hovered| {
+            i64::from(hovered.x) == left
+                && i64::from(hovered.width) == right - left
+                && hovered.y == 0
+                && i64::from(hovered.height) == i64::from(layout.toolbar_height)
+        });
+        if hot {
+            painter.rect_filled(
+                cell,
+                0.0,
+                if index == 2 {
+                    theme::CAPTION_CLOSE_HOVER
+                } else {
+                    theme::TOOLBAR_HOVER
+                },
+            );
+        }
+        let center = snap(full_cell.center());
+        match index {
+            0 => {
+                painter.line_segment(
+                    [
+                        snap(center - egui::vec2(5.0, 0.0)),
+                        snap(center + egui::vec2(5.0, 0.0)),
+                    ],
+                    stroke,
+                );
+            }
+            1 => paint_caption_maximize_glyph(&painter, center, stroke, maximized),
+            _ => {
+                let rect = egui::Rect::from_center_size(center, egui::vec2(10.0, 10.0));
+                painter.line_segment([snap(rect.left_top()), snap(rect.right_bottom())], stroke);
+                painter.line_segment([snap(rect.right_top()), snap(rect.left_bottom())], stroke);
+            }
+        }
+    }
+}
+
+fn paint_caption_maximize_glyph(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    stroke: egui::Stroke,
+    maximized: bool,
+) {
+    if maximized {
+        for offset in [egui::vec2(-1.5, -1.5), egui::vec2(1.5, 1.5)] {
+            let square = egui::Rect::from_center_size(center + offset, egui::vec2(7.0, 7.0));
+            painter.rect_stroke(square, 0.0, stroke, egui::StrokeKind::Inside);
+        }
+    } else {
+        let square = egui::Rect::from_center_size(center, egui::vec2(9.0, 9.0));
+        painter.rect_stroke(square, 0.0, stroke, egui::StrokeKind::Inside);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1959,6 +2246,7 @@ fn draw_layout_in_rect(
                             &pane.collapsed_dirs,
                             &pane.file_infos,
                             pane.tree_viewport,
+                            pane.center_line.take(),
                             *id,
                             *id == active,
                             *id == active && drag_active,
@@ -2164,6 +2452,51 @@ fn picker_completion_action(pane_id: PaneId, selection: Option<GuiAction>) -> Gu
     selection.unwrap_or(GuiAction::PickerClosed { pane_id })
 }
 
+pub(crate) fn caption_modal(ctx: &egui::Context, id: egui::Id) -> egui::Modal {
+    let caption = ctx.data(|data| {
+        data.get_temp::<(bool, Option<NativeCaptionLayout>)>(egui::Id::new("fyler-native-caption"))
+    });
+    let Some((true, layout)) = caption else {
+        return egui::Modal::new(id);
+    };
+    let Some(layout) = layout else {
+        return egui::Modal::new(id).backdrop_color(egui::Color32::TRANSPARENT);
+    };
+
+    let content = ctx.content_rect();
+    let scale = ctx.pixels_per_point();
+    let strip_left = layout.buttons.x as f32 / scale;
+    let strip_bottom = (content.top() + layout.toolbar_height as f32 / scale).min(content.bottom());
+    let reserved = egui::Rect::from_min_max(
+        egui::pos2(strip_left, content.top()),
+        egui::pos2(content.right(), strip_bottom),
+    )
+    .intersect(content);
+    if !reserved.is_positive() {
+        return egui::Modal::new(id);
+    }
+
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, id));
+    let dim = egui::Color32::from_black_alpha(100);
+    for rect in [
+        egui::Rect::from_min_max(content.min, egui::pos2(content.right(), reserved.top())),
+        egui::Rect::from_min_max(egui::pos2(content.left(), reserved.bottom()), content.max),
+        egui::Rect::from_min_max(
+            egui::pos2(content.left(), reserved.top()),
+            egui::pos2(reserved.left(), reserved.bottom()),
+        ),
+        egui::Rect::from_min_max(
+            egui::pos2(reserved.right(), reserved.top()),
+            egui::pos2(content.right(), reserved.bottom()),
+        ),
+    ] {
+        if rect.is_positive() {
+            painter.rect_filled(rect, 0.0, dim);
+        }
+    }
+    egui::Modal::new(id).backdrop_color(egui::Color32::TRANSPARENT)
+}
+
 #[allow(clippy::too_many_arguments)] // pickerの表示状態をDialogStateと同じ粒度で明示する。
 fn draw_file_picker(
     ui: &mut egui::Ui,
@@ -2178,7 +2511,7 @@ fn draw_file_picker(
     let keys = read_picker_keys(ui.ctx());
     let mut clicked_selection = None;
     let mut query_changed = false;
-    egui::Modal::new(egui::Id::new("fyler-file-picker")).show(ui.ctx(), |ui| {
+    caption_modal(ui.ctx(), egui::Id::new("fyler-file-picker")).show(ui.ctx(), |ui| {
         ui.set_min_width(560.0);
         ui.heading("Find file");
         ui.add_space(6.0);
@@ -2256,7 +2589,7 @@ fn draw_feedback(
     }
 
     let mut result = None;
-    egui::Modal::new(egui::Id::new("fyler-feedback")).show(ui.ctx(), |ui| {
+    caption_modal(ui.ctx(), egui::Id::new("fyler-feedback")).show(ui.ctx(), |ui| {
         ui.set_min_width(560.0);
         ui.heading("Anonymous feedback");
         ui.add_space(8.0);
@@ -2406,82 +2739,163 @@ fn draw_feedback(
     });
     result
 }
-fn draw_help(ui: &mut egui::Ui, help_entries: &[HelpEntry]) -> bool {
-    let dismiss_from_keyboard = ui.ctx().input(|input| {
-        input.key_pressed(egui::Key::Escape)
-            || input
-                .events
-                .iter()
-                .any(|event| matches!(event, egui::Event::Text(text) if text == "?"))
-    });
+fn help_matches<'a>(help_entries: &'a [HelpEntry], query: &str) -> Vec<&'a HelpEntry> {
+    let needle = query.to_lowercase();
+    help_entries
+        .iter()
+        .filter(|entry| {
+            needle.is_empty()
+                || entry.command.to_lowercase().contains(&needle)
+                || entry.description.to_lowercase().contains(&needle)
+        })
+        .collect()
+}
 
-    egui::Modal::new(egui::Id::new("fyler-help")).show(ui.ctx(), |ui| {
-        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-            ui.set_min_width(540.0);
-            let (header_rect, _) = ui
-                .allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
-            ui.painter().text(
-                header_rect.left_center(),
-                egui::Align2::LEFT_CENTER,
-                "Keyboard",
-                egui::TextStyle::Heading.resolve(ui.style()),
-                theme::TEXT,
-            );
-            ui.painter().text(
-                header_rect.right_center(),
-                egui::Align2::RIGHT_CENTER,
-                "? / esc",
-                egui::FontId::monospace(11.0),
-                theme::TEXT_MUTED,
-            );
-            ui.add_space(6.0);
+fn help_content_height(viewport_height: f32, frame: egui::Frame) -> f32 {
+    (viewport_height * 0.7 - frame.total_margin().sum().y).max(0.0)
+}
+
+fn apply_help_keys(
+    escape: bool,
+    slash: bool,
+    key_j: bool,
+    key_k: bool,
+    text_entry: bool,
+    query: &mut String,
+    searching: &mut bool,
+) -> (bool, bool, f32) {
+    let dismiss = escape && !*searching;
+    if escape && *searching {
+        *searching = false;
+        query.clear();
+    }
+    let begin_search = slash && !text_entry;
+    if begin_search {
+        *searching = true;
+    }
+    let scroll_delta = if text_entry {
+        0.0
+    } else if key_j {
+        -80.0
+    } else if key_k {
+        80.0
+    } else {
+        0.0
+    };
+    (dismiss, begin_search, scroll_delta)
+}
+
+fn draw_help(
+    ui: &mut egui::Ui,
+    help_entries: &[HelpEntry],
+    query: &mut String,
+    searching: &mut bool,
+) -> (bool, egui::Rect) {
+    let text_entry = *searching;
+    let (escape, slash, key_j, key_k) = ui.ctx().input(|input| {
+        (
+            input.key_pressed(egui::Key::Escape),
+            input.key_pressed(egui::Key::Slash),
+            input.key_pressed(egui::Key::J),
+            input.key_pressed(egui::Key::K),
+        )
+    });
+    let (dismiss, begin_search, scroll_delta) =
+        apply_help_keys(escape, slash, key_j, key_k, text_entry, query, searching);
+    if escape || begin_search || scroll_delta != 0.0 {
+        ui.ctx().input_mut(|input| {
+            input.events.retain(|event| {
+                !(matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::Escape | egui::Key::Slash,
+                        ..
+                    }
+                ) || (scroll_delta != 0.0
+                    && matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::J | egui::Key::K,
+                            ..
+                        }
+                    )))
+            });
+        });
+    }
+    let viewport = ui.ctx().content_rect().size();
+    let frame = egui::Frame::popup(ui.style());
+    let content_height = help_content_height(viewport.y, frame);
+    let outer_width = viewport.x * 0.3;
+    let content_width = (outer_width - frame.total_margin().sum().x).max(0.0);
+    let modal_response = caption_modal(ui.ctx(), egui::Id::new("fyler-help"))
+        .frame(frame)
+        .show(ui.ctx(), |ui| {
+            ui.set_min_width(content_width);
+            ui.set_max_width(content_width);
+            ui.set_min_height(content_height);
+            ui.set_max_height(content_height);
+            let command_width = (content_width * 0.35).max(0.0);
+            let description_width = (content_width - command_width - 8.0).max(0.0);
+            ui.heading("Keyboard");
+            ui.label("j/k scroll · / search · esc close");
+            if *searching {
+                let response = ui.add(
+                    egui::TextEdit::singleline(query)
+                        .hint_text("Filter commands")
+                        .desired_width(content_width),
+                );
+                if begin_search {
+                    response.request_focus();
+                }
+            }
             ui.separator();
+            let matches = help_matches(help_entries, query);
+            let scroll_height = ui.available_height().max(0.0);
             egui::ScrollArea::vertical()
-                .max_height(520.0)
-                .auto_shrink([false, true])
+                .id_salt("fyler-help-commands")
+                .max_height(scroll_height)
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    egui::Grid::new("fyler-help-commands")
-                        .num_columns(2)
-                        .min_col_width(150.0)
-                        .spacing([24.0, 8.0])
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new("KEY")
-                                    .monospace()
-                                    .strong()
-                                    .size(10.0)
-                                    .color(theme::TEXT_MUTED),
-                            );
-                            ui.label(
-                                egui::RichText::new("COMMAND")
-                                    .monospace()
-                                    .strong()
-                                    .size(10.0)
-                                    .color(theme::TEXT_MUTED),
-                            );
-                            ui.end_row();
-                            for entry in help_entries {
-                                ui.label(
-                                    egui::RichText::new(&entry.command)
-                                        .monospace()
-                                        .strong()
-                                        .size(12.0)
-                                        .color(theme::BLUE),
-                                );
-                                ui.label(
-                                    egui::RichText::new(&entry.description)
-                                        .monospace()
-                                        .size(12.0)
-                                        .color(theme::TEXT_SECONDARY),
-                                );
-                                ui.end_row();
-                            }
-                        });
+                    if scroll_delta != 0.0 {
+                        ui.scroll_with_delta(egui::vec2(0.0, scroll_delta));
+                    }
+                    if matches.is_empty() {
+                        ui.label("No matching commands");
+                    } else {
+                        egui::Grid::new("fyler-help-commands-grid")
+                            .num_columns(2)
+                            .spacing([8.0, 8.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for entry in matches {
+                                    ui.add_sized(
+                                        [command_width, 0.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(&entry.command)
+                                                .monospace()
+                                                .strong()
+                                                .size(12.0)
+                                                .color(theme::BLUE),
+                                        )
+                                        .wrap(),
+                                    );
+                                    ui.add_sized(
+                                        [description_width, 0.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(&entry.description)
+                                                .monospace()
+                                                .size(12.0)
+                                                .color(theme::TEXT_SECONDARY),
+                                        )
+                                        .wrap(),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
+                    }
                 });
         });
-    });
-    dismiss_from_keyboard
+    (dismiss, modal_response.response.rect)
 }
 
 /// [`draw_tree_context_menu`] の描画結果。
@@ -2775,17 +3189,32 @@ fn native_options(window: Option<StartupWindow>) -> eframe::NativeOptions {
                 builder
             }
         })
-        .with_decorations(false)
+        .with_decorations(!cfg!(windows))
+        .with_transparent(cfg!(windows))
         .with_min_inner_size([720.0, 480.0])
         .with_title("fyler")
         .with_icon(window_icon());
-    eframe::NativeOptions {
+    let options = eframe::NativeOptions {
         viewport,
         // Geometry is persisted in session.toml so it shares the same normal-shutdown contract
         // as pane state and does not depend on eframe's optional persistence feature.
         persist_window: false,
         ..Default::default()
-    }
+    };
+    #[cfg(windows)]
+    let options = {
+        let mut options = options;
+        let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+        setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+        setup
+            .instance_descriptor
+            .backend_options
+            .dx12
+            .presentation_system = eframe::wgpu::Dx12SwapchainKind::DxgiFromVisual;
+        options.wgpu_options.wgpu_setup = eframe::egui_wgpu::WgpuSetup::CreateNew(setup);
+        options
+    };
+    options
 }
 
 /// GUIを起動する(メインスレッドで呼ぶこと。eframeの制約)。
@@ -2801,6 +3230,7 @@ pub fn run(
     event_dequeued: Arc<dyn Fn() + Send + Sync>,
     initial_window: Option<StartupWindow>,
     window_geometry: Arc<Mutex<Option<WindowGeometry>>>,
+    native_caption_factory: Option<NativeWindowCaptionFactory>,
 ) -> anyhow::Result<()> {
     let native_options = native_options(initial_window);
     eframe::run_native(
@@ -2830,6 +3260,33 @@ pub fn run(
                             window.geometry.outer_y,
                         ))
                     });
+            #[cfg(windows)]
+            let native_caption = {
+                let factory = native_caption_factory.ok_or_else(|| {
+                    anyhow::anyhow!("Windows GUI requires native caption integration")
+                })?;
+                let hwnd = match creation_context.window_handle()?.as_raw() {
+                    RawWindowHandle::Win32(handle) => handle.hwnd.get(),
+                    _ => {
+                        return Err(anyhow::anyhow!(
+                            "Windows GUI did not provide a Win32 window handle"
+                        )
+                        .into());
+                    }
+                };
+                let repaint_context = creation_context.egui_ctx.clone();
+                let surface = theme::SURFACE;
+                Some(factory(
+                    hwnd,
+                    Arc::new(move || repaint_context.request_repaint()),
+                    [surface.r(), surface.g(), surface.b()],
+                )?)
+            };
+            #[cfg(not(windows))]
+            let native_caption = {
+                let _ = native_caption_factory;
+                None
+            };
             theme::install(&creation_context.egui_ctx);
             install_fallback_font(&creation_context.egui_ctx, font_path.as_deref());
             let mut app = FylerApp::new(
@@ -2847,6 +3304,7 @@ pub fn run(
                 },
                 creation_context.egui_ctx.clone(),
                 event_dequeued,
+                native_caption,
             )
             .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
             app.resize_to_monitor_on_first_frame = resize_to_monitor_on_first_frame;
@@ -2910,6 +3368,195 @@ fn install_fallback_font(context: &egui::Context, configured: Option<&Path>) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn physical_drag_region_tracks_scale_and_rejects_invalid_geometry() {
+        let rect = egui::Rect::from_min_max(egui::pos2(50.25, 4.0), egui::pos2(200.0, 40.0));
+        assert_eq!(
+            physical_drag_region(rect, 1.0),
+            Some(PhysicalRect {
+                x: 51,
+                y: 4,
+                width: 149,
+                height: 36
+            })
+        );
+        assert_eq!(
+            physical_drag_region(rect, 2.0),
+            Some(PhysicalRect {
+                x: 101,
+                y: 8,
+                width: 299,
+                height: 72
+            })
+        );
+        let drag = physical_drag_region(rect, 2.0).unwrap();
+        assert!(drag.x + drag.width <= (rect.right() * 2.0) as i32);
+        assert_eq!(physical_drag_region(rect, f32::INFINITY), None);
+        assert_eq!(physical_drag_region(rect, 0.0), None);
+        assert_eq!(physical_drag_region(egui::Rect::NOTHING, 1.0), None);
+        assert_eq!(
+            physical_drag_region(
+                egui::Rect::from_min_max(egui::pos2(0.01, 0.01), egui::pos2(0.1, 0.1)),
+                1.0
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn native_caption_paints_opaque_full_height_hover_and_centered_glyphs() {
+        let context = egui::Context::default();
+        context.set_pixels_per_point(1.25);
+        let layout = NativeCaptionLayout {
+            buttons: PhysicalRect {
+                x: 70,
+                y: 0,
+                width: 31,
+                height: 43,
+            },
+            hovered_button: Some(PhysicalRect {
+                x: 90,
+                y: 0,
+                width: 11,
+                height: 43,
+            }),
+            toolbar_height: 43,
+        };
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(110.0, 50.0),
+                )),
+                ..Default::default()
+            },
+            |_| paint_native_caption(&context, layout),
+        );
+        let surface = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect) if rect.fill == theme::SURFACE => Some(rect.rect),
+                _ => None,
+            })
+            .expect("caption strip has an opaque surface");
+        assert_eq!(
+            surface,
+            egui::Rect::from_min_max(egui::pos2(56.0, 0.0), egui::pos2(80.8, 34.4))
+        );
+        let close_hover = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect) if rect.fill == theme::CAPTION_CLOSE_HOVER => {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("close hover is painted red");
+        assert_eq!(
+            close_hover,
+            egui::Rect::from_min_max(egui::pos2(72.0, 0.0), egui::pos2(80.8, 34.4))
+        );
+        let min_hover = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(110.0, 50.0),
+                )),
+                ..Default::default()
+            },
+            |_| {
+                paint_native_caption(
+                    &context,
+                    NativeCaptionLayout {
+                        hovered_button: Some(PhysicalRect {
+                            x: 70,
+                            y: 0,
+                            width: 10,
+                            height: 43,
+                        }),
+                        ..layout
+                    },
+                )
+            },
+        );
+        assert!(min_hover.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Rect(rect) if rect.fill == theme::TOOLBAR_HOVER
+                && rect.rect == egui::Rect::from_min_max(egui::pos2(56.0, 0.0), egui::pos2(64.0, 34.4)))));
+        assert_eq!(
+            theme::CAPTION_CLOSE_HOVER,
+            egui::Color32::from_rgb(232, 17, 35)
+        );
+        assert_eq!(theme::TOOLBAR_HOVER, egui::Color32::from_rgb(31, 31, 34));
+        let lines: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::LineSegment { points, stroke }
+                    if stroke.color == egui::Color32::WHITE =>
+                {
+                    Some(*points)
+                }
+                _ => None,
+            })
+            .collect();
+        for center in [60.0, 76.0] {
+            assert!(
+                lines.iter().any(|points| {
+                    ((points[0].x + points[1].x) * 0.5 - center).abs() <= 1.0
+                        && ((points[0].y + points[1].y) * 0.5 - 17.2).abs() <= 1.0
+                }),
+                "minimize and close glyphs are centered in their unclipped cells"
+            );
+        }
+        assert!(
+            output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Rect(rect) if rect.stroke.color == egui::Color32::WHITE
+                && (rect.rect.center().x - 68.0).abs() <= 1.0
+                && (rect.rect.center().y - 17.2).abs() <= 1.0)),
+            "maximize uses a centered outlined square"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|points| (points[0].x - points[1].x).abs() > 5.0),
+            "caption glyphs use crisp white strokes"
+        );
+        for (maximized, expected_squares) in [(false, 1), (true, 2)] {
+            let state_output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(110.0, 50.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    paint_caption_maximize_glyph(
+                        &ctx.layer_painter(egui::LayerId::new(
+                            egui::Order::Foreground,
+                            egui::Id::new("caption-maximize-test"),
+                        )),
+                        egui::pos2(68.0, 17.2),
+                        egui::Stroke::new(1.0, egui::Color32::WHITE),
+                        maximized,
+                    );
+                },
+            );
+            assert_eq!(
+                state_output
+                    .shapes
+                    .iter()
+                    .filter(|shape| matches!(&shape.shape,
+                        egui::Shape::Rect(rect) if rect.stroke.color == egui::Color32::WHITE))
+                    .count(),
+                expected_squares,
+                "maximized and restored windows have distinct caption glyphs"
+            );
+        }
+    }
+
     struct RecordingEngine(Arc<fyler_core::editor::EditorSnapshot>);
 
     impl EditorEngine for RecordingEngine {
@@ -2926,6 +3573,231 @@ mod tests {
         Arc::new(RecordingEngine(Arc::new(
             fyler_core::editor::EditorSnapshot::empty(),
         )))
+    }
+
+    struct FakeNativeCaption {
+        layout: Option<NativeCaptionLayout>,
+        drag_region: Arc<Mutex<Option<PhysicalRect>>>,
+    }
+
+    impl NativeWindowCaption for FakeNativeCaption {
+        fn update(&mut self, _toolbar_height: u32) -> anyhow::Result<Option<NativeCaptionLayout>> {
+            Ok(self.layout)
+        }
+
+        fn set_drag_region(&mut self, region: Option<PhysicalRect>) {
+            *self.drag_region.lock().unwrap() = region;
+        }
+    }
+
+    #[test]
+    fn native_caption_headless_ui_keeps_opaque_caption_and_drag_separate() {
+        for (width, ppp, caption_width) in [
+            (720.0, 1.0, 100.0),
+            (720.0, 1.5, 560.0),
+            (1344.0, 2.0, 100.0),
+        ] {
+            let context = egui::Context::default();
+            context.set_pixels_per_point(ppp);
+            theme::install(&context);
+            let (mut app, _, _) = empty_test_app();
+            let caption_x = (width - caption_width) * ppp;
+            let drag_region = Arc::new(Mutex::new(None));
+            app.native_caption = Some(Box::new(FakeNativeCaption {
+                layout: Some(NativeCaptionLayout {
+                    buttons: PhysicalRect {
+                        x: caption_x as i32,
+                        y: 0,
+                        width: (caption_width * ppp) as i32,
+                        height: (theme::TOOLBAR_HEIGHT * ppp) as i32,
+                    },
+                    hovered_button: Some(PhysicalRect {
+                        x: caption_x as i32 + (caption_width * ppp * 2.0 / 3.0) as i32,
+                        y: 0,
+                        width: (caption_width * ppp) as i32 - (caption_width * ppp) as i32 * 2 / 3,
+                        height: (theme::TOOLBAR_HEIGHT * ppp) as i32,
+                    }),
+                    toolbar_height: (theme::TOOLBAR_HEIGHT * ppp) as u32,
+                }),
+                drag_region: Arc::clone(&drag_region),
+            }));
+            app.dialog = Some(DialogState::Help {
+                query: String::new(),
+                searching: false,
+            });
+            let mut frame = eframe::Frame::_new_kittest();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 480.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = egui::FullOutput::default();
+            for _ in 0..2 {
+                output = context.run_ui(input.clone(), |ui| {
+                    eframe::App::logic(&mut app, ui.ctx(), &mut frame);
+                    eframe::App::ui(&mut app, ui, &mut frame);
+                });
+            }
+            let drag = drag_region.lock().unwrap();
+            if ppp == 1.5 {
+                assert!(
+                    drag.is_none(),
+                    "native-sized controls do not fit this stress viewport"
+                );
+                assert!(
+                    output.shapes.iter().all(|shape| !matches!(
+                        &shape.shape,
+                        egui::Shape::Text(text)
+                            if ["←", "→", "↑", "↻"].contains(&text.galley.job.text.as_str())
+                    )),
+                    "controls too wide for the stress viewport must not paint navigation glyphs"
+                );
+            } else {
+                let drag = drag.expect("toolbar should expose drag area");
+                assert!(drag.x + drag.width <= caption_x as i32);
+                assert_eq!(drag.y, 0);
+                assert_eq!(drag.height, (theme::TOOLBAR_HEIGHT * ppp) as i32);
+                let refresh_glyph_right = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.job.text == "↻" => {
+                            Some((text.pos.x + text.galley.size().x) * ppp)
+                        }
+                        _ => None,
+                    })
+                    .expect("refresh navigation control must be painted");
+                assert!(drag.x >= refresh_glyph_right.ceil() as i32);
+            }
+            let reserved = egui::Rect::from_min_size(
+                egui::pos2(width - caption_width, 0.0),
+                egui::vec2(caption_width, theme::TOOLBAR_HEIGHT),
+            );
+            let caption_surface = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect)
+                    if rect.fill == theme::SURFACE
+                        && rect.rect.contains(reserved.center())
+                        && rect.rect.height() >= theme::TOOLBAR_HEIGHT =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            });
+            assert!(
+                caption_surface.is_some(),
+                "reserved caption strip is opaque surface"
+            );
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Rect(rect) if rect.fill == theme::CAPTION_CLOSE_HOVER
+                    && rect.rect.intersect(reserved).is_positive())));
+            let dim_backdrops = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect)
+                        if rect.fill == egui::Color32::from_black_alpha(100) =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                !dim_backdrops.is_empty(),
+                "Help still dims non-caption content"
+            );
+            assert!(
+                dim_backdrops
+                    .iter()
+                    .all(|rect| !rect.intersect(reserved).is_positive()),
+                "Help backdrop must not paint any part of the OS-owned caption strip"
+            );
+            assert!(
+                dim_backdrops
+                    .iter()
+                    .enumerate()
+                    .all(|(index, rect)| dim_backdrops[index + 1..]
+                        .iter()
+                        .all(|other| !rect.intersect(*other).is_positive())),
+                "Help backdrop pieces must not overlap and darken pixels twice"
+            );
+            let dim_count_at = |point| {
+                dim_backdrops
+                    .iter()
+                    .filter(|rect| rect.contains(point))
+                    .count()
+            };
+            assert_eq!(
+                dim_count_at(egui::pos2(
+                    (width - caption_width) * 0.5,
+                    theme::TOOLBAR_HEIGHT * 0.5
+                )),
+                1,
+                "content beside the reserved strip is dimmed exactly once"
+            );
+            assert_eq!(
+                dim_count_at(egui::pos2(width - 20.0, theme::TOOLBAR_HEIGHT + 10.0)),
+                1,
+                "content below the reserved strip is dimmed exactly once"
+            );
+            assert_eq!(
+                dim_count_at(egui::pos2(width - 20.0, theme::TOOLBAR_HEIGHT * 0.5)),
+                0,
+                "the reserved strip remains undimmed"
+            );
+        }
+
+        let context = egui::Context::default();
+        let (mut app, _, _) = empty_test_app();
+        let drag_region = Arc::new(Mutex::new(None));
+        app.native_caption = Some(Box::new(FakeNativeCaption {
+            layout: None,
+            drag_region,
+        }));
+        app.dialog = Some(DialogState::Help {
+            query: String::new(),
+            searching: false,
+        });
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(720.0, 480.0),
+            )),
+            ..Default::default()
+        };
+        let output = context.run_ui(input, |ui| {
+            eframe::App::logic(&mut app, ui.ctx(), &mut frame);
+            eframe::App::ui(&mut app, ui, &mut frame);
+        });
+        assert!(
+            !output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(text)
+                    if ["←", "→", "↑", "↻"].contains(&text.galley.job.text.as_str()))
+            }),
+            "startup without a caption layout must not invent OS caption controls"
+        );
+        assert!(
+            !output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Rect(rect)
+                if rect.fill == egui::Color32::from_black_alpha(100)
+                    && rect.rect == egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(720.0, 480.0)
+                    ))
+            }),
+            "Help modal must not paint its backdrop over OS-owned caption controls"
+        );
+        assert!(
+            !output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Rect(rect)
+                    if rect.fill == theme::SURFACE
+                        && rect.rect.top() < theme::TOOLBAR_HEIGHT)
+            }),
+            "startup without native metrics must not paint an unknown-width toolbar surface"
+        );
     }
 
     fn candidate(path: &str, kind: fyler_core::tree::EntryKind) -> PickerHit {
@@ -2968,10 +3840,286 @@ mod tests {
                 window_geometry: Arc::new(Mutex::new(None)),
                 position_correction: None,
                 tree_drag: None,
+                pending_font: None,
+                viewport_close_requested: false,
+                viewport_maximize_requested: false,
+                viewport_minimize_requested: false,
+                native_caption: None,
+                native_caption_layout: None,
             },
             event_tx,
             action_rx,
         )
+    }
+
+    #[test]
+    fn help_modal_geometry_stays_fixed_across_results_search_and_viewports() {
+        for size in [egui::vec2(720.0, 480.0), egui::vec2(1344.0, 756.0)] {
+            for (count, searching) in [
+                (0, false),
+                (1, false),
+                (20, false),
+                (0, true),
+                (1, true),
+                (20, true),
+            ] {
+                let context = egui::Context::default();
+                let entries = (0..count)
+                    .map(|index| HelpEntry {
+                        command: format!("Command{index}"),
+                        description: format!("Description {index}"),
+                    })
+                    .collect::<Vec<_>>();
+                let mut query = if count == 0 {
+                    "no-match".to_owned()
+                } else {
+                    String::new()
+                };
+                let mut searching = searching;
+                let mut rect = egui::Rect::NOTHING;
+                for _ in 0..3 {
+                    let input = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        ..Default::default()
+                    };
+                    let _ = context.run_ui(input, |ui| {
+                        rect = draw_help(ui, &entries, &mut query, &mut searching).1;
+                    });
+                }
+                assert!((rect.width() - size.x * 0.3).abs() < 1.0);
+                assert!((rect.height() - size.y * 0.7).abs() < 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn application_panels_reach_viewport_edges_with_message_and_cmdline() {
+        for size in [egui::vec2(720.0, 480.0), egui::vec2(1344.0, 756.0)] {
+            for state in ["normal", "message", "cmdline"] {
+                let context = egui::Context::default();
+                theme::install(&context);
+                let (mut app, event_tx, _) = empty_test_app();
+                let pane = PaneId::new(1);
+                event_tx
+                    .send(GuiEvent::AddPane {
+                        pane_id: pane,
+                        engine: recording_engine(),
+                        root: PathBuf::from("root"),
+                    })
+                    .unwrap();
+                app.receive_events();
+                app.active = Some(pane);
+                app.layout = Some(PaneLayout::Leaf(pane));
+                app.navigation_dock.open = false;
+                match state {
+                    "message" => {
+                        app.message = Some(EditorMessage {
+                            kind: fyler_core::editor::MessageKind::Info,
+                            text: "visible message".to_owned(),
+                        });
+                    }
+                    "cmdline" => {
+                        app.cmdline = Some(CmdlineState {
+                            prompt: ':',
+                            content: "visible command".to_owned(),
+                            cursor: 15,
+                        });
+                    }
+                    _ => {}
+                }
+                let mut frame = eframe::Frame::_new_kittest();
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    ..Default::default()
+                };
+                let mut output = egui::FullOutput::default();
+                for _ in 0..3 {
+                    output = context.run_ui(input.clone(), |ui| {
+                        eframe::App::ui(&mut app, ui, &mut frame);
+                    });
+                }
+                let pane_rect = output
+                    .shapes
+                    .iter()
+                    .filter_map(|clipped| match &clipped.shape {
+                        egui::Shape::Rect(rect)
+                            if rect.stroke.width == 1.0
+                                && rect.stroke.color == theme::BORDER_SUBTLE =>
+                        {
+                            Some(rect.rect)
+                        }
+                        _ => None,
+                    })
+                    .find(|rect| (rect.width() - size.x).abs() < 1.0)
+                    .expect("pane border must span the production pane rectangle");
+                let pane_top = theme::TOOLBAR_HEIGHT + if state == "message" { 34.0 } else { 0.0 };
+                assert!(pane_rect.left().abs() < 1.0, "{pane_rect:?}");
+                assert!((pane_rect.right() - size.x).abs() < 1.0, "{pane_rect:?}");
+                assert!((pane_rect.top() - pane_top).abs() < 1.0, "{pane_rect:?}");
+                assert!(
+                    output.shapes.iter().any(|clipped| match &clipped.shape {
+                        egui::Shape::Rect(rect) => {
+                            rect.fill == theme::SURFACE
+                                && rect.rect.left().abs() < 1.0
+                                && (rect.rect.right() - size.x).abs() < 1.0
+                                && rect.rect.top().abs() < 1.0
+                                && (rect.rect.height() - theme::TOOLBAR_HEIGHT).abs() < 1.0
+                        }
+                        _ => false,
+                    }),
+                    "toolbar background must reach the top and side viewport edges"
+                );
+                if state == "message" {
+                    assert!(
+                        output.shapes.iter().any(|clipped| match &clipped.shape {
+                            egui::Shape::Rect(rect) => {
+                                rect.fill == theme::SURFACE
+                                    && rect.rect.left().abs() < 1.0
+                                    && (rect.rect.right() - size.x).abs() < 1.0
+                                    && (rect.rect.top() - theme::TOOLBAR_HEIGHT).abs() < 1.0
+                                    && (rect.rect.height() - 34.0).abs() < 1.0
+                            }
+                            _ => false,
+                        }),
+                        "message background must fill its edge-to-edge panel"
+                    );
+                }
+
+                let command_rect = if state == "cmdline" {
+                    Some(
+                        output
+                            .shapes
+                            .iter()
+                            .find_map(|clipped| match &clipped.shape {
+                                egui::Shape::Rect(rect)
+                                    if rect.fill == theme::SURFACE
+                                        && (rect.rect.width() - size.x).abs() < 1.0
+                                        && (rect.rect.bottom() - size.y).abs() < 1.0 =>
+                                {
+                                    Some(rect.rect)
+                                }
+                                _ => None,
+                            })
+                            .expect("command band background must reach the bottom viewport edge"),
+                    )
+                } else {
+                    None
+                };
+                let pane_bottom = command_rect.map_or(size.y, |rect| rect.top());
+                assert!(
+                    (pane_rect.bottom() - pane_bottom).abs() < 1.0,
+                    "{pane_rect:?} vs {command_rect:?}"
+                );
+
+                let modeline_rect = egui::Rect::from_min_max(
+                    egui::pos2(
+                        pane_rect.left() + 1.0,
+                        pane_rect.bottom() - 1.0 - theme::STATUSBAR_HEIGHT,
+                    ),
+                    egui::pos2(pane_rect.right() - 1.0, pane_rect.bottom() - 1.0),
+                );
+                assert!(
+                    output.shapes.iter().any(|clipped| match &clipped.shape {
+                        egui::Shape::Rect(rect) =>
+                            rect.fill == theme::SURFACE && rect.rect == modeline_rect,
+                        _ => false,
+                    }),
+                    "modeline must retain its inset surface: {modeline_rect:?}"
+                );
+                let viewport = app.panes[&pane]
+                    .tree_viewport
+                    .expect("production app UI must render the pane tree");
+                let expected_tree_height = pane_rect.height() - 2.0 - theme::STATUSBAR_HEIGHT;
+                assert!(
+                    (viewport.height - expected_tree_height).abs() < 1.0,
+                    "{state} at {size:?}: tree height {} should be {expected_tree_height}",
+                    viewport.height
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn help_filter_is_case_insensitive_and_height_reserves_modal_chrome() {
+        let entries = vec![
+            HelpEntry {
+                command: "OpenFile".to_owned(),
+                description: "Open a file".to_owned(),
+            },
+            HelpEntry {
+                command: "ClosePane".to_owned(),
+                description: "Close pane".to_owned(),
+            },
+        ];
+        assert_eq!(help_matches(&entries, "OPEN").len(), 1);
+        assert_eq!(help_matches(&entries, "close").len(), 1);
+        assert_eq!(help_matches(&entries, "missing").len(), 0);
+    }
+    #[test]
+    fn help_keys_focus_search_preserve_text_keys_and_exit_before_closing() {
+        let mut query = String::new();
+        let mut searching = false;
+        assert_eq!(
+            apply_help_keys(false, true, false, false, false, &mut query, &mut searching),
+            (false, true, 0.0)
+        );
+        assert!(searching);
+        query = "jk".to_owned();
+        assert_eq!(
+            apply_help_keys(false, false, true, true, true, &mut query, &mut searching),
+            (false, false, 0.0)
+        );
+        assert_eq!(query, "jk");
+        assert_eq!(
+            apply_help_keys(true, false, false, false, true, &mut query, &mut searching),
+            (false, false, 0.0)
+        );
+        assert!(!searching);
+        assert!(query.is_empty());
+        assert_eq!(
+            apply_help_keys(true, false, false, false, false, &mut query, &mut searching),
+            (true, false, 0.0)
+        );
+        assert_eq!(
+            apply_help_keys(false, false, true, false, false, &mut query, &mut searching),
+            (false, false, -80.0)
+        );
+    }
+
+    #[test]
+    fn reload_options_replaces_display_settings_and_keeps_live_recent_roots() {
+        let (mut app, tx, _) = empty_test_app();
+        app.recent_roots = vec![PathBuf::from("live-root")];
+        let help = HelpEntry {
+            command: "new-command".to_owned(),
+            description: "new description".to_owned(),
+        };
+        let font_path = PathBuf::from("custom-font.ttf");
+        tx.send(GuiEvent::ReloadOptions(Box::new(GuiOptions {
+            confirm_detail: ConfirmDetail::Summary,
+            font_path: Some(font_path.clone()),
+            help_entries: vec![help.clone()],
+            dock_focus_bindings: Vec::new(),
+            bookmarks: vec![("bookmark".to_owned(), PathBuf::from("bookmarked"))],
+            recent_roots: vec![PathBuf::from("stale-config-root")],
+            drives: vec![PathBuf::from("drive")],
+            statusline_left: vec![StatusItem::Mode],
+            statusline_right: Vec::new(),
+        })))
+        .unwrap();
+        app.receive_events();
+
+        assert_eq!(app.confirm_detail, ConfirmDetail::Summary);
+        assert_eq!(app.help_entries, vec![help]);
+        assert_eq!(
+            app.bookmarks,
+            [("bookmark".to_owned(), PathBuf::from("bookmarked"))]
+        );
+        assert_eq!(app.recent_roots, [PathBuf::from("live-root")]);
+        assert_eq!(app.drives, [PathBuf::from("drive")]);
+        assert_eq!(app.statusline_left, [StatusItem::Mode]);
+        assert!(app.statusline_right.is_empty());
+        assert_eq!(app.pending_font, Some(Some(font_path)));
     }
 
     #[test]
@@ -2996,6 +4144,7 @@ mod tests {
                         collapsed_dirs: HashSet::new(),
                         engine_error: None,
                         tree_viewport: None,
+                        center_line: None,
                         can_go_back: false,
                         can_go_forward: false,
                     },
@@ -3014,6 +4163,7 @@ mod tests {
                         collapsed_dirs: HashSet::new(),
                         engine_error: None,
                         tree_viewport: None,
+                        center_line: None,
                         can_go_back: false,
                         can_go_forward: false,
                     },
@@ -3049,6 +4199,12 @@ mod tests {
             window_geometry: Arc::new(Mutex::new(None)),
             position_correction: None,
             tree_drag: None,
+            pending_font: None,
+            viewport_close_requested: false,
+            viewport_maximize_requested: false,
+            viewport_minimize_requested: false,
+            native_caption: None,
+            native_caption_layout: None,
         };
         let (tx, rx) = mpsc::channel();
         app.event_rx = rx;
@@ -3882,6 +5038,30 @@ mod tests {
 
         let options = native_options(None);
         assert!(options.viewport.icon.is_some());
+        assert_eq!(options.viewport.decorations, Some(!cfg!(windows)));
+        assert_eq!(options.viewport.transparent, Some(cfg!(windows)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_options_use_transparent_dx12_composition_swapchain() {
+        let options = native_options(None);
+        assert_eq!(options.renderer, eframe::Renderer::Wgpu);
+        let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = options.wgpu_options.wgpu_setup else {
+            panic!("Windows native path must explicitly configure a new DX12 instance");
+        };
+        assert_eq!(
+            setup.instance_descriptor.backends,
+            eframe::wgpu::Backends::DX12
+        );
+        assert_eq!(
+            setup
+                .instance_descriptor
+                .backend_options
+                .dx12
+                .presentation_system,
+            eframe::wgpu::Dx12SwapchainKind::DxgiFromVisual
+        );
     }
 
     #[test]
