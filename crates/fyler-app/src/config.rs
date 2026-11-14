@@ -88,7 +88,7 @@ pub fn load() -> (Config, Vec<String>) {
             return (Config::default(), warnings);
         }
     };
-    let path = directory.join(CONFIG_FILE);
+    let path = config_file_path(&directory);
     let source = match fs::read_to_string(&path) {
         Ok(source) => source,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -411,6 +411,14 @@ pub fn record_recent_root(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Path to the user-owned configuration file. The application never creates or writes it.
+pub(crate) fn config_path() -> anyhow::Result<PathBuf> {
+    Ok(config_file_path(&config_dir()?))
+}
+
+fn config_file_path(directory: &Path) -> PathBuf {
+    directory.join(CONFIG_FILE)
+}
 pub(crate) fn config_dir() -> anyhow::Result<PathBuf> {
     resolve_config_dir(nonempty_env)
 }
@@ -546,6 +554,16 @@ mod tests {
             PathBuf::from(platform_default)
         );
         assert!(resolve_config_dir(|_: &str| None).is_err());
+    }
+
+    #[test]
+    fn config_file_path_uses_the_shared_user_config_directory() {
+        let directory = tempdir().unwrap();
+        assert_eq!(
+            config_file_path(directory.path()),
+            directory.path().join("config.toml")
+        );
+        assert!(!config_file_path(directory.path()).exists());
     }
 
     #[test]

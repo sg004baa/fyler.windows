@@ -11,5 +11,8 @@ fyler-core.workspace = true
 anyhow.workspace = true
 eframe.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+
 [build-dependencies]
 ico = "0.6"

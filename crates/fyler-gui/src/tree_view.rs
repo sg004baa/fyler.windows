@@ -147,6 +147,7 @@ pub fn draw(
     collapsed_dirs: &HashSet<EntryId>,
     file_infos: &HashMap<EntryId, FileInfo>,
     previous_viewport: Option<TreeViewport>,
+    center_line: Option<usize>,
     pane_id: PaneId,
     is_active: bool,
     drag_active: bool,
@@ -162,20 +163,35 @@ pub fn draw(
     ui.spacing_mut().item_spacing.y = 0.0;
     let row_pitch = row_height + ui.spacing().item_spacing.y;
     let selection = display_selection(snapshot);
-    let requested_offset = previous_viewport
-        .filter(|viewport| viewport.cursor_line != snapshot.cursor.line)
-        .filter(|_| snapshot.cursor.line < snapshot.lines.len())
-        .and_then(|viewport| {
-            let (cursor_top, cursor_bottom) =
-                row_bounds(snapshot.cursor.line, row_height, row_pitch);
-            follow_offset(
-                cursor_top,
-                cursor_bottom,
-                viewport.scroll_offset,
-                viewport.height,
+    let viewport_height = previous_viewport
+        .map(|viewport| viewport.height)
+        .unwrap_or_else(|| ui.available_height());
+    let requested_offset = center_line
+        .filter(|&line| line < snapshot.lines.len())
+        .map(|line| {
+            center_offset(
+                line,
+                row_height,
+                row_pitch,
+                viewport_height,
+                snapshot.lines.len(),
             )
+        })
+        .or_else(|| {
+            previous_viewport
+                .filter(|viewport| viewport.cursor_line != snapshot.cursor.line)
+                .filter(|_| snapshot.cursor.line < snapshot.lines.len())
+                .and_then(|viewport| {
+                    let (cursor_top, cursor_bottom) =
+                        row_bounds(snapshot.cursor.line, row_height, row_pitch);
+                    follow_offset(
+                        cursor_top,
+                        cursor_bottom,
+                        viewport.scroll_offset,
+                        viewport.height,
+                    )
+                })
         });
-
     let mut scroll_area = egui::ScrollArea::vertical()
         .id_salt(pane_id.get())
         .auto_shrink([false, false]);
@@ -863,6 +879,17 @@ fn follow_offset(
         None
     }
 }
+fn center_offset(
+    line: usize,
+    row_height: f32,
+    row_pitch: f32,
+    view_height: f32,
+    line_count: usize,
+) -> f32 {
+    let (line_top, line_bottom) = row_bounds(line, row_height, row_pitch);
+    let max_offset = (line_count as f32 * row_pitch - view_height).max(0.0);
+    ((line_top + line_bottom) / 2.0 - view_height / 2.0).clamp(0.0, max_offset)
+}
 
 fn valid_byte_index(text: &str, requested: usize) -> usize {
     let mut index = requested.min(text.len());
@@ -1079,6 +1106,24 @@ mod tests {
     #[test]
     fn cursor_follow_prioritizes_top_when_row_is_taller_than_viewport() {
         assert_eq!(follow_offset(20.0, 60.0, 30.0, 10.0), Some(20.0));
+    }
+
+    #[test]
+    fn center_scroll_centers_visible_and_same_line_requests() {
+        assert_eq!(center_offset(10, 20.0, 20.0, 100.0, 30), 160.0);
+        // The requested offset is unconditional, including an already-visible row.
+        assert_eq!(center_offset(2, 20.0, 20.0, 100.0, 30), 0.0);
+    }
+
+    #[test]
+    fn center_scroll_clamps_at_content_edges() {
+        assert_eq!(center_offset(0, 20.0, 20.0, 100.0, 30), 0.0);
+        assert_eq!(center_offset(29, 20.0, 20.0, 100.0, 30), 500.0);
+    }
+
+    #[test]
+    fn center_scroll_keeps_short_content_at_origin() {
+        assert_eq!(center_offset(1, 20.0, 20.0, 100.0, 3), 0.0);
     }
 
     #[test]

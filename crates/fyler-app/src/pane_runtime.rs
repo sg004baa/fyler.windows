@@ -546,8 +546,89 @@ fn help_entries(bindings: &[KeyBinding]) -> Vec<HelpEntry> {
             command: ":feedback".to_owned(),
             description: "Send anonymous feedback".to_owned(),
         },
+        HelpEntry {
+            command: ":config".to_owned(),
+            description: "Open the user configuration file".to_owned(),
+        },
+        HelpEntry {
+            command: ":refresh".to_owned(),
+            description: "Refresh the file list".to_owned(),
+        },
+        HelpEntry {
+            command: ":reload".to_owned(),
+            description: "Reload configuration".to_owned(),
+        },
+        HelpEntry {
+            command: ":q".to_owned(),
+            description: "Close the application".to_owned(),
+        },
+        HelpEntry {
+            command: ":max".to_owned(),
+            description: "Maximize the window".to_owned(),
+        },
+        HelpEntry {
+            command: ":min".to_owned(),
+            description: "Minimize the window".to_owned(),
+        },
     ]);
     entries
+}
+
+fn make_gui_options(config: &super::config::Config) -> GuiOptions {
+    GuiOptions {
+        confirm_detail: config.confirm_detail,
+        font_path: config.font.clone(),
+        help_entries: help_entries(&config.bindings),
+        dock_focus_bindings: config
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding.target == BindingTarget::Action(EditorAction::ToggleDockFocus)
+            })
+            .map(|binding| KeySequence(binding.sequence.0.clone()))
+            .collect(),
+        bookmarks: config.bookmarks.clone(),
+        recent_roots: super::config::load_recent_roots(),
+        drives: fyler_fsops::drives::list_drives(),
+        statusline_left: config.statusline_left.clone(),
+        statusline_right: config.statusline_right.clone(),
+    }
+}
+
+fn config_reload_pane_rejection(
+    crashed: bool,
+    offline: bool,
+    dirty: bool,
+    idle: bool,
+) -> Option<&'static str> {
+    if crashed {
+        Some("Cannot reload configuration while a pane is crashed")
+    } else if offline {
+        Some("Cannot reload configuration while a pane is offline")
+    } else if dirty {
+        Some("Buffer has unsaved changes; save or discard before reloading configuration")
+    } else if !idle {
+        Some("Cannot reload configuration while a pane operation is in progress")
+    } else {
+        None
+    }
+}
+
+fn config_reload_rejection(
+    panes: &BTreeMap<PaneId, PaneSession>,
+    globally_busy: bool,
+) -> Option<&'static str> {
+    if globally_busy {
+        return Some("Cannot reload configuration while another operation is in progress");
+    }
+    panes.values().find_map(|session| {
+        config_reload_pane_rejection(
+            session.crashed,
+            session.save_controller.is_offline(),
+            session.engine.snapshot().dirty,
+            session.save_controller.is_idle(),
+        )
+    })
 }
 
 fn should_restore_session(explicit_root: bool, restore_session: bool) -> bool {
@@ -659,20 +740,20 @@ pub(super) fn run() -> anyhow::Result<()> {
         .map(normalize_root)
         .transpose()?
         .unwrap_or_else(|| fallback_root.clone());
-    let feedback_endpoint = resolve_endpoint(
+    let mut feedback_endpoint = resolve_endpoint(
         config.feedback_url.as_deref(),
         option_env!("FYLER_FEEDBACK_URL"),
     );
-    let terminal_kind = config.terminal;
-    let scan_options = ScanOptions {
+    let mut terminal_kind = config.terminal;
+    let mut scan_options = ScanOptions {
         show_hidden: config.show_hidden,
         sort: config.sort,
         key: config.sort_key,
         reverse: config.sort_reverse,
     };
     // config由来のソート既定。Downloads自動既定を適用しないpane/rootで使う基準値。
-    let config_sort = (config.sort_key, config.sort_reverse);
-    let bindings = Arc::new(config.bindings);
+    let mut config_sort = (config.sort_key, config.sort_reverse);
+    let mut bindings = config.bindings.clone();
     let gui_options = GuiOptions {
         confirm_detail: config.confirm_detail,
         font_path: config.font,
@@ -690,7 +771,7 @@ pub(super) fn run() -> anyhow::Result<()> {
         statusline_left: config.statusline_left,
         statusline_right: config.statusline_right,
     };
-    let bookmarks = config.bookmarks;
+    let mut bookmarks = config.bookmarks.clone();
     let resolved_nvim = nvim_locate::resolve();
     let nvim_exe = resolved_nvim.path.clone();
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1457,6 +1538,113 @@ pub(super) fn run() -> anyhow::Result<()> {
                             return;
                         }
                     }
+                    AppEvent::Editor(pane_id, EditorEvent::OpenConfigRequested) => {
+                        let result = super::config::config_path().and_then(|path| {
+                            if !path.is_file() {
+                                anyhow::bail!(
+                                    "Configuration file {} does not exist. Fyler does not create or write this user-owned file.",
+                                    path.display()
+                                );
+                            }
+                            fyler_fsops::open::open_with_default_app(&path)
+                        });
+                        if let Err(error) = result
+                            && send_gui_message(
+                                &gui_event_tx,
+                                pane_id,
+                                MessageKind::Warn,
+                                format!("Could not open configuration: {error:#}"),
+                            )
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    AppEvent::Editor(pane_id, EditorEvent::ReloadConfigRequested) => {
+                        let busy = feedback_open || apply_owner.is_some()
+                            || transfer.is_awaiting() || transfer.is_running()
+                            || import.is_awaiting() || import.is_running()
+                            || extract.is_awaiting() || extract.is_running()
+                            || loader_owner.is_some() || dialog_owner.is_some()
+                            || active_picker.is_some() || pending_open_with.is_some()
+                            || pending_shortcut.is_some() || drag_out.is_busy();
+                        if let Some(reason) = config_reload_rejection(&panes, busy) {
+                            if send_gui_message(&gui_event_tx, pane_id, MessageKind::Info, reason).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        let (loaded, warnings) = super::config::load();
+                        let next_options = ScanOptions {
+                            show_hidden: loaded.show_hidden, sort: loaded.sort,
+                            key: loaded.sort_key, reverse: loaded.sort_reverse,
+                        };
+                        let next_sort = (loaded.sort_key, loaded.sort_reverse);
+                        let downloads = fyler_fsops::known_folders::downloads_dir();
+                        let mut scan_errors = Vec::new();
+                        for session in panes.values_mut() {
+                            let options = resolve_scan_options(
+                                session.sort_explicit, next_options, &session.root,
+                                downloads, next_sort,
+                            );
+                            if let Err(error) = session.save_controller.reload_scan_options(options) {
+                                scan_errors.push(format!("Pane {}: {error:#}", session.id));
+                            }
+                            session.config_sort = next_sort;
+                            if send_view_state(
+                                &gui_event_tx,
+                                session.id,
+                                &mut session.save_controller,
+                                &session.computed_dir_sizes,
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        for session in panes.values_mut() {
+                            if let Err(error) = session.engine.send(EditorCommand::ConfigureBindings(loaded.bindings.clone())) {
+                                if send_gui_message(
+                                    &gui_event_tx, pane_id, MessageKind::Error,
+                                    format!("Could not reload key bindings: {error:#}"),
+                                ).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        let runtime_config = loaded;
+                        bookmarks = runtime_config.bookmarks.clone();
+                        scan_options = next_options;
+                        config_sort = next_sort;
+                        bindings = runtime_config.bindings.clone();
+                        terminal_kind = runtime_config.terminal;
+                        feedback_endpoint = resolve_endpoint(
+                            runtime_config.feedback_url.as_deref(), option_env!("FYLER_FEEDBACK_URL"),
+                        );
+                        if gui_event_tx.send(GuiEvent::ReloadOptions(Box::new(make_gui_options(&runtime_config)))).is_err() {
+                            return;
+                        }
+                        if !warnings.is_empty() && send_gui_message(
+                            &gui_event_tx, pane_id, MessageKind::Warn,
+                            format!("Configuration: {}", warnings.join(" / ")),
+                        ).is_err() {
+                            return;
+                        }
+                        if !scan_errors.is_empty()
+                            && send_gui_message(
+                                &gui_event_tx,
+                                pane_id,
+                                MessageKind::Error,
+                                format!(
+                                    "Configuration loaded, but rescanning failed: {}",
+                                    scan_errors.join(" / ")
+                                ),
+                            )
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
                     AppEvent::Editor(pane_id, event) => {
                         let Some(session) = panes.get_mut(&pane_id) else {
                             continue;
@@ -1464,7 +1652,12 @@ pub(super) fn run() -> anyhow::Result<()> {
                         if session.crashed
                             && !matches!(
                                 event,
-                                EditorEvent::OpenFilePicker | EditorEvent::FeedbackRequested
+                                EditorEvent::OpenFilePicker
+                                    | EditorEvent::FeedbackRequested
+                                    | EditorEvent::WindowCloseRequested
+                                    | EditorEvent::WindowMaximizeRequested
+                                    | EditorEvent::WindowMinimizeRequested
+                                    | EditorEvent::CenterCursor { .. }
                             )
                         {
                             continue;
@@ -4731,6 +4924,13 @@ pub(super) fn run() -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("Failed to start GUI event forwarding: {error}"))?;
 
     let gui_dequeue_gauge = Arc::clone(&gui_event_gauge);
+    #[cfg(windows)]
+    let native_caption_factory: Option<fyler_core::window::NativeWindowCaptionFactory> =
+        Some(Box::new(|hwnd, repaint, background_rgb| {
+            fyler_fsops::window_caption::install(hwnd, repaint, background_rgb)
+        }));
+    #[cfg(not(windows))]
+    let native_caption_factory = None;
     let gui_result = fyler_gui::app::run(
         gui_event_rx,
         action_tx,
@@ -4738,6 +4938,7 @@ pub(super) fn run() -> anyhow::Result<()> {
         Arc::new(move || gui_dequeue_gauge.dequeue()),
         startup_window,
         Arc::clone(&window_geometry),
+        native_caption_factory,
     );
     let final_window = window_geometry.lock().ok().and_then(|window| *window);
     let _ = app_event_tx.send(AppEvent::Shutdown {
@@ -6106,7 +6307,7 @@ enum RefreshGate {
     Reject(&'static str),
 }
 
-/// `:reload` / `Ctrl+R`(manual refresh)の実行可否を判定する。既存のroot変更gate
+/// `:refresh` / `Ctrl+R`(manual refresh)の実行可否を判定する。既存のroot変更gate
 /// (`loader_start_gate`)と違い、busy/apply/undo/transfer/loader中の拒否はcoalesce
 /// せず必ずMessageを出す(設計決定済み)。
 fn refresh_gate(
@@ -6637,6 +6838,33 @@ mod tests {
             custom_entries
                 .iter()
                 .any(|entry| { entry.command == ";" && entry.description == "Feed keys: :" })
+        );
+        for command in [":config", ":refresh", ":reload", ":q", ":max", ":min"] {
+            assert!(custom_entries.iter().any(|entry| entry.command == command));
+        }
+    }
+
+    #[test]
+    fn config_reload_gate_rejects_unsafe_panes_and_allows_idle_clean_panes() {
+        assert_eq!(
+            config_reload_pane_rejection(true, false, false, true),
+            Some("Cannot reload configuration while a pane is crashed")
+        );
+        assert_eq!(
+            config_reload_pane_rejection(false, true, false, true),
+            Some("Cannot reload configuration while a pane is offline")
+        );
+        assert_eq!(
+            config_reload_pane_rejection(false, false, true, true),
+            Some("Buffer has unsaved changes; save or discard before reloading configuration")
+        );
+        assert_eq!(
+            config_reload_pane_rejection(false, false, false, false),
+            Some("Cannot reload configuration while a pane operation is in progress")
+        );
+        assert_eq!(
+            config_reload_pane_rejection(false, false, false, true),
+            None
         );
     }
 

@@ -1423,6 +1423,7 @@ dependencies = [
  "eframe",
  "fyler-core",
  "ico",
+ "raw-window-handle",
 ]
 
 [[package]]

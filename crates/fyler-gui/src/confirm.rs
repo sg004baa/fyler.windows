@@ -15,6 +15,7 @@ use fyler_core::transfer::{
 use fyler_core::validate::ValidateError;
 
 use crate::theme;
+use crate::widgets::{key_badge, summary_badge};
 
 /// ユーザーの選択。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,28 +62,6 @@ impl From<&OperationPlan> for PlanCounts {
     }
 }
 
-fn count_badge(ui: &mut egui::Ui, count: usize, noun: &str, color: egui::Color32) {
-    egui::Frame::NONE
-        .fill(theme::SURFACE_RAISED)
-        .stroke(egui::Stroke::new(1.0, theme::BORDER))
-        .corner_radius(egui::CornerRadius::same(4))
-        .inner_margin(egui::Margin::symmetric(7, 3))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(format!("{count} {noun}"))
-                    .monospace()
-                    .size(11.0)
-                    .color(color),
-            );
-        });
-}
-
-fn summary_badge(ui: &mut egui::Ui, count: usize, noun: &str, color: egui::Color32) {
-    if count > 0 {
-        count_badge(ui, count, noun, color);
-    }
-}
-
 /// OperationPlanをモーダルで表示し、選択があれば返す。
 ///
 /// 実装契約:
@@ -111,20 +90,12 @@ pub fn draw_plan(
     });
     let counts = PlanCounts::from(plan);
 
-    egui::Modal::new(egui::Id::new("save-plan-confirmation"))
+    crate::app::caption_modal(ui.ctx(), egui::Id::new("save-plan-confirmation"))
         .show(ui.ctx(), |ui| {
             ui.set_min_width(520.0);
             ui.horizontal(|ui| {
                 ui.heading("Review changes");
-                count_badge(ui, plan.ops.len(), "operations", theme::TEXT_SECONDARY);
             });
-            ui.label(
-                egui::RichText::new(
-                    "These will be applied to disk. Deletions go to the recycle bin.",
-                )
-                .size(11.0)
-                .color(theme::TEXT_MUTED),
-            );
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 summary_badge(ui, counts.create, "create", theme::GREEN);
@@ -152,13 +123,6 @@ pub fn draw_plan(
                                     .strong()
                                     .color(group.kind.color()),
                             );
-                            if group.kind == OpKind::Delete {
-                                ui.label(
-                                    egui::RichText::new("·  recoverable from recycle bin")
-                                        .size(10.0)
-                                        .color(theme::TEXT_FAINT),
-                                );
-                            }
                         });
                         ui.add_space(2.0);
                         for entry in &group.entries {
@@ -208,24 +172,27 @@ pub fn draw_plan(
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let approve_label = if overwrites.is_empty() {
-                        format!("Apply {} changes  ↵", plan.ops.len())
+                        "Apply"
                     } else {
-                        format!("Overwrite + apply {}  ↵", plan.ops.len())
+                        "Overwrite + apply"
                     };
                     let approve_clicked = ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(approve_label)
-                                    .strong()
-                                    .color(theme::CANVAS),
-                            )
-                            .fill(theme::ACCENT)
-                            .stroke(egui::Stroke::new(1.0, theme::ACCENT)),
-                        )
-                        .clicked();
+                        .horizontal(|ui| {
+                            let badge = key_badge(ui, "↵").clicked();
+                            let label = ui
+                                .add(egui::Button::new(approve_label).frame(false))
+                                .clicked();
+                            label || badge
+                        })
+                        .inner;
+                    ui.add_space(8.0);
                     let cancel_clicked = ui
-                        .add(egui::Button::new("Cancel  esc").frame(false))
-                        .clicked();
+                        .horizontal(|ui| {
+                            let badge = key_badge(ui, "esc").clicked();
+                            let label = ui.add(egui::Button::new("Cancel").frame(false)).clicked();
+                            label || badge
+                        })
+                        .inner;
                     confirm_choice_from_buttons(approve_clicked, cancel_clicked, key_choice)
                 })
                 .inner
@@ -250,7 +217,7 @@ pub fn draw_transfer_plan(
             input.key_pressed(egui::Key::Escape),
         )
     });
-    egui::Modal::new(egui::Id::new("save-plan-confirmation"))
+    crate::app::caption_modal(ui.ctx(), egui::Id::new("save-plan-confirmation"))
         .show(ui.ctx(), |ui| {
             ui.heading("Confirm changes");
             ui.add_space(8.0);
@@ -297,7 +264,7 @@ pub fn draw_import_plan(
             input.key_pressed(egui::Key::Escape),
         )
     });
-    egui::Modal::new(egui::Id::new("import-plan-confirmation"))
+    crate::app::caption_modal(ui.ctx(), egui::Id::new("import-plan-confirmation"))
         .show(ui.ctx(), |ui| {
             ui.heading("Confirm import");
             ui.add_space(8.0);
@@ -346,7 +313,7 @@ pub fn draw_action_confirm(
         )
     });
 
-    egui::Modal::new(egui::Id::new("action-confirmation"))
+    crate::app::caption_modal(ui.ctx(), egui::Id::new("action-confirmation"))
         .show(ui.ctx(), |ui| {
             ui.heading(title);
             ui.add_space(8.0);
@@ -376,7 +343,7 @@ pub fn draw_action_report(
         .ctx()
         .input(|input| input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape));
 
-    egui::Modal::new(egui::Id::new("action-report"))
+    crate::app::caption_modal(ui.ctx(), egui::Id::new("action-report"))
         .show(ui.ctx(), |ui| {
             ui.heading(title);
             ui.add_space(8.0);
@@ -408,7 +375,7 @@ pub fn draw_undo_plan(ui: &mut egui::Ui, lines: &[String]) -> Option<ConfirmChoi
         )
     });
 
-    egui::Modal::new(egui::Id::new("undo-plan-confirmation"))
+    crate::app::caption_modal(ui.ctx(), egui::Id::new("undo-plan-confirmation"))
         .show(ui.ctx(), |ui| {
             ui.heading("Confirm undo");
             ui.add_space(8.0);
@@ -550,7 +517,7 @@ pub fn draw_report(ui: &mut egui::Ui, report: &CommitReport) -> bool {
         .count();
     let skipped = report.results.len().saturating_sub(succeeded + failed);
 
-    egui::Modal::new(egui::Id::new("save-commit-report"))
+    crate::app::caption_modal(ui.ctx(), egui::Id::new("save-commit-report"))
         .show(ui.ctx(), |ui| {
             ui.set_min_width(460.0);
             ui.heading(if failed == 0 {
@@ -605,7 +572,7 @@ pub fn draw_undo_report(ui: &mut egui::Ui, lines: &[String], any_failed: bool) -
         .ctx()
         .input(|input| input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape));
 
-    egui::Modal::new(egui::Id::new("undo-commit-report"))
+    crate::app::caption_modal(ui.ctx(), egui::Id::new("undo-commit-report"))
         .show(ui.ctx(), |ui| {
             ui.heading("Undo result");
             ui.add_space(8.0);
@@ -631,7 +598,7 @@ pub fn draw_transfer_report(ui: &mut egui::Ui, report: &CommitReport<TransferOp>
     let dismiss_from_keyboard = ui
         .ctx()
         .input(|input| input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape));
-    egui::Modal::new(egui::Id::new("save-commit-report"))
+    crate::app::caption_modal(ui.ctx(), egui::Id::new("save-commit-report"))
         .show(ui.ctx(), |ui| {
             ui.heading("Apply result");
             ui.add_space(8.0);
@@ -662,7 +629,7 @@ pub fn draw_import_report(
     let dismiss_from_keyboard = ui
         .ctx()
         .input(|input| input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape));
-    egui::Modal::new(egui::Id::new("import-commit-report"))
+    crate::app::caption_modal(ui.ctx(), egui::Id::new("import-commit-report"))
         .show(ui.ctx(), |ui| {
             ui.heading("Import result");
             ui.add_space(8.0);
@@ -699,7 +666,7 @@ pub fn draw_undo_recovery(ui: &mut egui::Ui, descriptions: &[String]) -> Option<
         )
     });
 
-    egui::Modal::new(egui::Id::new("undo-recovery"))
+    crate::app::caption_modal(ui.ctx(), egui::Id::new("undo-recovery"))
         .show(ui.ctx(), |ui| {
             ui.heading("Undo recovery");
             ui.add_space(8.0);
@@ -737,7 +704,7 @@ pub fn draw_drag_cleanup_confirm(ui: &mut egui::Ui, paths: &[PathBuf]) -> Option
         )
     });
 
-    egui::Modal::new(egui::Id::new("drag-cleanup-confirm"))
+    crate::app::caption_modal(ui.ctx(), egui::Id::new("drag-cleanup-confirm"))
         .show(ui.ctx(), |ui| {
             ui.heading("Finish move");
             ui.add_space(8.0);
@@ -781,7 +748,7 @@ pub fn draw_apply_progress(
         .saturating_sub(completed)
         .saturating_sub(usize::from(current.is_some()));
 
-    egui::Modal::new(egui::Id::new("save-apply-progress"))
+    crate::app::caption_modal(ui.ctx(), egui::Id::new("save-apply-progress"))
         .show(ui.ctx(), |ui| {
             ui.set_min_width(480.0);
             ui.horizontal(|ui| {
@@ -878,7 +845,7 @@ pub fn draw_loader_progress(
     let cancel_from_keyboard =
         !cancel_requested && ui.ctx().input(|input| input.key_pressed(egui::Key::Escape));
 
-    egui::Modal::new(egui::Id::new("loader-progress"))
+    crate::app::caption_modal(ui.ctx(), egui::Id::new("loader-progress"))
         .show(ui.ctx(), |ui| {
             ui.heading(title);
             ui.add_space(8.0);
@@ -933,12 +900,13 @@ pub fn draw_open_with(
         None
     };
 
-    let choice = egui::Modal::new(egui::Id::new("open-with-selection"))
+    let choice = crate::app::caption_modal(ui.ctx(), egui::Id::new("open-with-selection"))
         .show(ui.ctx(), |ui| {
             ui.heading("Open with");
             ui.add_space(4.0);
             ui.monospace(file_name);
             ui.add_space(8.0);
+            ui.set_width(ui.ctx().content_rect().width() * 0.3);
 
             let mut clicked_choice = None;
             for (index, choice) in choices.iter().enumerate() {

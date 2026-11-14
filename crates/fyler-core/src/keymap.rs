@@ -209,7 +209,7 @@ impl EditorAction {
             Self::PaneClose => "Close pane",
             Self::HistoryBack => "Go back in navigation history",
             Self::HistoryForward => "Go forward in navigation history",
-            Self::Refresh => "Reload the current root from disk",
+            Self::Refresh => "Refresh the current root from disk",
             Self::Undo => {
                 "Undo text edits in modified buffers; undo the last file operation in clean buffers"
             }

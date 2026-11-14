@@ -36,6 +36,8 @@ pub mod shortcut;
 pub mod terminal;
 pub mod undo;
 pub mod watch;
+#[cfg(windows)]
+pub mod window_caption;
 
 mod winattr;
 

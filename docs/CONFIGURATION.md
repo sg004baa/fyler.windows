@@ -1,7 +1,9 @@
 # Configuration
 
-fyler reads user settings from `config.toml`. Settings are loaded only at startup, so restart
-fyler after changing the file.
+fyler reads user settings from `config.toml`. At startup, settings are loaded from that file if it
+exists; missing files are not created automatically. Use `:config` to open the existing,
+user-owned configuration file in your editor. If it does not exist, the command reports its path
+and that it has not been created.
 
 ## Configuration file location
 
@@ -12,7 +14,7 @@ fyler after changing the file.
 | Linux and other platforms | `~/.config/fyler/config.toml` |
 
 If the file does not exist, fyler starts with the defaults. fyler only reads `config.toml`; it
-does not create or rewrite it.
+does not create or rewrite it. Create the file yourself to customize settings.
 
 For development and testing, `FYLER_CONFIG_DIR` overrides the configuration directory.
 `FYLER_NVIM_EXE` selects the Neovim executable used by fyler.
@@ -42,8 +44,7 @@ show_hidden = false
 sort = "dirs_first"
 sort_key = "name"
 sort_reverse = false
-# Restore the last normally closed pane session
-restore_session = true
+# Restore the last normally closed pane session on the next startup
 
 
 # External terminal emulator used by :terminal
@@ -139,11 +140,11 @@ values are ignored with a warning. Pending-change and health indicators (`[offli
 ### Session and window restoration
 
 With `restore_session = true`, a normally closed fyler window writes `session.toml` beside
-`config.toml` using schema version 1. The session contains only display state: the binary pane
-layout and split ratios, each pane's root, the active pane, root-relative cursor and fold hints,
-per-pane hidden-file and sorting settings, and native window size, position, and maximized state.
-Dirty buffer text, editor mode, dialogs, in-flight apply/transfer state, clipboard data,
-Neovim/RPC state, and undo transactions are never stored in the session.
+`config.toml`; the saved session is restored on the next startup. It uses schema version 1 and
+contains only display state: the binary pane layout and split ratios, each pane's root, the active
+pane, root-relative cursor and fold hints, per-pane hidden-file and sorting settings, and native
+window size, position, and maximized state. Dirty buffer text, editor mode, dialogs, in-flight
+apply/transfer state, clipboard data, Neovim/RPC state, and undo transactions are never stored.
 
 An explicit command-line root always starts one pane and bypasses `session.toml` entirely.
 `restore_session = false` also starts one pane without reading the session. When session loading
@@ -185,14 +186,37 @@ stopped engine, wrong entry kind, and so on).
 | `:shortcut` | Create shortcut | Create a `.lnk` shortcut next to the entry, after a confirmation dialog. Filesystem writes happen only after approval |
 | | Copy path | Copy the entry's absolute path to the OS clipboard |
 | `:terminal` | Open terminal here | Open an external terminal (see below) |
-| `:reload` | Refresh | Re-scan the pane's root from disk |
+| `:reload` | Reload configuration | Reload runtime settings from `config.toml` across panes |
+| `:refresh` | Re-scan the pane's root from disk | |
+
+
+### Help, search, and window commands
+
+The help view supports `j`/`k` scrolling and `/` search. It opens centered at 30% of the window width and 70% of its height; filtering does not shrink the modal.
+Search with `/` and press `n` to move to the next match; search results center the cursor.
+
+| Command | Description |
+|---|---|
+| `:q` | Close fyler |
+| `:max` | Maximize the window |
+| `:min` | Minimize the window |
+
+On Windows, the toolbar stays integrated into the titlebar. Fyler paints the minimize, maximize/restore, and close glyphs over an opaque 34-logical-point caption strip (extended only when native caption geometry requires more height); the strip is flush with the client right edge, and Windows retains nonclient click processing. The visual hover fill spans the toolbar, but click activation retains the OS-native caption area.
+The full-height hover fill is neutral gray for minimize and maximize/restore, and standard Windows red for close; glyphs are white. Drag a window edge or corner to resize it, or the blank toolbar area to move it. Modal dimming leaves the caption strip undimmed.
+Navigation controls use two-thirds of one native caption-cell width, with a one-point gap and an opaque neutral-gray hover highlight.
+Non-Windows development builds use the platform's standard window decorations and reduce navigation width to two-thirds of the fallback cell width.
 
 ### Confirmation dialogs
 
-`confirm_detail` controls how save and transfer operations appear before they are applied:
+`confirm_detail` controls how save-operation plans appear before they are applied:
 
 - `full`: show every operation
-- `summary`: summarize large plans by operation type
+- `summary`: summarize plans containing more than five operations by operation type; plans of five
+  operations or fewer still show each operation
+
+This setting applies to save confirmations only. Transfer confirmations use their own display and
+are not summarized by `confirm_detail`.
+
 
 ### Fonts and icons
 
@@ -314,7 +338,8 @@ Rules and limitations:
   pane-command dispatcher, which only understands actions.
 - Invalid keys, unknown actions or key sequences, duplicates, and `none` entries with no binding
   to remove produce warnings.
-- Runtime reload is not supported; restart fyler after changing the keymap.
+- Use `:reload` to reload runtime settings from the configuration file across panes; restart fyler
+  to apply startup-only settings such as `restore_session`.
 
 ### Available actions
 
@@ -353,8 +378,7 @@ Rules and limitations:
 | `pane_close` | Close the current pane | `<C-w>q`, `<C-w>c` |
 | `history_back` | Go back in navigation history | `<C-p>` |
 | `history_forward` | Go forward in navigation history | `<C-n>` |
-| `refresh` | Reload the current root from disk | `<C-r>` |
-| `undo` | Undo text edits in modified buffers; undo the last file operation in clean buffers | `u` |
+| `refresh` | Re-scan the current root from disk | `<C-r>` |
 
 `none` is not an action. It is a special value that removes the binding for the specified key
 sequence.
@@ -362,6 +386,8 @@ sequence.
 The help dialog opened with `?` is generated from the resolved built-in and user bindings. It
 omits actions with no remaining bindings, reflects added or reassigned keys, and lists each
 key-to-key binding (rule 3 above) as its own entry, described as "Feed keys: ...".
+
+Operations retain the cursor position of the affected pane.
 
 While the navigation dock has focus, use `j`/`k` or the arrow keys to move and `<CR>` to change
 the active pane's root. `<Esc>` returns keyboard input to the editor without closing the dock.
@@ -373,9 +399,11 @@ Root changes (`^`, `gd`, `:cd`, bookmarks, recent roots, and drive selection) ar
 per-pane back/forward history, capped at 100 entries per direction. `:back` (`<C-p>` by default)
 and `:forward` (`<C-n>`) step through it; both are rejected while editing, offline, or during
 another operation, and an entry pointing at a since-removed root is discarded with a message
-instead of being retried. `:reload` (`<C-r>`) re-scans the current root from disk without writing
+instead of being retried. `:refresh` (`<C-r>`) re-scans the current root from disk without writing
 anything; it is also rejected while editing or busy, except on an offline pane, where it retries
-the connection immediately instead of waiting for the periodic retry.
+the connection immediately instead of waiting for the periodic retry. `:reload` reloads runtime
+settings from `config.toml` across panes and refreshes those panes; unlike `:refresh`, it reloads
+settings as well as rescanning.
 
 `<C-r>` normally performs Neovim's built-in redo, and `<C-p>` / `<C-n>` normally move the
 cursor up/down like `k` / `j`. Fyler's default keymap shadows all three inside fyler buffers;

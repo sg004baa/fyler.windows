@@ -17,97 +17,90 @@ pub enum ChromeAction {
     Refresh,
 }
 
-/// タイトルバー・ツールバー・ぱんくずを1行へ統合したトップchrome。
+/// Navigation controls share the top row; caption controls are app-painted but remain
+/// owned by the native window for input.
 ///
-/// フレームレスウィンドウのため、空き領域をドラッグ/ダブルクリックで
-/// ウィンドウ移動・最大化に使う。ウィンドウ操作ボタンもこの行に置く。
-///
-/// `can_go_back` / `can_go_forward` はアクティブpaneのnavigation historyの
-/// 可用性(GUIが把握できる範囲)。↻(reload)は権威判定をapp層に委ねるため
-/// 常に有効にする。
+/// `caption_cell_size` is one native caption cell in logical points; navigation controls
+/// use two-thirds of its width. `native_caption_left` delimits the reserved caption strip.
+/// The returned drag region excludes navigation and that strip.
 pub fn draw_toolbar(
     ui: &mut egui::Ui,
     can_go_back: bool,
     can_go_forward: bool,
-) -> Option<ChromeAction> {
-    ui.painter().rect_filled(ui.max_rect(), 0.0, theme::SURFACE);
-    ui.painter().line_segment(
-        [ui.max_rect().left_bottom(), ui.max_rect().right_bottom()],
+    caption_cell_size: egui::Vec2,
+    native_caption_left: Option<f32>,
+) -> (Option<ChromeAction>, Option<egui::Rect>) {
+    let bounds = ui.max_rect();
+    let content_right = native_caption_left
+        .map(|left| left.clamp(bounds.left(), bounds.right()))
+        .unwrap_or(bounds.right());
+    let content = egui::Rect::from_min_max(bounds.min, egui::pos2(content_right, bounds.bottom()));
+    ui.set_clip_rect(ui.clip_rect().intersect(content));
+    ui.painter()
+        .with_clip_rect(content)
+        .rect_filled(content, 0.0, theme::SURFACE);
+    ui.painter().with_clip_rect(content).line_segment(
+        [content.left_bottom(), content.right_bottom()],
         egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
     );
 
-    // 空き領域全体をドラッグ判定に敷く。個々のウィジェットは後段で上に描かれ、
-    // クリックはウィジェットが優先的に受け取る(eguiの重なり順)。
-    let drag = ui.interact(
-        ui.max_rect(),
-        ui.id().with("chrome-drag"),
-        egui::Sense::click_and_drag(),
-    );
-    if drag.double_clicked() {
-        let maximized = ui
-            .ctx()
-            .input(|input| input.viewport().maximized.unwrap_or(false));
-        ui.ctx()
-            .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-    } else if drag.drag_started() {
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-    }
-
+    let navigation_button_size = egui::vec2(caption_cell_size.x * (2.0 / 3.0), caption_cell_size.y);
+    let mut drag_rect = None;
     let mut action = None;
-    ui.horizontal_centered(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
-        ui.add_space(8.0);
-        if ui
-            .add_enabled(can_go_back, chrome_button("←"))
-            .on_hover_text("Go back in history (:back)")
-            .on_disabled_hover_text("No earlier location in history")
-            .clicked()
-        {
-            action = Some(ChromeAction::HistoryBack);
-        }
-        if ui
-            .add_enabled(can_go_forward, chrome_button("→"))
-            .on_hover_text("Go forward in history (:forward)")
-            .on_disabled_hover_text("No later location in history")
-            .clicked()
-        {
-            action = Some(ChromeAction::HistoryForward);
-        }
-        if ui
-            .add(chrome_button("↑"))
-            .on_hover_text("Parent directory")
-            .clicked()
-        {
-            action = Some(ChromeAction::NavigateParent);
-        }
-        if ui
-            .add(chrome_button("↻"))
-            .on_hover_text("Reload from disk (:reload)")
-            .clicked()
-        {
-            action = Some(ChromeAction::Refresh);
-        }
-
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            if window_button(ui, "×", true).clicked() {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-            if window_button(ui, "□", false).clicked() {
-                let maximized = ui
-                    .ctx()
-                    .input(|input| input.viewport().maximized.unwrap_or(false));
-                ui.ctx()
-                    .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-            }
-            if window_button(ui, "—", false).clicked() {
-                ui.ctx()
-                    .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            }
-        });
-    });
-    action
+    ui.allocate_ui_with_layout(
+        content.size(),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 1.0;
+                let controls_width = 8.0 + 4.0 * navigation_button_size.x + 3.0;
+                if content.width() >= controls_width {
+                    ui.add_space(8.0);
+                    let back = toolbar_button(ui, "←", can_go_back, navigation_button_size)
+                        .on_hover_text("Go back in history (:back)")
+                        .on_disabled_hover_text("No earlier location in history");
+                    if back.clicked() {
+                        action = Some(ChromeAction::HistoryBack);
+                    }
+                    let forward = toolbar_button(ui, "→", can_go_forward, navigation_button_size)
+                        .on_hover_text("Go forward in history (:forward)")
+                        .on_disabled_hover_text("No later location in history");
+                    if forward.clicked() {
+                        action = Some(ChromeAction::HistoryForward);
+                    }
+                    let parent = toolbar_button(ui, "↑", true, navigation_button_size)
+                        .on_hover_text("Parent directory");
+                    if parent.clicked() {
+                        action = Some(ChromeAction::NavigateParent);
+                    }
+                    let refresh = toolbar_button(ui, "↻", true, navigation_button_size)
+                        .on_hover_text("Refresh from disk (:refresh)");
+                    if refresh.clicked() {
+                        action = Some(ChromeAction::Refresh);
+                    }
+                    let rect = egui::Rect::from_min_max(
+                        egui::pos2(refresh.rect.right(), bounds.top()),
+                        egui::pos2(content_right, bounds.bottom()),
+                    );
+                    if rect.is_positive() {
+                        let drag = ui.interact(
+                            rect,
+                            ui.id().with("chrome-drag"),
+                            egui::Sense::click_and_drag(),
+                        );
+                        if drag.drag_started() {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        }
+                        drag_rect = Some(rect);
+                    }
+                }
+            });
+        },
+    );
+    (action, drag_rect)
 }
+
+// Window sizing, caption buttons, and caption hit-testing are handled by the OS.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NavigationSection {
@@ -320,39 +313,40 @@ fn navigation_path_label(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-fn window_button(ui: &mut egui::Ui, label: &str, close: bool) -> egui::Response {
-    let response = ui.add_sized(
-        [40.0, theme::TOOLBAR_HEIGHT],
+fn toolbar_button(
+    ui: &mut egui::Ui,
+    label: &'static str,
+    enabled: bool,
+    size: egui::Vec2,
+) -> egui::Response {
+    ui.spacing_mut().interact_size = size;
+    let background = ui.painter().add(egui::Shape::Noop);
+    let response = ui.add_enabled(
+        enabled,
         egui::Button::new(
             egui::RichText::new(label)
                 .monospace()
-                .size(13.0)
-                .color(theme::TEXT_MUTED),
+                .size(16.0)
+                .color(theme::TEXT_SECONDARY),
         )
-        .frame(false),
+        .frame(false)
+        .min_size(size),
     );
-    if close && response.hovered() {
-        ui.painter().rect_filled(response.rect, 0.0, theme::RED);
-        ui.painter().text(
-            response.rect.center(),
-            egui::Align2::CENTER_CENTER,
-            label,
-            egui::FontId::monospace(13.0),
-            theme::CANVAS,
-        );
-    }
+    paint_toolbar_hover(ui, background, &response);
     response
 }
 
-fn chrome_button(label: &'static str) -> egui::Button<'static> {
-    egui::Button::new(
-        egui::RichText::new(label)
-            .monospace()
-            .size(14.0)
-            .color(theme::TEXT_SECONDARY),
-    )
-    .frame(false)
-    .min_size(egui::vec2(26.0, 26.0))
+fn paint_toolbar_hover(
+    ui: &egui::Ui,
+    background: egui::layers::ShapeIdx,
+    response: &egui::Response,
+) {
+    if response.hovered() && response.enabled() {
+        ui.painter().set(
+            background,
+            egui::Shape::rect_filled(response.rect, 0.0, theme::TOOLBAR_HOVER),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -408,5 +402,281 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].section, NavigationSection::Pinned);
         assert_eq!(entries[0].path, PathBuf::from("/"));
+    }
+
+    #[test]
+    fn four_navigation_buttons_share_neutral_hover_fill() {
+        use egui::{Event, Pos2, RawInput, Rect, Vec2};
+
+        fn frame(ctx: &egui::Context, pointer: Option<Pos2>) -> egui::FullOutput {
+            theme::install(ctx);
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 40.0))),
+                events: pointer.into_iter().map(Event::PointerMoved).collect(),
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ctx| {
+                egui::Panel::top("toolbar-test")
+                    .exact_size(32.0)
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        draw_toolbar(ui, true, true, egui::vec2(69.0, 27.75), None);
+                    });
+            })
+        }
+
+        fn text_center(output: &egui::FullOutput, text: &str) -> Pos2 {
+            output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(shape) if shape.galley.job.text == text => {
+                        Some(shape.pos + shape.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing toolbar glyph {text:?}"))
+        }
+
+        fn hover_fills(output: &egui::FullOutput) -> Vec<(usize, Rect)> {
+            output
+                .shapes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, clipped)| match &clipped.shape {
+                    egui::Shape::Rect(shape) if shape.fill == theme::TOOLBAR_HOVER => {
+                        Some((index, shape.rect))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let ctx = egui::Context::default();
+        let baseline = frame(&ctx, None); // warmup pass
+        assert!(
+            hover_fills(&baseline).is_empty(),
+            "non-hovered controls stay transparent"
+        );
+        let centers: Vec<(&str, Pos2)> = ["←", "→", "↑", "↻"]
+            .into_iter()
+            .map(|label| (label, text_center(&baseline, label)))
+            .collect();
+
+        for (label, center) in centers {
+            let output = frame(&ctx, Some(center));
+            let fills = hover_fills(&output);
+            assert_eq!(
+                fills.len(),
+                1,
+                "{label} should paint exactly one hover fill"
+            );
+            let (fill_index, fill_rect) = fills[0];
+            assert_eq!(
+                fill_rect.size(),
+                Vec2::new(46.0, 27.75),
+                "{label} uses the full native-sized hit rectangle"
+            );
+            assert_eq!(fill_rect.center().y, 16.0, "{label} is vertically centered");
+            assert!(
+                fill_rect.contains(center),
+                "{label} fill misses its control"
+            );
+            assert!(
+                !output.shapes.iter().any(|clipped| matches!(
+                    &clipped.shape,
+                    egui::Shape::Rect(shape) if shape.fill == theme::RED
+                )),
+                "{label} must not use a red special-case fill"
+            );
+            if label == "←" {
+                let text_index = output
+                    .shapes
+                    .iter()
+                    .position(|clipped| {
+                        matches!(
+                            &clipped.shape,
+                            egui::Shape::Text(shape) if shape.galley.job.text == label
+                        )
+                    })
+                    .expect("hovered button text should be painted");
+                assert!(
+                    text_index > fill_index,
+                    "button text must remain above its fill"
+                );
+            }
+        }
+
+        let disabled_ctx = egui::Context::default();
+        let _ = frame(&disabled_ctx, None);
+        let disabled_output = {
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 40.0))),
+                ..Default::default()
+            };
+            disabled_ctx.run_ui(input, |ctx| {
+                egui::Panel::top("toolbar-disabled-test")
+                    .exact_size(32.0)
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        draw_toolbar(ui, false, false, egui::vec2(69.0, 27.75), None);
+                    });
+            })
+        };
+        for label in ["←", "→"] {
+            let center = text_center(&baseline, label);
+            let output = {
+                let input = RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 40.0))),
+                    events: vec![Event::PointerMoved(center)],
+                    ..Default::default()
+                };
+                disabled_ctx.run_ui(input, |ctx| {
+                    egui::Panel::top("toolbar-disabled-test")
+                        .exact_size(32.0)
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            draw_toolbar(ui, false, false, egui::vec2(69.0, 27.75), None);
+                        });
+                })
+            };
+            assert!(
+                hover_fills(&output).is_empty(),
+                "disabled {label} must not highlight"
+            );
+        }
+        assert!(hover_fills(&disabled_output).is_empty());
+    }
+
+    #[test]
+    fn native_sized_button_hit_area_matches_caption_dimensions() {
+        use egui::{Event, PointerButton, Pos2, RawInput, Rect, Vec2};
+
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let caption_cell_size = Vec2::new(69.0, 27.75);
+        let size = Vec2::new(caption_cell_size.x * (2.0 / 3.0), caption_cell_size.y);
+        let mut action = None;
+        let mut run = |events| {
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 40.0))),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ctx| {
+                egui::Panel::top("native-sized-button-test")
+                    .exact_size(32.0)
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        action = draw_toolbar(ui, true, true, caption_cell_size, None).0;
+                    });
+            })
+        };
+
+        let baseline = run(Vec::new());
+        let hover = run(vec![Event::PointerMoved(Pos2::new(30.0, 10.0))]);
+        let hit_rect = hover
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(shape) if shape.fill == theme::TOOLBAR_HOVER => Some(shape.rect),
+                _ => None,
+            })
+            .expect("hover paints the button hit rectangle");
+        assert_eq!(hit_rect.size(), size);
+        assert_eq!(hit_rect.center().y, 16.0);
+        assert!(baseline.shapes.iter().any(|clipped| matches!(
+            &clipped.shape,
+            egui::Shape::Text(text) if text.galley.job.text == "←"
+        )));
+
+        let click = hit_rect.right_bottom() - Vec2::splat(1.0);
+        let _ = run(vec![
+            Event::PointerMoved(click),
+            Event::PointerButton {
+                pos: click,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+        ]);
+        let _ = run(vec![Event::PointerButton {
+            pos: click,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        }]);
+        assert_eq!(action, Some(ChromeAction::HistoryBack));
+    }
+    #[test]
+    fn blank_drag_region_stops_before_native_caption_at_supported_widths() {
+        use egui::{Pos2, RawInput, Rect, Vec2};
+        for (width, caption_left) in [(720.0, 620.0), (1344.0, 1244.0)] {
+            let ctx = egui::Context::default();
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 40.0))),
+                ..Default::default()
+            };
+            let mut drag_region = None;
+            let _ = ctx.run_ui(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let (_, region) = draw_toolbar(
+                            ui,
+                            true,
+                            true,
+                            egui::vec2(69.0, 32.0),
+                            Some(caption_left),
+                        );
+                        drag_region = region;
+                    });
+            });
+            let drag_region = drag_region.expect("toolbar leaves a blank drag area");
+            assert_eq!(drag_region.right(), caption_left);
+            assert!(drag_region.left() < drag_region.right());
+        }
+    }
+
+    #[test]
+    fn toolbar_clips_controls_and_drag_region_to_native_strip_at_narrow_width() {
+        use egui::{Pos2, RawInput, Rect, Vec2};
+
+        let ctx = egui::Context::default();
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 40.0))),
+            events: vec![egui::Event::PointerMoved(Pos2::new(90.0, 20.0))],
+            ..Default::default()
+        };
+        let mut drag_region = None;
+        let output = ctx.run_ui(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    let (_, drag) =
+                        draw_toolbar(ui, true, true, egui::vec2(69.0, 32.0), Some(40.0));
+                    drag_region = drag;
+                });
+        });
+
+        assert!(
+            drag_region.is_none(),
+            "narrow content has no drag hit region"
+        );
+        assert!(
+            !output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(text)
+                    if ["←", "→", "↑", "↻"].contains(&text.galley.job.text.as_str()))
+            }),
+            "navigation glyphs are not painted when the native strip leaves no room"
+        );
+        assert!(output.shapes.iter().all(|shape| {
+            shape
+                .shape
+                .visual_bounding_rect()
+                .intersect(shape.clip_rect)
+                .right()
+                <= 40.0
+        }));
     }
 }
