@@ -2142,19 +2142,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
-name = "m0-spike"
-version = "0.1.11"
-dependencies = [
- "anyhow",
- "async-trait",
- "fyler-core",
- "fyler-engine-nvim",
- "nvim-rs",
- "rmpv",
- "tokio",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
