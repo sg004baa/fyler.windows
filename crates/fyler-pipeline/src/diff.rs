@@ -450,7 +450,6 @@ fn operation_target(operation: &FsOperation) -> Option<&TreePath> {
 mod tests {
     use super::*;
     use fyler_core::EntryId;
-    use fyler_core::editor::EditorLine;
     use fyler_core::tree::{BaselineEntry, DesiredEntry};
     use std::collections::HashSet;
 
@@ -548,13 +547,14 @@ mod tests {
         }
     }
 
+    #[cfg(not(debug_assertions))]
     #[test]
     #[ignore = "release benchmark: cargo test -p fyler-pipeline --release benchmark_unchanged_saved_buffer -- --ignored --nocapture"]
     fn benchmark_unchanged_saved_buffer() {
+        use fyler_core::editor::EditorLine;
         use std::hint::black_box;
         use std::time::Instant;
 
-        assert!(!cfg!(debug_assertions), "run this benchmark with --release");
         for size in [10_000, 20_000, 40_000] {
             let mut baseline = BaselineTree::new("C:/benchmark-root");
             let mut lines = Vec::with_capacity(size);
