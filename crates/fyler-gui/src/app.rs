@@ -575,6 +575,7 @@ pub struct FylerApp {
     event_rx: mpsc::Receiver<GuiEvent>,
     event_dequeued: Arc<dyn Fn() + Send + Sync>,
     cmdline: Option<CmdlineState>,
+    ime: input::ImeComposition,
     popupmenu: Option<PopupmenuState>,
     message: Option<EditorMessage>,
     pending_copy: Option<String>,
@@ -674,6 +675,7 @@ impl FylerApp {
             event_rx,
             event_dequeued,
             cmdline: None,
+            ime: input::ImeComposition::default(),
             popupmenu: None,
             message: None,
             pending_copy: None,
@@ -1336,22 +1338,51 @@ impl eframe::App for FylerApp {
                 self.fatal_error = Some("Failed to send toolbar action to app".to_owned());
             }
         }
-        let navigation_focused = self.navigation_dock.focused;
-        if !navigation_focused
+        let editor_owns_input = !self.navigation_dock.focused
+            && ui.ctx().input(|input| input.focused)
             && should_forward_input(
                 self.dialog.is_none(),
                 self.fatal_error.is_none(),
                 self.active
                     .and_then(|active| self.panes.get(&active))
                     .is_some_and(|pane| pane.engine_error.is_none()),
-            )
+            );
+        let ime_target = self
+            .active
+            .filter(|_| editor_owns_input)
+            .and_then(|active| {
+                snapshots
+                    .get(&active)
+                    .map(|snapshot| (active, &snapshot.mode))
+            })
+            .filter(|(_, mode)| input::ime_enabled(mode))
+            .map(|(active, mode)| (active, mode.clone()));
+        let mut ime_interrupted = self.ime.set_target(ime_target);
+        if ime_interrupted && !editor_owns_input {
+            ui.ctx().input_mut(|input| {
+                input.events.retain(|event| {
+                    !matches!(
+                        event,
+                        egui::Event::Ime(_) | egui::Event::Key { .. } | egui::Event::Text(_)
+                    )
+                });
+            });
+        }
+        if editor_owns_input
             && let Some(active) = self.active
             && let (Some(pane), Some(snapshot)) =
                 (self.panes.get_mut(&active), snapshots.get(&active))
-            && let Err(error) = input::forward_input(ui.ctx(), pane.engine.as_ref(), &snapshot.mode)
+            && let Err(error) = input::forward_input(
+                ui.ctx(),
+                pane.engine.as_ref(),
+                &snapshot.mode,
+                &mut self.ime,
+                ime_interrupted,
+            )
         {
             pane.engine_error = Some(format!("Failed to send input to editor engine: {error}"));
         }
+        let mut cmdline_caret = None;
         if self.cmdline.is_some() || self.popupmenu.is_some() {
             let command_frame = egui::Frame::NONE
                 .fill(theme::SURFACE)
@@ -1363,7 +1394,7 @@ impl eframe::App for FylerApp {
                         cmdline::draw_popupmenu(ui, state);
                     }
                     if let Some(state) = &self.cmdline {
-                        cmdline::draw_cmdline(ui, state);
+                        cmdline_caret = Some(cmdline::draw_cmdline(ui, state));
                     }
                 });
         } else if let Some(message) = &self.message {
@@ -1446,6 +1477,7 @@ impl eframe::App for FylerApp {
         if self.dialog.is_none()
             && let Some(TreeClickEvent { pane_id, click }) = tree_click
         {
+            ime_interrupted |= self.ime.set_target(None);
             match click {
                 TreeClickEventKind::Row(row) if row.kind == tree_view::RowClickKind::Secondary => {
                     let engine_ok = self
@@ -1507,16 +1539,32 @@ impl eframe::App for FylerApp {
                 }
             }
         }
-        if self.dialog.is_none()
-            && let Some(ime) = ime
-        {
-            ui.ctx().output_mut(|platform_output| {
-                platform_output.ime = Some(egui::output::IMEOutput {
-                    rect: ime.tree_rect,
-                    cursor_rect: ime.cursor_rect,
-                    should_interrupt_composition: false,
+        if editor_owns_input && self.dialog.is_none() && !self.navigation_dock.focused {
+            let geometry = if self.cmdline.is_some() {
+                cmdline_caret.map(|cursor_rect| ImeGeometry {
+                    tree_rect: ui.ctx().content_rect(),
+                    cursor_rect,
+                })
+            } else {
+                ime
+            };
+            if self
+                .active
+                .and_then(|id| snapshots.get(&id))
+                .is_some_and(|snapshot| input::ime_enabled(&snapshot.mode))
+                && let Some(geometry) = geometry
+            {
+                let rect = self.ime.draw(ui, geometry.cursor_rect, geometry.tree_rect);
+                ui.ctx().output_mut(|output| {
+                    output.ime = Some(egui::output::IMEOutput {
+                        rect,
+                        cursor_rect: geometry.cursor_rect,
+                        should_interrupt_composition: ime_interrupted,
+                    });
                 });
-            });
+            }
+        } else {
+            self.ime.set_target(None);
         }
         let dropped_paths: Vec<PathBuf> = ui.ctx().input(|input| {
             input
@@ -1847,6 +1895,13 @@ impl eframe::App for FylerApp {
                 }
                 TreeContextOutcome::Pending => {}
             }
+        }
+        if ime_interrupted {
+            ui.ctx().output_mut(|output| {
+                if let Some(ime) = &mut output.ime {
+                    ime.should_interrupt_composition = true;
+                }
+            });
         }
         if let Some(layout) = self.native_caption_layout {
             paint_native_caption(ui.ctx(), layout);
@@ -2301,9 +2356,7 @@ fn draw_layout_in_rect(
             } else {
                 None
             };
-            let ime = if *id == active
-                && matches!(snapshot.mode, Mode::Insert | Mode::Replace | Mode::Cmdline)
-            {
+            let ime = if *id == active && matches!(snapshot.mode, Mode::Insert | Mode::Replace) {
                 output.cursor_rect.map(|cursor_rect| ImeGeometry {
                     tree_rect: output.tree_rect,
                     cursor_rect,
@@ -3819,6 +3872,7 @@ mod tests {
                 event_rx,
                 event_dequeued: Arc::new(|| {}),
                 cmdline: None,
+                ime: input::ImeComposition::default(),
                 popupmenu: None,
                 message: None,
                 pending_copy: None,
@@ -3850,6 +3904,507 @@ mod tests {
             event_tx,
             action_rx,
         )
+    }
+
+    struct ImeTestEngine {
+        snapshot: Mutex<fyler_core::editor::EditorSnapshot>,
+        commands: Mutex<Vec<fyler_core::editor::EditorCommand>>,
+    }
+
+    impl EditorEngine for ImeTestEngine {
+        fn send(&self, command: fyler_core::editor::EditorCommand) -> anyhow::Result<()> {
+            self.commands.lock().unwrap().push(command);
+            Ok(())
+        }
+
+        fn snapshot(&self) -> Arc<fyler_core::editor::EditorSnapshot> {
+            Arc::new(self.snapshot.lock().unwrap().clone())
+        }
+    }
+
+    fn ime_test_app(mode: Mode) -> (FylerApp, Arc<ImeTestEngine>) {
+        let (mut app, tx, _) = empty_test_app();
+        let engine = Arc::new(ImeTestEngine {
+            snapshot: Mutex::new(fyler_core::editor::EditorSnapshot {
+                mode,
+                lines: Arc::from([fyler_core::editor::EditorLine::new("/001 \tfile.txt")]),
+                cursor: fyler_core::editor::Cursor { line: 0, col: 8 },
+                ..fyler_core::editor::EditorSnapshot::empty()
+            }),
+            commands: Mutex::new(Vec::new()),
+        });
+        let pane_id = PaneId::new(1);
+        tx.send(GuiEvent::AddPane {
+            pane_id,
+            engine: engine.clone(),
+            root: PathBuf::from("root"),
+        })
+        .unwrap();
+        app.receive_events();
+        app.active = Some(pane_id);
+        app.layout = Some(PaneLayout::Leaf(pane_id));
+        app.navigation_dock.open = false;
+        (app, engine)
+    }
+
+    fn ime_frame(
+        context: &egui::Context,
+        app: &mut FylerApp,
+        events: Vec<egui::Event>,
+        focused: bool,
+    ) -> egui::FullOutput {
+        let initialized = context.data_mut(|data| {
+            let initialized = data
+                .get_temp::<bool>(egui::Id::new("ime-test-fonts"))
+                .unwrap_or(false);
+            data.insert_temp(egui::Id::new("ime-test-fonts"), true);
+            initialized
+        });
+        if !initialized {
+            install_fallback_font(context, None);
+        }
+        context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(720.0, 480.0),
+                )),
+                events,
+                focused,
+                ..Default::default()
+            },
+            |ui| {
+                eframe::App::ui(app, ui, &mut eframe::Frame::_new_kittest());
+            },
+        )
+    }
+
+    fn ime_preedit(text: &str) -> egui::Event {
+        egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: text.to_owned(),
+            active_range_chars: Some(1..2),
+        })
+    }
+
+    fn ime_key(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    fn ime_painted_text<'a>(
+        output: &'a egui::FullOutput,
+        expected: &str,
+    ) -> Option<&'a egui::epaint::TextShape> {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text == expected => Some(text),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn ime_tree_preedit_persists_while_only_composition_keys_are_suppressed() {
+        for mode in [Mode::Insert, Mode::Replace] {
+            let context = egui::Context::default();
+            let (mut app, engine) = ime_test_app(mode);
+            let initial = ime_frame(&context, &mut app, vec![], true);
+            let caret = initial.platform_output.ime.unwrap().cursor_rect;
+            let output = ime_frame(&context, &mut app, vec![ime_preedit("かな")], true);
+            let text = ime_painted_text(&output, "かな").expect("preedit must be painted");
+            assert_eq!(text.pos, caret.min);
+            assert!(
+                text.galley.job.sections.iter().any(|section| {
+                    section.format.background == theme::ACCENT
+                        && &text.galley.job.text
+                            [section.byte_range.start.0..section.byte_range.end.0]
+                            == "な"
+                }),
+                "active IME range uses character offsets, not UTF-8 byte offsets"
+            );
+            assert_eq!(
+                output.platform_output.ime.as_ref().unwrap().rect,
+                egui::Rect::from_min_size(text.pos, text.galley.size())
+            );
+            let output = ime_frame(
+                &context,
+                &mut app,
+                vec![
+                    ime_key(egui::Key::ArrowLeft),
+                    ime_key(egui::Key::Backspace),
+                    egui::Event::Text("a".to_owned()),
+                ],
+                true,
+            );
+            assert!(ime_painted_text(&output, "かな").is_some());
+            assert_eq!(
+                *engine.commands.lock().unwrap(),
+                [fyler_core::editor::EditorCommand::Text("a".to_owned())]
+            );
+            assert_eq!(
+                &*engine.snapshot.lock().unwrap().lines[0].text,
+                "/001 \tfile.txt"
+            );
+        }
+    }
+
+    #[test]
+    fn ime_commit_and_enter_insert_literal_text_once_in_either_event_order() {
+        use fyler_core::editor::EditorCommand;
+        for enter_first in [false, true] {
+            let context = egui::Context::default();
+            let (mut app, engine) = ime_test_app(Mode::Insert);
+            let _ = ime_frame(&context, &mut app, vec![ime_preedit("にほん")], true);
+            let mut events = vec![
+                egui::Event::Ime(egui::ImeEvent::Commit("日本<CR>".to_owned())),
+                egui::Event::Text("日本<CR>".to_owned()),
+            ];
+            events.insert(
+                if enter_first { 0 } else { events.len() },
+                ime_key(egui::Key::Enter),
+            );
+            let output = ime_frame(&context, &mut app, events, true);
+            assert_eq!(
+                *engine.commands.lock().unwrap(),
+                [EditorCommand::Text("日本<CR>".to_owned())]
+            );
+            assert!(ime_painted_text(&output, "にほん").is_none());
+            let _ = ime_frame(&context, &mut app, vec![ime_key(egui::Key::Enter)], true);
+            assert_eq!(
+                engine.commands.lock().unwrap().last(),
+                Some(&EditorCommand::Key(KeyInput {
+                    key: Key::Enter,
+                    mods: Modifiers::default(),
+                }))
+            );
+        }
+    }
+
+    #[test]
+    fn ime_mixed_frames_preserve_unrelated_text_and_paste_in_order() {
+        use fyler_core::editor::EditorCommand;
+        for mode in [Mode::Insert, Mode::Replace, Mode::Cmdline] {
+            let cmdline = matches!(mode, Mode::Cmdline);
+            let context = egui::Context::default();
+            let (mut app, engine) = ime_test_app(mode);
+            if cmdline {
+                app.cmdline = Some(CmdlineState {
+                    prompt: ':',
+                    content: String::new(),
+                    cursor: 0,
+                });
+            }
+            let output = ime_frame(
+                &context,
+                &mut app,
+                vec![egui::Event::Text("x".to_owned()), ime_preedit("か")],
+                true,
+            );
+            assert!(ime_painted_text(&output, "か").is_some());
+            assert_eq!(
+                *engine.commands.lock().unwrap(),
+                [EditorCommand::Text("x".to_owned())]
+            );
+            engine.commands.lock().unwrap().clear();
+            let output = ime_frame(
+                &context,
+                &mut app,
+                vec![
+                    egui::Event::Text("before".to_owned()),
+                    egui::Event::Ime(egui::ImeEvent::Commit("日本".to_owned())),
+                    egui::Event::Text("x".to_owned()),
+                    egui::Event::Paste("paste".to_owned()),
+                    egui::Event::Ime(egui::ImeEvent::Commit("語".to_owned())),
+                    egui::Event::Text("after".to_owned()),
+                ],
+                true,
+            );
+            assert!(ime_painted_text(&output, "か").is_none());
+            assert_eq!(
+                *engine.commands.lock().unwrap(),
+                [
+                    EditorCommand::Text("before".to_owned()),
+                    EditorCommand::Text("日本".to_owned()),
+                    EditorCommand::Text("x".to_owned()),
+                    EditorCommand::Paste("paste".to_owned()),
+                    EditorCommand::Text("語".to_owned()),
+                    EditorCommand::Text("after".to_owned()),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn ime_commit_suppresses_only_one_matching_text_echo_in_either_order() {
+        use fyler_core::editor::EditorCommand;
+        for text_first in [false, true] {
+            let context = egui::Context::default();
+            let (mut app, engine) = ime_test_app(Mode::Insert);
+            let mut events = vec![
+                egui::Event::Ime(egui::ImeEvent::Commit("日本".to_owned())),
+                egui::Event::Text("日本".to_owned()),
+            ];
+            if text_first {
+                events.swap(0, 1);
+            }
+            events.extend([
+                egui::Event::Text("x".to_owned()),
+                egui::Event::Text("日本".to_owned()),
+            ]);
+            let _ = ime_frame(&context, &mut app, events, true);
+            assert_eq!(
+                *engine.commands.lock().unwrap(),
+                [
+                    EditorCommand::Text("日本".to_owned()),
+                    EditorCommand::Text("x".to_owned()),
+                    EditorCommand::Text("日本".to_owned()),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn ime_preedit_preserves_unrelated_shortcuts() {
+        use fyler_core::editor::EditorCommand;
+        let context = egui::Context::default();
+        let (mut app, engine) = ime_test_app(Mode::Insert);
+        let _ = ime_frame(&context, &mut app, vec![ime_preedit("かな")], true);
+        let output = ime_frame(
+            &context,
+            &mut app,
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL,
+                },
+                egui::Event::Key {
+                    key: egui::Key::ArrowLeft,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL,
+                },
+            ],
+            true,
+        );
+        assert!(ime_painted_text(&output, "かな").is_some());
+        assert_eq!(
+            *engine.commands.lock().unwrap(),
+            [
+                EditorCommand::Key(KeyInput {
+                    key: Key::Char('a'),
+                    mods: Modifiers {
+                        ctrl: true,
+                        ..Default::default()
+                    },
+                }),
+                EditorCommand::Key(KeyInput {
+                    key: Key::Left,
+                    mods: Modifiers {
+                        ctrl: true,
+                        ..Default::default()
+                    },
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn ime_cancellation_clears_preedit_and_restores_regular_input() {
+        for cancel in [
+            ime_preedit(""),
+            egui::Event::Ime(egui::ImeEvent::Commit(String::new())),
+            egui::Event::Ime(egui::ImeEvent::Disabled),
+        ] {
+            let context = egui::Context::default();
+            let (mut app, engine) = ime_test_app(Mode::Insert);
+            let _ = ime_frame(&context, &mut app, vec![ime_preedit("かな")], true);
+            let output = ime_frame(
+                &context,
+                &mut app,
+                vec![cancel, ime_key(egui::Key::Escape)],
+                true,
+            );
+            assert!(ime_painted_text(&output, "かな").is_none());
+            assert!(engine.commands.lock().unwrap().is_empty());
+            let _ = ime_frame(
+                &context,
+                &mut app,
+                vec![egui::Event::Text("x".to_owned())],
+                true,
+            );
+            assert_eq!(
+                *engine.commands.lock().unwrap(),
+                [fyler_core::editor::EditorCommand::Text("x".to_owned()),]
+            );
+        }
+    }
+
+    #[test]
+    fn ime_is_disabled_in_non_text_modes_without_breaking_navigation() {
+        for mode in [
+            Mode::Normal,
+            Mode::Visual,
+            Mode::VisualLine,
+            Mode::VisualBlock,
+            Mode::OperatorPending,
+            Mode::Other("terminal".to_owned()),
+        ] {
+            let context = egui::Context::default();
+            let (mut app, engine) = ime_test_app(mode);
+            let output = ime_frame(
+                &context,
+                &mut app,
+                vec![
+                    ime_preedit("かな"),
+                    egui::Event::Ime(egui::ImeEvent::Commit("仮名".to_owned())),
+                    ime_key(egui::Key::J),
+                    egui::Event::Text("j".to_owned()),
+                ],
+                true,
+            );
+            assert!(output.platform_output.ime.is_none());
+            assert!(ime_painted_text(&output, "かな").is_none());
+            assert_eq!(
+                *engine.commands.lock().unwrap(),
+                [fyler_core::editor::EditorCommand::Key(KeyInput {
+                    key: Key::Char('j'),
+                    mods: Modifiers::default(),
+                }),]
+            );
+        }
+    }
+
+    #[test]
+    fn ime_owner_changes_cancel_preedit_and_reject_pending_commit() {
+        for owner in ["focus", "modal", "dock", "pane", "normal", "cmdline"] {
+            let context = egui::Context::default();
+            let (mut app, engine) = ime_test_app(Mode::Insert);
+            let _ = ime_frame(&context, &mut app, vec![ime_preedit("かな")], true);
+            match owner {
+                "modal" => {
+                    app.dialog = Some(DialogState::Help {
+                        query: String::new(),
+                        searching: false,
+                    })
+                }
+                "dock" => app.navigation_dock.focused = true,
+                "pane" => {
+                    let old = app.panes.remove(&PaneId::new(1)).unwrap();
+                    let pane = PaneId::new(2);
+                    app.panes.insert(pane, old);
+                    app.active = Some(pane);
+                    app.layout = Some(PaneLayout::Leaf(pane));
+                }
+                "normal" => engine.snapshot.lock().unwrap().mode = Mode::Normal,
+                "cmdline" => {
+                    engine.snapshot.lock().unwrap().mode = Mode::Cmdline;
+                    app.cmdline = Some(CmdlineState {
+                        prompt: ':',
+                        content: String::new(),
+                        cursor: 0,
+                    });
+                }
+                _ => {}
+            }
+            let output = ime_frame(
+                &context,
+                &mut app,
+                vec![egui::Event::Ime(egui::ImeEvent::Commit("仮名".to_owned()))],
+                owner != "focus",
+            );
+            assert!(ime_painted_text(&output, "かな").is_none(), "{owner}");
+            assert!(engine.commands.lock().unwrap().is_empty(), "{owner}");
+            if matches!(owner, "pane" | "cmdline") {
+                assert!(
+                    output
+                        .platform_output
+                        .ime
+                        .unwrap()
+                        .should_interrupt_composition
+                );
+            } else {
+                assert!(output.platform_output.ime.is_none(), "{owner}");
+            }
+            app.dialog = None;
+            app.navigation_dock.focused = false;
+            engine.snapshot.lock().unwrap().mode = Mode::Insert;
+            app.cmdline = None;
+            let output = ime_frame(&context, &mut app, vec![], true);
+            assert!(ime_painted_text(&output, "かな").is_none(), "{owner}");
+            assert!(output.platform_output.ime.is_some(), "{owner}");
+        }
+    }
+
+    #[test]
+    fn ime_cmdline_uses_the_rendered_utf8_caret_instead_of_the_tree() {
+        let context = egui::Context::default();
+        let (mut app, engine) = ime_test_app(Mode::Cmdline);
+        app.cmdline = Some(CmdlineState {
+            prompt: ':',
+            content: "s/日本/語/".to_owned(),
+            cursor: "s/日".len(),
+        });
+        let mut output = egui::FullOutput::default();
+        for _ in 0..3 {
+            output = ime_frame(&context, &mut app, vec![], true);
+        }
+        let text = ime_painted_text(&output, ":s/日本/語/").unwrap();
+        let expected = text.pos
+            + text
+                .galley
+                .pos_from_cursor(egui::text::CCursor::new(4))
+                .min
+                .to_vec2();
+        let ime = output.platform_output.ime.as_ref().unwrap();
+        assert_eq!(ime.rect.min, expected);
+        assert!(
+            ime.rect.top() > 400.0,
+            "candidate must be in the command band"
+        );
+        let output = ime_frame(&context, &mut app, vec![ime_preedit("かな")], true);
+        assert_eq!(ime_painted_text(&output, "かな").unwrap().pos, expected);
+        assert!(engine.commands.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ime_dialog_text_edit_keeps_its_own_composition() {
+        let context = egui::Context::default();
+        let (mut app, engine) = ime_test_app(Mode::Insert);
+        let _ = ime_frame(&context, &mut app, vec![ime_preedit("ツリー")], true);
+        app.dialog = Some(DialogState::Feedback {
+            kind: FeedbackKind::Impression,
+            body: String::new(),
+            stage: FeedbackStage::Input,
+        });
+        app.feedback_needs_focus = true;
+        for _ in 0..3 {
+            let _ = ime_frame(&context, &mut app, vec![], true);
+        }
+        let output = ime_frame(&context, &mut app, vec![ime_preedit("にほん")], true);
+        assert!(
+            output.platform_output.ime.is_some(),
+            "TextEdit must still own native IME"
+        );
+        assert!(ime_painted_text(&output, "ツリー").is_none());
+        let _ = ime_frame(
+            &context,
+            &mut app,
+            vec![egui::Event::Ime(egui::ImeEvent::Commit("日本".to_owned()))],
+            true,
+        );
+        let Some(DialogState::Feedback { body, .. }) = &app.dialog else {
+            panic!("feedback closed");
+        };
+        assert_eq!(body, "日本");
+        assert!(engine.commands.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -4178,6 +4733,7 @@ mod tests {
             event_rx,
             event_dequeued: Arc::new(|| {}),
             cmdline: None,
+            ime: input::ImeComposition::default(),
             popupmenu: None,
             message: None,
             pending_copy: None,

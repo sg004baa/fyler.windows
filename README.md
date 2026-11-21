@@ -11,6 +11,7 @@ fyler.windows は、[fyler.nvim](https://github.com/FylerOrg/fyler.nvim) にイ�
 - Git status、ファイル情報、OneDrive プレースホルダー、隠しファイルの表示
 - ブックマークと最近使ったルート
 - キーマップと leader key のカスタマイズ
+- Insert / Replace / コマンドラインでの日本語 IME 入力。未確定文字列と変換候補をカーソル位置に表示
 - `:terminal` による現在位置での外部ターミナル起動
 
 ## インストール
