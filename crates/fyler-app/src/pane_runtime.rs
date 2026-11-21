@@ -951,9 +951,15 @@ pub(super) fn run() -> anyhow::Result<()> {
                         path,
                         action,
                     },
-                    GuiAction::PickerQuery { pane_id, query } => {
-                        AppEvent::PickerQuery { pane_id, query }
-                    }
+                    GuiAction::PickerQuery {
+                        pane_id,
+                        request_id,
+                        query,
+                    } => AppEvent::PickerQuery {
+                        pane_id,
+                        request_id,
+                        query,
+                    },
                     GuiAction::PickerClosed { pane_id } => AppEvent::PickerClosed(pane_id),
                     GuiAction::FeedbackSubmit { kind, body } => {
                         AppEvent::FeedbackSubmit { kind, body }
@@ -1746,19 +1752,15 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     let root = session.root.clone();
                                     let include_hidden =
                                         session.save_controller.scan_options().show_hidden;
-                                    let catalog = catalogs.ensure(&root);
+                                    catalogs.ensure(&root);
+                                    picker_search.invalidate_pending();
                                     active_picker = Some(ActivePicker {
                                         pane_id,
+                                        request_id: None,
                                         root,
                                         query: String::new(),
                                         include_hidden,
                                     });
-                                    picker_search.request(
-                                        pane_id,
-                                        String::new(),
-                                        include_hidden,
-                                        catalog,
-                                    );
                                 }
                             }
                             EditorEvent::CommitRequested { changedtick, lines } => {
@@ -3206,17 +3208,19 @@ pub(super) fn run() -> anyhow::Result<()> {
                             return;
                         }
                     }
-                    AppEvent::PickerQuery { pane_id, query } => {
+                    AppEvent::PickerQuery { pane_id, request_id, query } => {
                         let Some(picker) = active_picker.as_mut() else {
                             continue;
                         };
                         if picker.pane_id != pane_id {
                             continue;
                         }
+                        picker.request_id = Some(request_id);
                         picker.query = query.clone();
                         if let Some(catalog) = catalogs.get(&picker.root) {
                             picker_search.request(
                                 pane_id,
+                                request_id,
                                 query,
                                 picker.include_hidden,
                                 catalog,
@@ -3247,9 +3251,13 @@ pub(super) fn run() -> anyhow::Result<()> {
                         if picker.root != root {
                             continue;
                         }
+                        let Some(request_id) = picker.request_id else {
+                            continue;
+                        };
                         if let Some(catalog) = catalogs.get(&root) {
                             picker_search.request(
                                 picker.pane_id,
+                                request_id,
                                 picker.query.clone(),
                                 picker.include_hidden,
                                 catalog,
@@ -4649,10 +4657,12 @@ pub(super) fn run() -> anyhow::Result<()> {
                             if catalogs.update(&root, &paths)
                                 && let Some(picker) = active_picker.as_ref()
                                 && picker.root == root
+                                && let Some(request_id) = picker.request_id
                                 && let Some(catalog) = catalogs.get(&root)
                             {
                                 picker_search.request(
                                     picker.pane_id,
+                                    request_id,
                                     picker.query.clone(),
                                     picker.include_hidden,
                                     catalog,
@@ -4758,9 +4768,11 @@ pub(super) fn run() -> anyhow::Result<()> {
                         let catalog = catalogs.ensure(&root);
                         if let Some(picker) = active_picker.as_ref()
                             && picker.root == root
+                            && let Some(request_id) = picker.request_id
                         {
                             picker_search.request(
                                 picker.pane_id,
+                                request_id,
                                 picker.query.clone(),
                                 picker.include_hidden,
                                 catalog,

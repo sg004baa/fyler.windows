@@ -62,6 +62,7 @@ enum AppEvent {
     },
     PickerQuery {
         pane_id: PaneId,
+        request_id: u64,
         query: String,
     },
     PickerClosed(PaneId),
