@@ -141,7 +141,7 @@ fn confirm_elevation(root: &Path) -> anyhow::Result<bool> {
     match choice {
         IDOK => Ok(true),
         IDCANCEL => Ok(false),
-        _ => Err(std::io::Error::last_os_error()).map_err(anyhow::Error::from),
+        _ => Err(anyhow::Error::from(std::io::Error::last_os_error())),
     }
 }
 
