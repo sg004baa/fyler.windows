@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
 use fyler_core::editor::{
-    CmdlineState, Cursor, EditorCommand, EditorEngine, EditorEvent, EditorLine, EditorMessage,
-    EditorSnapshot, FoldOp, MessageKind, Mode, PopupmenuItem, PopupmenuState, SearchHighlight,
+    BlockSelectionPoint, BlockSelectionSpan, CmdlineState, Cursor, EditorCommand, EditorEngine,
+    EditorEvent, EditorLine, EditorMessage, EditorSnapshot, FoldOp, MessageKind, Mode,
+    PopupmenuItem, PopupmenuState, SearchHighlight,
 };
 use fyler_core::pane::PaneAction;
 use fyler_core::transfer::TransferKind;
@@ -174,6 +175,9 @@ impl NvimEngine {
             .set_name(&buffer_uri)
             .await
             .map_err(|error| anyhow::anyhow!("Failed to set buffer name: {error}"))?;
+        nvim.exec_lua(BLOCK_SELECTION_LUA, Vec::new())
+            .await
+            .map_err(|error| anyhow::anyhow!("Failed to install block selection query: {error}"))?;
 
         let mut ui_options = UiAttachOptions::new();
         ui_options.set_cmdline_external(true);
@@ -1110,6 +1114,7 @@ struct Status {
     cursor: Cursor,
     mode: Mode,
     visual_start: Option<Cursor>,
+    block_selection: Option<Arc<[BlockSelectionSpan]>>,
     dirty: bool,
     /// 検索状態の生値。パターンの実効解決は [`resolve_search`] で行う。
     search: SearchRaw,
@@ -1150,6 +1155,13 @@ async fn query_status(nvim: &Nvim) -> anyhow::Result<Status> {
                 "[getreg('/'), v:hlsearch, &ignorecase, &smartcase]",
             )],
         ),
+        atomic_call(
+            "nvim_exec_lua",
+            vec![
+                Value::from("return _G.__fyler_block_selection()"),
+                Value::Array(Vec::new()),
+            ],
+        ),
     ];
     let response = nvim
         .call_atomic(calls)
@@ -1163,9 +1175,9 @@ async fn query_status(nvim: &Nvim) -> anyhow::Result<Status> {
     if let Some(error) = response.get(1).filter(|value| !value.is_nil()) {
         anyhow::bail!("A call inside nvim_call_atomic failed: {error:?}");
     }
-    if results.len() != 6 {
+    if results.len() != 7 {
         anyhow::bail!(
-            "Invalid result count from nvim_call_atomic: expected 6, got {}",
+            "Invalid result count from nvim_call_atomic: expected 7, got {}",
             results.len()
         );
     }
@@ -1232,9 +1244,91 @@ async fn query_status(nvim: &Nvim) -> anyhow::Result<Status> {
         },
         mode,
         visual_start,
+        block_selection: parse_block_selection(&results[6])?,
         dirty,
         search,
     })
+}
+
+// Run in the same atomic status query, so endpoints and buffer coordinates
+// describe the same input state. Neovim owns cell widths and composing clusters.
+const BLOCK_SELECTION_LUA: &str = r#"
+local function point(pos, is_end, line)
+  local byte, offset = pos[3] - 1, pos[4]
+  if #line == 0 or byte >= #line then return {#line, #line, offset, 1} end
+  local character = vim.fn.charidx(line, byte)
+  local first = vim.fn.byteidx(line, character)
+  local after = vim.fn.byteidx(line, character + 1)
+  if is_end and offset == 0 then return {after, after, 0, 1} end
+  if offset == 0 then return {first, first, 0, 1} end
+  local cells = vim.fn.virtcol({pos[2], first + 1}, true)
+  return {first, after, offset, vim.fn.strdisplaywidth(line:sub(first + 1, after), cells[1] - 1)}
+end
+_G.__fyler_block_selection = function()
+  if vim.fn.mode() ~= string.char(22) then return vim.NIL end
+  local regions = vim.fn.getregionpos(vim.fn.getpos('v'), vim.fn.getpos('.'), {
+    type = string.char(22), exclusive = vim.o.selection == 'exclusive', eol = true,
+  })
+  local spans = {}
+  for _, region in ipairs(regions) do
+    local line_number = region[1][2]
+    local line = vim.api.nvim_buf_get_lines(0, line_number - 1, line_number, false)[1]
+    spans[#spans + 1] = {
+      line_number - 1, point(region[1], false, line), point(region[2], true, line),
+    }
+  end
+  return spans
+end
+"#;
+
+fn parse_block_selection(value: &Value) -> anyhow::Result<Option<Arc<[BlockSelectionSpan]>>> {
+    if value.is_nil() {
+        return Ok(None);
+    }
+    let rows = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Invalid block selection rows"))?;
+    let mut spans = Vec::with_capacity(rows.len());
+    for row in rows {
+        let row = row
+            .as_array()
+            .filter(|row| row.len() == 3)
+            .ok_or_else(|| anyhow::anyhow!("Invalid block selection row"))?;
+        let line = row[0]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("Invalid block selection line"))?
+            as usize;
+        spans.push(BlockSelectionSpan {
+            line,
+            start: parse_block_selection_point(&row[1])?,
+            end: parse_block_selection_point(&row[2])?,
+        });
+    }
+    Ok(Some(spans.into()))
+}
+
+fn parse_block_selection_point(value: &Value) -> anyhow::Result<BlockSelectionPoint> {
+    let values = value
+        .as_array()
+        .filter(|values| values.len() == 4)
+        .ok_or_else(|| anyhow::anyhow!("Invalid block selection endpoint"))?;
+    let number = |index: usize| {
+        values[index]
+            .as_u64()
+            .map(|value| value as usize)
+            .ok_or_else(|| anyhow::anyhow!("Invalid block selection endpoint coordinate"))
+    };
+    let point = BlockSelectionPoint {
+        byte: number(0)?,
+        character_end: number(1)?,
+        cell_offset: number(2)?,
+        cell_width: number(3)?,
+    };
+    anyhow::ensure!(
+        point.character_end >= point.byte && point.cell_width > 0,
+        "Invalid block selection character bounds"
+    );
+    Ok(point)
 }
 
 fn atomic_call(name: &str, args: Vec<Value>) -> Value {
@@ -1242,7 +1336,7 @@ fn atomic_call(name: &str, args: Vec<Value>) -> Value {
 }
 
 fn lines_to_arc(lines: &[EditorLine]) -> Arc<[EditorLine]> {
-    Arc::from(lines.to_vec())
+    Arc::from(lines)
 }
 
 fn build_snapshot(
@@ -1259,6 +1353,7 @@ fn build_snapshot(
         cursor: status.cursor,
         mode: status.mode,
         visual_start: status.visual_start,
+        block_selection: status.block_selection,
         dirty: status.dirty,
         search,
     }

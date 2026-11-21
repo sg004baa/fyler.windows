@@ -27,6 +27,13 @@ pub(crate) struct OpFailure {
     pub(crate) error: anyhow::Error,
     progress: Option<String>,
     permission_denied: bool,
+    recovery: RecoveryDisposition,
+}
+
+#[derive(Debug)]
+enum RecoveryDisposition {
+    RollBackDestination,
+    RetainCopiedDestination,
 }
 
 impl OpFailure {
@@ -35,6 +42,7 @@ impl OpFailure {
             permission_denied: crate::privilege::is_permission_denied(&error),
             error,
             progress: Some(progress.into()),
+            recovery: RecoveryDisposition::RollBackDestination,
         }
     }
 }
@@ -45,6 +53,7 @@ impl From<anyhow::Error> for OpFailure {
             permission_denied: crate::privilege::is_permission_denied(&error),
             error,
             progress: None,
+            recovery: RecoveryDisposition::RollBackDestination,
         }
     }
 }
@@ -245,6 +254,27 @@ fn execute_with_staged_overwrite(
                 ))
             }
         },
+        Err(mut operation_error)
+            if matches!(
+                operation_error.recovery,
+                RecoveryDisposition::RetainCopiedDestination
+            ) =>
+        {
+            let progress = operation_error.progress.get_or_insert_with(String::new);
+            progress.push_str(&format!(
+                " The completed destination at {} and the old entry staged at {} are retained. Recover manually; the old entry's original location is {}.",
+                target.display(),
+                staged_path.display(),
+                original.display()
+            ));
+            if let Some(backup) = backup.as_ref() {
+                progress.push_str(&format!(
+                    " Backup payload {} is also retained.",
+                    backup.payload_rel
+                ));
+            }
+            Err(operation_error)
+        }
         Err(mut operation_error) => {
             let cleanup = cleanup_staged_operation_target(target);
             let restore = if cleanup.is_ok() {
@@ -1026,23 +1056,52 @@ pub(crate) fn move_file_across_volumes(
 }
 
 pub(crate) fn move_directory_across_volumes(source: &Path, target: &Path) -> Result<(), OpFailure> {
-    let progress = copy_tree(source, target)?;
-    fs::remove_dir_all(crate::long_path::to_fs(source))
-        .with_context(|| {
-            format!(
+    let tasks = collect_copy_tasks(source, target).map_err(|error| {
+        OpFailure::with_progress(
+            error,
+            "Copy complete: 0 entries; could not determine total number of entries",
+        )
+    })?;
+    let progress = execute_copy_tasks(target, &tasks)?;
+    let mut removed = 0;
+    let removal = (|| -> anyhow::Result<()> {
+        fault_point("directory_source_removal", source)?;
+        for task in tasks.iter().rev() {
+            match task.kind {
+                EntryKind::Dir => {
+                    fs::remove_dir(crate::long_path::to_fs(&task.source)).with_context(|| {
+                        format!(
+                            "Failed to remove source directory: {}",
+                            task.source.display()
+                        )
+                    })?;
+                }
+                kind @ (EntryKind::File | EntryKind::Symlink) => {
+                    remove_non_directory_entry(&task.source, kind)?;
+                }
+            }
+            removed += 1;
+            fault_point("directory_source_entry_removed", &task.source)?;
+        }
+        fs::remove_dir(crate::long_path::to_fs(source))
+            .with_context(|| format!("Failed to remove source directory: {}", source.display()))
+    })();
+    removal.map_err(|error| {
+        let mut failure = OpFailure::with_progress(
+            error.context(format!(
                 "Failed to remove source directory after copy: {}",
                 source.display()
-            )
-        })
-        .map_err(|error| {
-            OpFailure::with_progress(
-                error,
-                format!(
-                    "Copy complete: {0}/{0} entries; failed to remove source directory",
-                    progress.total
-                ),
-            )
-        })
+            )),
+            format!(
+                "Copy complete: {0}/{0} entries; source removal complete: {removed}/{0} entries. Remaining source at {1} and completed destination at {2} are retained for manual recovery.",
+                progress.total,
+                source.display(),
+                target.display()
+            ),
+        );
+        failure.recovery = RecoveryDisposition::RetainCopiedDestination;
+        failure
+    })
 }
 
 pub(crate) fn copy_single_entry(
@@ -1090,6 +1149,10 @@ pub(crate) fn copy_tree(source: &Path, target: &Path) -> Result<CopyProgress, Op
             "Copy complete: 0 entries; could not determine total number of entries",
         )
     })?;
+    execute_copy_tasks(target, &tasks)
+}
+
+fn execute_copy_tasks(target: &Path, tasks: &[CopyTask]) -> Result<CopyProgress, OpFailure> {
     let total = tasks.len();
 
     fs::create_dir(crate::long_path::to_fs(target))
@@ -1101,7 +1164,7 @@ pub(crate) fn copy_tree(source: &Path, target: &Path) -> Result<CopyProgress, Op
         })
         .map_err(|error| OpFailure::with_progress(error, copy_progress(0, total)))?;
 
-    for (copied, task) in tasks.into_iter().enumerate() {
+    for (copied, task) in tasks.iter().enumerate() {
         let result = match task.kind {
             EntryKind::Dir => fs::create_dir(crate::long_path::to_fs(&task.target))
                 .with_context(|| {
@@ -2704,6 +2767,149 @@ mod tests {
             fs::read(target.join("nested/file.txt")).unwrap(),
             b"content"
         );
+    }
+
+    #[test]
+    fn cross_volume_directory_move_preserves_new_source_entries() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("copied.txt"), b"copied").unwrap();
+        FAULT_INJECTION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|stage, path| {
+                if stage == "directory_source_removal" {
+                    fs::write(path.join("new.txt"), b"new arrival").unwrap();
+                }
+                None
+            }));
+        });
+        let _fault = FaultGuard;
+
+        let result = move_directory_across_volumes(&source, &target);
+
+        assert_eq!(fs::read(source.join("new.txt")).unwrap(), b"new arrival");
+        assert_eq!(fs::read(target.join("copied.txt")).unwrap(), b"copied");
+        assert!(!target.join("new.txt").exists());
+        let failure = result.unwrap_err();
+        let progress = failure.progress.unwrap();
+        assert!(progress.contains("Copy complete: 1/1 entries"));
+        assert!(progress.contains(&source.display().to_string()));
+        assert!(progress.contains(&target.display().to_string()));
+    }
+
+    #[test]
+    fn cross_volume_directory_move_partial_removal_retains_overwrite_recovery() {
+        let root = tempdir().unwrap();
+        let backup = tempdir().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("removed.txt"), b"removed source bytes").unwrap();
+        fs::write(source.join("remaining.txt"), b"remaining source bytes").unwrap();
+        fs::write(&target, b"original target bytes").unwrap();
+        let mut recorder = UndoRecorder::new(
+            "tx".to_owned(),
+            root.path().to_path_buf(),
+            backup.path().to_path_buf(),
+        );
+        FAULT_INJECTION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|stage, path| {
+                if stage == "directory_source_removal" {
+                    fs::remove_file(path.join("removed.txt")).unwrap();
+                    return Some(anyhow!("source removal failed after first entry"));
+                }
+                None
+            }));
+        });
+        let _fault = FaultGuard;
+
+        let failure = execute_with_staged_overwrite(&target, true, Some(&mut recorder), || {
+            move_directory_across_volumes(&source, &target)
+        })
+        .unwrap_err();
+
+        assert!(!source.join("removed.txt").exists());
+        assert_eq!(
+            fs::read(source.join("remaining.txt")).unwrap(),
+            b"remaining source bytes"
+        );
+        assert_eq!(
+            fs::read(target.join("removed.txt")).unwrap(),
+            b"removed source bytes"
+        );
+        assert_eq!(
+            fs::read(target.join("remaining.txt")).unwrap(),
+            b"remaining source bytes"
+        );
+        let staged = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".fyler-staged-")
+            })
+            .unwrap()
+            .join("target");
+        assert_eq!(fs::read(&staged).unwrap(), b"original target bytes");
+        assert_eq!(
+            fs::read(backup.path().join("payload/0/target")).unwrap(),
+            b"original target bytes"
+        );
+        assert!(
+            failure
+                .error
+                .to_string()
+                .contains("Failed to remove source")
+        );
+        let progress = failure.progress.unwrap();
+        assert!(progress.contains("Copy complete: 2/2 entries"));
+        assert!(progress.contains(&source.display().to_string()));
+        assert!(progress.contains(&target.display().to_string()));
+        assert!(progress.contains(&staged.display().to_string()));
+        assert!(progress.contains("payload/0/target"));
+        assert!(progress.contains("manually"));
+    }
+
+    #[test]
+    fn cross_volume_directory_move_fault_after_first_removal_keeps_copied_bytes() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("nested/file.txt"), b"copied bytes").unwrap();
+        fs::write(&target, b"original bytes").unwrap();
+        let _fault = FaultGuard::once("directory_source_entry_removed");
+
+        let failure = execute_with_staged_overwrite(&target, true, None, || {
+            move_directory_across_volumes(&source, &target)
+        })
+        .unwrap_err();
+
+        assert!(source.join("nested").is_dir());
+        assert!(!source.join("nested/file.txt").exists());
+        assert_eq!(
+            fs::read(target.join("nested/file.txt")).unwrap(),
+            b"copied bytes"
+        );
+        let staged = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".fyler-staged-")
+            })
+            .unwrap()
+            .join("target");
+        assert_eq!(fs::read(&staged).unwrap(), b"original bytes");
+        let progress = failure.progress.unwrap();
+        assert!(progress.contains("Copy complete: 2/2 entries"));
+        assert!(progress.contains("source removal complete: 1/2 entries"));
+        assert!(progress.contains(&staged.display().to_string()));
     }
 
     fn transfer_plan(from_root: &Path, to_root: &Path, ops: Vec<TransferOp>) -> TransferPlan {

@@ -107,6 +107,7 @@ pub enum GuiAction {
     },
     PickerQuery {
         pane_id: PaneId,
+        request_id: u64,
         query: String,
     },
     PickerClosed {
@@ -264,6 +265,7 @@ pub enum GuiEvent {
     /// 検索workerが返した最新のpicker結果。
     PickerResults {
         pane_id: PaneId,
+        request_id: u64,
         query: String,
         results: Vec<PickerHit>,
         indexed_count: usize,
@@ -437,6 +439,7 @@ enum DialogState {
     },
     FilePicker {
         pane_id: PaneId,
+        request_id: u64,
         query: String,
         selected: usize,
         results: Vec<PickerHit>,
@@ -583,6 +586,7 @@ pub struct FylerApp {
     dialog: Option<DialogState>,
     action_tx: mpsc::Sender<GuiAction>,
     picker_needs_focus: bool,
+    next_picker_request_id: u64,
     feedback_needs_focus: bool,
     confirm_detail: ConfirmDetail,
     help_entries: Vec<HelpEntry>,
@@ -683,6 +687,7 @@ impl FylerApp {
             dialog: None,
             action_tx,
             picker_needs_focus: false,
+            next_picker_request_id: 0,
             feedback_needs_focus: false,
             confirm_detail,
             help_entries,
@@ -913,8 +918,10 @@ impl FylerApp {
                     }
                 }
                 GuiEvent::ShowFilePicker { pane_id } => {
+                    let request_id = next_picker_request_id(&mut self.next_picker_request_id);
                     self.dialog = Some(DialogState::FilePicker {
                         pane_id,
+                        request_id,
                         query: String::new(),
                         selected: 0,
                         results: Vec::new(),
@@ -922,19 +929,24 @@ impl FylerApp {
                         indexing: true,
                     });
                     self.picker_needs_focus = true;
-                    let _ = self
-                        .action_tx
-                        .send(picker_query_action(pane_id, String::new()));
+                    let _ = self.action_tx.send(picker_query_action(
+                        pane_id,
+                        request_id,
+                        String::new(),
+                    ));
                 }
                 GuiEvent::PickerResults {
                     pane_id,
-                    query: _,
+                    request_id,
+                    query,
                     results,
                     indexed_count,
                     indexing,
                 } => {
                     if let Some(DialogState::FilePicker {
                         pane_id: owner,
+                        request_id: current_request_id,
+                        query: current_query,
                         selected,
                         results: current,
                         indexed_count: current_count,
@@ -942,6 +954,8 @@ impl FylerApp {
                         ..
                     }) = &mut self.dialog
                         && *owner == pane_id
+                        && *current_request_id == request_id
+                        && *current_query == query
                     {
                         *current = results;
                         *current_count = indexed_count;
@@ -1768,6 +1782,7 @@ impl eframe::App for FylerApp {
             }
             Some(DialogState::FilePicker {
                 pane_id,
+                request_id,
                 query,
                 selected,
                 results,
@@ -1778,6 +1793,8 @@ impl eframe::App for FylerApp {
                 let (closed, query_action) = draw_file_picker(
                     ui,
                     *pane_id,
+                    request_id,
+                    &mut self.next_picker_request_id,
                     query,
                     selected,
                     results,
@@ -2497,8 +2514,19 @@ fn apply_picker_keys(
     }))
 }
 
-fn picker_query_action(pane_id: PaneId, query: String) -> GuiAction {
-    GuiAction::PickerQuery { pane_id, query }
+fn next_picker_request_id(next: &mut u64) -> u64 {
+    *next = next
+        .checked_add(1)
+        .expect("picker request identity exhausted");
+    *next
+}
+
+fn picker_query_action(pane_id: PaneId, request_id: u64, query: String) -> GuiAction {
+    GuiAction::PickerQuery {
+        pane_id,
+        request_id,
+        query,
+    }
 }
 
 fn picker_completion_action(pane_id: PaneId, selection: Option<GuiAction>) -> GuiAction {
@@ -2554,9 +2582,11 @@ pub(crate) fn caption_modal(ctx: &egui::Context, id: egui::Id) -> egui::Modal {
 fn draw_file_picker(
     ui: &mut egui::Ui,
     pane_id: PaneId,
+    request_id: &mut u64,
+    next_request_id: &mut u64,
     query: &mut String,
     selected: &mut usize,
-    results: &[PickerHit],
+    results: &mut Vec<PickerHit>,
     indexed_count: usize,
     indexing: bool,
     needs_focus: &mut bool,
@@ -2579,8 +2609,8 @@ fn draw_file_picker(
         }
         query_changed = response.changed();
         if query_changed {
-            // 入力が変わったら選択を先頭へ戻す。workerの新結果を待たず、この
-            // フレームの描画から先頭ハイライトにする。
+            *request_id = next_picker_request_id(next_request_id);
+            results.clear();
             *selected = 0;
         }
 
@@ -2617,7 +2647,8 @@ fn draw_file_picker(
     if let Some(position) = clicked_selection {
         *selected = position;
     }
-    let query_action = query_changed.then(|| picker_query_action(pane_id, query.clone()));
+    let query_action =
+        query_changed.then(|| picker_query_action(pane_id, *request_id, query.clone()));
     (
         apply_picker_keys(keys, pane_id, results, selected),
         query_action,
@@ -3880,6 +3911,7 @@ mod tests {
                 dialog: None,
                 action_tx,
                 picker_needs_focus: false,
+                next_picker_request_id: 0,
                 feedback_needs_focus: false,
                 confirm_detail: ConfirmDetail::Full,
                 help_entries: Vec::new(),
@@ -4739,6 +4771,7 @@ mod tests {
             pending_copy: None,
             fatal_error: None,
             dialog: None,
+            next_picker_request_id: 0,
             action_tx,
             picker_needs_focus: false,
             feedback_needs_focus: false,
@@ -5269,6 +5302,7 @@ mod tests {
             action_rx.try_recv().unwrap(),
             GuiAction::PickerQuery {
                 pane_id: pane,
+                request_id: 1,
                 query: String::new(),
             }
         );
@@ -5276,6 +5310,7 @@ mod tests {
         event_tx
             .send(GuiEvent::PickerResults {
                 pane_id: pane,
+                request_id: 1,
                 query: String::new(),
                 results: vec![candidate("README.md", fyler_core::tree::EntryKind::File)],
                 indexed_count: 42,
@@ -5291,6 +5326,271 @@ mod tests {
                 indexing: true,
                 ..
             }) if results[0].display == "README.md"
+        ));
+    }
+
+    #[test]
+    fn picker_rejects_queued_results_after_query_changes() {
+        let pane = PaneId::new(3);
+        let (mut app, event_tx, _) = empty_test_app();
+        event_tx
+            .send(GuiEvent::ShowFilePicker { pane_id: pane })
+            .unwrap();
+        app.receive_events();
+        event_tx
+            .send(GuiEvent::PickerResults {
+                pane_id: pane,
+                request_id: 1,
+                query: String::new(),
+                results: vec![candidate("obsolete.txt", fyler_core::tree::EntryKind::File)],
+                indexed_count: 99,
+                indexing: false,
+            })
+            .unwrap();
+        let Some(DialogState::FilePicker { query, .. }) = &mut app.dialog else {
+            panic!("picker did not open");
+        };
+        *query = "new".to_owned();
+
+        app.receive_events();
+
+        assert!(matches!(
+            app.dialog,
+            Some(DialogState::FilePicker {
+                ref results,
+                indexed_count: 0,
+                indexing: true,
+                ..
+            }) if results.is_empty()
+        ));
+    }
+
+    fn picker_frame(
+        app: &mut FylerApp,
+        context: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> Option<Option<GuiAction>> {
+        let mut completion = None;
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                let Some(DialogState::FilePicker {
+                    pane_id,
+                    request_id,
+                    query,
+                    selected,
+                    results,
+                    indexed_count,
+                    indexing,
+                }) = &mut app.dialog
+                else {
+                    panic!("picker did not open");
+                };
+                let (closed, action) = draw_file_picker(
+                    ui,
+                    *pane_id,
+                    request_id,
+                    &mut app.next_picker_request_id,
+                    query,
+                    selected,
+                    results,
+                    *indexed_count,
+                    *indexing,
+                    &mut app.picker_needs_focus,
+                );
+                completion = closed;
+                if let Some(action) = action {
+                    app.action_tx.send(action).unwrap();
+                }
+            },
+        );
+        completion
+    }
+
+    fn replace_picker_query(
+        app: &mut FylerApp,
+        context: &egui::Context,
+        query: &str,
+    ) -> Option<Option<GuiAction>> {
+        picker_frame(
+            app,
+            context,
+            vec![
+                arrow_key_event(
+                    egui::Key::A,
+                    egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+                ),
+                egui::Event::Text(query.to_owned()),
+                arrow_key_event(egui::Key::Enter, egui::Modifiers::NONE),
+            ],
+        )
+    }
+
+    #[test]
+    fn picker_input_clears_old_candidates_before_same_frame_selection() {
+        let pane = PaneId::new(3);
+        let (mut app, event_tx, action_rx) = empty_test_app();
+        let context = egui::Context::default();
+        event_tx
+            .send(GuiEvent::ShowFilePicker { pane_id: pane })
+            .unwrap();
+        app.receive_events();
+        let GuiAction::PickerQuery {
+            request_id: first_id,
+            ..
+        } = action_rx.try_recv().unwrap()
+        else {
+            panic!("missing initial query");
+        };
+        event_tx
+            .send(GuiEvent::PickerResults {
+                pane_id: pane,
+                request_id: first_id,
+                query: String::new(),
+                results: vec![candidate("old.txt", fyler_core::tree::EntryKind::File)],
+                indexed_count: 1,
+                indexing: false,
+            })
+            .unwrap();
+        app.receive_events();
+        picker_frame(&mut app, &context, Vec::new());
+        assert_eq!(replace_picker_query(&mut app, &context, "new"), None);
+        let GuiAction::PickerQuery {
+            request_id, query, ..
+        } = action_rx.try_recv().unwrap()
+        else {
+            panic!("missing changed query");
+        };
+        assert!(request_id > first_id);
+        assert_eq!(query, "new");
+        assert!(matches!(
+            app.dialog,
+            Some(DialogState::FilePicker { ref results, selected: 0, .. }) if results.is_empty()
+        ));
+    }
+
+    #[test]
+    fn picker_rejects_queued_results_after_query_returns_to_same_text() {
+        let pane = PaneId::new(3);
+        let (mut app, event_tx, action_rx) = empty_test_app();
+        let context = egui::Context::default();
+        event_tx
+            .send(GuiEvent::ShowFilePicker { pane_id: pane })
+            .unwrap();
+        app.receive_events();
+        action_rx.try_recv().unwrap();
+        picker_frame(&mut app, &context, Vec::new());
+        assert_eq!(replace_picker_query(&mut app, &context, "a"), None);
+        let GuiAction::PickerQuery {
+            request_id: old_id, ..
+        } = action_rx.try_recv().unwrap()
+        else {
+            panic!("missing query a");
+        };
+        event_tx
+            .send(GuiEvent::PickerResults {
+                pane_id: pane,
+                request_id: old_id,
+                query: "a".to_owned(),
+                results: vec![candidate(
+                    "obsolete-a.txt",
+                    fyler_core::tree::EntryKind::File,
+                )],
+                indexed_count: 99,
+                indexing: false,
+            })
+            .unwrap();
+        assert_eq!(replace_picker_query(&mut app, &context, "b"), None);
+        let GuiAction::PickerQuery {
+            request_id: middle_id,
+            ..
+        } = action_rx.try_recv().unwrap()
+        else {
+            panic!("missing query b");
+        };
+        assert_eq!(replace_picker_query(&mut app, &context, "a"), None);
+        let GuiAction::PickerQuery {
+            request_id: current_id,
+            ..
+        } = action_rx.try_recv().unwrap()
+        else {
+            panic!("missing repeated query a");
+        };
+        assert!(old_id < middle_id && middle_id < current_id);
+        app.receive_events();
+        assert!(matches!(
+            app.dialog,
+            Some(DialogState::FilePicker { ref results, indexed_count: 0, indexing: true, .. })
+                if results.is_empty()
+        ));
+        event_tx
+            .send(GuiEvent::PickerResults {
+                pane_id: pane,
+                request_id: current_id,
+                query: "a".to_owned(),
+                results: vec![candidate(
+                    "current-a.txt",
+                    fyler_core::tree::EntryKind::File,
+                )],
+                indexed_count: 1,
+                indexing: false,
+            })
+            .unwrap();
+        app.receive_events();
+        assert!(matches!(
+            app.dialog,
+            Some(DialogState::FilePicker { ref results, indexed_count: 1, indexing: false, .. })
+                if results.len() == 1 && results[0].display == "current-a.txt"
+        ));
+    }
+
+    #[test]
+    fn picker_rejects_queued_results_after_same_query_close_and_reopen() {
+        let pane = PaneId::new(3);
+        let (mut app, event_tx, action_rx) = empty_test_app();
+        event_tx
+            .send(GuiEvent::ShowFilePicker { pane_id: pane })
+            .unwrap();
+        app.receive_events();
+        let GuiAction::PickerQuery {
+            request_id: old_id, ..
+        } = action_rx.try_recv().unwrap()
+        else {
+            panic!("missing initial query");
+        };
+        event_tx.send(GuiEvent::CloseDialog).unwrap();
+        event_tx
+            .send(GuiEvent::ShowFilePicker { pane_id: pane })
+            .unwrap();
+        event_tx
+            .send(GuiEvent::PickerResults {
+                pane_id: pane,
+                request_id: old_id,
+                query: String::new(),
+                results: vec![candidate("obsolete.txt", fyler_core::tree::EntryKind::File)],
+                indexed_count: 99,
+                indexing: false,
+            })
+            .unwrap();
+        app.receive_events();
+        let GuiAction::PickerQuery {
+            request_id: new_id, ..
+        } = action_rx.try_recv().unwrap()
+        else {
+            panic!("missing reopened query");
+        };
+        assert!(new_id > old_id);
+        assert!(matches!(
+            app.dialog,
+            Some(DialogState::FilePicker { ref results, indexed_count: 0, indexing: true, .. })
+                if results.is_empty()
         ));
     }
 
@@ -5378,9 +5678,10 @@ mod tests {
             GuiAction::PickerClosed { pane_id: pane }
         );
         assert_eq!(
-            picker_query_action(pane, "read".to_owned()),
+            picker_query_action(pane, 7, "read".to_owned()),
             GuiAction::PickerQuery {
                 pane_id: pane,
+                request_id: 7,
                 query: "read".to_owned(),
             }
         );

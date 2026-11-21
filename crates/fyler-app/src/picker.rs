@@ -276,6 +276,7 @@ pub(super) struct PickerSearchWorker {
 struct SearchRequest {
     generation: u64,
     pane_id: PaneId,
+    request_id: u64,
     query: String,
     include_hidden: bool,
     catalog: Arc<SearchCatalog>,
@@ -297,12 +298,17 @@ impl PickerSearchWorker {
                     while let Ok(latest) = request_rx.try_recv() {
                         request = latest;
                     }
-                    let results = run_search(&request, &mut matcher);
+                    let Some(results) = run_search(&request, &mut matcher, || {
+                        worker_generation.load(Ordering::Acquire) != request.generation
+                    }) else {
+                        continue;
+                    };
                     if worker_generation.load(Ordering::Acquire) != request.generation {
                         continue;
                     }
                     let _ = gui_event_tx.send(GuiEvent::PickerResults {
                         pane_id: request.pane_id,
+                        request_id: request.request_id,
                         query: request.query,
                         results,
                         indexed_count: request.catalog.indexed_count.load(Ordering::Relaxed),
@@ -320,6 +326,7 @@ impl PickerSearchWorker {
     pub(super) fn request(
         &self,
         pane_id: PaneId,
+        request_id: u64,
         query: String,
         include_hidden: bool,
         catalog: Arc<SearchCatalog>,
@@ -328,6 +335,7 @@ impl PickerSearchWorker {
         let _ = self.request_tx.send(SearchRequest {
             generation,
             pane_id,
+            request_id,
             query,
             include_hidden,
             catalog,
@@ -343,34 +351,65 @@ impl PickerSearchWorker {
 ///
 /// scoreは降順、同点はpath昇順で安定させる(並列scan下でも決定的)。空queryは
 /// 走査順の先頭N件をscore 0で返す。matchのみをsortし、候補全体はsortしない。
-fn run_search(request: &SearchRequest, matcher: &mut Matcher) -> Vec<PickerHit> {
+fn run_search(
+    request: &SearchRequest,
+    matcher: &mut Matcher,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Option<Vec<PickerHit>> {
+    if is_cancelled() {
+        return None;
+    }
     let chunks = request.catalog.chunks();
-    let (overlay_entries, overlay_order, removed_directories) = request
-        .catalog
-        .overlay
-        .lock()
-        .map(|overlay| {
-            (
-                overlay.entries.clone(),
-                overlay.order.clone(),
-                overlay.removed_directories.clone(),
-            )
-        })
-        .unwrap_or_default();
+    let mut overlay_entries = HashMap::new();
+    let mut overlay_order = Vec::new();
+    let mut removed_directories = HashSet::new();
+    if let Ok(overlay) = request.catalog.overlay.lock() {
+        if is_cancelled() {
+            return None;
+        }
+        overlay_entries.reserve(overlay.entries.len());
+        for (path, candidate) in &overlay.entries {
+            if is_cancelled() {
+                return None;
+            }
+            overlay_entries.insert(path.clone(), candidate.clone());
+        }
+        overlay_order.reserve(overlay.order.len());
+        for path in &overlay.order {
+            if is_cancelled() {
+                return None;
+            }
+            overlay_order.push(path.clone());
+        }
+        removed_directories.reserve(overlay.removed_directories.len());
+        for directory in &overlay.removed_directories {
+            if is_cancelled() {
+                return None;
+            }
+            removed_directories.insert(directory.clone());
+        }
+    }
 
     // 未sealed batchのdirがdir_indexへ入る前にdelete通知が先行した場合は、一時的な
     // ghostを許容する。選択時のbaseline再解決でstale Warnとなり、次のwatch更新または
     // catalog再構築で収束するため、検索毎の全件走査はしない。
-    let shadowed = |display: &str| {
-        overlay_entries.contains_key(display)
-            || removed_directories.iter().any(|directory| {
-                display.len() > directory.len()
-                    && display.starts_with(directory.as_ref())
-                    && display.as_bytes().get(directory.len()) == Some(&b'/')
-            })
-    };
-    let include = |candidate: &SearchCandidate| {
-        (request.include_hidden || !candidate.hidden) && !shadowed(candidate.display.as_ref())
+    let include = |candidate: &SearchCandidate, is_cancelled: &mut dyn FnMut() -> bool| {
+        if !request.include_hidden && candidate.hidden {
+            return Some(false);
+        }
+        for directory in &removed_directories {
+            if is_cancelled() {
+                return None;
+            }
+            let display = candidate.display.as_ref();
+            if display.len() > directory.len()
+                && display.starts_with(directory.as_ref())
+                && display.as_bytes().get(directory.len()) == Some(&b'/')
+            {
+                return Some(false);
+            }
+        }
+        Some(true)
     };
 
     let pattern = Pattern::parse(&request.query, CaseMatching::Ignore, Normalization::Smart);
@@ -380,31 +419,44 @@ fn run_search(request: &SearchRequest, matcher: &mut Matcher) -> Vec<PickerHit> 
         let mut hits = Vec::with_capacity(PICKER_RESULT_LIMIT);
         for chunk in &chunks {
             for candidate in chunk.candidates.iter() {
-                if include(candidate) {
+                if is_cancelled() {
+                    return None;
+                }
+                if !overlay_entries.contains_key(candidate.display.as_ref())
+                    && include(candidate, &mut is_cancelled)?
+                {
                     hits.push(picker_hit(candidate));
                     if hits.len() >= PICKER_RESULT_LIMIT {
-                        return hits;
+                        return (!is_cancelled()).then_some(hits);
                     }
                 }
             }
         }
         for path in &overlay_order {
+            if is_cancelled() {
+                return None;
+            }
             if let Some(Some(candidate)) = overlay_entries.get(path.as_ref())
-                && include(candidate)
+                && include(candidate, &mut is_cancelled)?
             {
                 hits.push(picker_hit(candidate));
                 if hits.len() >= PICKER_RESULT_LIMIT {
-                    return hits;
+                    return (!is_cancelled()).then_some(hits);
                 }
             }
         }
-        return hits;
+        return (!is_cancelled()).then_some(hits);
     }
 
     let mut matches: Vec<(&SearchCandidate, u32)> = Vec::new();
     for chunk in &chunks {
         for (index, candidate) in chunk.candidates.iter().enumerate() {
-            if !include(candidate) {
+            if is_cancelled() {
+                return None;
+            }
+            if overlay_entries.contains_key(candidate.display.as_ref())
+                || !include(candidate, &mut is_cancelled)?
+            {
                 continue;
             }
             if let Some(score) = pattern.score(chunk.haystacks[index].slice(..), matcher) {
@@ -413,8 +465,11 @@ fn run_search(request: &SearchRequest, matcher: &mut Matcher) -> Vec<PickerHit> 
         }
     }
     for path in &overlay_order {
+        if is_cancelled() {
+            return None;
+        }
         if let Some(Some(candidate)) = overlay_entries.get(path.as_ref())
-            && include(candidate)
+            && include(candidate, &mut is_cancelled)?
         {
             let haystack = Utf32String::from(candidate.display.as_ref());
             if let Some(score) = pattern.score(haystack.slice(..), matcher) {
@@ -423,17 +478,32 @@ fn run_search(request: &SearchRequest, matcher: &mut Matcher) -> Vec<PickerHit> 
         }
     }
 
-    matches.sort_by(|left, right| {
+    let rank = |left: &(&SearchCandidate, u32), right: &(&SearchCandidate, u32)| {
         right
             .1
             .cmp(&left.1)
             .then_with(|| left.0.display.cmp(&right.0.display))
-    });
-    matches.truncate(PICKER_RESULT_LIMIT);
-    matches
-        .into_iter()
-        .map(|(candidate, _)| picker_hit(candidate))
-        .collect()
+    };
+    if is_cancelled() {
+        return None;
+    }
+    if matches.len() > PICKER_RESULT_LIMIT {
+        matches.select_nth_unstable_by(PICKER_RESULT_LIMIT, rank);
+        matches.truncate(PICKER_RESULT_LIMIT);
+    }
+    if is_cancelled() {
+        return None;
+    }
+    matches.sort_by(rank);
+    if is_cancelled() {
+        return None;
+    }
+    Some(
+        matches
+            .into_iter()
+            .map(|(candidate, _)| picker_hit(candidate))
+            .collect(),
+    )
 }
 
 fn picker_hit(candidate: &SearchCandidate) -> PickerHit {
@@ -447,6 +517,7 @@ fn picker_hit(candidate: &SearchCandidate) -> PickerHit {
 #[derive(Debug, Clone)]
 pub(super) struct ActivePicker {
     pub pane_id: PaneId,
+    pub request_id: Option<u64>,
     pub root: PathBuf,
     pub query: String,
     pub include_hidden: bool,
@@ -491,41 +562,23 @@ mod tests {
         SearchCandidate::new(path.to_owned(), EntryKind::File, false)
     }
 
-    fn matched(candidates: Vec<SearchCandidate>, query: &str, include_hidden: bool) -> Vec<String> {
+    fn searched(catalog: &Arc<SearchCatalog>, query: &str, include_hidden: bool) -> Vec<PickerHit> {
         let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
         let request = SearchRequest {
             generation: 0,
             pane_id: PaneId::new(1),
+            request_id: 0,
             query: query.to_owned(),
             include_hidden,
-            catalog: catalog(candidates),
+            catalog: Arc::clone(catalog),
         };
-        run_search(&request, &mut matcher)
-            .into_iter()
-            .map(|hit| hit.display)
-            .collect()
+        run_search(&request, &mut matcher, || false).unwrap()
     }
 
-    fn visible_overlay_paths(catalog: &SearchCatalog) -> Vec<String> {
-        let chunks = catalog.chunks();
-        let overlay = catalog.overlay.lock().unwrap();
-        chunks
-            .iter()
-            .flat_map(|chunk| chunk.candidates.iter())
-            .filter(|candidate| {
-                !overlay.entries.contains_key(candidate.display.as_ref())
-                    && !overlay.removed_directories.iter().any(|directory| {
-                        candidate.display.starts_with(directory.as_ref())
-                            && candidate.display.as_bytes().get(directory.len()) == Some(&b'/')
-                    })
-            })
-            .chain(
-                overlay
-                    .order
-                    .iter()
-                    .filter_map(|path| overlay.entries.get(path.as_ref()).and_then(Option::as_ref)),
-            )
-            .map(|candidate| candidate.display.to_string())
+    fn matched(candidates: Vec<SearchCandidate>, query: &str, include_hidden: bool) -> Vec<String> {
+        searched(&catalog(candidates), query, include_hidden)
+            .into_iter()
+            .map(|hit| hit.display)
             .collect()
     }
 
@@ -600,6 +653,49 @@ mod tests {
     }
 
     #[test]
+    fn limited_fuzzy_results_match_full_score_and_path_sort() {
+        for count in [
+            PICKER_RESULT_LIMIT - 1,
+            PICKER_RESULT_LIMIT,
+            PICKER_RESULT_LIMIT + 1,
+            250,
+        ] {
+            let candidates = (0..count)
+                .rev()
+                .map(|index| {
+                    if index % 5 == 0 {
+                        file(&format!("{index:04}/i_t_e_m.txt"))
+                    } else {
+                        file(&format!("{index:04}/item.txt"))
+                    }
+                })
+                .collect::<Vec<_>>();
+            let pattern = Pattern::parse("item", CaseMatching::Ignore, Normalization::Smart);
+            let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+            let mut expected = candidates
+                .iter()
+                .filter_map(|candidate| {
+                    let haystack = Utf32String::from(candidate.display.as_ref());
+                    pattern
+                        .score(haystack.slice(..), &mut matcher)
+                        .map(|score| (candidate.display.to_string(), score))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(expected.len(), count);
+            assert!(expected.iter().any(|(_, score)| *score != expected[0].1));
+            expected.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+            expected.truncate(PICKER_RESULT_LIMIT);
+            assert_eq!(
+                matched(candidates, "item", true),
+                expected
+                    .into_iter()
+                    .map(|(path, _)| path)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
     fn catalog_is_shared_until_the_last_pane_leaves_the_root() {
         let gauge = Arc::new(QueueGauge::new());
         let (tx, _rx) = mpsc::channel();
@@ -623,7 +719,7 @@ mod tests {
     #[test]
     fn build_batch_directory_is_tombstoned_through_dir_index() {
         let root = tempfile::tempdir().unwrap();
-        let catalog = SearchCatalog::new();
+        let catalog = Arc::new(SearchCatalog::new());
         catalog.append_build_batch(vec![
             SearchCandidate::new("built-dir".to_owned(), EntryKind::Dir, false),
             SearchCandidate::new("built-dir/child".to_owned(), EntryKind::File, false),
@@ -634,45 +730,88 @@ mod tests {
             &[root.path().join("built-dir")].into_iter().collect(),
         );
 
-        assert!(visible_overlay_paths(&catalog).is_empty());
-        assert!(
-            catalog
-                .overlay
-                .lock()
-                .unwrap()
-                .removed_directories
-                .contains("built-dir")
-        );
+        for query in ["", "built"] {
+            assert!(searched(&catalog, query, true).is_empty());
+        }
     }
 
     #[test]
-    fn overlay_create_delete_rename_and_directory_delete_affect_search() {
+    fn overlay_create_update_delete_and_rename_affect_real_search() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("old.txt"), b"x").unwrap();
         std::fs::rename(root.path().join("old.txt"), root.path().join("renamed.txt")).unwrap();
         std::fs::write(root.path().join("created.txt"), b"x").unwrap();
+        std::fs::create_dir(root.path().join("updated.txt")).unwrap();
         let catalog = catalog(vec![
-            SearchCandidate::new("old.txt".to_owned(), EntryKind::File, false),
-            SearchCandidate::new("deleted.txt".to_owned(), EntryKind::File, false),
-            SearchCandidate::new("dir".to_owned(), EntryKind::Dir, false),
-            SearchCandidate::new("dir/child.txt".to_owned(), EntryKind::File, false),
+            file("untouched.txt"),
+            file("old.txt"),
+            file("deleted.txt"),
+            file("updated.txt"),
         ]);
         catalog.update_overlay(
             root.path(),
             &[
-                root.path().join("old.txt"),
-                root.path().join("renamed.txt"),
-                root.path().join("created.txt"),
-                root.path().join("deleted.txt"),
-                root.path().join("dir"),
+                "old.txt",
+                "renamed.txt",
+                "created.txt",
+                "deleted.txt",
+                "updated.txt",
+            ]
+            .into_iter()
+            .map(|path| root.path().join(path))
+            .collect(),
+        );
+
+        let hits = searched(&catalog, "", false);
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.display.as_str())
+                .collect::<Vec<_>>(),
+            ["untouched.txt", "created.txt", "renamed.txt", "updated.txt"]
+        );
+        assert_eq!(hits[3].kind, EntryKind::Dir);
+        for (query, expected, kind) in [
+            ("created", "created.txt", EntryKind::File),
+            ("renamed", "renamed.txt", EntryKind::File),
+            ("updated", "updated.txt", EntryKind::Dir),
+        ] {
+            let hits = searched(&catalog, query, false);
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].display, expected);
+            assert_eq!(hits[0].kind, kind);
+        }
+        for query in ["old", "deleted"] {
+            assert!(searched(&catalog, query, false).is_empty());
+        }
+    }
+
+    #[test]
+    fn overlay_hidden_policy_does_not_restore_shadowed_chunk_entries() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".hidden.txt"), b"x").unwrap();
+        std::fs::write(root.path().join("visible.txt"), b"x").unwrap();
+        let catalog = catalog(vec![file(".hidden.txt")]);
+        catalog.update_overlay(
+            root.path(),
+            &[
+                root.path().join(".hidden.txt"),
+                root.path().join("visible.txt"),
             ]
             .into_iter()
             .collect(),
         );
 
-        let mut visible = visible_overlay_paths(&catalog);
-        visible.sort();
-        assert_eq!(visible, ["created.txt", "renamed.txt"]);
+        for query in ["", "txt"] {
+            let visible = searched(&catalog, query, false);
+            assert_eq!(visible.len(), 1);
+            assert_eq!(visible[0].display, "visible.txt");
+            let mut all = searched(&catalog, query, true)
+                .into_iter()
+                .map(|hit| hit.display)
+                .collect::<Vec<_>>();
+            all.sort();
+            assert_eq!(all, [".hidden.txt", "visible.txt"]);
+        }
     }
 
     #[test]
@@ -680,24 +819,107 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("X")).unwrap();
         std::fs::write(root.path().join("X/a"), b"x").unwrap();
-        let catalog = catalog(Vec::new());
+        let catalog = catalog(vec![
+            SearchCandidate::new("X".to_owned(), EntryKind::Dir, false),
+            file("X/sealed"),
+            file("XY/kept"),
+        ]);
         catalog.update_overlay(
             root.path(),
             &[root.path().join("X"), root.path().join("X/a")]
                 .into_iter()
                 .collect(),
         );
-        let mut visible = visible_overlay_paths(&catalog);
-        visible.sort();
-        assert_eq!(visible, ["X", "X/a"]);
+        for query in ["", "X"] {
+            let mut visible = searched(&catalog, query, true)
+                .into_iter()
+                .map(|hit| hit.display)
+                .collect::<Vec<_>>();
+            visible.sort();
+            assert_eq!(visible, ["X", "X/a", "X/sealed", "XY/kept"]);
+        }
 
         std::fs::remove_dir_all(root.path().join("X")).unwrap();
         catalog.update_overlay(root.path(), &[root.path().join("X")].into_iter().collect());
 
-        assert!(visible_overlay_paths(&catalog).is_empty());
-        let overlay = catalog.overlay.lock().unwrap();
-        assert!(overlay.entries["X"].is_none());
-        assert!(overlay.entries["X/a"].is_none());
+        for query in ["", "X"] {
+            let hits = searched(&catalog, query, true);
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].display, "XY/kept");
+        }
+    }
+
+    #[test]
+    fn cancelled_search_returns_no_results() {
+        let catalog = catalog(vec![file("item.txt")]);
+        let request = SearchRequest {
+            generation: 7,
+            pane_id: PaneId::new(1),
+            request_id: 1,
+            query: "item".to_owned(),
+            include_hidden: true,
+            catalog: Arc::clone(&catalog),
+        };
+        let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+        assert!(run_search(&request, &mut matcher, || true).is_none());
+    }
+
+    #[test]
+    fn superseded_search_aborts_mid_scan_for_chunks_and_overlay() {
+        for query in ["", "item"] {
+            for overlay_only in [false, true] {
+                let candidates = (0..1_024)
+                    .map(|index| {
+                        SearchCandidate::new(format!("item-{index:04}.txt"), EntryKind::File, true)
+                    })
+                    .collect::<Vec<_>>();
+                let catalog = if overlay_only {
+                    let catalog = catalog(Vec::new());
+                    {
+                        let mut overlay = catalog.overlay.lock().unwrap();
+                        for candidate in candidates {
+                            overlay.order.push(candidate.display.clone());
+                            overlay
+                                .entries
+                                .insert(candidate.display.clone(), Some(candidate));
+                        }
+                    }
+                    catalog
+                } else {
+                    catalog(candidates)
+                };
+                let request = SearchRequest {
+                    generation: 7,
+                    pane_id: PaneId::new(1),
+                    request_id: 1,
+                    query: query.to_owned(),
+                    include_hidden: false,
+                    catalog: Arc::clone(&catalog),
+                };
+                let generation = AtomicU64::new(request.generation);
+                let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+                let mut snapshot_started = false;
+                let mut scan_checks = 0;
+                let result = run_search(&request, &mut matcher, || {
+                    if catalog.overlay.try_lock().is_err() {
+                        snapshot_started = true;
+                    } else if snapshot_started {
+                        scan_checks += 1;
+                        if scan_checks == 32 {
+                            generation.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                    generation.load(Ordering::Acquire) != request.generation
+                });
+
+                assert!(result.is_none(), "query={query:?}, overlay={overlay_only}");
+                assert_eq!(
+                    scan_checks, 32,
+                    "cancel must stop a partially scanned catalog"
+                );
+                assert!(scan_checks < 1_024);
+            }
+        }
     }
 
     #[test]
@@ -714,16 +936,24 @@ mod tests {
         );
         worker.request(
             PaneId::new(1),
+            1,
             "item".to_owned(),
             false,
             Arc::clone(&catalog),
         );
-        worker.request(PaneId::new(1), "49999".to_owned(), false, catalog);
+        worker.request(PaneId::new(1), 2, "49999".to_owned(), false, catalog);
         let event = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let GuiEvent::PickerResults { query, results, .. } = event else {
+        let GuiEvent::PickerResults {
+            request_id,
+            query,
+            results,
+            ..
+        } = event
+        else {
             panic!("unexpected event");
         };
         assert_eq!(query, "49999");
+        assert_eq!(request_id, 2);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].display, "item-49999.txt");
         assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());

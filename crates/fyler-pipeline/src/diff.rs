@@ -9,12 +9,32 @@
 //! | IDのない行 | Create |
 //! | 同一IDが複数行に出現(yy→p) | 1つを元位置とみなし、残りはCopy |
 
-use std::collections::HashSet;
+use std::collections::{HashMap, hash_map::Entry};
 
+use fyler_core::id::EntryId;
 use fyler_core::path::TreePath;
 use fyler_core::plan::{FsOperation, OperationPlan};
-use fyler_core::tree::{BaselineTree, DesiredTree, EditContext, EntryKind};
+use fyler_core::tree::{BaselineTree, DesiredEntry, DesiredTree, EditContext, EntryKind};
 use fyler_core::validate::ValidateError;
+
+struct DesiredOccurrences<'a> {
+    id: EntryId,
+    first: &'a DesiredEntry,
+    duplicates: Vec<&'a DesiredEntry>,
+}
+
+impl<'a> DesiredOccurrences<'a> {
+    fn iter(&self) -> impl Iterator<Item = &'a DesiredEntry> + '_ {
+        std::iter::once(self.first).chain(self.duplicates.iter().copied())
+    }
+
+    fn origin(&self, original_path: &TreePath) -> (usize, &'a DesiredEntry) {
+        self.iter()
+            .enumerate()
+            .find(|(_, entry)| entry.path == *original_path)
+            .unwrap_or((0, self.first))
+    }
+}
 
 /// planを構築する。**validate通過後にのみ呼ぶ契約**(エラー状態の入力は未定義動作でよい)。
 ///
@@ -44,12 +64,28 @@ pub fn build_plan(
     desired: &DesiredTree,
     ctx: &EditContext,
 ) -> Result<OperationPlan, Vec<ValidateError>> {
-    let desired_ids = desired
-        .entries
-        .iter()
-        .filter_map(|entry| entry.id)
-        .collect::<HashSet<_>>();
-    let moved_dirs = planned_directory_moves(baseline, desired);
+    let mut desired_ids: HashMap<EntryId, usize> = HashMap::with_capacity(desired.entries.len());
+    let mut occurrences_by_id: Vec<DesiredOccurrences<'_>> =
+        Vec::with_capacity(desired.entries.len());
+    for entry in &desired.entries {
+        let Some(id) = entry.id else {
+            continue;
+        };
+        match desired_ids.entry(id) {
+            Entry::Occupied(index) => {
+                occurrences_by_id[*index.get()].duplicates.push(entry);
+            }
+            Entry::Vacant(index) => {
+                index.insert(occurrences_by_id.len());
+                occurrences_by_id.push(DesiredOccurrences {
+                    id,
+                    first: entry,
+                    duplicates: Vec::new(),
+                });
+            }
+        }
+    }
+    let moved_dirs = planned_directory_moves(baseline, &occurrences_by_id);
 
     let mut operations = desired
         .entries
@@ -61,27 +97,12 @@ pub fn build_plan(
         })
         .collect::<Vec<_>>();
 
-    let mut planned_ids = HashSet::new();
-    for entry in &desired.entries {
-        let Some(id) = entry.id else {
-            continue;
-        };
-        if !planned_ids.insert(id) {
-            continue;
-        }
-
+    for occurrences in &occurrences_by_id {
+        let id = occurrences.id;
         let Some(original) = baseline.get(id) else {
             continue;
         };
-        let occurrences = desired
-            .entries
-            .iter()
-            .filter(|candidate| candidate.id == Some(id))
-            .collect::<Vec<_>>();
-        let origin_index = occurrences
-            .iter()
-            .position(|candidate| candidate.path == original.path)
-            .unwrap_or(0);
+        let (origin_index, origin) = occurrences.origin(&original.path);
 
         for (index, occurrence) in occurrences.iter().enumerate() {
             if index != origin_index {
@@ -96,7 +117,6 @@ pub fn build_plan(
             }
         }
 
-        let origin = occurrences[origin_index];
         if moved_with_ancestor(&original.path, &origin.path, &moved_dirs) {
             continue;
         }
@@ -115,7 +135,7 @@ pub fn build_plan(
             .entries()
             .iter()
             .filter(|entry| {
-                !desired_ids.contains(&entry.id)
+                !desired_ids.contains_key(&entry.id)
                     && !is_hidden_by_collapsed_dir(&entry.path, baseline, ctx)
             })
             .map(|entry| FsOperation::Delete {
@@ -191,18 +211,12 @@ fn incomplete_operation_errors(
 
 fn planned_directory_moves(
     baseline: &BaselineTree,
-    desired: &DesiredTree,
+    occurrences_by_id: &[DesiredOccurrences<'_>],
 ) -> Vec<(TreePath, TreePath)> {
-    let mut planned_ids = HashSet::new();
     let mut moves = Vec::new();
 
-    for entry in &desired.entries {
-        let Some(id) = entry.id else {
-            continue;
-        };
-        if !planned_ids.insert(id) {
-            continue;
-        }
+    for occurrences in occurrences_by_id {
+        let id = occurrences.id;
 
         let Some(original) = baseline.get(id) else {
             continue;
@@ -211,16 +225,7 @@ fn planned_directory_moves(
             continue;
         }
 
-        let occurrences = desired
-            .entries
-            .iter()
-            .filter(|candidate| candidate.id == Some(id))
-            .collect::<Vec<_>>();
-        let origin_index = occurrences
-            .iter()
-            .position(|candidate| candidate.path == original.path)
-            .unwrap_or(0);
-        let origin = occurrences[origin_index];
+        let (_, origin) = occurrences.origin(&original.path);
         if origin.path != original.path {
             moves.push((original.path.clone(), origin.path.clone()));
         }
@@ -438,5 +443,183 @@ fn operation_target(operation: &FsOperation) -> Option<&TreePath> {
         FsOperation::Create { path, .. } => Some(path),
         FsOperation::Move { to, .. } | FsOperation::Copy { to, .. } => Some(to),
         FsOperation::Delete { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fyler_core::EntryId;
+    use fyler_core::tree::{BaselineEntry, DesiredEntry};
+    use std::collections::HashSet;
+
+    #[test]
+    fn interleaved_copies_preserve_origin_and_operation_order() {
+        let mut baseline = BaselineTree::new("C:/test-root");
+        for (id, path, kind) in [
+            (1, "original-dir", EntryKind::Dir),
+            (3, "original-dir/hidden.txt", EntryKind::File),
+            (2, "original.txt", EntryKind::File),
+        ] {
+            baseline.insert(BaselineEntry {
+                id: EntryId(id),
+                path: TreePath::parse(path),
+                kind,
+            });
+        }
+        let ctx = EditContext {
+            collapsed_dirs: HashSet::from([EntryId(1)]),
+        };
+
+        for original_present in [true, false] {
+            let file_origin = if original_present {
+                "original.txt"
+            } else {
+                "second.txt"
+            };
+            let dir_origin = if original_present {
+                "original-dir"
+            } else {
+                "second-dir"
+            };
+            let desired = DesiredTree {
+                entries: [
+                    (2, "first.txt", EntryKind::File),
+                    (1, "first-dir", EntryKind::Dir),
+                    (2, file_origin, EntryKind::File),
+                    (1, dir_origin, EntryKind::Dir),
+                    (2, "last.txt", EntryKind::File),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(line, (id, path, kind))| DesiredEntry {
+                    id: Some(EntryId(id)),
+                    path: TreePath::parse(path),
+                    kind,
+                    line,
+                })
+                .collect(),
+            };
+            let mut expected = vec![
+                FsOperation::Copy {
+                    src: EntryId(2),
+                    from: TreePath::parse("original.txt"),
+                    to: TreePath::parse(if original_present {
+                        "first.txt"
+                    } else {
+                        file_origin
+                    }),
+                },
+                FsOperation::Copy {
+                    src: EntryId(2),
+                    from: TreePath::parse("original.txt"),
+                    to: TreePath::parse("last.txt"),
+                },
+            ];
+            if !original_present {
+                expected.push(FsOperation::Move {
+                    id: EntryId(2),
+                    from: TreePath::parse("original.txt"),
+                    to: TreePath::parse("first.txt"),
+                });
+            }
+            expected.push(FsOperation::Copy {
+                src: EntryId(1),
+                from: TreePath::parse("original-dir"),
+                to: TreePath::parse(if original_present {
+                    "first-dir"
+                } else {
+                    dir_origin
+                }),
+            });
+            if !original_present {
+                expected.push(FsOperation::Move {
+                    id: EntryId(1),
+                    from: TreePath::parse("original-dir"),
+                    to: TreePath::parse("first-dir"),
+                });
+            }
+            assert_eq!(
+                build_plan(&baseline, &desired, &ctx).unwrap().ops,
+                expected,
+                "original_present={original_present}",
+            );
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    #[ignore = "release benchmark: cargo test -p fyler-pipeline --release benchmark_unchanged_saved_buffer -- --ignored --nocapture"]
+    fn benchmark_unchanged_saved_buffer() {
+        use fyler_core::editor::EditorLine;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        for size in [10_000, 20_000, 40_000] {
+            let mut baseline = BaselineTree::new("C:/benchmark-root");
+            let mut lines = Vec::with_capacity(size);
+            for index in 0..size {
+                let id = EntryId(index as u64 + 1);
+                let is_dir = index % 2 == 0;
+                let name = format!("entry-{index:05}");
+                baseline.insert(BaselineEntry {
+                    id,
+                    path: TreePath::parse(&name),
+                    kind: if is_dir {
+                        EntryKind::Dir
+                    } else {
+                        EntryKind::File
+                    },
+                });
+                lines.push(EditorLine::new(format!(
+                    "/{:03} {name}{}",
+                    id.0,
+                    if is_dir { "/" } else { "" },
+                )));
+            }
+            let desired = crate::parse::to_desired_tree(&crate::parse::parse(&lines)).unwrap();
+            let ctx = EditContext::default();
+            assert_eq!(desired.entries.len(), size);
+            assert!(crate::validate::validate(&baseline, &desired, &ctx).is_empty());
+
+            let mut planner_samples = Vec::new();
+            let mut save_samples = Vec::new();
+            for sample in 0..5 {
+                let start = Instant::now();
+                let plan = build_plan(black_box(&baseline), black_box(&desired), black_box(&ctx));
+                let elapsed = start.elapsed();
+                assert!(black_box(plan).unwrap().is_empty());
+                planner_samples.push(elapsed.as_secs_f64() * 1_000.0);
+
+                let start = Instant::now();
+                let plan = {
+                    let parsed = crate::parse::parse(black_box(&lines));
+                    let desired = crate::parse::to_desired_tree(&parsed).unwrap();
+                    assert!(
+                        crate::validate::validate(black_box(&baseline), &desired, &ctx).is_empty()
+                    );
+                    build_plan(&baseline, &desired, &ctx)
+                };
+                let elapsed = start.elapsed();
+                assert!(black_box(plan).unwrap().is_empty());
+                save_samples.push(elapsed.as_secs_f64() * 1_000.0);
+                eprintln!(
+                    "entries={size} sample={} build_plan_ms={:.3} saved_buffer_ms={:.3}",
+                    sample + 1,
+                    planner_samples[sample],
+                    save_samples[sample],
+                );
+            }
+            for (stage, mut samples) in [
+                ("build_plan", planner_samples),
+                ("parse_validate_build_plan", save_samples),
+            ] {
+                samples.sort_by(f64::total_cmp);
+                eprintln!(
+                    "entries={size} stage={stage} samples=5 median_ms={:.3} min_ms={:.3} max_ms={:.3}",
+                    samples[2], samples[0], samples[4],
+                );
+            }
+        }
     }
 }
