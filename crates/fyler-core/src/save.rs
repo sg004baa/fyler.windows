@@ -306,6 +306,7 @@ mod tests {
 
     fn undo_report(outcome: OpOutcome) -> CommitReport<UndoStep> {
         CommitReport {
+            permission_denied: false,
             results: vec![OpResult {
                 op: undo_step("created.txt"),
                 outcome,

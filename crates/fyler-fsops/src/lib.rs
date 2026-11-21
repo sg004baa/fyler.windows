@@ -30,6 +30,7 @@ pub mod onedrive;
 pub mod open;
 pub mod openwith;
 pub mod preflight;
+pub mod privilege;
 pub mod recycle;
 pub mod scan;
 pub mod shortcut;

@@ -13,7 +13,7 @@ use fyler_core::editor::{CmdlineState, EditorMessage, MessageKind, PopupmenuStat
 use crate::theme;
 
 /// cmdline入力中の表示。プロンプト文字 + 内容 + カーソル。
-pub fn draw_cmdline(ui: &mut egui::Ui, state: &CmdlineState) {
+pub fn draw_cmdline(ui: &mut egui::Ui, state: &CmdlineState) -> egui::Rect {
     ui.painter().rect_filled(ui.max_rect(), 0.0, theme::SURFACE);
     ui.painter().line_segment(
         [ui.max_rect().left_top(), ui.max_rect().right_top()],
@@ -58,7 +58,15 @@ pub fn draw_cmdline(ui: &mut egui::Ui, state: &CmdlineState) {
     job.append(before, 0.0, normal.clone());
     job.append(under_cursor, 0.0, cursor_format);
     job.append(after_cursor, 0.0, normal);
-    ui.label(job);
+    job.wrap.max_width = ui.available_width();
+    let galley = ui.painter().layout_job(job);
+    let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
+    let mut caret = galley
+        .pos_from_cursor(egui::text::CCursor::new(1 + before.chars().count()))
+        .translate(rect.min.to_vec2());
+    caret.max.x = caret.min.x + 1.0;
+    ui.painter().galley(rect.min, galley, theme::TEXT);
+    caret
 }
 
 /// cmdline補完候補の表示。最大8件を、選択行が見える窓へ切って描画する。

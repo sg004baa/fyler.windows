@@ -2,6 +2,183 @@
 
 use eframe::egui;
 use fyler_core::editor::{EditorCommand, EditorEngine, Key, KeyInput, Mode, Modifiers};
+use fyler_core::pane::PaneId;
+
+use crate::theme;
+
+#[derive(Default)]
+pub(crate) struct ImeComposition {
+    target: Option<(PaneId, Mode)>,
+    preedit: Option<Preedit>,
+}
+
+struct Preedit {
+    text: String,
+    active_range_chars: Option<std::ops::Range<usize>>,
+}
+
+impl ImeComposition {
+    pub(crate) fn set_target(&mut self, target: Option<(PaneId, Mode)>) -> bool {
+        if self.target == target {
+            return false;
+        }
+        let interrupted = self.preedit.is_some();
+        self.target = target;
+        self.preedit = None;
+        interrupted
+    }
+
+    fn translate(
+        &mut self,
+        events: &[egui::Event],
+        mode: &Mode,
+        interrupted: bool,
+    ) -> Vec<EditorCommand> {
+        if interrupted {
+            return Vec::new();
+        }
+        let text_mode = ime_enabled(mode);
+        let has_text = events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Text(text) if !text.is_empty()));
+        let suppress_composition_keys = self.preedit.is_some()
+            || (self.target.is_some()
+                && events.iter().any(|event| match event {
+                    egui::Event::Ime(egui::ImeEvent::Preedit { text, .. })
+                    | egui::Event::Ime(egui::ImeEvent::Commit(text)) => !text.is_empty(),
+                    _ => false,
+                }));
+        let mut commit_echoes: Vec<&str> = if has_text && self.target.is_some() {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    egui::Event::Ime(egui::ImeEvent::Commit(text)) if !text.is_empty() => {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut commands = Vec::new();
+        for event in events {
+            match event {
+                egui::Event::Ime(event) => {
+                    if self.target.is_none() {
+                        continue;
+                    }
+                    match event {
+                        egui::ImeEvent::Preedit {
+                            text,
+                            active_range_chars,
+                        } => {
+                            self.preedit = (!text.is_empty()).then(|| Preedit {
+                                text: text.clone(),
+                                active_range_chars: active_range_chars.clone(),
+                            });
+                        }
+                        egui::ImeEvent::Commit(text) => {
+                            self.preedit = None;
+                            if !text.is_empty() {
+                                commands.push(EditorCommand::Text(text.clone()));
+                            }
+                        }
+                        #[allow(deprecated)]
+                        egui::ImeEvent::Disabled => self.preedit = None,
+                        #[allow(deprecated)]
+                        egui::ImeEvent::Enabled => {}
+                    }
+                }
+                egui::Event::Key {
+                    key:
+                        egui::Key::Enter
+                        | egui::Key::Escape
+                        | egui::Key::Tab
+                        | egui::Key::Space
+                        | egui::Key::ArrowUp
+                        | egui::Key::ArrowDown
+                        | egui::Key::ArrowLeft
+                        | egui::Key::ArrowRight
+                        | egui::Key::Home
+                        | egui::Key::End
+                        | egui::Key::PageUp
+                        | egui::Key::PageDown
+                        | egui::Key::Backspace
+                        | egui::Key::Delete,
+                    modifiers,
+                    ..
+                } if suppress_composition_keys
+                    && !modifiers.ctrl
+                    && !modifiers.command
+                    && !modifiers.alt => {}
+                egui::Event::Text(text) => {
+                    if let Some(index) = commit_echoes.iter().position(|commit| *commit == text) {
+                        commit_echoes.swap_remove(index);
+                    } else {
+                        translate_event(event, text_mode, has_text, &mut commands);
+                    }
+                }
+                _ => translate_event(event, text_mode, has_text, &mut commands),
+            }
+        }
+        commands
+    }
+
+    pub(crate) fn draw(&self, ui: &egui::Ui, caret: egui::Rect, clip: egui::Rect) -> egui::Rect {
+        let Some(preedit) = &self.preedit else {
+            return caret;
+        };
+        let normal = egui::TextFormat {
+            font_id: egui::TextStyle::Monospace.resolve(ui.style()),
+            color: theme::TEXT,
+            background: theme::SURFACE,
+            underline: egui::Stroke::new(1.0, theme::TEXT),
+            ..Default::default()
+        };
+        let mut job = egui::text::LayoutJob::default();
+        let active = preedit.active_range_chars.as_ref().and_then(|range| {
+            let len = range.end.checked_sub(range.start)?;
+            let mut boundaries = preedit
+                .text
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain(std::iter::once(preedit.text.len()));
+            let start = boundaries.nth(range.start)?;
+            let end = if len == 0 {
+                start
+            } else {
+                boundaries.nth(len - 1)?
+            };
+            Some((start, end))
+        });
+        if let Some((start, end)) = active {
+            job.append(&preedit.text[..start], 0.0, normal.clone());
+            job.append(
+                &preedit.text[start..end],
+                0.0,
+                egui::TextFormat {
+                    background: theme::ACCENT,
+                    color: theme::CANVAS,
+                    ..normal.clone()
+                },
+            );
+            job.append(&preedit.text[end..], 0.0, normal);
+        } else {
+            job.append(&preedit.text, 0.0, normal);
+        }
+        let painter = ui.painter().with_clip_rect(clip);
+        let galley = painter.layout_job(job);
+        let rect = egui::Rect::from_min_size(caret.min, galley.size());
+        painter.rect_filled(rect, 0.0, theme::SURFACE);
+        painter.galley(caret.min, galley, theme::TEXT);
+        rect
+    }
+}
+
+pub(crate) fn ime_enabled(mode: &Mode) -> bool {
+    matches!(mode, Mode::Insert | Mode::Replace | Mode::Cmdline)
+}
 
 /// このフレームの入力イベントをエンジンへ転送する。
 ///
@@ -13,17 +190,19 @@ use fyler_core::editor::{EditorCommand, EditorEngine, Key, KeyInput, Mode, Modif
 ///   ではTextの各文字を修飾なしの `EditorCommand::Key(Key::Char)` として送る
 /// - Textを伴わない `egui::Event::Key` は `fyler_core::editor::KeyInput` に正規化し、
 ///   Ctrl組み合わせ・特殊キー・印字可能文字のfallbackとして送る
-/// - `egui::Event::Ime(Commit)` はモードを問わず `EditorCommand::Text` として送る
+/// - IME未確定文字列はGUIだけに保持し、確定文字列のみ `EditorCommand::Text` にする
 /// - `egui::Event::Paste` → `EditorCommand::Paste`
 /// - 確認ダイアログ表示中はエンジンへ転送せずダイアログが入力を消費する
 /// - 送信は失敗し得る(エンジン停止)。失敗はエラー表示へ回す(panicしない)
-pub fn forward_input(
+pub(crate) fn forward_input(
     ctx: &egui::Context,
     engine: &dyn EditorEngine,
     mode: &Mode,
+    ime: &mut ImeComposition,
+    interrupted: bool,
 ) -> anyhow::Result<()> {
-    let events = ctx.input(|input| input.events.clone());
-    for command in translate_events(&events, mode) {
+    let commands = ctx.input(|input| ime.translate(&input.events, mode, interrupted));
+    for command in commands {
         engine.send(command)?;
     }
 
@@ -43,71 +222,59 @@ pub(crate) fn normalized_keys(ctx: &egui::Context) -> Vec<KeyInput> {
 }
 
 fn translate_events(events: &[egui::Event], mode: &Mode) -> Vec<EditorCommand> {
-    let text_mode = matches!(mode, Mode::Insert | Mode::Replace | Mode::Cmdline);
+    let text_mode = ime_enabled(mode);
     let has_text = events.iter().any(|event| match event {
         egui::Event::Text(text) => !text.is_empty(),
-        egui::Event::Ime(egui::ImeEvent::Commit(text)) => !text.is_empty(),
         _ => false,
     });
-    let has_plain_printable_key = events.iter().any(|event| {
-        let egui::Event::Key {
+    let mut commands = Vec::new();
+    for event in events {
+        translate_event(event, text_mode, has_text, &mut commands);
+    }
+    commands
+}
+
+fn translate_event(
+    event: &egui::Event,
+    text_mode: bool,
+    has_text: bool,
+    commands: &mut Vec<EditorCommand>,
+) {
+    match event {
+        egui::Event::Key {
             key,
             pressed: true,
             modifiers,
             ..
-        } = event
-        else {
-            return false;
-        };
-        !modifiers.ctrl
-            && !modifiers.command
-            && !modifiers.alt
-            && printable_char(*key, modifiers.shift).is_some()
-    });
-    let mut commands = Vec::new();
-
-    for event in events {
-        match event {
-            egui::Event::Key {
-                key,
-                pressed: true,
-                modifiers,
-                ..
-            } => {
-                let Some(key_input) = key_input(*key, *modifiers) else {
-                    continue;
-                };
-                let is_plain_char = matches!(key_input.key, Key::Char(_))
-                    && !key_input.mods.ctrl
-                    && !key_input.mods.alt;
-                if has_text && has_plain_printable_key && is_plain_char {
-                    // eframeは通常の文字キーでKeyとTextを同一フレームに出す。
-                    // OSのキーボードレイアウトを反映したText側だけを使う。
-                    continue;
-                }
-                commands.push(EditorCommand::Key(key_input));
+        } => {
+            let Some(key_input) = key_input(*key, *modifiers) else {
+                return;
+            };
+            let is_plain_char = matches!(key_input.key, Key::Char(_))
+                && !key_input.mods.ctrl
+                && !key_input.mods.alt;
+            if has_text && is_plain_char {
+                // eframeは通常の文字キーでKeyとTextを同一フレームに出す。
+                // OSのキーボードレイアウトを反映したText側だけを使う。
+                return;
             }
-            egui::Event::Text(text) if !text.is_empty() => {
-                if text_mode {
-                    commands.push(EditorCommand::Text(text.clone()));
-                } else {
-                    commands.extend(text.chars().map(|character| {
-                        EditorCommand::Key(KeyInput {
-                            key: Key::Char(character),
-                            mods: Modifiers::default(),
-                        })
-                    }));
-                }
-            }
-            egui::Event::Ime(egui::ImeEvent::Commit(text)) if !text.is_empty() => {
-                commands.push(EditorCommand::Text(text.clone()));
-            }
-            egui::Event::Paste(text) => commands.push(EditorCommand::Paste(text.clone())),
-            _ => continue,
+            commands.push(EditorCommand::Key(key_input));
         }
+        egui::Event::Text(text) if !text.is_empty() => {
+            if text_mode {
+                commands.push(EditorCommand::Text(text.clone()));
+            } else {
+                commands.extend(text.chars().map(|character| {
+                    EditorCommand::Key(KeyInput {
+                        key: Key::Char(character),
+                        mods: Modifiers::default(),
+                    })
+                }));
+            }
+        }
+        egui::Event::Paste(text) => commands.push(EditorCommand::Paste(text.clone())),
+        _ => {}
     }
-
-    commands
 }
 
 fn key_input(key: egui::Key, modifiers: egui::Modifiers) -> Option<KeyInput> {
@@ -326,13 +493,10 @@ mod tests {
     }
 
     #[test]
-    fn normal_mode_keeps_ime_commit_as_text() {
+    fn normal_mode_ignores_ime_commit() {
         let events = [egui::Event::Ime(egui::ImeEvent::Commit("あ".to_owned()))];
 
-        assert_eq!(
-            translate_events(&events, &Mode::Normal),
-            [EditorCommand::Text("あ".to_owned())]
-        );
+        assert!(translate_events(&events, &Mode::Normal).is_empty());
     }
 
     #[test]

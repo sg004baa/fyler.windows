@@ -1054,6 +1054,7 @@ pub(super) fn run() -> anyhow::Result<()> {
             let mut dialog_owner = None;
             let mut feedback_open = false;
             let mut apply_owner = None;
+            let mut elevation_pending = false;
             let mut loader_owner: Option<LoaderOwner> = None;
             let mut transfer = TransferController::new();
             let mut import = ImportController::new();
@@ -1147,6 +1148,36 @@ pub(super) fn run() -> anyhow::Result<()> {
                     },
                 };
                 match event {
+                    AppEvent::OfferElevation { pane_id, root } => {
+                        if elevation_pending {
+                            continue;
+                        }
+                        elevation_pending = true;
+                        let worker_tx = event_tx.clone();
+                        if let Err(error) = thread::Builder::new()
+                            .name("fyler-elevation".to_owned())
+                            .spawn(move || {
+                                let result = fyler_fsops::privilege::offer_elevation(&root);
+                                let _ = worker_tx.send(AppEvent::ElevationFinished(pane_id, result));
+                            })
+                        {
+                            elevation_pending = false;
+                            let _ = send_gui_message(&gui_event_tx, pane_id, MessageKind::Error,
+                                format!("Failed to start administrator prompt: {error}"));
+                        }
+                    }
+                    AppEvent::ElevationFinished(pane_id, result) => {
+                        use fyler_fsops::privilege::ElevationOutcome;
+                        elevation_pending = false;
+                        let (kind, message) = match result {
+                            Ok(ElevationOutcome::Unavailable | ElevationOutcome::AlreadyElevated) => continue,
+                            Ok(ElevationOutcome::Declined) => (MessageKind::Info, "Administrator window cancelled. No operation was retried.".to_owned()),
+                            Ok(ElevationOutcome::UacCancelled) => (MessageKind::Warn, "Windows UAC was cancelled. No administrator window was opened and no operation was retried.".to_owned()),
+                            Ok(ElevationOutcome::Opened) => (MessageKind::Info, "Opened a separate administrator fyler window. No operation was retried; this editor stays open.".to_owned()),
+                            Err(error) => (MessageKind::Error, format!("Could not open an administrator fyler window: {error:#}")),
+                        };
+                        let _ = send_gui_message(&gui_event_tx, pane_id, kind, message);
+                    }
                     AppEvent::Editor(pane_id, EditorEvent::PaneAction(action)) => {
                         if handle_pane_action(
                             action,
@@ -3342,13 +3373,18 @@ pub(super) fn run() -> anyhow::Result<()> {
                                                     );
                                                 },
                                             );
+                                            let permission_denied = report.permission_denied;
                                             let _ = worker_event_tx
                                                 .send(AppEvent::TransferFinished(report));
+                                            super::request_elevation_if_needed(
+                                                permission_denied, target, &worker_plan.to_root, &worker_event_tx,
+                                            );
                                         });
                                     if let Err(error) = spawn_result {
                                         let error =
                                             format!("Failed to start transfer worker: {error}");
                                         let report = CommitReport {
+                                            permission_denied: false,
                                             results: plan
                                                 .ops
                                                 .into_iter()
@@ -3425,13 +3461,18 @@ pub(super) fn run() -> anyhow::Result<()> {
                                                     );
                                                 },
                                             );
+                                            let permission_denied = report.permission_denied;
                                             let _ = worker_event_tx
                                                 .send(AppEvent::ImportFinished(report));
+                                            super::request_elevation_if_needed(
+                                                permission_denied, pane, &worker_plan.destination, &worker_event_tx,
+                                            );
                                         });
                                     if let Err(error) = spawn_result {
                                         let error =
                                             format!("Failed to start import worker: {error}");
                                         let report = CommitReport {
+                                            permission_denied: false,
                                             results: plan
                                                 .ops
                                                 .into_iter()
@@ -3501,13 +3542,20 @@ pub(super) fn run() -> anyhow::Result<()> {
                                                     );
                                                 },
                                             );
+                                            let permission_denied = report.permission_denied;
                                             let _ = worker_event_tx
                                                 .send(AppEvent::ExtractFinished(report));
+                                            super::request_elevation_if_needed(
+                                                permission_denied, pane,
+                                                worker_plan.archive.parent().unwrap_or(&worker_plan.dest_dir),
+                                                &worker_event_tx,
+                                            );
                                         });
                                     if let Err(error) = spawn_result {
                                         let error =
                                             format!("Failed to start extract worker: {error}");
                                         let report = CommitReport {
+                                            permission_denied: false,
                                             results: plan
                                                 .ops
                                                 .into_iter()
@@ -3686,11 +3734,15 @@ pub(super) fn run() -> anyhow::Result<()> {
                                             );
                                         let transaction =
                                             recorder.map(fyler_fsops::UndoRecorder::into_transaction);
+                                        let permission_denied = report.permission_denied;
                                         let _ = worker_event_tx.send(AppEvent::ApplyFinished(
                                             pane_id,
                                             report,
                                             transaction,
                                         ));
+                                        super::request_elevation_if_needed(
+                                            permission_denied, pane_id, &worker_root, &worker_event_tx,
+                                        );
                                     });
                                 if let Err(error) = spawn_result {
                                     if let (Some(journal), Some(id)) = (&journal, recorder_id)
@@ -3702,6 +3754,7 @@ pub(super) fn run() -> anyhow::Result<()> {
                                     }
                                     let error = format!("Failed to start apply worker: {error}");
                                     let report = CommitReport {
+                                        permission_denied: false,
                                         results: plan
                                             .ops
                                             .into_iter()
@@ -3758,12 +3811,17 @@ pub(super) fn run() -> anyhow::Result<()> {
                                                 );
                                             },
                                         );
+                                        let permission_denied = report.permission_denied;
                                         let _ = worker_event_tx
                                             .send(AppEvent::UndoFinished(pane_id, report));
+                                        super::request_elevation_if_needed(
+                                            permission_denied, pane_id, &worker_transaction.root, &worker_event_tx,
+                                        );
                                     });
                                 if let Err(error) = spawn_result {
                                     let error = format!("Failed to start undo worker: {error}");
                                     let report = CommitReport {
+                                        permission_denied: false,
                                         results: transaction
                                             .steps
                                             .into_iter()

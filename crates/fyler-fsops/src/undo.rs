@@ -4,6 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use anyhow::{Context, anyhow};
+
 use fyler_core::tree::EntryKind;
 use fyler_core::undo::{
     BackupRef, FileIdentity, Fingerprint, ManifestEntry, UndoStep, UndoStepStatus, UndoTransaction,
@@ -139,7 +141,9 @@ pub fn preflight_undo(transaction: &UndoTransaction) -> Vec<UndoStepStatus> {
         .iter()
         .map(|step| match validate_undo_step(transaction, step) {
             Ok(()) => Ready,
-            Err(reason) => Rejected { reason },
+            Err(error) => Rejected {
+                reason: format!("{error:#}"),
+            },
         })
         .collect()
 }
@@ -165,6 +169,7 @@ pub fn apply_undo_cancellable(
     let execution_steps = transaction.steps.iter().rev().cloned().collect::<Vec<_>>();
     let total = execution_steps.len();
     let mut results = Vec::with_capacity(total);
+    let mut permission_denied = false;
     let mut attempted = 0;
 
     for (index, step) in execution_steps.iter().enumerate() {
@@ -187,10 +192,13 @@ pub fn apply_undo_cancellable(
 
         let outcome = match execute_undo_step(transaction, step) {
             Ok(()) => OpOutcome::Success,
-            Err(error) => OpOutcome::Failed {
-                error,
-                progress: None,
-            },
+            Err(error) => {
+                permission_denied |= crate::privilege::is_permission_denied(&error);
+                OpOutcome::Failed {
+                    error: format!("{error:#}"),
+                    progress: None,
+                }
+            }
         };
         results.push(OpResult {
             op: step.clone(),
@@ -204,16 +212,18 @@ pub fn apply_undo_cancellable(
         current: None,
     });
 
-    CommitReport { results }
+    CommitReport {
+        results,
+        permission_denied,
+    }
 }
 
-fn execute_undo_step(transaction: &UndoTransaction, step: &UndoStep) -> Result<(), String> {
+fn execute_undo_step(transaction: &UndoTransaction, step: &UndoStep) -> anyhow::Result<()> {
     validate_undo_step(transaction, step)?;
     match step {
         UndoStep::RemoveCreated { path, .. } | UndoStep::RemoveCopied { path, .. } => {
-            crate::recycle::delete_to_recycle_bin(&crate::long_path::to_fs(path)).map_err(|error| {
-                format!("Failed to move undo target to the recycle bin: {error:#}")
-            })
+            crate::recycle::delete_to_recycle_bin(&crate::long_path::to_fs(path))
+                .context("Failed to move undo target to the recycle bin")
         }
         UndoStep::MoveBack {
             from,
@@ -230,10 +240,10 @@ fn execute_undo_step(transaction: &UndoTransaction, step: &UndoStep) -> Result<(
             let backup_dir = transaction
                 .backup_dir
                 .as_deref()
-                .ok_or_else(|| "Backup directory was not recorded".to_owned())?;
-            crate::backup::restore_entry(backup_dir, backup, path).map_err(|error| {
-                format!("Failed to restore from backup payload: {error:#}; the backup payload remains available")
-            })
+                .ok_or_else(|| anyhow!("Backup directory was not recorded"))?;
+            crate::backup::restore_entry(backup_dir, backup, path).context(
+                "Failed to restore from backup payload; the backup payload remains available",
+            )
         }
     }
 }
@@ -243,24 +253,24 @@ fn execute_move_back(
     to: &Path,
     kind: EntryKind,
     case_only: bool,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     let case_sensitive_directory = case_only
         && from
             .parent()
             .is_some_and(|parent| crate::case::dir_is_case_sensitive(parent).unwrap_or(false));
     if case_only && !case_sensitive_directory {
         return crate::case::case_only_rename(to, from)
-            .map_err(|error| format!("Failed to reverse case-only rename: {error:#}"));
+            .context("Failed to reverse case-only rename");
     }
 
     match crate::classify::classify_move(to, from, kind)
-        .map_err(|error| format!("Failed to classify volume for undo move: {error:#}"))?
+        .context("Failed to classify volume for undo move")?
     {
         MoveClass::SameVolumeRename => {
-            fs::rename(crate::long_path::to_fs(to), crate::long_path::to_fs(from)).map_err(
-                |error| {
+            fs::rename(crate::long_path::to_fs(to), crate::long_path::to_fs(from)).with_context(
+                || {
                     format!(
-                        "Failed to reverse rename: {} → {}: {error}",
+                        "Failed to reverse rename: {} → {}",
                         to.display(),
                         from.display()
                     )
@@ -288,7 +298,7 @@ fn move_back_requires_vacancy(
     !case_only || dir_is_case_sensitive()
 }
 
-fn validate_undo_step(transaction: &UndoTransaction, step: &UndoStep) -> Result<(), String> {
+fn validate_undo_step(transaction: &UndoTransaction, step: &UndoStep) -> anyhow::Result<()> {
     match step {
         UndoStep::RemoveCreated {
             path,
@@ -322,7 +332,7 @@ fn validate_remove_created(
     path: &Path,
     identity: Option<&FileIdentity>,
     post: &Fingerprint,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     match post.kind {
         EntryKind::File => {
             let current = capture_current(path, identity, "Created file was not found")?;
@@ -372,7 +382,7 @@ fn validate_remove_copied(
     identity: Option<&FileIdentity>,
     post: &Fingerprint,
     manifest: Option<&[ManifestEntry]>,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     match post.kind {
         EntryKind::File => {
             let current = capture_current(path, identity, "Copied file was not found")?;
@@ -389,7 +399,7 @@ fn validate_remove_copied(
         }
         EntryKind::Dir => {
             let expected_manifest = manifest
-                .ok_or_else(|| "Manifest for copied directory was not recorded".to_owned())?;
+                .ok_or_else(|| anyhow!("Manifest for copied directory was not recorded"))?;
             let current = capture_current(path, identity, "Copied directory was not found")?;
             ensure_identity_matches(
                 identity,
@@ -401,13 +411,13 @@ fn validate_remove_copied(
                 current.fingerprint.kind,
                 "Type changed after copy",
             )?;
-            let current_manifest = crate::identity::capture_manifest(path).map_err(|error| {
-                format!("Failed to capture manifest for copied directory: {error:#}")
-            })?;
+            let current_manifest = crate::apply::fault_point("undo_manifest", path)
+                .and_then(|()| crate::identity::capture_manifest(path))
+                .context("Failed to capture manifest for copied directory")?;
             if current_manifest == expected_manifest {
                 Ok(())
             } else {
-                Err("Directory contents changed after copy".to_owned())
+                Err(anyhow!("Directory contents changed after copy"))
             }
         }
         EntryKind::Symlink => {
@@ -432,7 +442,7 @@ fn validate_move_back(
     identity: Option<&FileIdentity>,
     post: &Fingerprint,
     case_only: bool,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     // case-insensitiveディレクトリでのcase-only renameは from と to が同一実体を
     // 指すため、fromの存在確認は必ず「占有」になる(forward側 apply.rs の
     // case_only分岐と同じ理由)。この場合だけ空き確認をスキップする。
@@ -471,19 +481,25 @@ fn validate_restore(
     transaction: &UndoTransaction,
     path: &Path,
     backup: &BackupRef,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     ensure_path_vacant(path, "Another entry exists at the restore destination")?;
     let backup_dir = transaction
         .backup_dir
         .as_deref()
-        .ok_or_else(|| "Backup directory was not recorded".to_owned())?;
+        .ok_or_else(|| anyhow!("Backup directory was not recorded"))?;
     let payload = backup_payload_path(backup_dir, backup)?;
-    let metadata = fs::symlink_metadata(crate::long_path::to_fs(&payload)).map_err(|error| {
-        match error.kind() {
-            std::io::ErrorKind::NotFound => "Backup payload was not found".to_owned(),
-            _ => format!("Failed to inspect backup payload: {error}"),
-        }
-    })?;
+    let metadata = crate::apply::fault_point("undo_backup_metadata", &payload)
+        .and_then(|()| fs::symlink_metadata(crate::long_path::to_fs(&payload)).map_err(Into::into))
+        .map_err(|error| {
+            let missing = error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            error.context(if missing {
+                "Backup payload was not found"
+            } else {
+                "Failed to inspect backup payload"
+            })
+        })?;
     let actual_kind = crate::scan::kind_from_metadata(&metadata);
     // symlinkのpayloadは実リンクではなく記述子(通常ファイル)として保存される
     // (crate::backup::write_symlink_descriptor)。特権不要化がbackupの契約なので、
@@ -496,7 +512,7 @@ fn validate_restore(
     if actual_kind == expected_payload_kind {
         Ok(())
     } else {
-        Err("Backup payload type does not match the record".to_owned())
+        Err(anyhow!("Backup payload type does not match the record"))
     }
 }
 
@@ -508,13 +524,13 @@ fn validate_restore(
 fn validate_restore_deleted_symlink(
     transaction: &UndoTransaction,
     path: &Path,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     ensure_path_vacant(path, "Another entry exists at the restore destination")?;
     if transaction.backup_dir.is_none() {
-        return Err("Backup directory was not recorded".to_owned());
+        return Err(anyhow!("Backup directory was not recorded"));
     }
     match crate::recycle::has_restore_candidate(path) {
-        Ok(false) => Err("The deleted link is no longer in the recycle bin".to_owned()),
+        Ok(false) => Err(anyhow!("The deleted link is no longer in the recycle bin")),
         Ok(true) | Err(_) => Ok(()),
     }
 }
@@ -529,13 +545,13 @@ fn execute_restore_deleted_symlink(
     transaction: &UndoTransaction,
     path: &Path,
     backup: &BackupRef,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     crate::recycle::restore_from_recycle_bin(path)
-        .map_err(|error| format!("Failed to restore link from the recycle bin: {error:#}"))?;
+        .context("Failed to restore link from the recycle bin")?;
     let backup_dir = transaction
         .backup_dir
         .as_deref()
-        .ok_or_else(|| "Backup directory was not recorded".to_owned())?;
+        .ok_or_else(|| anyhow!("Backup directory was not recorded"))?;
     verify_restored_symlink_matches_backup(backup_dir, backup, path)
 }
 
@@ -548,7 +564,7 @@ fn verify_restored_symlink_matches_backup(
     backup_dir: &Path,
     backup: &BackupRef,
     path: &Path,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     let mismatch = || {
         format!(
             "The restored link at {} does not match the recorded backup (a different entry may have been created at the same path outside fyler.windows); the restored item remains at {}",
@@ -556,32 +572,23 @@ fn verify_restored_symlink_matches_backup(
             path.display()
         )
     };
-    let metadata = fs::symlink_metadata(crate::long_path::to_fs(path)).map_err(|error| {
-        format!(
-            "Failed to verify the restored link at {}: {error}",
-            path.display()
-        )
-    })?;
+    let metadata = fs::symlink_metadata(crate::long_path::to_fs(path))
+        .with_context(|| format!("Failed to verify the restored link at {}", path.display()))?;
     if crate::scan::kind_from_metadata(&metadata) != EntryKind::Symlink {
-        return Err(mismatch());
+        return Err(anyhow!(mismatch()));
     }
-    let (_, expected_target) =
-        crate::backup::read_symlink_descriptor(backup_dir, backup).map_err(|error| {
-            format!(
-                "Failed to verify the restored link at {}: {error:#}",
-                path.display()
-            )
-        })?;
-    let actual_target = fs::read_link(crate::long_path::to_fs(path)).map_err(|error| {
+    let (_, expected_target) = crate::backup::read_symlink_descriptor(backup_dir, backup)
+        .with_context(|| format!("Failed to verify the restored link at {}", path.display()))?;
+    let actual_target = fs::read_link(crate::long_path::to_fs(path)).with_context(|| {
         format!(
-            "Failed to read the restored link target at {}: {error}",
+            "Failed to read the restored link target at {}",
             path.display()
         )
     })?;
     if actual_target == expected_target {
         Ok(())
     } else {
-        Err(mismatch())
+        Err(anyhow!(mismatch()))
     }
 }
 
@@ -595,18 +602,21 @@ fn capture_current(
     path: &Path,
     expected_identity: Option<&FileIdentity>,
     not_found_reason: &str,
-) -> Result<CurrentEntry, String> {
-    let fingerprint = crate::identity::capture_fingerprint(path).map_err(|error| {
-        if metadata_missing(path) {
-            not_found_reason.to_owned()
-        } else {
-            format!("Failed to capture current fingerprint: {error:#}")
-        }
-    })?;
+) -> anyhow::Result<CurrentEntry> {
+    let fingerprint = crate::apply::fault_point("undo_fingerprint", path)
+        .and_then(|()| crate::identity::capture_fingerprint(path))
+        .map_err(|error| {
+            if metadata_missing(path) {
+                error.context(not_found_reason.to_owned())
+            } else {
+                error.context("Failed to capture current fingerprint")
+            }
+        })?;
     let identity = if expected_identity.is_some() {
         Some(
-            crate::identity::capture_identity(path)
-                .map_err(|error| format!("Failed to capture current object identity: {error:#}"))?,
+            crate::apply::fault_point("undo_identity", path)
+                .and_then(|()| crate::identity::capture_identity(path))
+                .context("Failed to capture current object identity")?,
         )
     } else {
         None
@@ -621,10 +631,10 @@ fn ensure_identity_matches(
     expected: Option<&FileIdentity>,
     current: Option<&FileIdentity>,
     reason: &str,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     match expected {
         Some(expected) if Some(expected) == current => Ok(()),
-        Some(_) => Err(reason.to_owned()),
+        Some(_) => Err(anyhow!(reason.to_owned())),
         None => Ok(()),
     }
 }
@@ -633,12 +643,12 @@ fn ensure_file_fingerprint_matches(
     expected: &Fingerprint,
     current: &Fingerprint,
     reason: &str,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     ensure_kind_matches(expected.kind, current.kind, "Type has changed")?;
     if current.size == expected.size && current.mtime == expected.mtime {
         Ok(())
     } else {
-        Err(reason.to_owned())
+        Err(anyhow!(reason.to_owned()))
     }
 }
 
@@ -646,12 +656,12 @@ fn ensure_symlink_fingerprint_matches(
     expected: &Fingerprint,
     current: &Fingerprint,
     reason: &str,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     ensure_kind_matches(expected.kind, current.kind, "Type has changed")?;
     if current.link_target == expected.link_target {
         Ok(())
     } else {
-        Err(reason.to_owned())
+        Err(anyhow!(reason.to_owned()))
     }
 }
 
@@ -659,31 +669,41 @@ fn ensure_kind_matches(
     expected: EntryKind,
     current: EntryKind,
     reason: &str,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     if current == expected {
         Ok(())
     } else {
-        Err(reason.to_owned())
+        Err(anyhow!(reason.to_owned()))
     }
 }
 
-fn ensure_directory_empty(path: &Path) -> Result<(), String> {
-    let mut entries = fs::read_dir(crate::long_path::to_fs(path))
-        .map_err(|error| format!("Failed to enumerate created directory: {error}"))?;
-    match entries.next() {
-        None => Ok(()),
-        Some(Ok(_)) => Err("Directory contents changed after creation".to_owned()),
-        Some(Err(error)) => Err(format!(
-            "Failed to inspect entry in created directory: {error}"
-        )),
+fn ensure_directory_empty(path: &Path) -> anyhow::Result<()> {
+    let mut entries = crate::apply::fault_point("undo_read_dir", path)
+        .and_then(|()| fs::read_dir(crate::long_path::to_fs(path)).map_err(Into::into))
+        .context("Failed to enumerate created directory")?;
+    let entry = crate::apply::fault_point("undo_read_dir_entry", path)
+        .and_then(|()| entries.next().transpose().map_err(Into::into))
+        .context("Failed to inspect entry in created directory")?;
+    if entry.is_some() {
+        Err(anyhow!("Directory contents changed after creation"))
+    } else {
+        Ok(())
     }
 }
 
-fn ensure_path_vacant(path: &Path, occupied_reason: &str) -> Result<(), String> {
-    match fs::symlink_metadata(crate::long_path::to_fs(path)) {
-        Ok(_) => Err(occupied_reason.to_owned()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("Failed to check whether path exists: {error}")),
+fn ensure_path_vacant(path: &Path, occupied_reason: &str) -> anyhow::Result<()> {
+    let metadata = crate::apply::fault_point("undo_vacancy", path)
+        .and_then(|()| fs::symlink_metadata(crate::long_path::to_fs(path)).map_err(Into::into));
+    match metadata {
+        Ok(_) => Err(anyhow!(occupied_reason.to_owned())),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.context("Failed to check whether path exists")),
     }
 }
 
@@ -694,11 +714,11 @@ fn metadata_missing(path: &Path) -> bool {
     )
 }
 
-fn backup_payload_path(backup_dir: &Path, backup: &BackupRef) -> Result<PathBuf, String> {
+fn backup_payload_path(backup_dir: &Path, backup: &BackupRef) -> anyhow::Result<PathBuf> {
     let mut path = backup_dir.to_path_buf();
     for component in backup.payload_rel.split('/') {
         if component.is_empty() || component == "." || component == ".." {
-            return Err(format!(
+            return Err(anyhow!(
                 "Invalid backup payload relative path: {}",
                 backup.payload_rel
             ));
@@ -722,6 +742,101 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    struct FaultGuard;
+
+    impl Drop for FaultGuard {
+        fn drop(&mut self) {
+            crate::apply::FAULT_INJECTION.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+
+    fn assert_validation_error_report(kind: std::io::ErrorKind) {
+        for stage in [
+            "undo_fingerprint",
+            "undo_identity",
+            "undo_read_dir",
+            "undo_read_dir_entry",
+            "undo_manifest",
+            "undo_vacancy",
+            "undo_backup_metadata",
+        ] {
+            let root = tempdir().unwrap();
+            let backup = tempdir().unwrap();
+            let target = root.path().join("target");
+            let mut recorder = UndoRecorder::new(
+                "tx".to_owned(),
+                root.path().to_path_buf(),
+                backup.path().to_path_buf(),
+            );
+            match stage {
+                "undo_read_dir" | "undo_read_dir_entry" => {
+                    fs::create_dir(&target).unwrap();
+                    recorder.record_created(&target, EntryKind::Dir);
+                }
+                "undo_manifest" => {
+                    fs::create_dir(&target).unwrap();
+                    fs::write(target.join("child"), b"copied").unwrap();
+                    recorder.record_copied(&target, EntryKind::Dir);
+                }
+                "undo_vacancy" => {
+                    fs::write(&target, b"moved").unwrap();
+                    recorder.record_moved(
+                        &root.path().join("original"),
+                        &target,
+                        EntryKind::File,
+                        false,
+                    );
+                }
+                "undo_backup_metadata" => {
+                    fs::write(&target, b"deleted").unwrap();
+                    let reference = recorder.backup_for_next_step(&target).unwrap();
+                    recorder.record_deleted(&target, reference);
+                    fs::remove_file(&target).unwrap();
+                }
+                _ => {
+                    fs::write(&target, b"created").unwrap();
+                    recorder.record_created(&target, EntryKind::File);
+                }
+            }
+            let transaction = recorder.into_transaction();
+            let before = relative_entry_snapshot(root.path());
+            let backup_before = relative_entry_snapshot(backup.path());
+            crate::apply::FAULT_INJECTION.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |actual, _| {
+                    (actual == stage).then(|| std::io::Error::from(kind).into())
+                }));
+            });
+            let _fault = FaultGuard;
+
+            assert!(matches!(
+                preflight_undo(&transaction).as_slice(),
+                [Rejected { .. }]
+            ));
+            assert_eq!(relative_entry_snapshot(root.path()), before);
+            assert_eq!(relative_entry_snapshot(backup.path()), backup_before);
+            let report = apply_undo(&transaction);
+
+            assert_eq!(
+                report.permission_denied,
+                kind == std::io::ErrorKind::PermissionDenied,
+                "{stage}: {report:#?}"
+            );
+            assert!(report.all_failed(), "{stage}: {report:#?}");
+            assert_eq!(relative_entry_snapshot(root.path()), before);
+            assert_eq!(relative_entry_snapshot(backup.path()), backup_before);
+        }
+    }
+
+    #[test]
+    fn undo_validation_permission_failures_request_elevation_without_mutation() {
+        assert_validation_error_report(std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn undo_validation_unrelated_failures_do_not_request_elevation() {
+        assert_validation_error_report(std::io::ErrorKind::Other);
+    }
 
     #[test]
     fn transaction_omits_backup_dir_until_backup_step_is_recorded() {

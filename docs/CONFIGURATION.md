@@ -34,6 +34,29 @@ The undo journal and the startup error log live in the state directory.
 
 `FYLER_UNDO_DIR` overrides the undo journal directory for development and testing.
 
+## Administrator permission prompt
+
+On Windows, a permission failure during a save, pane transfer, paste, drop import,
+ZIP extraction, or undo offers to open the affected directory in a separate
+administrator fyler window. This includes copying symbolic links when Windows
+requires the symbolic-link privilege. Missing files, occupied destinations, and
+sharing violations do not trigger the prompt.
+
+The native dialog defaults to **Cancel**. **OK** continues to Windows UAC.
+Cancelling either dialog does not open an administrator window or retry an operation.
+fyler reports UAC cancellation in the original window.
+
+The failed operation is **not replayed automatically**. Other operations in the same
+report may already have succeeded. Review that report before trying again.
+The original window stays open. The elevation flow does not transfer or change its
+editor state or unsaved edits. Normal operation reporting and reconciliation still apply.
+The new window opens the directory from the failed request, even if you switch panes.
+
+The elevated window runs fyler and its Neovim configuration with administrator
+privileges. Use only trusted executables and configuration. Elevation does not
+guarantee access to every file. A window that is already elevated does not offer
+another elevation prompt. This behavior has no configuration setting.
+
 ## Complete example
 
 ```toml
