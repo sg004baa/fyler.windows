@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use fyler_core::editor::{
-    EditorCommand, EditorEngine, EditorEvent, EditorLine, EditorMessage, FoldOp, Key, KeyInput,
-    MessageKind, Mode, Modifiers, SearchHighlight,
+    BlockSelectionPoint, BlockSelectionSpan, EditorCommand, EditorEngine, EditorEvent, EditorLine,
+    EditorMessage, FoldOp, Key, KeyInput, MessageKind, Mode, Modifiers, SearchHighlight,
 };
 use fyler_core::keymap::{default_leader, resolve_bindings};
 use fyler_core::pane::PaneAction;
@@ -1948,6 +1948,286 @@ async fn select_lines_enters_linewise_visual_selection_both_directions() -> anyh
     assert_eq!(snapshot.cursor.line, 0);
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a compatible nvim executable"]
+async fn block_selection_matches_native_region_and_yank_in_both_directions() -> anyhow::Result<()> {
+    let _serial = NVIM_TEST_SERIAL.lock().await;
+    let nvim_exe = std::env::var_os("FYLER_NVIM_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvim"));
+    let (engine, _events) =
+        NvimEngine::start(NvimConfig::new(nvim_exe, std::env::current_dir()?)).await?;
+    assert!(engine.snapshot().block_selection.is_none());
+    let rows = [
+        "/001 abcdef",
+        "/002 日本語",
+        "/003 a\tbcdef",
+        "/100000\tabcdef",
+        "/005 e\u{301}abc",
+        "/006 x",
+        "",
+        "/007 abcdef",
+    ];
+    let boundary = |byte| BlockSelectionPoint {
+        byte,
+        character_end: byte,
+        cell_offset: 0,
+        cell_width: 1,
+    };
+    for reverse in [false, true] {
+        engine.set_initial_lines(rows.iter().map(|line| EditorLine::new(*line)).collect())?;
+        wait_for_lines(&engine, |lines| lines.len() == rows.len()).await?;
+        block_ex_command(
+            &engine,
+            "set tabstop=8 virtualedit=block selection=inclusive",
+            Mode::Normal,
+        )
+        .await?;
+        let selection = if reverse {
+            "execute \"normal! 8G8|\\<C-v>7k\""
+        } else {
+            "execute \"normal! gg8|\\<C-v>7j\""
+        };
+        block_ex_command(&engine, selection, Mode::VisualBlock).await?;
+        let snapshot = engine.snapshot();
+        let spans = snapshot
+            .block_selection
+            .as_deref()
+            .context("missing block selection")?;
+        assert_eq!(spans.len(), rows.len());
+        assert_eq!(
+            spans[0],
+            BlockSelectionSpan {
+                line: 0,
+                start: boundary(7),
+                end: boundary(8),
+            }
+        );
+        assert_eq!(
+            spans[1],
+            BlockSelectionSpan {
+                line: 1,
+                start: boundary(8),
+                end: BlockSelectionPoint {
+                    byte: 8,
+                    character_end: 11,
+                    cell_offset: 1,
+                    cell_width: 2
+                },
+            }
+        );
+        assert_eq!(
+            spans[2],
+            BlockSelectionSpan {
+                line: 2,
+                start: BlockSelectionPoint {
+                    byte: 6,
+                    character_end: 7,
+                    cell_offset: 1,
+                    cell_width: 2
+                },
+                end: BlockSelectionPoint {
+                    byte: 6,
+                    character_end: 7,
+                    cell_offset: 2,
+                    cell_width: 2
+                },
+            }
+        );
+        assert_eq!(
+            spans[3],
+            BlockSelectionSpan {
+                line: 3,
+                start: boundary(7),
+                end: boundary(8),
+            }
+        );
+        assert_eq!(
+            spans[4],
+            BlockSelectionSpan {
+                line: 4,
+                start: boundary(9),
+                end: boundary(10),
+            }
+        );
+        assert_eq!(
+            spans[5],
+            BlockSelectionSpan {
+                line: 5,
+                start: BlockSelectionPoint {
+                    cell_offset: 1,
+                    ..boundary(6)
+                },
+                end: BlockSelectionPoint {
+                    cell_offset: 2,
+                    ..boundary(6)
+                },
+            }
+        );
+        assert_eq!(
+            spans[6],
+            BlockSelectionSpan {
+                line: 6,
+                start: BlockSelectionPoint {
+                    cell_offset: 7,
+                    ..boundary(0)
+                },
+                end: BlockSelectionPoint {
+                    cell_offset: 8,
+                    ..boundary(0)
+                },
+            }
+        );
+        assert_eq!(snapshot.cursor.line, if reverse { 0 } else { 7 });
+        assert_eq!(
+            snapshot.visual_start.map(|cursor| cursor.line),
+            Some(if reverse { 7 } else { 0 })
+        );
+        drop(snapshot);
+
+        // Entering ':' records the native visual marks. Compare getregion and a
+        // real block yank, then expose both through buffer lines, not engine internals.
+        block_ex_command(
+            &engine,
+            "lua local r=vim.fn.getregion(vim.fn.getpos(\"'<\"),vim.fn.getpos(\"'>\"),{type=string.char(22)}); vim.cmd('normal! gv\"zy'); local y=vim.fn.getreg('z',1,true); vim.api.nvim_buf_set_lines(0,-1,-1,false,r); vim.api.nvim_buf_set_lines(0,-1,-1,false,y)",
+            Mode::Normal,
+        ).await?;
+        wait_for_lines(&engine, |lines| lines.len() == rows.len() * 3).await?;
+        let snapshot = engine.snapshot();
+        let expected = ["c", " ", " ", "\t", "b", " ", " ", "c"];
+        let region: Vec<_> = snapshot.lines[8..16]
+            .iter()
+            .map(|line| line.text.as_ref())
+            .collect();
+        let yank: Vec<_> = snapshot.lines[16..24]
+            .iter()
+            .map(|line| line.text.as_ref())
+            .collect();
+        assert_eq!(region, expected);
+        assert_eq!(yank, expected);
+        assert!(snapshot.block_selection.is_none());
+    }
+
+    engine.set_initial_lines(rows.iter().map(|line| EditorLine::new(*line)).collect())?;
+    wait_for_lines(&engine, |lines| lines.len() == rows.len()).await?;
+    block_ex_command(&engine, "set virtualedit=", Mode::Normal).await?;
+    block_ex_command(
+        &engine,
+        "execute \"normal! gg8|\\<C-v>7j\"",
+        Mode::VisualBlock,
+    )
+    .await?;
+    let snapshot = engine.snapshot();
+    let spans = snapshot
+        .block_selection
+        .as_deref()
+        .context("missing block selection")?;
+    assert_eq!(
+        spans[5],
+        BlockSelectionSpan {
+            line: 5,
+            start: BlockSelectionPoint {
+                cell_offset: 1,
+                ..boundary(6)
+            },
+            end: BlockSelectionPoint {
+                cell_offset: 2,
+                ..boundary(6)
+            },
+        }
+    );
+    assert_eq!(
+        spans[6],
+        BlockSelectionSpan {
+            line: 6,
+            start: BlockSelectionPoint {
+                cell_offset: 7,
+                ..boundary(0)
+            },
+            end: BlockSelectionPoint {
+                cell_offset: 8,
+                ..boundary(0)
+            },
+        }
+    );
+    drop(snapshot);
+    block_ex_command(
+        &engine,
+        "lua local r=vim.fn.getregion(vim.fn.getpos(\"'<\"),vim.fn.getpos(\"'>\"),{type=string.char(22)}); vim.cmd('normal! gv\"zy'); local y=vim.fn.getreg('z',1,true); vim.api.nvim_buf_set_lines(0,-1,-1,false,r); vim.api.nvim_buf_set_lines(0,-1,-1,false,y)",
+        Mode::Normal,
+    ).await?;
+    wait_for_lines(&engine, |lines| lines.len() == rows.len() * 3).await?;
+    let snapshot = engine.snapshot();
+    let expected = ["c", " ", " ", "\t", "b", " ", " ", "c"];
+    let region: Vec<_> = snapshot.lines[8..16]
+        .iter()
+        .map(|line| line.text.as_ref())
+        .collect();
+    let yank: Vec<_> = snapshot.lines[16..24]
+        .iter()
+        .map(|line| line.text.as_ref())
+        .collect();
+    assert_eq!(region, expected);
+    assert_eq!(yank, expected);
+    assert!(snapshot.block_selection.is_none());
+
+    // A complete composed character ends after its combining bytes, not after
+    // just the base code point. Selection=exclusive is also read by the engine.
+    engine.set_initial_lines(vec![EditorLine::new("/001 e\u{301}abc")])?;
+    wait_for_lines(&engine, |lines| lines.len() == 1).await?;
+    block_ex_command(
+        &engine,
+        "set selection=exclusive virtualedit=",
+        Mode::Normal,
+    )
+    .await?;
+    block_ex_command(
+        &engine,
+        "execute \"normal! gg6|\\<C-v>l\"",
+        Mode::VisualBlock,
+    )
+    .await?;
+    let snapshot = engine.snapshot();
+    assert_eq!(
+        snapshot.block_selection.as_deref(),
+        Some(
+            [BlockSelectionSpan {
+                line: 0,
+                start: boundary(5),
+                end: boundary(8),
+            }]
+            .as_slice()
+        )
+    );
+    drop(snapshot);
+    block_ex_command(
+        &engine,
+        "lua local r=vim.fn.getregion(vim.fn.getpos(\"'<\"),vim.fn.getpos(\"'>\"),{type=string.char(22)}); vim.cmd('normal! gv\"zy'); vim.api.nvim_buf_set_lines(0,-1,-1,false,r); vim.api.nvim_buf_set_lines(0,-1,-1,false,vim.fn.getreg('z',1,true))",
+        Mode::Normal,
+    ).await?;
+    wait_for_lines(&engine, |lines| lines.len() == 3).await?;
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot.lines[1].text.as_ref(), "e\u{301}");
+    assert_eq!(snapshot.lines[2].text.as_ref(), "e\u{301}");
+    assert!(snapshot.block_selection.is_none());
+    Ok(())
+}
+
+async fn block_ex_command(engine: &NvimEngine, command: &str, mode: Mode) -> anyhow::Result<()> {
+    engine.send(key_command(Key::Char(':')))?;
+    wait_for_mode(engine, Mode::Cmdline).await?;
+    engine.send(EditorCommand::Key(KeyInput {
+        key: Key::Char('u'),
+        mods: Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        },
+    }))?;
+    engine.send(EditorCommand::Text(command.to_owned()))?;
+    engine.send(key_command(Key::Enter))?;
+    wait_for_mode(engine, mode).await
 }
 
 #[tokio::test(flavor = "multi_thread")]

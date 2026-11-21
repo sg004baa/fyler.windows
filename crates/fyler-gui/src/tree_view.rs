@@ -3,7 +3,9 @@
 use std::collections::{HashMap, HashSet};
 
 use eframe::egui;
-use fyler_core::editor::{Cursor, EditorSnapshot, Mode, SearchHighlight};
+use fyler_core::editor::{
+    BlockSelectionPoint, BlockSelectionSpan, Cursor, EditorSnapshot, Mode, SearchHighlight,
+};
 use fyler_core::fileinfo::{FileInfo, human_readable_size};
 use fyler_core::gitstatus::GitBadge;
 use fyler_core::grammar::PrefixParse;
@@ -344,7 +346,36 @@ pub fn draw(
                 );
             }
 
-            if let Some((start, cursor)) = selection {
+            if matches!(snapshot.mode, Mode::VisualBlock) {
+                if let Some(spans) = snapshot.block_selection.as_deref()
+                    && let Ok(index) = spans.binary_search_by_key(&line_index, |span| span.line)
+                {
+                    let span = &spans[index];
+                    let needs_virtual_cells = span.start.cell_offset > 0
+                        && span.start.byte == line.text.len()
+                        || span.end.cell_offset > 0 && span.end.byte == line.text.len();
+                    let space_width = if needs_virtual_cells {
+                        painter
+                            .layout_no_wrap(" ".to_owned(), font_id.clone(), text_color)
+                            .size()
+                            .x
+                    } else {
+                        0.0
+                    };
+                    if let Some((left, right)) =
+                        block_selection_x_bounds(span, &concealed, &text_galley, space_width)
+                    {
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(rect.left() + text_offset + left, rect.top()),
+                                egui::pos2(rect.left() + text_offset + right, rect.bottom()),
+                            ),
+                            0.0,
+                            translucent_selection_fill(),
+                        );
+                    }
+                }
+            } else if let Some((start, cursor)) = selection {
                 draw_selection(
                     ui,
                     rect,
@@ -535,6 +566,52 @@ fn display_selection(snapshot: &EditorSnapshot) -> Option<(Cursor, Cursor)> {
     ))
 }
 
+fn block_selection_x_bounds(
+    span: &BlockSelectionSpan,
+    concealed: &conceal::ConcealedLine<'_>,
+    galley: &egui::Galley,
+    space_width: f32,
+) -> Option<(f32, f32)> {
+    let point_x = |point: BlockSelectionPoint| {
+        if point.byte < concealed.concealed_bytes {
+            return Some(0.0);
+        }
+        let byte = point.byte - concealed.concealed_bytes;
+        let start = galley_byte_x(concealed.display, galley, byte)?;
+        if point.cell_offset == 0 {
+            return Some(start);
+        }
+        let width = if byte == concealed.display.len() {
+            space_width
+        } else {
+            galley_byte_x(
+                concealed.display,
+                galley,
+                point.character_end.checked_sub(concealed.concealed_bytes)?,
+            )? - start
+        };
+        Some(start + width * point.cell_offset as f32 / point.cell_width as f32)
+    };
+    let left = point_x(span.start)?;
+    let right = point_x(span.end)?;
+    (right > left).then_some((left, right))
+}
+
+fn galley_byte_x(display: &str, galley: &egui::Galley, byte: usize) -> Option<f32> {
+    let character = display.get(..byte)?.chars().count();
+    let Some(row) = galley.rows.first() else {
+        return Some(0.0);
+    };
+    Some(
+        row.pos.x
+            + row
+                .row
+                .glyphs
+                .get(character)
+                .map_or(row.row.size.x, |glyph| glyph.pos.x),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_selection(
     ui: &egui::Ui,
@@ -626,11 +703,7 @@ fn selection_span(
 
     match mode {
         Mode::VisualLine => Some((0, line_display.len())),
-        Mode::VisualBlock => {
-            let span_start = valid_byte_index(line_display, start.col.min(cursor.col));
-            let span_end = byte_after_character(line_display, start.col.max(cursor.col));
-            Some((span_start, span_end.max(span_start)))
-        }
+        Mode::VisualBlock => None,
         Mode::Visual => {
             let (first, last) = if (start.line, start.col) <= (cursor.line, cursor.col) {
                 (start, cursor)
@@ -911,6 +984,27 @@ mod tests {
     }
 
     #[test]
+    fn visual_block_selects_japanese_by_cells_not_endpoint_bytes() {
+        with_galley("日本語", |galley, _| {
+            let span = BlockSelectionSpan {
+                line: 1,
+                start: block_boundary(3),
+                end: block_boundary(6),
+            };
+            let concealed = conceal::conceal_line("日本語");
+            let expected = (
+                galley_byte_x("日本語", galley, 3).unwrap(),
+                galley_byte_x("日本語", galley, 6).unwrap(),
+            );
+            assert_eq!(
+                block_selection_x_bounds(&span, &concealed, galley, 0.0),
+                Some(expected)
+            );
+            assert!(expected.0 > 0.0);
+        });
+    }
+
+    #[test]
     fn display_name_is_zip_matches_extension_case_insensitively() {
         assert!(display_name_is_zip("Archive.ZIP"));
         assert!(display_name_is_zip("bundle.zip"));
@@ -1172,23 +1266,182 @@ mod tests {
         }
     }
 
-    #[test]
-    fn block_selection_normalizes_columns_and_clamps_utf8_boundaries() {
-        let start = Cursor { line: 4, col: 4 };
-        let cursor = Cursor { line: 1, col: 1 };
+    fn block_boundary(byte: usize) -> BlockSelectionPoint {
+        BlockSelectionPoint {
+            byte,
+            character_end: byte,
+            cell_offset: 0,
+            cell_width: 1,
+        }
+    }
 
-        assert_eq!(
-            selection_span(&Mode::VisualBlock, start, cursor, 2, "abcdef"),
-            Some((1, 5))
-        );
-        assert_eq!(
-            selection_span(&Mode::VisualBlock, start, cursor, 2, "新ab"),
-            Some((0, 5))
-        );
-        assert_eq!(
-            selection_span(&Mode::VisualBlock, start, cursor, 0, "abcdef"),
-            None
-        );
+    fn with_galley(text: &str, check: impl FnOnce(&egui::Galley, f32)) {
+        let context = egui::Context::default();
+        let mut check = Some(check);
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            let context = ui.ctx();
+            let painter = context.layer_painter(egui::LayerId::background());
+            let font = egui::FontId::monospace(16.0);
+            let galley =
+                painter.layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE);
+            let space = painter
+                .layout_no_wrap(" ".to_owned(), font, egui::Color32::WHITE)
+                .size()
+                .x;
+            check.take().unwrap()(&galley, space);
+        });
+    }
+
+    #[test]
+    fn block_selection_uses_partial_tab_and_wide_glyph_geometry() {
+        for (text, byte, end, width) in [("a\tb", 1, 2, 7), ("a日本", 1, 4, 2)] {
+            with_galley(text, |galley, _| {
+                let start_x = galley_byte_x(text, galley, byte).unwrap();
+                let glyph_width = galley_byte_x(text, galley, end).unwrap() - start_x;
+                let span = BlockSelectionSpan {
+                    line: 0,
+                    start: BlockSelectionPoint {
+                        byte,
+                        character_end: end,
+                        cell_offset: 1,
+                        cell_width: width,
+                    },
+                    end: BlockSelectionPoint {
+                        byte,
+                        character_end: end,
+                        cell_offset: 2,
+                        cell_width: width,
+                    },
+                };
+                let bounds =
+                    block_selection_x_bounds(&span, &conceal::conceal_line(text), galley, 0.0)
+                        .unwrap();
+                assert!((bounds.0 - (start_x + glyph_width / width as f32)).abs() < 0.001);
+                assert!((bounds.1 - (start_x + glyph_width * 2.0 / width as f32)).abs() < 0.001);
+            });
+        }
+    }
+
+    #[test]
+    fn block_selection_conceals_each_rows_prefix_and_indent() {
+        for raw in ["/001 \t日本語", "/100000 日本語", "日本語"] {
+            let concealed = conceal::conceal_line(raw);
+            with_galley(concealed.display, |galley, _| {
+                let span = BlockSelectionSpan {
+                    line: 0,
+                    start: block_boundary(concealed.concealed_bytes + 3),
+                    end: block_boundary(concealed.concealed_bytes + 6),
+                };
+                assert_eq!(
+                    block_selection_x_bounds(&span, &concealed, galley, 0.0),
+                    Some((
+                        galley_byte_x("日本語", galley, 3).unwrap(),
+                        galley_byte_x("日本語", galley, 6).unwrap()
+                    )),
+                );
+                let hidden = BlockSelectionSpan {
+                    start: block_boundary(0),
+                    end: block_boundary(concealed.concealed_bytes),
+                    ..span
+                };
+                assert_eq!(
+                    block_selection_x_bounds(&hidden, &concealed, galley, 0.0),
+                    None
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn block_selection_keeps_combining_sequence_and_virtual_cells() {
+        with_galley("e\u{301}a", |galley, space| {
+            let concealed = conceal::conceal_line("e\u{301}a");
+            let composed = BlockSelectionSpan {
+                line: 0,
+                start: block_boundary(0),
+                end: block_boundary(3),
+            };
+            assert_eq!(
+                block_selection_x_bounds(&composed, &concealed, galley, space),
+                Some((0.0, galley_byte_x(concealed.display, galley, 3).unwrap())),
+            );
+            let empty = BlockSelectionSpan {
+                start: block_boundary(4),
+                end: block_boundary(4),
+                ..composed
+            };
+            assert_eq!(
+                block_selection_x_bounds(&empty, &concealed, galley, space),
+                None
+            );
+            let virtual_span = BlockSelectionSpan {
+                start: BlockSelectionPoint {
+                    cell_offset: 7,
+                    ..block_boundary(4)
+                },
+                end: BlockSelectionPoint {
+                    cell_offset: 8,
+                    ..block_boundary(4)
+                },
+                ..composed
+            };
+            let end = galley_byte_x(concealed.display, galley, 4).unwrap();
+            assert_eq!(
+                block_selection_x_bounds(&virtual_span, &concealed, galley, space),
+                Some((end + 7.0 * space, end + 8.0 * space)),
+            );
+        });
+    }
+
+    #[test]
+    fn block_selection_skips_stale_byte_and_character_boundaries() {
+        for (raw, invalid_bytes) in [("/001 x", &[2][..]), ("/001 日本語", &[1, 10][..])] {
+            let concealed = conceal::conceal_line(raw);
+            let prefix = concealed.concealed_bytes;
+            with_galley(concealed.display, |galley, space| {
+                for &invalid_byte in invalid_bytes {
+                    assert_eq!(galley_byte_x(concealed.display, galley, invalid_byte), None);
+                    for invalid_start in [true, false] {
+                        for invalid_character_end in [false, true] {
+                            let mut span = BlockSelectionSpan {
+                                line: 0,
+                                start: block_boundary(prefix),
+                                end: block_boundary(prefix + concealed.display.len()),
+                            };
+                            let point = if invalid_start {
+                                &mut span.start
+                            } else {
+                                &mut span.end
+                            };
+                            if invalid_character_end {
+                                *point = BlockSelectionPoint {
+                                    byte: prefix,
+                                    character_end: prefix + invalid_byte,
+                                    cell_offset: 1,
+                                    cell_width: 2,
+                                };
+                            } else {
+                                *point = block_boundary(prefix + invalid_byte);
+                            }
+                            assert_eq!(
+                                block_selection_x_bounds(&span, &concealed, galley, space),
+                                None,
+                                "{raw:?}, byte {invalid_byte}, start {invalid_start}, character_end {invalid_character_end}",
+                            );
+                        }
+                    }
+                }
+                let neighbor = BlockSelectionSpan {
+                    line: 1,
+                    start: block_boundary(prefix),
+                    end: block_boundary(prefix + concealed.display.len()),
+                };
+                let bounds =
+                    block_selection_x_bounds(&neighbor, &concealed, galley, space).unwrap();
+                assert_eq!(bounds.0, 0.0);
+                assert!(bounds.1 > bounds.0);
+            });
+        }
     }
 
     #[test]

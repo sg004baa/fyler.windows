@@ -96,6 +96,8 @@ pub struct EditorSnapshot {
     pub mode: Mode,
     /// Visual系モード中の選択起点(0始まり)。Visual系モード以外では`None`。
     pub visual_start: Option<Cursor>,
+    /// Block selection's ordered, per-row raw-buffer spans. Other modes use `None`.
+    pub block_selection: Option<Arc<[BlockSelectionSpan]>>,
     /// 未保存の変更があるか(`modified` 相当)。
     pub dirty: bool,
     /// 現在ハイライトすべき検索状態(`/` 検索 + hlsearch/incsearch)。
@@ -113,6 +115,7 @@ impl EditorSnapshot {
             cursor: Cursor::default(),
             mode: Mode::Normal,
             visual_start: None,
+            block_selection: None,
             dirty: false,
             search: None,
         }
@@ -306,6 +309,30 @@ impl EditorLine {
 pub struct Cursor {
     pub line: usize,
     pub col: usize,
+}
+
+/// One row of a block selection, with half-open endpoints in raw-buffer coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockSelectionSpan {
+    pub line: usize,
+    pub start: BlockSelectionPoint,
+    pub end: BlockSelectionPoint,
+}
+
+/// A byte boundary, or a cell boundary within a multi-cell composed character.
+///
+/// `byte` and `character_end` are zero-based UTF-8 byte boundaries. For a plain
+/// boundary they are equal and `cell_offset` is zero. Otherwise `character_end`
+/// bounds the complete composed character and `cell_offset / cell_width` locates
+/// the boundary within its rendered width. `cell_width` is always nonzero.
+/// At end-of-line both byte fields equal the line length; offsets count virtual
+/// cells beyond it and may exceed `cell_width` (which is one there).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockSelectionPoint {
+    pub byte: usize,
+    pub character_end: usize,
+    pub cell_offset: usize,
+    pub cell_width: usize,
 }
 
 /// エディタのモード(エンジン非依存の語彙)。
