@@ -111,6 +111,14 @@ enum AppEvent {
     ImportFinished(CommitReport<ImportOp>),
     ExtractProgress(ApplyProgress<ExtractOp>),
     ExtractFinished(CommitReport<ExtractOp>),
+    OfferElevation {
+        pane_id: PaneId,
+        root: PathBuf,
+    },
+    ElevationFinished(
+        PaneId,
+        anyhow::Result<fyler_fsops::privilege::ElevationOutcome>,
+    ),
     FilesDropped {
         pane_id: PaneId,
         line: Option<usize>,
@@ -1397,6 +1405,20 @@ fn handle_picker_select(
     )
 }
 
+fn request_elevation_if_needed(
+    permission_denied: bool,
+    pane_id: PaneId,
+    root: &Path,
+    event_tx: &CountingSender<AppEvent>,
+) {
+    if permission_denied {
+        let _ = event_tx.send(AppEvent::OfferElevation {
+            pane_id,
+            root: root.to_path_buf(),
+        });
+    }
+}
+
 fn send_gui_message(
     gui_event_tx: &CountingSender<GuiEvent>,
     pane_id: PaneId,
@@ -1584,6 +1606,25 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let gauge = Arc::new(crate::queue_stats::QueueGauge::new());
         (CountingSender::new(tx, gauge), rx)
+    }
+
+    #[test]
+    fn permission_failure_requests_original_directory_once() {
+        let (tx, rx) = counting_channel();
+        let root = PathBuf::from("C:/original request");
+        request_elevation_if_needed(true, PaneId::new(7), &root, &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AppEvent::OfferElevation { pane_id, root: requested } if pane_id == PaneId::new(7) && requested == root
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn nonpermission_failure_does_not_offer_elevation() {
+        let (tx, rx) = counting_channel();
+        request_elevation_if_needed(false, PaneId::new(7), Path::new("C:/untouched"), &tx);
+        assert!(rx.try_recv().is_err());
     }
 
     struct PickerEngine {

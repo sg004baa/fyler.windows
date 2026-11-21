@@ -206,6 +206,7 @@ mod tests {
             backup: backup(),
         };
         let report = CommitReport {
+            permission_denied: false,
             results: vec![OpResult {
                 op: step,
                 outcome: OpOutcome::Failed {

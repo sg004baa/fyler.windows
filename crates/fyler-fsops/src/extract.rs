@@ -130,6 +130,7 @@ pub fn apply_extract_cancellable(
     }) {
         Ok(zip) => zip,
         Err(error) => {
+            let permission_denied = crate::privilege::is_permission_denied(&error);
             let error = error.to_string();
             let results = plan
                 .ops
@@ -148,11 +149,15 @@ pub fn apply_extract_cancellable(
                 total,
                 current: None,
             });
-            return CommitReport { results };
+            return CommitReport {
+                results,
+                permission_denied,
+            };
         }
     };
 
     let mut results = Vec::with_capacity(total);
+    let mut permission_denied = false;
     let mut attempted = 0;
 
     for (index, operation) in plan.ops.iter().enumerate() {
@@ -175,10 +180,13 @@ pub fn apply_extract_cancellable(
 
         let outcome = match execute_extract_operation(&mut zip, index, operation) {
             Ok(()) => OpOutcome::Success,
-            Err(error) => OpOutcome::Failed {
-                error: error.to_string(),
-                progress: None,
-            },
+            Err(error) => {
+                permission_denied |= crate::privilege::is_permission_denied(&error);
+                OpOutcome::Failed {
+                    error: error.to_string(),
+                    progress: None,
+                }
+            }
         };
         results.push(OpResult {
             op: operation.clone(),
@@ -192,7 +200,10 @@ pub fn apply_extract_cancellable(
         current: None,
     });
 
-    CommitReport { results }
+    CommitReport {
+        results,
+        permission_denied,
+    }
 }
 
 /// [`zip::read::ZipFile::enclosed_name`]が返す相対パスを、OSセパレータに
@@ -279,6 +290,49 @@ mod tests {
             }
         }
         writer.finish().unwrap();
+    }
+
+    #[test]
+    fn invalid_archive_failure_does_not_request_elevation() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("broken.zip");
+        fs::write(&archive, b"Permission denied (os error 1314)").unwrap();
+        let target = dir.path().join("out/file");
+        let plan = ExtractPlan {
+            archive,
+            dest_dir: dir.path().join("out"),
+            ops: vec![ExtractOp {
+                name: "file".into(),
+                target: target.clone(),
+                is_dir: false,
+            }],
+            total_bytes: 0,
+        };
+        let report = apply_extract_cancellable(&plan, &AtomicBool::new(false), &mut |_| {});
+        assert!(report.all_failed());
+        assert!(!report.permission_denied);
+        assert!(!target.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn archive_access_denied_is_preserved_in_report() {
+        let dir = tempfile::tempdir().unwrap();
+        // Opening a directory as an ordinary File fails with ERROR_ACCESS_DENIED on Windows.
+        let plan = ExtractPlan {
+            archive: dir.path().to_path_buf(),
+            dest_dir: dir.path().join("out"),
+            ops: vec![ExtractOp {
+                name: "file".into(),
+                target: dir.path().join("out/file"),
+                is_dir: false,
+            }],
+            total_bytes: 0,
+        };
+        let report = apply_extract_cancellable(&plan, &AtomicBool::new(false), &mut |_| {});
+        assert!(report.all_failed());
+        assert!(report.permission_denied);
+        assert!(!plan.dest_dir.exists());
     }
 
     #[test]

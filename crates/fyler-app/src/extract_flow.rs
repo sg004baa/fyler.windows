@@ -208,6 +208,7 @@ mod tests {
         assert!(!cancel.load(Ordering::Relaxed));
 
         let report = CommitReport {
+            permission_denied: false,
             results: Vec::new(),
         };
         let ExtractFlowResult::Finished {
@@ -352,6 +353,7 @@ mod tests {
     #[test]
     fn report_lines_marks_failures_with_ng_prefix() {
         let report = CommitReport {
+            permission_denied: false,
             results: vec![
                 OpResult {
                     op: ExtractOp {

@@ -2324,6 +2324,7 @@ mod tests {
 
     fn undo_report(step: UndoStep, outcome: OpOutcome) -> CommitReport<UndoStep> {
         CommitReport {
+            permission_denied: false,
             results: vec![OpResult { op: step, outcome }],
         }
     }
@@ -2616,6 +2617,7 @@ mod tests {
         let selected_id = controller.baseline.entries()[0].id;
         engine.set_view(controller.visible_lines(), 0);
         let report = CommitReport {
+            permission_denied: false,
             results: vec![
                 OpResult {
                     op: FsOperation::Move {
@@ -2664,6 +2666,7 @@ mod tests {
             SaveController::new(root, ids, baseline, Arc::<RecordingEngine>::clone(&engine));
         engine.set_view(controller.visible_lines(), 1);
         let apply_report = CommitReport {
+            permission_denied: false,
             results: vec![
                 OpResult {
                     op: FsOperation::Move {
@@ -2716,6 +2719,7 @@ mod tests {
         let identity = fyler_core::undo::FileIdentity { volume: 1, file: 2 };
         let other_identity = fyler_core::undo::FileIdentity { volume: 1, file: 3 };
         let undo_report = CommitReport {
+            permission_denied: false,
             results: vec![
                 OpResult {
                     op: UndoStep::MoveBack {
@@ -3373,6 +3377,7 @@ mod tests {
         let (mut controller, engine) = controller(temp_root.path());
         let (plan, _, _) = begin_rename_apply(&mut controller);
         let report = CommitReport {
+            permission_denied: false,
             results: plan
                 .ops
                 .into_iter()

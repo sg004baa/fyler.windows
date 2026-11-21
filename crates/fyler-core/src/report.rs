@@ -19,12 +19,15 @@ pub struct ApplyProgress<Operation = FsOperation> {
 pub struct CommitReport<Operation = FsOperation> {
     /// planの `ops` と同順・同数。
     pub results: Vec<OpResult<Operation>>,
+    /// A mutation failed with a typed access-denied or missing-privilege error.
+    pub permission_denied: bool,
 }
 
 impl<Operation> Default for CommitReport<Operation> {
     fn default() -> Self {
         Self {
             results: Vec::new(),
+            permission_denied: false,
         }
     }
 }

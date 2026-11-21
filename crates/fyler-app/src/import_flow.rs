@@ -229,6 +229,7 @@ mod tests {
         assert!(!cancel.load(Ordering::Relaxed));
 
         let report = CommitReport {
+            permission_denied: false,
             results: Vec::new(),
         };
         let ImportFlowResult::Finished {

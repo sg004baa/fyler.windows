@@ -24,14 +24,16 @@ use crate::undo::UndoRecorder;
 
 #[derive(Debug)]
 pub(crate) struct OpFailure {
-    pub(crate) error: String,
+    pub(crate) error: anyhow::Error,
     progress: Option<String>,
+    permission_denied: bool,
 }
 
 impl OpFailure {
     pub(crate) fn with_progress(error: anyhow::Error, progress: impl Into<String>) -> Self {
         Self {
-            error: error.to_string(),
+            permission_denied: crate::privilege::is_permission_denied(&error),
+            error,
             progress: Some(progress.into()),
         }
     }
@@ -40,23 +42,24 @@ impl OpFailure {
 impl From<anyhow::Error> for OpFailure {
     fn from(error: anyhow::Error) -> Self {
         Self {
-            error: error.to_string(),
+            permission_denied: crate::privilege::is_permission_denied(&error),
+            error,
             progress: None,
         }
     }
 }
 
 #[cfg(test)]
-type FaultHook = Box<dyn FnMut(&str, &Path) -> Option<anyhow::Error>>;
+pub(super) type FaultHook = Box<dyn FnMut(&str, &Path) -> Option<anyhow::Error>>;
 
 #[cfg(test)]
 thread_local! {
-    static FAULT_INJECTION: std::cell::RefCell<Option<FaultHook>> =
+    pub(super) static FAULT_INJECTION: std::cell::RefCell<Option<FaultHook>> =
         std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
-fn fault_point(stage: &str, path: &Path) -> anyhow::Result<()> {
+pub(super) fn fault_point(stage: &str, path: &Path) -> anyhow::Result<()> {
     FAULT_INJECTION.with(|hook| {
         let mut hook = hook.borrow_mut();
         if let Some(error) = hook.as_mut().and_then(|hook| hook(stage, path)) {
@@ -68,7 +71,7 @@ fn fault_point(stage: &str, path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(not(test))]
-fn fault_point(_stage: &str, _path: &Path) -> anyhow::Result<()> {
+pub(super) fn fault_point(_stage: &str, _path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -242,7 +245,7 @@ fn execute_with_staged_overwrite(
                 ))
             }
         },
-        Err(operation_error) => {
+        Err(mut operation_error) => {
             let cleanup = cleanup_staged_operation_target(target);
             let restore = if cleanup.is_ok() {
                 staged.restore()
@@ -259,24 +262,30 @@ fn execute_with_staged_overwrite(
                     Err(operation_error)
                 }
                 (cleanup, restore) => {
+                    operation_error.permission_denied |= cleanup
+                        .as_ref()
+                        .err()
+                        .is_some_and(crate::privilege::is_permission_denied)
+                        || restore
+                            .as_ref()
+                            .err()
+                            .is_some_and(crate::privilege::is_permission_denied);
                     let backup_note = backup.as_ref().map_or(String::new(), |backup| {
                         format!(" Backup payload {} is also retained.", backup.payload_rel)
                     });
-                    Err(OpFailure::with_progress(
-                        anyhow!(operation_error.error),
-                        format!(
-                            "Compensation after the operation failed also failed (cleanup: {}; restore: {}). The old entry remains staged at {}. Restore it manually to {}.{}",
-                            cleanup
-                                .err()
-                                .map_or_else(|| "success".to_owned(), |error| error.to_string()),
-                            restore
-                                .err()
-                                .map_or_else(|| "success".to_owned(), |error| error.to_string()),
-                            staged_path.display(),
-                            original.display(),
-                            backup_note
-                        ),
-                    ))
+                    operation_error.progress = Some(format!(
+                        "Compensation after the operation failed also failed (cleanup: {}; restore: {}). The old entry remains staged at {}. Restore it manually to {}.{}",
+                        cleanup
+                            .err()
+                            .map_or_else(|| "success".to_owned(), |error| error.to_string()),
+                        restore
+                            .err()
+                            .map_or_else(|| "success".to_owned(), |error| error.to_string()),
+                        staged_path.display(),
+                        original.display(),
+                        backup_note
+                    ));
+                    Err(operation_error)
                 }
             }
         }
@@ -284,6 +293,7 @@ fn execute_with_staged_overwrite(
 }
 
 fn cleanup_staged_operation_target(target: &Path) -> anyhow::Result<()> {
+    fault_point("cleanup_staged_target", target)?;
     let metadata = match fs::symlink_metadata(crate::long_path::to_fs(target)) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -362,6 +372,7 @@ pub fn apply_plan_cancellable(
     mut recorder: Option<&mut UndoRecorder>,
 ) -> CommitReport {
     let mut results = Vec::with_capacity(plan.ops.len());
+    let mut permission_denied = false;
     let mut failed_directories = Vec::new();
     let mut attempted = 0;
     let total = plan.ops.len();
@@ -400,6 +411,7 @@ pub fn apply_plan_cancellable(
         {
             Ok(()) => OpOutcome::Success,
             Err(failure) => {
+                permission_denied |= failure.permission_denied;
                 if let FsOperation::Create {
                     path,
                     kind: EntryKind::Dir,
@@ -408,7 +420,7 @@ pub fn apply_plan_cancellable(
                     failed_directories.push(path.clone());
                 }
                 OpOutcome::Failed {
-                    error: failure.error,
+                    error: failure.error.to_string(),
                     progress: failure.progress,
                 }
             }
@@ -425,7 +437,10 @@ pub fn apply_plan_cancellable(
         current: None,
     });
 
-    CommitReport { results }
+    CommitReport {
+        results,
+        permission_denied,
+    }
 }
 
 /// 承認済みのpane間transfer planを実行する。
@@ -449,6 +464,7 @@ pub fn apply_transfer_plan_cancellable(
     let from_root = absolute_path(&plan.from_root);
     let to_root = absolute_path(&plan.to_root);
     let mut results = Vec::with_capacity(plan.ops.len());
+    let mut permission_denied = false;
     let mut attempted = 0;
     let total = plan.ops.len();
 
@@ -473,10 +489,13 @@ pub fn apply_transfer_plan_cancellable(
         let outcome = match execute_transfer_operation(&from_root, &to_root, operation, overwrites)
         {
             Ok(()) => OpOutcome::Success,
-            Err(failure) => OpOutcome::Failed {
-                error: failure.error,
-                progress: failure.progress,
-            },
+            Err(failure) => {
+                permission_denied |= failure.permission_denied;
+                OpOutcome::Failed {
+                    error: failure.error.to_string(),
+                    progress: failure.progress,
+                }
+            }
         };
         results.push(OpResult {
             op: operation.clone(),
@@ -490,7 +509,10 @@ pub fn apply_transfer_plan_cancellable(
         current: None,
     });
 
-    CommitReport { results }
+    CommitReport {
+        results,
+        permission_denied,
+    }
 }
 
 fn execute_transfer_operation(
@@ -636,6 +658,7 @@ pub fn apply_import_plan_cancellable(
     on_progress: &mut dyn FnMut(ApplyProgress<ImportOp>),
 ) -> CommitReport<ImportOp> {
     let mut results = Vec::with_capacity(plan.ops.len());
+    let mut permission_denied = false;
     let mut attempted = 0;
     let total = plan.ops.len();
 
@@ -659,10 +682,13 @@ pub fn apply_import_plan_cancellable(
 
         let outcome = match execute_import_operation(plan.effect, operation, overwrites) {
             Ok(()) => OpOutcome::Success,
-            Err(failure) => OpOutcome::Failed {
-                error: failure.error,
-                progress: failure.progress,
-            },
+            Err(failure) => {
+                permission_denied |= failure.permission_denied;
+                OpOutcome::Failed {
+                    error: failure.error.to_string(),
+                    progress: failure.progress,
+                }
+            }
         };
         results.push(OpResult {
             op: operation.clone(),
@@ -676,7 +702,10 @@ pub fn apply_import_plan_cancellable(
         current: None,
     });
 
-    CommitReport { results }
+    CommitReport {
+        results,
+        permission_denied,
+    }
 }
 
 fn execute_import_operation(
@@ -1364,12 +1393,248 @@ mod tests {
             });
             Self
         }
+
+        fn permission(stage: &'static str) -> Self {
+            FAULT_INJECTION.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |actual, _| {
+                    (actual == stage)
+                        .then(|| std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+                }));
+            });
+            Self
+        }
     }
 
     impl Drop for FaultGuard {
         fn drop(&mut self) {
             FAULT_INJECTION.with(|hook| *hook.borrow_mut() = None);
         }
+    }
+
+    #[test]
+    fn permission_report_keeps_partial_success_without_replaying() {
+        let root = tempdir().unwrap();
+        let _fault = FaultGuard::permission("create_file");
+        let plan = OperationPlan {
+            ops: vec![
+                FsOperation::Create {
+                    path: TreePath::parse("denied.txt"),
+                    kind: EntryKind::File,
+                },
+                FsOperation::Create {
+                    path: TreePath::parse("created"),
+                    kind: EntryKind::Dir,
+                },
+            ],
+        };
+        let report = apply_plan(root.path(), &plan);
+        assert!(report.permission_denied);
+        assert!(matches!(
+            report.results[0].outcome,
+            OpOutcome::Failed { .. }
+        ));
+        assert!(matches!(report.results[1].outcome, OpOutcome::Success));
+        assert!(!root.path().join("denied.txt").exists());
+        assert!(root.path().join("created").is_dir());
+    }
+
+    #[test]
+    fn transfer_and_import_reports_preserve_permission_errors() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(source.join("file"), b"unchanged").unwrap();
+        {
+            let _fault = FaultGuard::permission("transfer_copy");
+            let plan = transfer_plan(
+                &source,
+                &target,
+                vec![transfer_op(
+                    TransferKind::Copy,
+                    "file",
+                    "copy",
+                    EntryKind::File,
+                )],
+            );
+            let report = apply_transfer_plan_cancellable(
+                &plan,
+                &HashSet::new(),
+                &AtomicBool::new(false),
+                &mut |_| {},
+            );
+            assert!(report.permission_denied);
+            assert!(report.all_failed());
+        }
+        {
+            let _fault = FaultGuard::permission("import_copy");
+            let plan = ImportPlan {
+                destination: target.clone(),
+                effect: DropEffect::Copy,
+                ops: vec![ImportOp {
+                    source: source.join("file"),
+                    target: target.join("copy"),
+                }],
+            };
+            let report = apply_import_plan_cancellable(
+                &plan,
+                &HashSet::new(),
+                &AtomicBool::new(false),
+                &mut |_| {},
+            );
+            assert!(report.permission_denied);
+            assert!(report.all_failed());
+        }
+        assert_eq!(fs::read(source.join("file")).unwrap(), b"unchanged");
+        assert!(!target.join("copy").exists());
+    }
+
+    #[test]
+    fn unrelated_apply_failure_never_requests_elevation() {
+        let root = tempdir().unwrap();
+        let _fault = FaultGuard::once("create_file");
+        let report = apply_plan(
+            root.path(),
+            &OperationPlan {
+                ops: vec![FsOperation::Create {
+                    path: TreePath::parse("file"),
+                    kind: EntryKind::File,
+                }],
+            },
+        );
+        assert!(report.all_failed());
+        assert!(!report.permission_denied);
+    }
+
+    fn assert_compensation_report<Op>(
+        report: CommitReport<Op>,
+        compensation_kind: std::io::ErrorKind,
+    ) {
+        assert_eq!(
+            report.permission_denied,
+            compensation_kind == std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(report.results.len(), 2);
+        match &report.results[0].outcome {
+            OpOutcome::Failed { error, progress } => {
+                assert_eq!(error, "primary operation failure");
+                assert!(progress.is_some());
+            }
+            outcome => panic!("expected failed overwrite, got {outcome:?}"),
+        }
+        assert!(matches!(report.results[1].outcome, OpOutcome::Success));
+    }
+
+    fn assert_compensation_error_reports(compensation_kind: std::io::ErrorKind) {
+        for compensation_stage in ["cleanup_staged_target", "restore"] {
+            for operation_stage in ["copy_single", "transfer_copy", "import_copy"] {
+                let root = tempdir().unwrap();
+                let source = root.path().join("source");
+                let target = root.path().join("target");
+                let continued = root.path().join("continued");
+                fs::write(&source, b"source").unwrap();
+                fs::write(&target, b"old").unwrap();
+                let fault_target = target.clone();
+                FAULT_INJECTION.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move |stage, path| {
+                        if stage == operation_stage && path == fault_target {
+                            fs::write(path, b"incomplete").unwrap();
+                            Some(std::io::Error::other("primary operation failure").into())
+                        } else if stage == compensation_stage {
+                            Some(std::io::Error::from(compensation_kind).into())
+                        } else {
+                            None
+                        }
+                    }));
+                });
+                let _fault = FaultGuard;
+                let cancel = AtomicBool::new(false);
+                match operation_stage {
+                    "copy_single" => {
+                        let plan = OperationPlan {
+                            ops: ["target", "continued"]
+                                .map(|to| FsOperation::Copy {
+                                    src: EntryId(1),
+                                    from: TreePath::parse("source"),
+                                    to: TreePath::parse(to),
+                                })
+                                .to_vec(),
+                        };
+                        assert_compensation_report(
+                            apply_plan_with_overwrites(
+                                root.path(),
+                                &plan,
+                                &HashSet::from([TreePath::parse("target")]),
+                            ),
+                            compensation_kind,
+                        );
+                    }
+                    "transfer_copy" => {
+                        let plan = transfer_plan(
+                            root.path(),
+                            root.path(),
+                            ["target", "continued"]
+                                .map(|to| {
+                                    transfer_op(TransferKind::Copy, "source", to, EntryKind::File)
+                                })
+                                .to_vec(),
+                        );
+                        assert_compensation_report(
+                            apply_transfer_plan_cancellable(
+                                &plan,
+                                &HashSet::from([target.clone()]),
+                                &cancel,
+                                &mut |_| {},
+                            ),
+                            compensation_kind,
+                        );
+                    }
+                    "import_copy" => {
+                        let plan = ImportPlan {
+                            destination: root.path().to_path_buf(),
+                            effect: DropEffect::Copy,
+                            ops: vec![import_op(&source, &target), import_op(&source, &continued)],
+                        };
+                        assert_compensation_report(
+                            apply_import_plan_cancellable(
+                                &plan,
+                                &HashSet::from([target.clone()]),
+                                &cancel,
+                                &mut |_| {},
+                            ),
+                            compensation_kind,
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+
+                assert_eq!(fs::read(&source).unwrap(), b"source");
+                assert_eq!(fs::read(&continued).unwrap(), b"source");
+                if compensation_stage == "cleanup_staged_target" {
+                    assert_eq!(fs::read(&target).unwrap(), b"incomplete");
+                } else {
+                    assert!(!target.exists());
+                }
+                let staging = fs::read_dir(root.path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| path.is_dir())
+                    .collect::<Vec<_>>();
+                assert_eq!(staging.len(), 1);
+                assert_eq!(fs::read(staging[0].join("target")).unwrap(), b"old");
+            }
+        }
+    }
+
+    #[test]
+    fn compensation_permission_failures_request_elevation_and_keep_partial_results() {
+        assert_compensation_error_reports(std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn compensation_unrelated_failures_do_not_request_elevation() {
+        assert_compensation_error_reports(std::io::ErrorKind::Other);
     }
 
     /// ディレクトリ直下の実際の格納名を返す(ソート済み)。
