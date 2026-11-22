@@ -750,7 +750,7 @@ impl<'a> ScanControl<'a> {
 
     fn record_entry(&mut self) -> bool {
         self.entries += 1;
-        if self.entries % 1000 == 0 {
+        if self.entries.is_multiple_of(1000) {
             (self.progress)(self.entries);
         }
         !self.cancelled()

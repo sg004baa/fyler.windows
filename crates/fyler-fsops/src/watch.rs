@@ -153,10 +153,10 @@ fn run_debounce(rx: Receiver<RawWatchEvent>, tx: Sender<WatchEvent>) {
             }
         }
 
-        if let Some(change) = pending.into_change() {
-            if tx.send(WatchEvent::Changed(change)).is_err() {
-                break;
-            }
+        if let Some(change) = pending.into_change()
+            && tx.send(WatchEvent::Changed(change)).is_err()
+        {
+            break;
         }
         if source_disconnected {
             break;

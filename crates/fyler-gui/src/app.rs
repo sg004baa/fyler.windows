@@ -1189,13 +1189,13 @@ impl eframe::App for FylerApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_events();
         if let Some(font) = self.pending_font.take() {
-            if let Some(path) = font.as_deref() {
-                if let Err(error) = fs::read(path) {
-                    self.message = Some(EditorMessage {
-                        kind: fyler_core::editor::MessageKind::Error,
-                        text: format!("Failed to load font {}: {error}", path.display()),
-                    });
-                }
+            if let Some(path) = font.as_deref()
+                && let Err(error) = fs::read(path)
+            {
+                self.message = Some(EditorMessage {
+                    kind: fyler_core::editor::MessageKind::Error,
+                    text: format!("Failed to load font {}: {error}", path.display()),
+                });
             }
             install_fallback_font(ctx, font.as_deref());
         }
