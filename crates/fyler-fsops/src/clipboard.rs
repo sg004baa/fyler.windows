@@ -95,7 +95,7 @@ pub fn decode_hdrop(bytes: &[u8]) -> anyhow::Result<Vec<PathBuf>> {
     if f_wide == 0 {
         bail!("CF_HDROP payload is ANSI, not UTF-16 (fWide=0); this is not supported");
     }
-    if p_files > bytes.len() || (bytes.len() - p_files) % 2 != 0 {
+    if p_files > bytes.len() || !(bytes.len() - p_files).is_multiple_of(2) {
         bail!(
             "CF_HDROP file list offset ({p_files}) is out of range for a {}-byte payload",
             bytes.len()
@@ -103,9 +103,8 @@ pub fn decode_hdrop(bytes: &[u8]) -> anyhow::Result<Vec<PathBuf>> {
     }
 
     let list = &bytes[p_files..];
-    let units = list
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
+    let (pairs, _) = list.as_chunks::<2>();
+    let units = pairs.iter().copied().map(u16::from_le_bytes);
 
     let mut paths = Vec::new();
     let mut current = Vec::new();

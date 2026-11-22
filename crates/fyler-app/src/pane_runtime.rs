@@ -1640,13 +1640,12 @@ pub(super) fn run() -> anyhow::Result<()> {
                             }
                         }
                         for session in panes.values_mut() {
-                            if let Err(error) = session.engine.send(EditorCommand::ConfigureBindings(loaded.bindings.clone())) {
-                                if send_gui_message(
+                            if let Err(error) = session.engine.send(EditorCommand::ConfigureBindings(loaded.bindings.clone()))
+                                && send_gui_message(
                                     &gui_event_tx, pane_id, MessageKind::Error,
                                     format!("Could not reload key bindings: {error:#}"),
                                 ).is_err() {
-                                    return;
-                                }
+                                return;
                             }
                         }
                         let runtime_config = loaded;
