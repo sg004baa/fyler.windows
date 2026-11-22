@@ -78,7 +78,10 @@ pub fn preflight_extract(archive: &Path, dest_dir: &Path) -> anyhow::Result<Extr
                 archive.display()
             )
         })?;
-        if entry.name() != raw_name {
+        let decoded_name = entry.name().with_context(|| {
+            format!("Failed to decode zip entry #{index}: {}", archive.display())
+        })?;
+        if decoded_name != raw_name {
             bail!(
                 "Zip entry #{index} has a non-UTF-8 entry name (encoding not declared as UTF-8): {}",
                 archive.display()

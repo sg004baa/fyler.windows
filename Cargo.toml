@@ -12,7 +12,7 @@ members = [
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.92"
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -30,9 +30,8 @@ eframe = "0.35"
 trash = "5.2"
 notify = "8.2"
 toml = "1.1"
-# zip展開(fyler-fsops extract)。deflate対応の最小構成。8.x系はrust 1.88を
-# 要求するため、workspaceのrust-version 1.85でビルドできる7.x系に留める。
-zip = { version = "7.2", default-features = false, features = ["deflate"] }
+# zip展開(fyler-fsops extract)。deflate対応の最小構成。
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
